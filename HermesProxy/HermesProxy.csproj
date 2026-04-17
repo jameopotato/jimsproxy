@@ -9,8 +9,9 @@
     <OutputType>Exe</OutputType>
     <StartupObject>HermesProxy.Program</StartupObject>
     <ApplicationIcon>Hermes.ico</ApplicationIcon>
-    <Copyright>Copyright © WowLegacyCore 2023</Copyright>
-    <Authors>WowLegacyCore</Authors>
+    <AssemblyName>JimsProxy</AssemblyName>
+    <Copyright>Copyright © WowLegacyCore 2023; Fork © jameopotato 2026</Copyright>
+    <Authors>WowLegacyCore; jameopotato</Authors>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
 

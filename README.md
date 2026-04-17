@@ -1,4 +1,34 @@
-# HermesProxy ![Build](https://github.com/Xian55/HermesProxy/actions/workflows/Build_Proxy.yml/badge.svg)
+# JimsProxy
+
+A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesProxy) (archived November 2024) with rich diagnostic logging and fixes targeting Twinstar/Kronos servers.
+
+**Upstream:** https://github.com/WowLegacyCore/HermesProxy (archived)
+**License:** GPL v3 (inherited from upstream — see `LICENSE`)
+
+## Why the fork
+
+The upstream HermesProxy project was archived in November 2024. It works well for the servers it was tested against (VMaNGOS, CMaNGOS) but has translation bugs against Twinstar's MaNGOS fork (Kronos) that surface as disconnects, stuck cast bars, combat log issues, and other gameplay anomalies. JimsProxy adds:
+
+- **Structured JSONL event logging** — every packet, translation, and lifecycle event is emitted to a machine-readable log alongside the existing human-readable console output
+- **Untranslated / error event surfacing** — makes packet translation gaps and exceptions immediately visible
+- **Tight integration with the [Classic 1.14 Launcher](https://github.com/jameopotato/classic-114-launcher)** — the launcher bundles this proxy and provides an "Export Logs" flow for diagnosis
+
+See `CHANGES.md` for the complete change log.
+
+## Build
+
+```bash
+dotnet publish HermesProxy/HermesProxy.csproj \
+  -p:UsePublishBuildSettings=true -c Release -r win-x64 \
+  -o build/
+# Output: build/JimsProxy.exe (self-contained single-file) + build/CSV/
+```
+
+Requires **.NET SDK 6+**.
+
+
+## Upstream HermesProxy README (retained for reference)
+
 
 This project enables play on existing legacy WoW emulation cores using the modern clients. It serves as a translation layer, converting all network traffic to the appropriate format each side can understand.
 
