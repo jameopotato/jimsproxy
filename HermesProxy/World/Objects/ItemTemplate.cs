@@ -266,5 +266,62 @@ public class ItemTemplate
 
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_1_0_9767))
             HolidayID = packet.ReadInt32();
+
+        // JimsProxy: derive RequiredSkillId from item Class+SubClass when the
+        // server sends 0 (no skill specified). Some 1.12 servers (Kronos in
+        // particular) leave RequiredSkillId blank for items where the modern
+        // 1.14 client expects a populated value to render the tooltip's
+        // "Requires <Skill>" line in red for unmet requirements. The item is
+        // still correctly flagged as unequippable (red border in inventory),
+        // but the tooltip TEXT explaining WHY isn't colored. Other 1.12
+        // servers (Ashen-wow) populate this field correctly, so deriving as
+        // a fallback closes the Kronos gap without overriding good data.
+        // Mappings sourced from TrinityCore ItemPrototype::GetSkill().
+        if (RequiredSkillId == 0)
+            RequiredSkillId = DeriveSkillFromItemType(Class, SubClass);
+    }
+
+    // JimsProxy: ItemClass+SubClass -> SkillLine.dbc id mapping. Returns 0
+    // for unknown combinations (caller leaves RequiredSkillId at 0 unchanged).
+    private static uint DeriveSkillFromItemType(int itemClass, uint subClass)
+    {
+        // Item Class 2 = Weapon
+        if (itemClass == 2)
+        {
+            return subClass switch
+            {
+                0  => 44,   // 1H Axe       -> SKILL_AXES
+                1  => 172,  // 2H Axe       -> SKILL_2H_AXES
+                2  => 45,   // Bow          -> SKILL_BOWS
+                3  => 46,   // Gun          -> SKILL_GUNS
+                4  => 54,   // 1H Mace      -> SKILL_MACES
+                5  => 160,  // 2H Mace      -> SKILL_2H_MACES
+                6  => 229,  // Polearm      -> SKILL_POLEARMS
+                7  => 43,   // 1H Sword     -> SKILL_SWORDS
+                8  => 55,   // 2H Sword     -> SKILL_2H_SWORDS
+                10 => 136,  // Staff        -> SKILL_STAVES
+                13 => 473,  // Fist Weapon  -> SKILL_FIST_WEAPONS
+                15 => 173,  // Dagger       -> SKILL_DAGGERS
+                16 => 176,  // Thrown       -> SKILL_THROWN
+                18 => 226,  // Crossbow     -> SKILL_CROSSBOWS
+                19 => 228,  // Wand         -> SKILL_WANDS
+                20 => 356,  // Fishing Pole -> SKILL_FISHING
+                _  => 0,
+            };
+        }
+        // Item Class 4 = Armor
+        if (itemClass == 4)
+        {
+            return subClass switch
+            {
+                1 => 415,  // Cloth     -> SKILL_CLOTH
+                2 => 414,  // Leather   -> SKILL_LEATHER
+                3 => 413,  // Mail      -> SKILL_MAIL
+                4 => 293,  // Plate     -> SKILL_PLATE_MAIL
+                6 => 433,  // Shield    -> SKILL_SHIELD
+                _ => 0,
+            };
+        }
+        return 0;
     }
 }

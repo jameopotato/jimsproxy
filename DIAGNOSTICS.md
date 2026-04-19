@@ -81,7 +81,62 @@ Meanwhile, `SMSG_QUEST_GIVER_OFFER_REWARD_MESSAGE` (the packet that triggers the
 
 **Fix:** Added to `KnownBenignOpcodes.ModernOnly` allowlist with a new category comment explaining the bidirectional nature of the allowlist (modern-only c2s AND legacy-only s2c both have "nothing to translate to" on the other side). Wording in the file updated to reflect both directions.
 
-### Item red-restriction indicator missing (user report) — INVESTIGATION PENDING
+## 2026-04-19 — Block 4 iterative fixes (split diagnosis)
+
+**Sessions:** `jimsproxy-20260419-151457.jsonl` (focused 2-min test on Kronos)
+**Build:** JimsProxy 4.2.5+15(f908789) — instrumentation build with spell.cast events
+
+### PW:Shield visual missing — RESOLVED (intermittent / not reproducible)
+
+User reported last night that PW:Shield didn't show the bubble visual. After shipping spell.cast instrumentation, retest showed:
+
+- spell 17 (PW:S) translated correctly: `spell_id=17`, `spell_visual_id=242477`, `visual_lookup_missing=False` for both SMSG_SPELL_START and SMSG_SPELL_GO phases
+- User confirmed bubble visual now renders on cast
+
+Likely cause: situational / first-cast-after-login race or game-state issue. Could not reproduce with the instrumentation in place, so nothing to fix. The spell.cast event is still valuable instrumentation for future spell-path diagnosis — keeping it.
+
+### Item red-restriction indicator missing — PARTIAL FIX SHIPPED (RequiredSkill derivation)
+
+**Refined report:** Border IS red for restricted items (client knows item is unequippable). Tooltip TEXT for "Requires Thrown" stays white instead of red (client doesn't know WHICH requirement is unmet).
+
+**Critical diagnostic:** Same bug present on Kronos but NOT on Ashen-wow (different 1.12 server). So the proxy/client pipeline works when given good data — the issue is Kronos-specific server data.
+
+**Root cause:** 1.12 mangos Item Template serializer populates `RequiredSkillId` differently by server. Ashen-wow apparently populates it correctly for weapon/armor proficiency items; Kronos seems to leave it at 0 for many items including thrown weapons and leather armor. With `RequiredSkillId=0`, the modern client can flag the item as unequippable (via other logic: AllowableClass, equipment-slot proficiency) but can't render the specific "Requires Thrown" line in red because no skill is declared required.
+
+**Fix (commit pending):** In `ItemTemplate.ReadFromLegacyPacket`, after parsing `RequiredSkillId` from the server, if it's 0, derive from ItemClass+SubClass. Mappings sourced from TrinityCore's `ItemPrototype::GetSkill()`:
+
+- Weapon subclass 0/1 (1H/2H Axe) → skill 44 / 172
+- Weapon subclass 2 (Bow) → skill 45
+- Weapon subclass 3 (Gun) → skill 46
+- Weapon subclass 4/5 (1H/2H Mace) → skill 54 / 160
+- Weapon subclass 6 (Polearm) → skill 229
+- Weapon subclass 7/8 (1H/2H Sword) → skill 43 / 55
+- Weapon subclass 10 (Staff) → skill 136
+- Weapon subclass 13 (Fist) → skill 473
+- Weapon subclass 15 (Dagger) → skill 173
+- Weapon subclass 16 (Thrown) → skill 176
+- Weapon subclass 18/19 (Crossbow/Wand) → skill 226 / 228
+- Weapon subclass 20 (Fishing Pole) → skill 356
+- Armor subclass 1-4 (Cloth/Leather/Mail/Plate) → skill 415 / 414 / 413 / 293
+- Armor subclass 6 (Shield) → skill 433
+
+Derivation is purely additive — only fires when server sends 0, never overrides good data. Since Ashen-wow already populates the field correctly, this fix only changes behavior on servers like Kronos that don't.
+
+**Verification:** Next session, inspect a thrown weapon tooltip. Should now show "Requires Thrown" in red. Keep noting any remaining tooltip lines that stay white — those might need additional derivation (e.g., RequiredSkillLevel, weapon-damage-type fields).
+
+### Spell visuals missing for Stoneform / Weakened Soul / spell 31248 — DEFERRED
+
+Same analyzer session surfaced 4 other spells with `visual_lookup_missing=True`:
+
+- 20595, 20596 — Stoneform (dwarf racial cleanse)
+- 6788 — Weakened Soul (PW:S side effect debuff that prevents re-shield for 15s)
+- 31248 — unknown (some buff)
+
+All minor effects, low gameplay impact. Deferred until we have bigger fish or they correlate with another user-visible symptom.
+
+## Earlier findings (pre-Block 4)
+
+### Item red-restriction indicator missing (user report) — RESOLVED via RequiredSkill derivation above
 
 **Report:** Priest sees axes / leather armor as not-red in bag & tooltips. In vanilla WoW these would show with red-text "Axes" / "Leather" proficiency requirement because priest can't use them.
 
