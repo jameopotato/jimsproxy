@@ -1,4 +1,5 @@
 ﻿using Framework;
+using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Server.Packets;
@@ -556,6 +557,24 @@ public partial class WorldClient
         dbdata.SpellID = packet.ReadInt32();
         dbdata.SpellXSpellVisualID = GameData.GetSpellVisual((uint)dbdata.SpellID);
         dbdata.CastID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, (uint)dbdata.SpellID, (ulong)dbdata.SpellID + dbdata.CasterUnit.GetCounter());
+
+        // JimsProxy: emit structured spell.cast event so we can diagnose spell-ID
+        // and visual-kit lookup issues without parsing .pkt files. Particularly
+        // useful for comparing what different 1.12 servers (Kronos vs Ashen-wow)
+        // send for the same spell -- on Kronos PW:Shield doesn't render the
+        // bubble visual; on Ashen-wow it does. If spell_visual_id=0 here, the
+        // CSV lookup failed (either wrong spellId from server or missing row).
+        // Emitted for both SMSG_SPELL_START and SMSG_SPELL_GO (shared codepath).
+        Log.Event("spell.cast", new
+        {
+            direction = "s2c",
+            phase = isSpellGo ? "go" : "start",
+            spell_id = dbdata.SpellID,
+            spell_visual_id = dbdata.SpellXSpellVisualID,
+            visual_lookup_missing = dbdata.SpellXSpellVisualID == 0,
+            caster_guid = dbdata.CasterGUID.ToString(),
+            caster_is_player = dbdata.CasterGUID == GetSession().GameState.CurrentPlayerGuid,
+        });
 
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180) && LegacyVersion.RemovedInVersion(ClientVersionBuild.V3_0_2_9056) && !isSpellGo)
             packet.ReadUInt8(); // cast count
