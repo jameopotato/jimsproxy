@@ -324,6 +324,75 @@ public partial class WorldClient
         SendPacketToClient(spell2);
     }
 
+    // JimsProxy: SMSG_SPELL_FAILURE handler. Block 2 gameplay testing on Kronos
+    // surfaced this as packet.untranslated 7x in a 10-min priest leveling session
+    // (Smite/Heal failing for OOM, OOR, LoS). Without this, the modern client
+    // never sees the cast failure -- cast bar doesn't reset, button stays in
+    // "casting" state until the next valid cast. Spells feel unresponsive.
+    //
+    // SMSG_SPELL_FAILURE is the caster's direct notification (always sent to
+    // the caster); SMSG_SPELL_FAILED_OTHER is the broadcast variant for nearby
+    // players. Both opcodes carry essentially the same data; mirror the
+    // FAILED_OTHER handler logic but read the 1.12 wire format which includes
+    // the reason byte (FAILED_OTHER drops it because the broadcast variant in
+    // 1.12 didn't carry it consistently).
+    [PacketHandler(Opcode.SMSG_SPELL_FAILURE)]
+    void HandleSpellFailure(WorldPacket packet)
+    {
+        WowGuid128 casterUnit;
+        if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
+            casterUnit = packet.ReadPackedGuid().To128(GetSession().GameState);
+        else
+            casterUnit = packet.ReadGuid().To128(GetSession().GameState);
+
+        if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
+            packet.ReadUInt8(); // Cast Count
+
+        uint spellId = packet.ReadUInt32();
+
+        // 1.12 SMSG_SPELL_FAILURE wire format does include the reason byte
+        // (caster-direct notification, not the broadcast variant). Read and
+        // translate it via the same conversion table the modern client expects.
+        byte reason = 61; // SPELL_FAILED_UNKNOWN fallback
+        if (packet.CanRead())
+            reason = (byte)LegacyVersion.ConvertSpellCastResult(packet.ReadUInt8());
+
+        // Resolve cast/visual ID from pending cast bookkeeping (same lookup
+        // pattern as HandleSpellFailedOther so SoM-renumbered spells round-trip
+        // their LegacySpellId -> SpellId mapping correctly).
+        WowGuid128 castId;
+        uint spellVisual;
+        if (GetSession().GameState.CurrentPlayerGuid == casterUnit &&
+            GetSession().GameState.PendingNormalCasts.FirstOrDefault(c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId)) is { } pendingNormal)
+        {
+            castId = pendingNormal.ServerGUID;
+            spellVisual = pendingNormal.SpellXSpellVisualId;
+            if (pendingNormal.LegacySpellId != 0)
+                spellId = pendingNormal.SpellId;
+        }
+        else if (GetSession().GameState.CurrentPetGuid == casterUnit &&
+                 GetSession().GameState.PendingPetCasts.FirstOrDefault(c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId)) is { } pendingPet)
+        {
+            castId = pendingPet.ServerGUID;
+            spellVisual = pendingPet.SpellXSpellVisualId;
+            if (pendingPet.LegacySpellId != 0)
+                spellId = pendingPet.SpellId;
+        }
+        else
+        {
+            castId = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, spellId, spellId + casterUnit.GetCounter());
+            spellVisual = GameData.GetSpellVisual(spellId);
+        }
+
+        SpellFailure spell = new SpellFailure();
+        spell.CasterUnit = casterUnit;
+        spell.CastID = castId;
+        spell.SpellID = spellId;
+        spell.SpellXSpellVisualID = spellVisual;
+        spell.Reason = reason;
+        SendPacketToClient(spell);
+    }
+
     [PacketHandler(Opcode.SMSG_SPELL_START)]
     void HandleSpellStart(WorldPacket packet)
     {
