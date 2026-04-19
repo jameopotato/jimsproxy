@@ -407,6 +407,23 @@ public partial class WorldClient
         }
     }
 
+    /// <summary>
+    /// Opcodes the legacy server may legitimately send before SMSG_AUTH_RESPONSE
+    /// which we don't (yet) translate. They arrive during the auth handshake
+    /// and were previously setting _isSuccessful=false, killing the connection
+    /// before SMSG_AUTH_RESPONSE had a chance to succeed.
+    /// </summary>
+    private static bool IsIgnorableDuringHandshake(Opcode op)
+    {
+        switch (op)
+        {
+            case Opcode.SMSG_WARDEN_DATA:       // Warden challenge (Kronos/Twinstar, even with ReportedOS=OSX)
+                return true;
+            default:
+                return false;
+        }
+    }
+
     private void HandlePacket(WorldPacket packet)
     {
         Opcode universalOpcode = packet.GetUniversalOpcode(false);
@@ -449,6 +466,11 @@ public partial class WorldClient
                     }
                     else
                     {
+                        // JimsProxy: don't fail the handshake on ignorable opcodes
+                        // (e.g. SMSG_WARDEN_DATA on Kronos). The upstream logic set
+                        // _isSuccessful=false for ANY unknown opcode arriving before
+                        // SMSG_AUTH_RESPONSE, which kills the connection before auth
+                        // can complete.
                         Log.PrintNet(LogType.Warn, LogNetDir.S2P, $"No handler for opcode {universalOpcode} ({packet.GetOpcode()}) (Got unknown packet from WorldServer)");
                         Log.Event("packet.untranslated", new
                         {
@@ -457,7 +479,7 @@ public partial class WorldClient
                             opcode_raw = rawOpcodeJP,
                             size = packetSizeJP,
                         });
-                        if (_isSuccessful == null)
+                        if (_isSuccessful == null && !IsIgnorableDuringHandshake(universalOpcode))
                             _isSuccessful = false;
                     }
                     break;
