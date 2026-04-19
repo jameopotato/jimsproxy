@@ -32,6 +32,7 @@ using Framework.Realm;
 
 using HermesProxy.World.Enums;
 using HermesProxy.World.Server.Packets;
+using HermesProxy.World; // JimsProxy: KnownBenignOpcodes
 using static HermesProxy.World.Server.Packets.AuthResponse;
 using System.Net;
 using BNetServer;
@@ -380,6 +381,19 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
                 });
                 throw;
             }
+        }
+        else if (KnownBenignOpcodes.IsModernOnly(universalOpcode))
+        {
+            // Modern-only subsystem (Battle Pay, Calendar v2, LFG v2, etc.) —
+            // never had a 1.12 equivalent, safe to drop silently.
+            Log.Event("packet.ignored", new
+            {
+                direction = "c2s",
+                opcode_universal = universalOpcode.ToString(),
+                opcode_raw = rawOpcode,
+                size = packetSize,
+                reason = "modern_only",
+            });
         }
         else
         {

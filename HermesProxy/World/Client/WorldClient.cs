@@ -16,6 +16,7 @@ using System.Threading.Tasks;
 using System.Threading;
 using Framework.Networking;
 using HermesProxy.World.Server;
+using HermesProxy.World; // JimsProxy: KnownBenignOpcodes
 using System.Collections.Frozen;
 using System.Diagnostics;
 
@@ -463,6 +464,18 @@ public partial class WorldClient
                     if (_packetHandlers.ContainsKey(universalOpcode))
                     {
                         _packetHandlers[universalOpcode](packet);
+                    }
+                    else if (KnownBenignOpcodes.IsModernOnly(universalOpcode))
+                    {
+                        // Modern-only subsystem — drop silently, no handshake taint.
+                        Log.Event("packet.ignored", new
+                        {
+                            direction = "s2c",
+                            opcode_universal = universalOpcode.ToString(),
+                            opcode_raw = rawOpcodeJP,
+                            size = packetSizeJP,
+                            reason = "modern_only",
+                        });
                     }
                     else
                     {
