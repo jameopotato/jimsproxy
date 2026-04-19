@@ -188,9 +188,22 @@ public partial class AuthClient
 
             if (received == 0)
             {
-                SetAuthResponse(AuthResult.FAIL_INTERNAL_ERROR);
-
-                Log.PrintNet(LogType.Error, LogNetDir.S2P, "Socket Closed By Server");
+                // JimsProxy: distinguish benign post-auth realmd teardown from real errors.
+                // After a successful auth + realmlist fetch, realmd closes the socket by
+                // design -- that's not an error. The upstream code flagged every close as
+                // LogType.Error which made the connection log look alarming even on
+                // clean happy-path logins. Now: if auth already succeeded, log Network;
+                // otherwise still flag as Error (real auth failure).
+                bool authAlreadyCompleted = _response != null && _response.Task.IsCompleted;
+                if (authAlreadyCompleted)
+                {
+                    Log.PrintNet(LogType.Network, LogNetDir.S2P, "Realmd disconnected after successful auth (expected)");
+                }
+                else
+                {
+                    SetAuthResponse(AuthResult.FAIL_INTERNAL_ERROR);
+                    Log.PrintNet(LogType.Error, LogNetDir.S2P, "Socket Closed By Server");
+                }
                 return;
             }
 

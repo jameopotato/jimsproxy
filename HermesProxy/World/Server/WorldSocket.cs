@@ -268,6 +268,30 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             return ReadDataHandlerResult.Error;
         }
 
+        // JimsProxy: emit packet.in once here so ALL c2s opcodes are visible in the JSONL,
+        // including the ones handled inline in the switch below (CMSG_PING, CMSG_KEEP_ALIVE,
+        // CMSG_AUTH_SESSION, etc.) that previously bypassed HandlePacket's instrumentation.
+        // This closed a blindspot we hit in Block 1: couldn't see CMSG_PING timing when
+        // diagnosing the 17-min AFK-kick.
+        bool _jpInlineHandled = opcode == Opcode.CMSG_PING ||
+                                opcode == Opcode.CMSG_AUTH_SESSION ||
+                                opcode == Opcode.CMSG_AUTH_CONTINUED_SESSION ||
+                                opcode == Opcode.CMSG_KEEP_ALIVE ||
+                                opcode == Opcode.CMSG_LOG_DISCONNECT ||
+                                opcode == Opcode.CMSG_ENABLE_NAGLE ||
+                                opcode == Opcode.CMSG_CONNECT_TO_FAILED ||
+                                opcode == Opcode.CMSG_ENTER_ENCRYPTED_MODE_ACK ||
+                                opcode == Opcode.CMSG_SERVER_TIME_OFFSET_REQUEST;
+        Log.Event("packet.in", new
+        {
+            direction = "c2s",
+            opcode_universal = opcode.ToString(),
+            opcode_raw = packet.GetOpcode(),
+            size = packet.GetSize(),
+            has_handler = _jpInlineHandled || _clientPacketTable.ContainsKey(opcode),
+            path = _jpInlineHandled ? "inline" : "dispatch",
+        });
+
         switch (opcode)
         {
             case Opcode.CMSG_PING:
@@ -335,17 +359,11 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         Opcode universalOpcode = packet.GetUniversalOpcode(isModern: true);
         var handler = GetHandler(universalOpcode);
 
-        // JimsProxy: structured packet.in (c2s)
+        // JimsProxy: packet.in is now emitted upstream at the ReadDataHandler switch
+        // entry (see ReadData) so we capture ALL opcodes including those handled
+        // inline before reaching here. Don't duplicate the event here.
         uint packetSize = packet.GetSize();
         uint rawOpcode = packet.GetOpcode();
-        Log.Event("packet.in", new
-        {
-            direction = "c2s",
-            opcode_universal = universalOpcode.ToString(),
-            opcode_raw = rawOpcode,
-            size = packetSize,
-            has_handler = handler != null,
-        });
 
         if (handler != null)
         {

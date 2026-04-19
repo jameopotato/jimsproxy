@@ -73,6 +73,13 @@ public static class KnownBenignOpcodes
         Opcode.CMSG_CLOSE_INTERACTION,
         Opcode.CMSG_QUERY_QUEST_COMPLETION_NPCS,
 
+        // Added 2026-04-17 from Block 1 Test 1.1 cycle 1:
+        Opcode.CMSG_MOVE_SET_COLLISION_HEIGHT_ACK, // Wrath+ mount-resizes-hitbox ack
+        Opcode.CMSG_GUILD_GET_RANKS,               // Cata+ guild UI (annotated "// Cata only" in Opcodes.cs)
+
+        // Added 2026-04-17 from Block 1 Test 1.2 (20-min AFK session):
+        Opcode.CMSG_GET_ACCOUNT_NOTIFICATIONS,     // Modern account notification poll (MoP+)
+
         // Rest-XP notification packet — post-Wrath server→client
         // (Note: the modern client still expects this for rested XP banner
         //  in the player frame. Not translating means no visual feedback
