@@ -43,6 +43,20 @@ JSONL writer (`Logs/jimsproxy-*.jsonl`); analyzed with
 
 **Fix scope:** Mid-effort. Need to verify the modern client's expected packet layout (likely `SMSG_TRAINER_BUY_RESULT` or similar), construct it, send. Likely 30 lines of handler code following the pattern of other trainer-related handlers.
 
+### Quest turn-in: "quest template is missing" on item-reward quests — FIX IN PROGRESS
+
+**Hits:** 1 explicit `QuestHandler | Error` log at 22:44:47 during the session. JSONL shows 16x CMSG_QUEST_GIVER_CHOOSE_REWARD vs 14x SMSG_QUEST_GIVER_QUEST_COMPLETE — 2 turn-in attempts failed and had to be retried.
+
+**User report:** "I find if I take a while deciding on an item reward (this only seems to happen for quests with item reward options), then it will fail to turn in the first time. If I go through the accepting text quicker it succeeds." Matches exactly: quests WITHOUT item-reward choice hit an early-return before the template lookup, so only item-choice quests trigger the bug.
+
+**Root cause:** The server-side `CMSG_QUEST_GIVER_CHOOSE_REWARD` handler in `QuestHandler.cs:98` needs to translate the modern client's chosen `itemId` back to a 1.12-style choice index. To do that it calls `GameData.GetQuestTemplate(questId)` and iterates `UnfilteredChoiceItems`. The `QuestTemplates` dictionary is only populated by `SMSG_QUERY_QUEST_INFO_RESPONSE` (`QueryHandler.cs:262`), which requires the 1.14 client to have issued `CMSG_QUERY_QUEST_INFO` at some point. But the 1.14 client often has the quest cached from accept-time and skips the query at reward-choice time, leaving `QuestTemplates` empty for that questId.
+
+Meanwhile, `SMSG_QUEST_GIVER_OFFER_REWARD_MESSAGE` (the packet that triggers the reward-choice UI) already carries the full choice item list (`ReadExtraQuestInfo` reads it at `QuestHandler.cs:77`) — but the proxy was forwarding those IDs to the client and then discarding them.
+
+**Fix:** New parallel cache `GameData.OfferedRewardChoiceItems : Dictionary<questId, uint[]>` populated when `SMSG_QUEST_GIVER_OFFER_REWARD_MESSAGE` arrives. The choose-reward handler consults this cache first, falling back to the original `QuestTemplate` lookup for backwards compatibility. No roundtrip to server needed; the data is always warm by the time the user clicks.
+
+**Verification:** Turn in several item-reward quests on Kronos, deliberately hovering over reward choices for 10-30s each. Expect zero `QuestHandler | Error` lines; expect 1:1 CMSG_QUEST_GIVER_CHOOSE_REWARD to SMSG_QUEST_GIVER_QUEST_COMPLETE ratio in the JSONL.
+
 ### MSG_MOVE_TIME_SKIPPED (793, s2c) — OPEN
 
 **Hits:** 1 in 10 min

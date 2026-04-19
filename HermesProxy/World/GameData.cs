@@ -66,6 +66,15 @@ public static partial class GameData
     public static Dictionary<uint, QuestTemplate> QuestTemplates = [];
     public static Dictionary<uint, string> ItemNames = [];
 
+    // JimsProxy: quest reward-choice item IDs captured from
+    // SMSG_QUEST_GIVER_OFFER_REWARD_MESSAGE so that CMSG_QUEST_GIVER_CHOOSE_REWARD
+    // can translate (modern) item ID -> (legacy) choice index without depending on a
+    // full QuestTemplate having been populated by CMSG_QUERY_QUEST_INFO. The 1.14
+    // client doesn't always query quest info before clicking a reward, which left
+    // item-reward-choice quest turn-ins failing on the first click ("quest template
+    // is missing. Try again."). See DIAGNOSTICS.md 2026-04-18 Block 2 findings.
+    public static Dictionary<uint /*questId*/, uint[] /*choiceItemIds, index-ordered*/> OfferedRewardChoiceItems = [];
+
     #region GettersAndSetters
     public static void StoreItemName(uint entry, string name)
     {
@@ -108,6 +117,18 @@ public static partial class GameData
         if (QuestTemplates.TryGetValue(entry, out data))
             return data;
         return null;
+    }
+
+    // JimsProxy: reward-choice item ID cache. See OfferedRewardChoiceItems field comment.
+    public static void StoreOfferedRewardChoiceItems(uint questId, uint[] itemIds)
+    {
+        CollectionsMarshal.GetValueRefOrAddDefault(OfferedRewardChoiceItems, questId, out _) = itemIds;
+    }
+
+    public static uint[]? GetOfferedRewardChoiceItems(uint questId)
+    {
+        OfferedRewardChoiceItems.TryGetValue(questId, out var items);
+        return items;
     }
 
     public static QuestObjective? GetQuestObjectiveForItem(uint entry)

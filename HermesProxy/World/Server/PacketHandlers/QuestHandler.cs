@@ -101,30 +101,50 @@ public partial class WorldSocket
 
         if (quest.Choice.Item.ItemID != 0)
         {
-            QuestTemplate? questTemplate = GameData.GetQuestTemplate(quest.QuestID);
-            if (questTemplate == null)
+            // JimsProxy: prefer the offer-reward cache (populated when the server sent
+            // SMSG_QUEST_GIVER_OFFER_REWARD_MESSAGE with the choice item list). This
+            // avoids depending on a full QuestTemplate existing via CMSG_QUERY_QUEST_INFO,
+            // which the 1.14 client doesn't always issue before clicking a reward.
+            // Fallback to the QuestTemplate path for backwards compatibility.
+            uint[]? offeredItems = GameData.GetOfferedRewardChoiceItems(quest.QuestID);
+            if (offeredItems != null)
             {
-                Log.Print(LogType.Error, "Unable to select quest reward because quest template is missing. Try again.");
-                WorldPacket packet2 = new WorldPacket(Opcode.CMSG_QUERY_QUEST_INFO);
-                packet2.WriteUInt32(quest.QuestID);
-                SendPacketToServer(packet2);
-                QuestGiverQuestFailed fail = new QuestGiverQuestFailed();
-                fail.QuestID = quest.QuestID;
-                fail.Reason = InventoryResult.ItemNotFound;
-                SendPacket(fail);
-                return;
-            }
-
-            for (int i = 0; i < questTemplate.UnfilteredChoiceItems.Length; i++)
-            {
-                if (questTemplate.UnfilteredChoiceItems[i].ItemID == quest.Choice.Item.ItemID)
+                for (int i = 0; i < offeredItems.Length; i++)
                 {
-                    choiceIndex = i;
-                    break;
+                    if (offeredItems[i] == quest.Choice.Item.ItemID)
+                    {
+                        choiceIndex = i;
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                QuestTemplate? questTemplate = GameData.GetQuestTemplate(quest.QuestID);
+                if (questTemplate == null)
+                {
+                    Log.Print(LogType.Error, "Unable to select quest reward because quest template is missing. Try again.");
+                    WorldPacket packet2 = new WorldPacket(Opcode.CMSG_QUERY_QUEST_INFO);
+                    packet2.WriteUInt32(quest.QuestID);
+                    SendPacketToServer(packet2);
+                    QuestGiverQuestFailed fail = new QuestGiverQuestFailed();
+                    fail.QuestID = quest.QuestID;
+                    fail.Reason = InventoryResult.ItemNotFound;
+                    SendPacket(fail);
+                    return;
+                }
+
+                for (int i = 0; i < questTemplate.UnfilteredChoiceItems.Length; i++)
+                {
+                    if (questTemplate.UnfilteredChoiceItems[i].ItemID == quest.Choice.Item.ItemID)
+                    {
+                        choiceIndex = i;
+                        break;
+                    }
                 }
             }
         }
-        
+
         WorldPacket packet = new WorldPacket(Opcode.CMSG_QUEST_GIVER_CHOOSE_REWARD);
         packet.WriteGuid(quest.QuestGiverGUID.To64());
         packet.WriteUInt32(quest.QuestID);

@@ -277,6 +277,20 @@ public partial class WorldClient
 
         ReadExtraQuestInfo(packet, quest.QuestData.Rewards, true);
 
+        // JimsProxy: cache choice item IDs by questId so CMSG_QUEST_GIVER_CHOOSE_REWARD
+        // can translate the modern client's chosen itemId back to a legacy choice index.
+        // The 1.14 client often doesn't issue CMSG_QUERY_QUEST_INFO before clicking a
+        // reward (it already cached the quest on accept), so relying on QuestTemplates
+        // alone fails the first-click turn-in with "quest template is missing". This
+        // captures the choice list directly from the server's offer-reward payload.
+        if (quest.QuestData.Rewards.ChoiceItemCount > 0)
+        {
+            uint[] choiceIds = new uint[quest.QuestData.Rewards.ChoiceItemCount];
+            for (uint i = 0; i < quest.QuestData.Rewards.ChoiceItemCount; i++)
+                choiceIds[i] = quest.QuestData.Rewards.ChoiceItems[i].Item.ItemID;
+            GameData.StoreOfferedRewardChoiceItems(quest.QuestData.QuestID, choiceIds);
+        }
+
         SendPacketToClient(quest);
     }
 
