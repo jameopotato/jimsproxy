@@ -297,7 +297,7 @@ Run in order, ~2 hours total. After each test block, dump JSONL summary via the 
 
 ### Block 2 — movement + combat correctness (30 min)
 5. Run 100 yards, strafe-jump while running (#370 repro)
-6. Apply slow effect (drink a Hunter Mark or let a caster slow you), let it expire — watch for walk-lock
+6. Apply slow effect (let a mob daze you via attack-from-behind, or have a caster Frostbolt you), let it expire — watch for walk-lock
 7. Auto-attack a training dummy for 2 min, cast 10× Frostbolts
 8. Hunter: Auto Shot for 2 min — does it drop out after first volley? (#311)
 
