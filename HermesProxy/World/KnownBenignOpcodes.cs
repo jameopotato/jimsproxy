@@ -1,12 +1,20 @@
-// JimsProxy: opcodes we know cannot be translated because the subsystem
-// simply didn't exist in 1.12.1. Silencing these in the console + downgrading
-// the JSONL event from "packet.untranslated" (implies bug) to "packet.ignored"
-// (implies intentional no-op) lets real Kronos-specific translation gaps
-// stand out when reading logs.
+// JimsProxy: opcodes where the other side of the protocol-bridge has no
+// equivalent, so there's nothing to translate. Two shapes:
+//   (1) Modern client sends c2s for a subsystem that never existed in 1.12
+//       (Battle Pay, Calendar v2, etc.) -- the legacy server would ignore it
+//       if we forwarded it.
+//   (2) Legacy server sends s2c for a 1.12-only opcode the modern client
+//       doesn't expect (SMSG_TRAINER_BUY_SUCCEEDED, SMSG_SET_REST_START) --
+//       the modern client gets equivalent UX via a different packet
+//       (SMSG_LEARNED_SPELL for the trainer case).
+// Silencing these in the console + downgrading the JSONL event from
+// "packet.untranslated" (implies bug) to "packet.ignored" (implies
+// intentional no-op) lets real translation gaps stand out when reading logs.
 //
-// Source list: RESEARCH.md §4.Z — each subsystem has a citation-worthy reason
-// for being absent in vanilla. Grow this list cautiously; when in doubt, leave
-// the opcode in the untranslated pile so we at least get a warning for it.
+// Source list: RESEARCH.md section 4.Z -- each subsystem has a citation-worthy
+// reason for being absent on the destination side. Grow this list cautiously;
+// when in doubt, leave the opcode in the untranslated pile so we at least get
+// a warning for it.
 
 using System.Collections.Generic;
 using HermesProxy.World.Enums;
@@ -85,6 +93,14 @@ public static class KnownBenignOpcodes
         //  in the player frame. Not translating means no visual feedback
         //  for rested state, but gameplay is unaffected. Filed as backlog.)
         Opcode.SMSG_SET_REST_START,
+
+        // Added 2026-04-18 from Block 3 (priest L3-5 session):
+        // SMSG_TRAINER_BUY_SUCCEEDED is a 1.12-only s2c opcode — the modern
+        // 1.14 client doesn't have it in its opcode table and gets
+        // spell-learn confirmation from SMSG_LEARNED_SPELL instead (verified:
+        // 2x SMSG_LEARNED_SPELL translated successfully alongside the 2
+        // TRAINER_BUY_SUCCEEDED warnings in the same session).
+        Opcode.SMSG_TRAINER_BUY_SUCCEEDED,
     };
 
     /// <summary>True if the opcode is known to originate from a modern-client

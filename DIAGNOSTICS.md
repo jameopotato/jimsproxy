@@ -57,6 +57,44 @@ Meanwhile, `SMSG_QUEST_GIVER_OFFER_REWARD_MESSAGE` (the packet that triggers the
 
 **Verification:** Turn in several item-reward quests on Kronos, deliberately hovering over reward choices for 10-30s each. Expect zero `QuestHandler | Error` lines; expect 1:1 CMSG_QUEST_GIVER_CHOOSE_REWARD to SMSG_QUEST_GIVER_QUEST_COMPLETE ratio in the JSONL.
 
+## 2026-04-18 — Block 3 retest (verified Block 2 fixes + new findings)
+
+**Session:** `jimsproxy-20260418-225733.jsonl` (33,487 events, ~23.5 min, JAMEOPOTATO priest L3-5)
+**Build:** JimsProxy 4.2.5+10(19d54be) — Block 2 fixes installed
+**Translation rate:** 98.9% (up from 98.4%)
+**Errors:** 0 packet.error, 0 QuestHandler errors (VERIFIED)
+**SMSG_SPELL_FAILURE count:** 0 (VERIFIED — fix 88eee5b works)
+
+### SMSG_SPELL_EXECUTE_LOG (588) — DEFERRED (significant scope)
+
+**Hits:** 3 in 23 min. Combat log missing spell damage/heal lines ("Your Smite hits Wolf for 15 Holy damage").
+
+**Scope:** Unlike SMSG_SPELL_FAILURE, this requires writing the modern packet class from scratch PLUS a parser that handles ~30 effect-type variants (SPELL_EFFECT_POWER_DRAIN, _HEAL, _INTERRUPT_CAST, _DURABILITY_DAMAGE, _OPEN_LOCK, _CREATE_ITEM, _SUMMON, _DISPEL, _ENERGIZE, etc.) each with different sub-fields. Estimated 200+ lines, high risk of subtle bugs without ground-truth sniff data. Deferred until we have more urgent gaps closed or a specific user-visible symptom beyond "combat log is quieter than vanilla."
+
+**Impact:** Cosmetic. Damage still lands, cooldowns work, mobs die. The combat log is just less verbose.
+
+### SMSG_TRAINER_BUY_SUCCEEDED (435) — FIXED (added to KNOWN_BENIGN)
+
+**Hits:** 2 in 23 min (priest bought 2 spells at trainer).
+
+**Root cause:** This opcode exists in the 1.12 server's opcode table but was removed in 1.14. The modern client doesn't have it. The correct UX — "You have learned X" banner and sound — fires on `SMSG_LEARNED_SPELL`, which is correctly translated and arrived on time in the same session (verified: 2x SMSG_LEARNED_SPELL translated at 23:19:18 and 23:19:19, alongside the 2 TRAINER_BUY_SUCCEEDED warnings).
+
+**Fix:** Added to `KnownBenignOpcodes.ModernOnly` allowlist with a new category comment explaining the bidirectional nature of the allowlist (modern-only c2s AND legacy-only s2c both have "nothing to translate to" on the other side). Wording in the file updated to reflect both directions.
+
+### Item red-restriction indicator missing (user report) — INVESTIGATION PENDING
+
+**Report:** Priest sees axes / leather armor as not-red in bag & tooltips. In vanilla WoW these would show with red-text "Axes" / "Leather" proficiency requirement because priest can't use them.
+
+**Investigation so far:**
+- `SMSG_SEND_KNOWN_SPELLS` arrives once at login (159 bytes), contains priest proficiency spells (cloth 9078, daggers 1180, staves 199, one-hand maces 198, wands 5009). Forwarded cleanly to client.
+- `SMSG_ITEM_QUERY_SINGLE_RESPONSE` ~30+ per session, all translated (469-539 bytes).
+- CSV spot-check (items 25 Worn Shortsword, 35 Bent Staff, 118 Minor Healing Potion, 2048 Anvilmar Hammer, 6098 Neophyte's Robe): ALL have `AllowableClass=-1` (no class restriction) and `RequiredSkill=0` (no skill requirement). The CSV ships totally permissive.
+- `GameData.cs:2987` has a COMMENTED-OUT check: `//row.AllowableClass != (short)item.AllowedClasses ||`. An Explore agent suggested uncommenting, but this would almost certainly make things WORSE: 1.12 mangos sends `0` (means "no restriction" in vanilla semantics) while modern client expects `-1` for the same meaning. Uncommenting would overwrite CSV's `-1` with server's `0`, making the client think NO class can use the item.
+
+**Hypothesis:** The red-restriction logic is client-side and depends on the modern client's weapon/armor-proficiency check against the item's `ItemClass`/`ItemSubclass` vs the player's known proficiency spells. If the correct proficiency spells are in the client's spellbook (which the JSONL suggests they are), the client should compute red-ness itself. Something in the item-subclass translation path may be off, or the modern client's proficiency-check logic has a regression we can't see without specific item IDs.
+
+**Next-session ask:** Capture 1-2 specific items that SHOULD be red but aren't. Mouseover, note the exact item name / ID (addon like `/run print(GetItemInfo(bag,slot))` or RightClickMenu helps). With that ID I can grep the CSV, cross-check the server's `SMSG_ITEM_QUERY_SINGLE_RESPONSE` size/timing from the matching JSONL, and narrow down whether it's a CSV data issue or a proxy translation issue.
+
 ### MSG_MOVE_TIME_SKIPPED (793, s2c) — OPEN
 
 **Hits:** 1 in 10 min
