@@ -48,12 +48,15 @@ Launcher-tauri:
 
 **Not a packet-layer bug.** The JSONL shows 0 errors, 0 untranslated (except the usual one-off Warden). The aura is applying correctly — the client just isn't rendering the visual.
 
-**Likely cause:** `GameData.GetSpellVisual(spellId)` at `SpellHandler.cs:307/384` is the lookup that maps a 1.12 spell ID → modern `SpellXSpellVisualID`. If spell 17 (PW:S rank 1) isn't mapped (or maps to 0), the client gets "no visual kit" for the aura and renders nothing.
+**Initial hypothesis ruled out:** I checked `CSV/SpellVisuals1.csv` and spell 17 DOES have a mapping (`SpellId=17 → SpellXSpellVisualId=242477`). So `GameData.GetSpellVisual(17)` should return 242477, not 0. The CSV loader at `GameData.cs:1002-1015` reads this file into `SpellVisuals` dictionary at startup. So the cast packet SHOULD carry the visual kit ID.
+
+**Refined hypothesis:** The bug isn't in the CAST path — it's in the AURA path. Bubble shield is rendered by the client when it receives the aura on the target, not on the cast itself. So the aura data (in SMSG_UPDATE_OBJECT or equivalent) needs to carry the visual kit, OR a separate `SMSG_APPLY_AURA`-like packet needs to forward it.
 
 **Next steps to investigate:**
-- Check if `GameData.GetSpellVisual(17)` returns 0 or a valid ID
-- Look at the CSV `SpellXSpellVisual.csv` (or similar) that backs the mapping
-- Compare to a spell that DOES show a visual (e.g., Smite — does it have an impact effect?)
+- Find where auras are serialized to the modern client (`SMSG_AURA_UPDATE` / `SMSG_UPDATE_OBJECT` aura encoding)
+- Check if the aura's `SpellXSpellVisualID` field is being populated from `GameData.GetSpellVisual` — or if it's being dropped/zeroed
+- Compare to a priest buff that DOES show a visual (Renew has a green glow, Fortitude has a red upward arrow). If Renew's visual works and PW:S doesn't, it's specific to shield auras
+- Look at Opcodes.cs for SMSG_APPLY_AURA / SMSG_AURA_UPDATE — those are the server→client "add aura" packets
 
 ### 2. Red-restriction: "Small Throwing Knife" on priest
 
