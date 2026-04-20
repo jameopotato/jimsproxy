@@ -511,4 +511,4 @@ FodyWeavers.xsd
 debug.*
 
 # Claude local AI files
-.claude/*.local.*
+.claude/*.local.*build/
