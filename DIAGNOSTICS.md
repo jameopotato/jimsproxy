@@ -95,7 +95,32 @@ User reported last night that PW:Shield didn't show the bubble visual. After shi
 
 Likely cause: situational / first-cast-after-login race or game-state issue. Could not reproduce with the instrumentation in place, so nothing to fix. The spell.cast event is still valuable instrumentation for future spell-path diagnosis — keeping it.
 
-### Item red-restriction indicator missing — PARTIAL FIX SHIPPED (RequiredSkill derivation)
+### Item red-restriction indicator missing — SPLIT into 2 sub-bugs
+
+**User reports TWO separate visual issues — previously conflated into one.** Refining based on Block 4 live testing:
+
+**Sub-bug 4A: Red border around item icon — RESOLVED** (commit 19d54be or earlier).
+Small Throwing Knife shows a red border in bag/vendor UI correctly. Client knows item is unequippable. Works as expected on Kronos.
+
+**Sub-bug 4B: Tooltip type-line coloring — STILL OPEN, needs more diagnosis.**
+The word "Thrown" directly under "Small Throwing Knife" in the tooltip stays WHITE. Expected: RED (priest lacks Thrown proficiency). Confirmed working correctly on Ashen-wow (different 1.12 server), so this is Kronos-specific server data issue.
+
+**Hypothesis iteration:**
+
+- H1 (wrong): modern client uses `ItemSparse.RequiredSkill` to color the type-line. → Shipped derivation fix 982d416 to populate this field. Did not resolve. Fix remains shipped as incidental-value (will correctly color explicit "Requires X" lines if they appear on higher-level gear).
+- H2 (wrong): modern client reads spellbook for proficiency. → User's spellbook screenshot showed only Attack/Shoot/racials. No explicit proficiency spells. Yet priest CAN use maces/wands/etc so proficiency isn't coming from spellbook.
+- H3 (leading candidate): modern client reads `PLAYER_SKILL_INFO` update fields to decide tooltip coloring. User's `/run GetSkillLineInfo()` output showed 6 visible skills (Maces, Wands, Unarmed, Cloth, Defense, Holy). The visible API may not expose all 128 update-field slots — Kronos may populate hidden Thrown-at-0 entries the client reads but the API hides.
+
+**Next diagnostic (shipped 5c8b4c0):** `player.skills.snapshot` JSONL event that dumps every non-zero SkillLineID the proxy forwards. Run a login session, check JSONL for the snapshot, compare vs API-visible skills. If snapshot contains Thrown (id=176) or other suspicious entries, we filter at proxy. If not, hypothesis H3 is also wrong and the modern client has a default-white-for-unknown behavior — bigger fix, likely synthesize `PLAYER_FIELD_WEAPON_PROFICIENCY_FLAGS`.
+
+**Also pending — 3-item hover test:**
+- Priest-usable mace / dagger → expected WHITE
+- Axe / 2H sword → expected RED
+- Leather armor → expected RED
+
+Which of these render WHITE will scope the fix: Thrown-specific vs all-subclasses-broken.
+
+### Item red-restriction `RequiredSkill` derivation — SHIPPED (incidental win)
 
 **Refined report:** Border IS red for restricted items (client knows item is unequippable). Tooltip TEXT for "Requires Thrown" stays white instead of red (client doesn't know WHICH requirement is unmet).
 
