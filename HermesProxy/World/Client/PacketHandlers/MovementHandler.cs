@@ -582,6 +582,36 @@ public partial class WorldClient
                 GetSession().GameState.IsWaitingForTaxiStart = false;
             }
             GetSession().GameState.IsInTaxiFlight = true;
+
+            // Restore player control after the flight spline completes — without this,
+            // the modern client stays in the "flying" state (no gravity, no movement).
+            uint flightDuration = moveSpline.SplineTimeFull;
+            WowGuid128 playerGuid = guid;
+            System.Threading.Tasks.Task.Run(async () =>
+            {
+                await System.Threading.Tasks.Task.Delay((int)flightDuration + 250);
+                if (GetSession()?.GameState?.IsInTaxiFlight != true)
+                    return;
+
+                ControlUpdate control = new ControlUpdate();
+                control.Guid = playerGuid;
+                control.HasControl = true;
+                SendPacketToClient(control);
+
+                MoveSetFlag enableGravity = new MoveSetFlag(Opcode.SMSG_MOVE_ENABLE_GRAVITY);
+                enableGravity.MoverGUID = playerGuid;
+                SendPacketToClient(enableGravity);
+
+                MoveSetFlag unsetFly = new MoveSetFlag(Opcode.SMSG_MOVE_UNSET_CAN_FLY);
+                unsetFly.MoverGUID = playerGuid;
+                SendPacketToClient(unsetFly);
+
+                MoveSetFlag unroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
+                unroot.MoverGUID = playerGuid;
+                SendPacketToClient(unroot);
+
+                GetSession().GameState.IsInTaxiFlight = false;
+            });
         }
     }
 }

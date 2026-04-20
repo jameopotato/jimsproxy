@@ -47,7 +47,10 @@ public partial class WorldSocket
     void WriteSpellTargets(SpellTargetData target, SpellCastTargetFlags targetFlags, WorldPacket packet)
     {
         if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+        {
+            targetFlags = (SpellCastTargetFlags)((uint)targetFlags & 0x0000FFFF);
             packet.WriteUInt16((ushort)targetFlags);
+        }
         else
             packet.WriteUInt32((uint)targetFlags);
 
@@ -109,6 +112,9 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CAST_SPELL)]
     void HandleCastSpell(CastSpell cast)
     {
+        if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+            GetSession().GameState.LastDispellSpellId = (uint)cast.Cast.SpellID;
+
         bool isNextMelee = GameData.NextMeleeSpells.Contains(cast.Cast.SpellID);
         bool isAutoRepeat = GameData.AutoRepeatSpells.Contains(cast.Cast.SpellID);
 

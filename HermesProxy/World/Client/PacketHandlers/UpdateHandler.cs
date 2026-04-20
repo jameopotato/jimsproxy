@@ -1126,8 +1126,12 @@ public partial class WorldClient
         // client recognizes the aura and shows the buff icon.
         uint modernSpellId = GameData.GetModernSpellId(spellId);
 
+        // Unique CastID per aura application — guid.GetCounter() produces duplicates when
+        // auras are refreshed (e.g. PW:S recast), which crashes the modern client.
+        uint uniqueCastCounter = (uint)System.Guid.NewGuid().GetHashCode();
+
         AuraDataInfo data = new AuraDataInfo();
-        data.CastID = WowGuid128.Create(HighGuidType703.Cast, World.Enums.SpellCastSource.Aura, (uint)GetSession().GameState.CurrentMapId!, modernSpellId, guid.GetCounter());
+        data.CastID = WowGuid128.Create(HighGuidType703.Cast, World.Enums.SpellCastSource.Aura, (uint)GetSession().GameState.CurrentMapId!, modernSpellId, uniqueCastCounter);
         data.SpellID = modernSpellId;
         data.SpellXSpellVisualID = GameData.GetSpellVisual(modernSpellId);
 
@@ -2104,6 +2108,9 @@ public partial class WorldClient
             int PLAYER_VISIBLE_ITEM_1_0 = LegacyVersion.GetUpdateField(PlayerField.PLAYER_VISIBLE_ITEM_1_0);
             if (PLAYER_VISIBLE_ITEM_1_0 >= 0) // vanilla and tbc
             {
+                if (!GetSession().GameState.CachedPlayerEnchants.ContainsKey(guid))
+                    GetSession().GameState.CachedPlayerEnchants[guid] = new uint[19];
+
                 int offset = LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180) ? 16 : 12;
                 for (int i = 0; i < 19; i++)
                 {
@@ -2119,6 +2126,11 @@ public partial class WorldClient
                             itemVisual = (ushort)GameData.GetItemEnchantVisual(updates[tempEnchantIndex].UInt32Value);
                         if (itemVisual == 0 && updates.ContainsKey(permEnchantIndex))
                             itemVisual = (ushort)GameData.GetItemEnchantVisual(updates[permEnchantIndex].UInt32Value);
+
+                        // Cache permanent enchant for inspect display
+                        if (updates.ContainsKey(permEnchantIndex))
+                            GetSession().GameState.CachedPlayerEnchants[guid][i] = updates[permEnchantIndex].UInt32Value;
+
                         updateData.PlayerData.VisibleItems[i] = new VisibleItem(itemId, 0, itemVisual);
                     }
                 }

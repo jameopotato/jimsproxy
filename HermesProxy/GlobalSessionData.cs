@@ -70,6 +70,7 @@ public sealed class GameSessionData
     public uint PendingTransferMapId;
     public uint LastEnteredAreaTrigger;
     public uint LastDispellSpellId;
+    public Dictionary<WowGuid128, uint[]> CachedPlayerEnchants = new();
     public string LeftChannelName = "";
     public bool IsPassingOnLoot;
     public int GroupUpdateCounter;
