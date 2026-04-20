@@ -5,6 +5,35 @@ JSONL writer (`Logs/jimsproxy-*.jsonl`); analyzed with
 `launcher-tauri/scripts/analyze-jsonl.ps1`. Bugs surface as either
 `packet.untranslated` (missing handler) or `packet.error` (handler threw).
 
+## 2026-04-20 — Proxy-side work PAUSED
+
+A collaborator is now actively maintaining their own fork of Xian55 HermesProxy with
+their own fix pipeline. To avoid duplicated effort, this fork's proxy-side fixes are
+paused; focus shifts to the launcher side (making proxy binaries easy to swap in/out
+for A/B testing between our build, the collaborator's build, and reference
+HermesProxy).
+
+**Still OPEN at time of pause (see entries below for detail):**
+- PW:S visual — alternating pattern (works one session, not the next). Bisect `f908789`..`ef95e6b` with two-run-per-commit methodology would isolate. Not currently being worked.
+- Tooltip proficiency coloring — Kronos-specific (works on Ashen-wow with same proxy+client). Needs cross-server packet capture diff to isolate the Twinstar-custom field difference.
+- `SMSG_SPELL_EXECUTE_LOG` — combat log damage lines. ~30 effect variants to handle. Deferred, cosmetic.
+- `CMSG_EMOTE` (modern opcode 13632) — probable handler gap. 1 hit during 2026-04-19 Ironforge session. Unverified if emote actually played in-game.
+- `MSG_MOVE_TIME_SKIPPED` (s2c) — 1 hit per day, unclear significance.
+- `CMSG_COMMERCE_TOKEN_GET_LOG` + `CMSG_AUCTION_LIST_PENDING_SALES` — pending KNOWN_BENIGN additions.
+- Skill-snapshot instrumentation (`5c8b4c0`) was reverted after it correlated with a client `#132 ACCESS_VIOLATION` crash. Redesign needed before re-attempting: single-flag guard, once-per-session emission, not per-SMSG_UPDATE_OBJECT.
+
+**Shipped + verified fixes** (ef95e6b tip includes all of these):
+- `SMSG_SPELL_FAILURE` handler (priest spell-fail UX)
+- Quest reward-index cache race fix
+- `SMSG_TRAINER_BUY_SUCCEEDED` KNOWN_BENIGN
+- `RequiredSkill` derivation from item Class+SubClass
+- Warden handshake tolerance
+- Phase 1 JSONL instrumentation + analyzer workflow
+- Xian55 rebase (18 months of upstream fixes)
+- Trim-safety (PublishTrimmed=false)
+
+Collaborator may pick up any of the OPEN items independently.
+
 ## Status legend
 
 - **OPEN** — observed, no fix yet
