@@ -75,6 +75,11 @@ public sealed class SniffFile
 
     public void CloseFile()
     {
-        _fileWriter.Close();
+        if (_fileWriter != null && _fileWriter.BaseStream != null && _fileWriter.BaseStream.CanWrite)
+        {
+            _fileWriter.Flush();
+            _fileWriter.Close();
+        }
+        _fileWriter = null!;
     }
 }

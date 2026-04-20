@@ -512,3 +512,6 @@ debug.*
 
 # Claude local AI files
 .claude/*.local.*
+
+# Build script output
+build/

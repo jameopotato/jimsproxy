@@ -400,12 +400,27 @@ public partial class WorldClient
                 {
                     if (updates.ContainsKey(PLAYER_VISIBLE_ITEM_1_0 + i * offset))
                     {
-                        uint itemId = updates[PLAYER_VISIBLE_ITEM_1_0 + i * offset].UInt32Value;
-                        if (itemId != 0)
+                        uint rawItemValue = updates[PLAYER_VISIBLE_ITEM_1_0 + i * offset].UInt32Value;
+                        if (rawItemValue != 0)
                         {
+                            // Vanilla packs Item ID (lower 16 bits) and Enchant ID (upper 16 bits)
+                            uint realItemId = rawItemValue & 0xFFFF;
+                            uint packedEnchantId = (rawItemValue >> 16) & 0xFFFF;
+
                             InspectItemData itemData = new InspectItemData();
                             itemData.Index = i;
-                            itemData.Item.ItemID = itemId;
+                            itemData.Item.ItemID = realItemId;
+
+                            uint finalEnchantId = packedEnchantId;
+                            if (finalEnchantId == 0 &&
+                                GetSession().GameState.CachedPlayerEnchants.TryGetValue(inspect.DisplayInfo.GUID, out var cachedEnchants))
+                            {
+                                finalEnchantId = cachedEnchants[i];
+                            }
+
+                            if (finalEnchantId != 0)
+                                itemData.Enchants.Add(new InspectEnchantData(finalEnchantId, 0));
+
                             inspect.DisplayInfo.Items.Add(itemData);
                         }
                     }

@@ -443,13 +443,6 @@ public partial class WorldClient
                 GetSession().InstanceSocket.SendCastRequestFailed(failed, true);
         }
 
-        if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
-        {
-            // We need spell id for SMSG_SPELL_DISPELL_LOG since its not sent by server
-            if (GameData.DispellSpells.Contains((uint)spell.Cast.SpellID))
-                GetSession().GameState.LastDispellSpellId = (uint)spell.Cast.SpellID;
-        }
-
         SendPacketToClient(spell);
     }
 
@@ -1101,21 +1094,33 @@ public partial class WorldClient
         spell.CasterGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
 
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
-            spell.DispelledBySpellID = packet.ReadUInt32();
+        {
+            spell.DispelledBySpellID = GameData.GetModernSpellId(packet.ReadUInt32());
+        }
         else
+        {
+            // 1.12 sends a 4-byte field here — advance the buffer, use our tracked ID.
+            packet.ReadUInt32();
             spell.DispelledBySpellID = GetSession().GameState.LastDispellSpellId;
+        }
 
         bool hasDebug;
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
+        {
             hasDebug = packet.ReadBool();
+        }
         else
+        {
+            // 1.12 sends a 1-byte dummy flag here — must read to align buffer before count.
+            packet.ReadUInt8();
             hasDebug = false;
+        }
 
         int count = packet.ReadInt32();
         for (int i = 0; i < count; i++)
         {
             SpellDispellData dispel = new SpellDispellData();
-            dispel.SpellID = packet.ReadUInt32();
+            dispel.SpellID = GameData.GetModernSpellId(packet.ReadUInt32());
             if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
                 dispel.Harmful = packet.ReadBool();
             spell.DispellData.Add(dispel);
