@@ -2313,6 +2313,13 @@ public partial class WorldClient
             int PLAYER_SKILL_INFO_1_1 = LegacyVersion.GetUpdateField(PlayerField.PLAYER_SKILL_INFO_1_1);
             if (PLAYER_SKILL_INFO_1_1 >= 0)
             {
+                // JimsProxy: track which skill slots were modified in this update so we can
+                // emit a structured snapshot at the end. The Thrown-tooltip-not-red bug is
+                // specific to Kronos but works on Ashen-wow with the same client+proxy --
+                // strongly suggests Kronos sends skill data the visible /run skill list
+                // doesn't expose (e.g., Thrown skill at value 0). This snapshot will show
+                // every non-zero SkillLineID the proxy is forwarding to the modern client.
+                bool _jpAnySkillChanged = false;
                 for (int i = 0; i < 128; i++)
                 {
                     int idIndex = PLAYER_SKILL_INFO_1_1 + i * 3;
@@ -2320,19 +2327,48 @@ public partial class WorldClient
                     {
                         updateData.ActivePlayerData.Skill.SkillLineID[i] = (ushort)(updates[idIndex].UInt32Value & 0xFFFF);
                         updateData.ActivePlayerData.Skill.SkillStep[i] = (ushort)((updates[idIndex].UInt32Value >> 16) & 0xFFFF);
-            }
+                        _jpAnySkillChanged = true;
+                    }
                     int valueIndex = idIndex + 1;
                     if (updateMaskArray[valueIndex])
                     {
                         updateData.ActivePlayerData.Skill.SkillRank[i] = (ushort)(updates[valueIndex].UInt32Value & 0xFFFF);
                         updateData.ActivePlayerData.Skill.SkillMaxRank[i] = (ushort)((updates[valueIndex].UInt32Value >> 16) & 0xFFFF);
+                        _jpAnySkillChanged = true;
                     }
                     int bonusIndex = valueIndex + 1;
                     if (updateMaskArray[bonusIndex])
                     {
                         updateData.ActivePlayerData.Skill.SkillTempBonus[i] = (short)(updates[bonusIndex].Int32Value & 0xFFFF);
                         updateData.ActivePlayerData.Skill.SkillPermBonus[i] = (ushort)((updates[bonusIndex].UInt32Value >> 16) & 0xFFFF);
+                        _jpAnySkillChanged = true;
                     }
+                }
+
+                // JimsProxy: emit snapshot of the FULL forwarded skill set after any
+                // skill update. Only includes slots with non-zero SkillLineID. Format
+                // is a list of {id, rank, max_rank} so we can correlate against the
+                // /run skill list (which only shows API-exposed skills) and confirm
+                // whether Kronos sends hidden Thrown-at-0 type entries.
+                if (_jpAnySkillChanged)
+                {
+                    var _jpSkills = new List<object>();
+                    for (int i = 0; i < 128; i++)
+                    {
+                        ushort? id = updateData.ActivePlayerData.Skill.SkillLineID[i];
+                        if (!id.HasValue || id.Value == 0) continue;
+                        _jpSkills.Add(new
+                        {
+                            id = id.Value,
+                            rank = updateData.ActivePlayerData.Skill.SkillRank[i] ?? 0,
+                            max_rank = updateData.ActivePlayerData.Skill.SkillMaxRank[i] ?? 0,
+                        });
+                    }
+                    Framework.Logging.Log.Event("player.skills.snapshot", new
+                    {
+                        count = _jpSkills.Count,
+                        skills = _jpSkills,
+                    });
                 }
             }
             int PLAYER_CHARACTER_POINTS1 = LegacyVersion.GetUpdateField(PlayerField.PLAYER_CHARACTER_POINTS1);
