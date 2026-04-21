@@ -1180,24 +1180,46 @@ public partial class WorldClient
         return data;
     }
 
-    public byte ReadPvPFlags(Dictionary<int, UpdateField> updates)
+    public byte ReadPvPFlags(WowGuid128 guid, Dictionary<int, UpdateField> updates)
     {
         byte flags = 0;
 
+        // --- Mirasu PvP Cache Fix ---
+        // If the server didn't send flags in this specific update, pull them from Hermes' memory cache
+        var cachedFields = GetSession().GameState.GetCachedObjectFieldsLegacy(guid);
+
         int UNIT_FIELD_FLAGS = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_FLAGS);
-        if (UNIT_FIELD_FLAGS >= 0 && updates.ContainsKey(UNIT_FIELD_FLAGS))
+        if (UNIT_FIELD_FLAGS >= 0)
         {
-            if (updates[UNIT_FIELD_FLAGS].UInt32Value.HasAnyFlag(UnitFlags.Pvp))
-                flags |= (byte)PvPFlags.PvP;
+            if (updates.ContainsKey(UNIT_FIELD_FLAGS))
+            {
+                if (updates[UNIT_FIELD_FLAGS].UInt32Value.HasAnyFlag(UnitFlags.Pvp))
+                    flags |= (byte)PvPFlags.PvP;
+            }
+            else if (cachedFields != null && cachedFields.ContainsKey(UNIT_FIELD_FLAGS))
+            {
+                if (cachedFields[UNIT_FIELD_FLAGS].UInt32Value.HasAnyFlag(UnitFlags.Pvp))
+                    flags |= (byte)PvPFlags.PvP;
+            }
         }
 
         int PLAYER_FLAGS = LegacyVersion.GetUpdateField(PlayerField.PLAYER_FLAGS);
-        if (PLAYER_FLAGS >= 0 && updates.ContainsKey(PLAYER_FLAGS))
+        if (PLAYER_FLAGS >= 0)
         {
-            if (updates[PLAYER_FLAGS].UInt32Value.HasAnyFlag(PlayerFlagsLegacy.FreeForAllPvP))
-                flags |= (byte)PvPFlags.FFAPvp;
-            if (updates[PLAYER_FLAGS].UInt32Value.HasAnyFlag(PlayerFlagsLegacy.Sanctuary))
-                flags |= (byte)PvPFlags.Sanctuary;
+            if (updates.ContainsKey(PLAYER_FLAGS))
+            {
+                if (updates[PLAYER_FLAGS].UInt32Value.HasAnyFlag(PlayerFlagsLegacy.FreeForAllPvP))
+                    flags |= (byte)PvPFlags.FFAPvp;
+                if (updates[PLAYER_FLAGS].UInt32Value.HasAnyFlag(PlayerFlagsLegacy.Sanctuary))
+                    flags |= (byte)PvPFlags.Sanctuary;
+            }
+            else if (cachedFields != null && cachedFields.ContainsKey(PLAYER_FLAGS))
+            {
+                if (cachedFields[PLAYER_FLAGS].UInt32Value.HasAnyFlag(PlayerFlagsLegacy.FreeForAllPvP))
+                    flags |= (byte)PvPFlags.FFAPvp;
+                if (cachedFields[PLAYER_FLAGS].UInt32Value.HasAnyFlag(PlayerFlagsLegacy.Sanctuary))
+                    flags |= (byte)PvPFlags.Sanctuary;
+            }
         }
 
         return flags;
@@ -1676,7 +1698,7 @@ public partial class WorldClient
 
                 if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V3_0_2_9056) &&
                     updateData.UnitData.PvpFlags == null)
-                    updateData.UnitData.PvpFlags = ReadPvPFlags(updates);
+                    updateData.UnitData.PvpFlags = ReadPvPFlags(guid, updates);
             }
             int UNIT_FIELD_FLAGS_2 = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_FLAGS_2);
             if (UNIT_FIELD_FLAGS_2 >= 0 && updateMaskArray[UNIT_FIELD_FLAGS_2])
@@ -2071,7 +2093,7 @@ public partial class WorldClient
 
                 if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V3_0_2_9056) &&
                     updateData.UnitData.PvpFlags == null)
-                    updateData.UnitData.PvpFlags = ReadPvPFlags(updates);
+                    updateData.UnitData.PvpFlags = ReadPvPFlags(guid, updates);
             }
             else if (updateData.Guid == GetSession().GameState.CurrentPlayerGuid && GetSession().GameState.CurrentPlayerStorage.Settings.NeedToForcePatchFlags)
             { // If we did not patch the PlayerFlags the first time, we need to force include the field
