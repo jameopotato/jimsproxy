@@ -201,7 +201,16 @@ public partial class WorldClient
         {
             GetSession().GameState.IsWaitingForNewWorld = false;
             GetSession().GameState.IsWaitingForWorldPortAck = true;
+
+            // --- START FIX: Map Transition Race Condition ---
+            // Simulates a legacy HDD load time. Gives the 1.12 server a 2-second 
+            // head start to buffer heavy object updates (like 40-man zeppelins) 
+            // before the 1.14 client instantly loads the map and causes a desync.
+            System.Threading.Thread.Sleep(2000);
+            // --- END FIX ---
+
             SendPacketToClient(teleport);
+
             if (teleport.MapID > 1)
             {
                 UpdateLastInstance instance = new();
@@ -216,14 +225,6 @@ public partial class WorldClient
                 resume.Reason = 1;
                 SendPacketToClient(resume);
             }
-
-            WorldServerInfo info = new();
-            if (teleport.MapID > 1)
-            {
-                info.DifficultyID = 1;
-                info.InstanceGroupSize = 5;
-            }
-            SendPacketToClient(info);
         }
     }
 
