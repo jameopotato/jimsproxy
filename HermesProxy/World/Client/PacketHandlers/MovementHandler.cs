@@ -449,6 +449,7 @@ public partial class WorldClient
         if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
         {
             var splineFlags = (SplineFlagVanilla)packet.ReadUInt32();
+            
             hasAnimTier = false;
             hasTrajectory = false;
             hasCatmullRom = splineFlags.HasAnyFlag(SplineFlagVanilla.Flying);
@@ -464,7 +465,29 @@ public partial class WorldClient
                     moveSpline.SplineFlags |= SplineFlagModern.Steering | SplineFlagModern.Unknown10;
             }
             else
+            {
                 moveSpline.SplineFlags = splineFlags.CastFlags<SplineFlagModern>();
+            }
+            // TODO (WIP): Whelps occasionally "slowfall" dip at the end of flight paths.
+            // Faked Telemetry and Can_Fly flags caused a 51900319 disconnect. 
+            // Reverted to Native Hover for now. Needs polish later.
+            // --- Mirasu Native Hover Spline ---
+            float hoverHeight = GetSession().GameState.GetLegacyFieldValueFloat(guid, UnitField.UNIT_FIELD_HOVERHEIGHT);
+            if (hoverHeight > 0.0f)
+            {
+                // 1. Strip falling, ground snapping, AND CatmullRom (No curves!)
+                moveSpline.SplineFlags &= ~(SplineFlagModern.Unknown5 | SplineFlagModern.Falling | SplineFlagModern.FallingSlow | SplineFlagModern.SmoothGroundPath | SplineFlagModern.CatmullRom);
+
+                // 2. Add Flying AND AnimTierHover
+                // Flying cuts the downward ground leash over valleys.
+                // AnimTierHover automatically applies the visual +2 lift to the path!
+                moveSpline.SplineFlags |= SplineFlagModern.Flying | SplineFlagModern.AnimTierHover;
+
+                // 3. ABSOLUTELY NO Z-MATH!
+                // We pass the raw Vanilla coordinates through perfectly untouched.
+                // The native flags will handle the +2 lift perfectly.
+            }
+            // ---------------------------------------------
         }
         else if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V3_0_2_9056))
         {
