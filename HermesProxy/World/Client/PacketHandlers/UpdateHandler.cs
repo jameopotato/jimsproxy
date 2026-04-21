@@ -1171,7 +1171,12 @@ public partial class WorldClient
 
         if (GameData.SpellEffectPoints.TryGetValue(spellId, out var basePoints))
             data.Points = basePoints;
-
+        int duration = GameData.GetAuraSpellDuration(spellId);
+        if (duration > 0)
+        {
+            data.Duration = duration;
+            data.Remaining = duration;
+        }
         return data;
     }
 
