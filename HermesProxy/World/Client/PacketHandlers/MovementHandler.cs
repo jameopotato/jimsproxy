@@ -93,6 +93,18 @@ public partial class WorldClient
         control.Guid = packet.ReadPackedGuid().To128(GetSession().GameState);
         control.HasControl = packet.ReadBool();
         SendPacketToClient(control);
+
+        // --- Mirasu RP Walk Bug Fix ---
+        // The 1.14 client forgets to un-toggle Walk mode after CC wears off.
+        // When control is returned, we explicitly force a run speed update to reset the UI toggle.
+        if (control.HasControl && control.Guid == GetSession().GameState.CurrentPlayerGuid)
+        {
+            MoveSetSpeed runFix = new MoveSetSpeed(Opcode.SMSG_FORCE_RUN_SPEED_CHANGE);
+            runFix.MoverGUID = control.Guid;
+            runFix.MoveCounter = 0;
+            runFix.Speed = 7.0f; // Default WoW running speed
+            SendPacketToClient(runFix);
+        }
     }
 
     [PacketHandler(Opcode.MSG_MOVE_TELEPORT_ACK)]
