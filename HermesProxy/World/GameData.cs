@@ -604,6 +604,12 @@ public static partial class GameData
             LoadHotfixes
         );
 
+        // Must run sequentially AFTER Parallel.Invoke: reads+overwrites SpellVisuals,
+        // which is populated by LoadSpellVisuals (also in Parallel.Invoke). Running
+        // inside the parallel block causes a data race that wipes the base-game
+        // spell-visual table. See LoadHotfixes for the full note.
+        LoadSpellXSpellVisualHotfixes();
+
         Log.Print(LogType.Storage, $"Finished loading data. Time taken: {Stopwatch.GetElapsedTime(startTime).TotalMilliseconds} ms");
     }
 
@@ -1468,7 +1474,12 @@ public static partial class GameData
         LoadSpellAuraOptionsHotfixes();
         LoadSpellMiscHotfixes();
         LoadSpellEffectHotfixes();
-        LoadSpellXSpellVisualHotfixes();
+        // NOTE: LoadSpellXSpellVisualHotfixes intentionally runs AFTER Parallel.Invoke in
+        // LoadEverything. It seeds a dict from SpellVisuals and overwrites SpellVisuals
+        // when done — if it raced with LoadSpellVisuals (also in Parallel.Invoke) and
+        // read the pre-populated empty snapshot, it wipes out the 14k base-game entries.
+        // Symptom: every SMSG_SPELL_START logs spell_visual_id=0 in spell.cast events,
+        // spells render with no visual/sound. Non-deterministic — depends on scheduling.
         LoadItemSparseHotfixes();
         LoadItemHotfixes();
         LoadItemEffectHotfixes();
