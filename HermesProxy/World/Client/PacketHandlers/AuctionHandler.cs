@@ -137,7 +137,39 @@ public partial class WorldClient
                 break;
         }
         SendPacketToClient(auction);
+        //MIRASU: Auction House refresh fix for 1.14.2 client on Kronos (1.12 TrinityCore).
+        //MIRASU: The modern client does not auto-refresh the owned items list after a successful
+        //MIRASU: SellItem/RemoveItem/Bid. Native 1.12 clients refresh themselves; 1.14.2 waits for
+        //MIRASU: the server to push. We re-request the owned list so Kronos sends fresh data through.
+        if (auction.ErrorCode == AuctionHouseError.Ok &&
+            (auction.Command == AuctionHouseAction.Sell ||
+             auction.Command == AuctionHouseAction.Cancel))
+        {
+            WowGuid128 auctioneer = GetSession().GameState.CurrentInteractedWithNPC;
+            if (auctioneer != null && !auctioneer.IsEmpty())
+            {
+                WorldPacket refreshOwned = new WorldPacket(Opcode.CMSG_AUCTION_LIST_OWNED_ITEMS);
+                refreshOwned.WriteGuid(auctioneer.To64());
+                refreshOwned.WriteUInt32(0);
+                SendPacketToServer(refreshOwned);
+            }
+        }
+        //MIRASU: Bid refresh - requests the bidder list so 1.14.2 client shows updated bid state.
+        if (auction.ErrorCode == AuctionHouseError.Ok &&
+            auction.Command == AuctionHouseAction.Bid)
+        {
+            WowGuid128 auctioneer = GetSession().GameState.CurrentInteractedWithNPC;
+            if (auctioneer != null && !auctioneer.IsEmpty())
+            {
+                WorldPacket refreshBidder = new WorldPacket(Opcode.CMSG_AUCTION_LIST_BIDDED_ITEMS);
+                refreshBidder.WriteGuid(auctioneer.To64());
+                refreshBidder.WriteUInt32(0);
+                refreshBidder.WriteInt32(0); //MIRASU: AuctionItemIDs count - 0 means refresh all
+                SendPacketToServer(refreshBidder);
+            }
+        }
     }
+    
 
     [PacketHandler(Opcode.SMSG_AUCTION_OWNER_NOTIFICATION)]
     void HandleAuctionOwnerNotification(WorldPacket packet)
@@ -204,6 +236,18 @@ public partial class WorldClient
             auction.BidAmount = bidAmount;
             auction.MinIncrement = minIncrement;
             SendPacketToClient(auction);
+            //MIRASU: Outbid refresh - 1.14.2 client doesn't auto-refresh the bid list when
+            //MIRASU: outbid by another player. Re-request the bidded items so the UI updates
+            //MIRASU: in real-time (item disappears from "Bids" tab since money was refunded).
+            WowGuid128 auctioneer = GetSession().GameState.CurrentInteractedWithNPC;
+            if (auctioneer != null && !auctioneer.IsEmpty())
+            {
+                WorldPacket refreshBidder = new WorldPacket(Opcode.CMSG_AUCTION_LIST_BIDDED_ITEMS);
+                refreshBidder.WriteGuid(auctioneer.To64());
+                refreshBidder.WriteUInt32(0);
+                refreshBidder.WriteInt32(0); //MIRASU: AuctionItemIDs count - 0 means refresh all
+                SendPacketToServer(refreshBidder);
+            }
         }
     }
 }
