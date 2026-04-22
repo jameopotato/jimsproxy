@@ -24,28 +24,39 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_GET_ACCOUNT_CHARACTER_LIST)]
     void HandleGetAccountCharacterList(GetAccountCharacterListRequest request)
     {
-        GetAccountCharacterListResult response = new();
-        response.Token = request.Token;
-
-        foreach (var ownCharacter in GetSession().GameState.OwnCharacters)
+        // Safely hold the UI back in a background task so we don't freeze the main proxy thread!
+        System.Threading.Tasks.Task.Run(async () =>
         {
-            response.CharacterList.Add(new AccountCharacterListEntry
+            int timeout = 0;
+            // Wait up to 2 seconds for the server to reply and fill the cache
+            while (GetSession().GameState.OwnCharacters.Count == 0 && timeout < 100)
             {
-                AccountId = WowGuid128.Create(HighGuidType703.WowAccount, GetSession().GameAccountInfo.Id),
-                CharacterGuid = ownCharacter.CharacterGuid,
-                RealmVirtualAddress = GetSession().RealmId.GetAddress(),
-                RealmName = "", // If empty the realm name will not be displayed
-                LastLoginUnixSec = ownCharacter.LastLoginUnixSec,
+                await System.Threading.Tasks.Task.Delay(20);
+                timeout++;
+            }
 
-                Name = ownCharacter.Name ?? string.Empty,
-                Race = ownCharacter.RaceId,
-                Class = ownCharacter.ClassId,
-                Sex = ownCharacter.SexId,
-                Level = ownCharacter.Level,
-            });
-        }
+            GetAccountCharacterListResult response = new();
+            response.Token = request.Token;
 
-        SendPacket(response);
+            foreach (var ownCharacter in GetSession().GameState.OwnCharacters)
+            {
+                response.CharacterList.Add(new AccountCharacterListEntry
+                {
+                    AccountId = WowGuid128.Create(HighGuidType703.WowAccount, GetSession().GameAccountInfo.Id),
+                    CharacterGuid = ownCharacter.CharacterGuid,
+                    RealmVirtualAddress = GetSession().RealmId.GetAddress(),
+                    RealmName = "",
+                    LastLoginUnixSec = ownCharacter.LastLoginUnixSec,
+                    Name = ownCharacter.Name ?? string.Empty,
+                    Race = ownCharacter.RaceId,
+                    Class = ownCharacter.ClassId,
+                    Sex = ownCharacter.SexId,
+                    Level = ownCharacter.Level,
+                });
+            }
+
+            SendPacket(response);
+        });
     }
 
     [PacketHandler(Opcode.CMSG_GENERATE_RANDOM_CHARACTER_NAME)]
