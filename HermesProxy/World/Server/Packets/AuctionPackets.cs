@@ -216,7 +216,7 @@ public class AuctionListItemsResult : ServerPacket
 
     public List<AuctionItem> Items = new();
     public int TotalItemsCount;
-    public uint DesiredDelay = 300;
+    public uint DesiredDelay = 5000;
     public bool OnlyUsable;
 }
 
