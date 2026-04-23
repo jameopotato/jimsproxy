@@ -1,8 +1,10 @@
-﻿using HermesProxy.Enums;
+﻿using Framework.Logging;
+using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
 using System;
+using Framework.Logging; //MIRASU: for structured packet.partial events
 using System.Collections.Generic;
 
 namespace HermesProxy.World.Client;
@@ -68,6 +70,7 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_GROUP_LIST, ClientVersionBuild.Zero, ClientVersionBuild.V2_0_1_6180)]
     void HandleGroupListVanilla(WorldPacket packet)
     {
+
         GetSession().GameState.MasterLootCandidates = null;
         GetSession().GameState.LastMasterLootSentTarget = default;
         PartyUpdate party = new PartyUpdate();
@@ -105,6 +108,9 @@ public partial class WorldClient
             player.Subgroup = (byte)(ownSubGroupAndFlags & 0xF);
             player.Flags = (ownSubGroupAndFlags & 0x80) != 0 ? GroupMemberFlags.Assistant : GroupMemberFlags.None;
             player.Status = GroupMemberOnlineStatus.Online;
+            //MIRASU: Own class from the session cache (populated at char-select). Without
+            //MIRASU: this, self shows in party UI with no class icon.
+            player.ClassId = GetSession().GameState.GetUnitClass(player.GUID); //MIRASU
             party.PlayerList.Add(player);
 
             bool allAssist = true;
@@ -117,7 +123,17 @@ public partial class WorldClient
                 byte subGroupAndFlags = packet.ReadUInt8();
                 member.Subgroup = (byte)(subGroupAndFlags & 0xF);
                 member.Flags = (subGroupAndFlags & 0x80) != 0 ? GroupMemberFlags.Assistant : GroupMemberFlags.None;
-                member.ClassId = GetSession().GameState.GetUnitClass(member.GUID);
+                //MIRASU: If the member isn't in this session's player cache yet (very common
+                //MIRASU: for 2-box where session B never saw session A's character until the
+                //MIRASU: group forms), GetUnitClass returns Class.Warrior as a default — which
+                //MIRASU: paints the wrong class icon in the party UI and, combined with the
+                //MIRASU: subsequent SMSG_QUERY_PLAYER_NAME_RESPONSE correcting it a moment later,
+                //MIRASU: apparently confuses the 1.14 client into showing the member as "Unknown"
+                //MIRASU: until rejoin. Prefer leaving ClassId as 0 (None) here so the client
+                //MIRASU: relies solely on the name-query response for the class.
+                if (GetSession().GameState.CachedPlayers.ContainsKey(member.GUID)) //MIRASU
+                    member.ClassId = GetSession().GameState.GetUnitClass(member.GUID); //MIRASU
+                                                                                       // else: leave as Class.None (0); client will populate from SMSG_QUERY_PLAYER_NAME_RESPONSE
                 if (!member.Flags.HasAnyFlag(GroupMemberFlags.Assistant))
                     allAssist = false;
 
@@ -149,6 +165,16 @@ public partial class WorldClient
         }
         else
         {
+            //MIRASU: Kronos (TrinityCore-1.12) sends an empty SMSG_GROUP_LIST as a
+            //MIRASU: "clear state" packet BEFORE sending the populated one on party
+            //MIRASU: formation. If we weren't tracking an active group at this index,
+            //MIRASU: this empty is a protocol-level no-op for the modern client — do
+            //MIRASU: not synthesize a GroupUninvite, which the 1.14 client then treats
+            //MIRASU: as "you were kicked" and corrupts the party-UI state so members
+            //MIRASU: appear offline. Only send the uninvite if we actually had a group
+            //MIRASU: to dismiss. See jsonl trace L1474 @ 2026-04-23T15:48:27.
+            bool hadActiveGroupM = GetSession().GameState.CurrentGroups[party.PartyIndex] != null; //MIRASU
+
             party.PartyFlags |= GroupFlags.Destroyed;
             if (party.PartyIndex == 0)
                 party.PartyGUID = WowGuid128.Empty;
@@ -156,8 +182,15 @@ public partial class WorldClient
             party.MyIndex = -1;
             GetSession().GameState.CurrentGroups[party.PartyIndex] = null;
 
-            if (!GetSession().GameState.WeWantToLeaveGroup)
+            if (hadActiveGroupM && !GetSession().GameState.WeWantToLeaveGroup) //MIRASU - was: if (!WeWantToLeaveGroup)
                 SendPacketToClient(new GroupUninvite()); // Send kick message
+
+            if (!hadActiveGroupM) //MIRASU
+            { //MIRASU
+                //MIRASU: Skip forwarding the synthetic destroyed-party packet entirely
+                //MIRASU: when there was no prior group — it confuses the modern client.
+                return; //MIRASU
+            } //MIRASU
         }
 
         SendPacketToClient(party);
@@ -208,7 +241,7 @@ public partial class WorldClient
                 member.Status = (GroupMemberOnlineStatus)packet.ReadUInt8();
                 member.Subgroup = packet.ReadUInt8();
                 member.Flags = (GroupMemberFlags)packet.ReadUInt8();
-                member.ClassId = GetSession().GameState.GetUnitClass(member.GUID);
+                
                 if (!member.Flags.HasAnyFlag(GroupMemberFlags.Assistant))
                     allAssist = false;
 
@@ -249,15 +282,22 @@ public partial class WorldClient
         }
         else
         {
+            //MIRASU: See HandleGroupListVanilla — TBC variant has same empty-before-populated
+            //MIRASU: pattern on TrinityCore-derived servers.
+            bool hadActiveGroupM = GetSession().GameState.CurrentGroups[party.PartyIndex] != null; //MIRASU
+
             party.PartyFlags |= GroupFlags.Destroyed;
-            if (party.PartyIndex  == 0)
+            if (party.PartyIndex == 0)
                 party.PartyGUID = WowGuid128.Empty;
             party.LeaderGUID = WowGuid128.Empty;
             party.MyIndex = -1;
             GetSession().GameState.CurrentGroups[party.PartyIndex] = null;
 
-            if (!GetSession().GameState.WeWantToLeaveGroup)
+            if (hadActiveGroupM && !GetSession().GameState.WeWantToLeaveGroup) //MIRASU
                 SendPacketToClient(new GroupUninvite()); // Send kick message
+
+            if (!hadActiveGroupM) //MIRASU
+                return; //MIRASU
         }
 
         SendPacketToClient(party);
@@ -395,8 +435,12 @@ public partial class WorldClient
     uint _requestBgPlayerPosCounter = 0;
 
     [PacketHandler(Opcode.SMSG_PARTY_MEMBER_PARTIAL_STATE, ClientVersionBuild.Zero, ClientVersionBuild.V2_0_1_6180)]
+    //MIRASU: Same OOB-truncation risk as HandlePartyMemberStatsFull — see comment
+    //MIRASU: block on that handler. Kronos sends SMSG_PARTY_MEMBER_PARTIAL_STATE with
+    //MIRASU: flag-gated fields that can be truncated for distant members.
     void HandlePartyMemberStats(WorldPacket packet)
     {
+        
         if (GetSession().GameState.CurrentMapId == (uint)BattlegroundMapID.WarsongGulch &&
            (GetSession().GameState.HasWsgAllyFlagCarrier || GetSession().GameState.HasWsgHordeFlagCarrier))
         {
@@ -412,8 +456,11 @@ public partial class WorldClient
         state.AffectedGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
         var updateFlags = (GroupUpdateFlagVanilla)packet.ReadUInt32();
 
-        if (updateFlags.HasFlag(GroupUpdateFlagVanilla.Status))
-            state.StatusFlags = packet.ReadUInt8();// GroupMemberOnlineStatus
+       
+            try //MIRASU: OOB-tolerant region — see HandlePartyMemberStatsFull
+            {
+                if (updateFlags.HasFlag(GroupUpdateFlagVanilla.Status))
+                    state.StatusFlags = packet.ReadUInt8();// GroupMemberOnlineStatus
 
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.CurrentHealth))
             state.CurrentHealth = packet.ReadUInt16();
@@ -588,9 +635,34 @@ public partial class WorldClient
                     aura.ActiveFlags = 1;
                     aura.AuraFlags = (ushort)AuraFlagsModern.Negative;
                 }
-                state.Pet.Auras.Add(aura);
+                    state.Pet.Auras.Add(aura);
+                }
             }
-        }
+        } //MIRASU: end try — exit normally with fully-parsed state
+        catch (System.IndexOutOfRangeException exM) //MIRASU
+        { //MIRASU
+            Log.Event("packet.partial", new //MIRASU
+            { //MIRASU
+                direction = "s2c", //MIRASU
+                opcode_universal = "SMSG_PARTY_MEMBER_PARTIAL_STATE", //MIRASU
+                reason = "flag_truncated", //MIRASU
+                update_flags = (uint)updateFlags, //MIRASU
+                affected_guid = state.AffectedGUID.ToString(), //MIRASU
+                message = exM.Message, //MIRASU
+            }); //MIRASU
+        } //MIRASU
+        catch (System.ArgumentOutOfRangeException exM2) //MIRASU
+        { //MIRASU - BinaryPrimitives throws this variant on span underrun
+            Log.Event("packet.partial", new //MIRASU
+            { //MIRASU
+                direction = "s2c", //MIRASU
+                opcode_universal = "SMSG_PARTY_MEMBER_PARTIAL_STATE", //MIRASU
+                reason = "flag_truncated", //MIRASU
+                update_flags = (uint)updateFlags, //MIRASU
+                affected_guid = state.AffectedGUID.ToString(), //MIRASU
+                message = exM2.Message, //MIRASU
+            }); //MIRASU
+        } //MIRASU
 
         SendPacketToClient(state);
     }
@@ -743,8 +815,18 @@ public partial class WorldClient
     }
 
     [PacketHandler(Opcode.SMSG_PARTY_MEMBER_FULL_STATE, ClientVersionBuild.Zero, ClientVersionBuild.V2_0_1_6180)]
+    //MIRASU: Kronos/TrinityCore-1.12 sends truncated SMSG_PARTY_MEMBER_FULL_STATE
+    //MIRASU: for party members in other zones/maps — the update-flag mask advertises
+    //MIRASU: fields that aren't actually serialized, causing flag-gated ReadUInt16/8
+    //MIRASU: calls below to walk past end-of-buffer and throw IndexOutOfRangeException.
+    //MIRASU: The dispatcher in WorldClient.HandlePacket rethrows, killing the session.
+    //MIRASU: Reported as HermesProxy issues #376 #313 #292 #140. We swallow the OOB,
+    //MIRASU: emit a structured packet.partial event for visibility, and forward whatever
+    //MIRASU: state we managed to parse — the client gracefully degrades (stale fields
+    //MIRASU: for the distant member) rather than disconnecting.
     void HandlePartyMemberStatsFull(WorldPacket packet)
     {
+        
         if (GetSession().GameState.CurrentMapId == (uint)BattlegroundMapID.WarsongGulch &&
            (GetSession().GameState.HasWsgAllyFlagCarrier || GetSession().GameState.HasWsgHordeFlagCarrier))
         {
@@ -757,6 +839,12 @@ public partial class WorldClient
         }
 
         PartyMemberFullState state = new PartyMemberFullState();
+        //MIRASU: Default to Online. GroupMemberOnlineStatus.Offline = 0x0 happens to be
+        //MIRASU: the default value of StatusFlags, so when Kronos sends a tiny stats
+        //MIRASU: packet without the Status update-flag bit set (common when one character
+        //MIRASU: of a 2-box pair hands stats to the other before full party sync), the
+        //MIRASU: modern client's party UI shows that member as offline.
+        state.StatusFlags = GroupMemberOnlineStatus.Online; //MIRASU
         if (GetSession().GameState.IsInBattleground())
         {
             state.PartyType[0] = 0;
@@ -770,7 +858,24 @@ public partial class WorldClient
         
         state.MemberGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
         var updateFlags = (GroupUpdateFlagVanilla)packet.ReadUInt32();
-
+        //MIRASU: Kronos sometimes sends SMSG_PARTY_MEMBER_FULL_STATE with only the
+        //MIRASU: Status bit set in updateFlags — a status-only delta masquerading as a
+        //MIRASU: full state. If we built a PartyMemberFullState and sent it, all the
+        //MIRASU: other fields (HP, level, zone, position, auras, pet) would serialize
+        //MIRASU: as zero and clobber the modern client's cached values, making members
+        //MIRASU: show as offline/0HP after the first delta. Instead, translate this into
+        //MIRASU: a PartyMemberPartialState with only StatusFlags set — all other nullable
+        //MIRASU: fields are null so Write() skips them and the client's cache is preserved.
+        //MIRASU: See jsonl trace L3192/L3456 @ 2026-04-23T16:36:15 for the Kronos pattern.
+        if ((updateFlags & ~GroupUpdateFlagVanilla.Status) == GroupUpdateFlagVanilla.None) //MIRASU
+        { //MIRASU
+            var statusOnlyM = new PartyMemberPartialState(); //MIRASU
+            statusOnlyM.AffectedGUID = state.MemberGuid; //MIRASU
+            if (updateFlags.HasFlag(GroupUpdateFlagVanilla.Status)) //MIRASU
+                statusOnlyM.StatusFlags = (ushort)(GroupMemberOnlineStatus)packet.ReadUInt8(); //MIRASU
+            SendPacketToClient(statusOnlyM); //MIRASU
+            return; //MIRASU - skip the full-state build entirely
+        } //MIRASU  
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.Status))
             state.StatusFlags = (GroupMemberOnlineStatus)packet.ReadUInt8();
 
@@ -949,8 +1054,7 @@ public partial class WorldClient
                 state.Pet.Auras.Add(aura);
             }
         }
-
-        SendPacketToClient(state);
+        SendPacketToClient(state); //MIRASU: Restore missing call — was lost during earlier brace-rearrangement edits. Without this the modern client never gets the initial full-state on party join, so members show as offline/unknown until a PARTIAL_STATE delta arrives (which may never include Status+Health together).     
     }
 
     [PacketHandler(Opcode.SMSG_PARTY_MEMBER_FULL_STATE, ClientVersionBuild.V2_0_1_6180)]
