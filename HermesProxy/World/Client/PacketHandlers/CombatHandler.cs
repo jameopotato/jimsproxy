@@ -41,7 +41,25 @@ public partial class WorldClient
                 WorldPacket stopPacket = new WorldPacket(Opcode.CMSG_ATTACK_STOP);
                 SendPacketToServer(stopPacket, Opcode.MSG_NULL_ACTION);
             }
-            // If CurrentAttackTarget is set but no deferred stop, we're switching targets —
+            //MIRASU: Server-initiated SMSG_ATTACK_STOP — Gouge, Cheap Shot, Blind, Feign Death,
+            //MIRASU: stealth, Vanish, and similar incapacitate/stealth effects all cause Kronos/TC-1.12
+            //MIRASU: to push SMSG_ATTACK_STOP (attacker=self) without a prior CMSG_ATTACK_STOP from the
+            //MIRASU: client. WaitingForAttackStart is false (our prior SWING was already ack'd by
+            //MIRASU: SMSG_ATTACK_START long ago) and DeferredAttackStop is false (client never asked).
+            //MIRASU: We MUST clear CurrentAttackTarget here: otherwise the modern client's next
+            //MIRASU: CMSG_ATTACK_SWING (issued when the debuff wears off / stealth breaks / target is
+            //MIRASU: right-clicked / /startattack macro fires) hits the (target == CurrentAttackTarget)
+            //MIRASU: de-dupe guard in the server-side CMSG_ATTACK_SWING handler and gets swallowed —
+            //MIRASU: server never learns the player wants to resume, so no white-swings, no animation,
+            //MIRASU: until the user clicks the action-bar Attack button which bypasses the guard.
+            //MIRASU: The WaitingForAttackStart==true case below remains untouched: that's the
+            //MIRASU: client-driven target-switch sequence (CMSG_SWING(new) → SMSG_STOP(old) → SMSG_START(new))
+            //MIRASU: where the new CurrentAttackTarget is already set and must be preserved.
+            else if (!state.WaitingForAttackStart)
+            {
+                state.CurrentAttackTarget = default;
+            }
+            // If WaitingForAttackStart is true with no deferred stop, we're switching targets —
             // don't clear the attack target, the new SWING already set it
         }
 
