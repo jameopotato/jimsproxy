@@ -1189,14 +1189,11 @@ public partial class WorldClient
         if (GameData.StackableAuras.Contains(spellId))
             data.Applications++;
 
-        //MIRASU: Stealth idle animation fix (and likely other toggle-aura animation/UI bugs).
-        //MIRASU: Vanilla encodes non-stackable toggle auras (Stealth, Shadowmeld, Prowl, etc.)
-        //MIRASU: with Applications=0 - its clients treat 0 as "present, not stacked". The modern
-        //MIRASU: 1.14.2 client inherits retail semantics where Applications=0 means "aura not
-        //MIRASU: actually active", so it's discarded from the visible-auras animation gate.
-        //MIRASU: That leaves VisFlags.STEALTHED set on the unit with no backing aura the client
-        //MIRASU: can find, so the stealth crouch idle animation never engages.
-        //MIRASU: Clamp to a minimum of 1 so non-stackable auras we forward are seen as active.
+        //MIRASU: Vanilla encodes non-stackable toggle auras with Applications=0 (its clients
+        //MIRASU: treat 0 as "present, not stacked"). The modern 1.14.2 client inherits retail
+        //MIRASU: semantics where Applications=0 means "aura not actually active" and can skip
+        //MIRASU: client-side checks that read the visible aura list. Clamp to a minimum of 1
+        //MIRASU: so non-stackable auras we forward are recognised as live.
         if (data.Applications == 0)
             data.Applications = 1;
 
