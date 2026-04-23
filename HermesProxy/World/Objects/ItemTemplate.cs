@@ -237,7 +237,38 @@ public class ItemTemplate
         // In this single (?) case, map 0 means no map
         MapID = packet.ReadInt32();
 
-        BagFamily = packet.ReadUInt32();
+        //MIRASU: Translate Vanilla (1.12) BagFamily bitmask to the modern (1.14+) bitmask.
+        //MIRASU: In Vanilla the ItemBagFamily.dbc row order was Quiver, Ammo, Soul, Keyring, Herb,
+        //MIRASU: Enchanting, Engineering, Gems, Mining, Leatherworking (1..10 -> bits 0..9).
+        //MIRASU: In modern clients the order is Arrows, Bullets, Soul, Leatherworking, Inscription,
+        //MIRASU: Herbs, Enchanting, Engineering, Keyring, Gems, Mining (1..11 -> bits 0..10).
+        //MIRASU: The Keyring bit is the critical one for this bug: Vanilla bit 3 (=8) must map to
+        //MIRASU: modern bit 8 (=256) so the 1.14 client shows the Key Ring tab and routes keys into it.
+        //MIRASU: We also remap the other families best-effort; unrecognised bits are passed through
+        //MIRASU: unchanged so this is never worse than the prior behaviour.
+        uint rawBagFamily = packet.ReadUInt32();
+        if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+        {
+            uint translated = 0;
+            if ((rawBagFamily & 0x001) != 0) translated |= 0x001;   // Quiver        -> Arrows
+            if ((rawBagFamily & 0x002) != 0) translated |= 0x002;   // Ammo Pouch    -> Bullets
+            if ((rawBagFamily & 0x004) != 0) translated |= 0x004;   // Soul Bag      -> Soul Shards
+            if ((rawBagFamily & 0x008) != 0) translated |= 0x100;   // Key Ring      -> Keyring (bit 8)
+            if ((rawBagFamily & 0x010) != 0) translated |= 0x020;   // Herb Bag      -> Herbs
+            if ((rawBagFamily & 0x020) != 0) translated |= 0x040;   // Enchanting    -> Enchanting
+            if ((rawBagFamily & 0x040) != 0) translated |= 0x080;   // Engineering   -> Engineering
+            if ((rawBagFamily & 0x080) != 0) translated |= 0x200;   // Gem Bag       -> Gems
+            if ((rawBagFamily & 0x100) != 0) translated |= 0x400;   // Mining Bag    -> Mining
+            if ((rawBagFamily & 0x200) != 0) translated |= 0x008;   // Leatherworking-> Leatherworking
+            //MIRASU: Preserve any bits we didn't recognise (pass-through) so we never worsen behaviour
+            uint recognisedMask = 0x3FF; // bits 0..9
+            translated |= (rawBagFamily & ~recognisedMask);
+            BagFamily = translated;
+        }
+        else
+        {
+            BagFamily = rawBagFamily;
+        }
 
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
         {
