@@ -32,6 +32,7 @@ public partial class WorldClient
     LegacyWorldCrypt _worldCrypt = null!;
     FrozenDictionary<Opcode, Action<WorldPacket>> _packetHandlers = null!;
     GlobalSessionData _globalSession = null!;
+    byte[] _authSessionKey = null!; //MIRASU: captured at connect time so we don't depend on GetSession().AuthClient surviving a realm swap
     readonly Lock _sendLock = new();
     Timer? _keepAliveTimer;
     uint _keepAlivePingSerial;
@@ -62,6 +63,33 @@ public partial class WorldClient
         _isSuccessful = null;
         _delayedPacketsToServer = new Dictionary<Opcode, List<WorldPacket>>();
         _delayedPacketsToClient = new Dictionary<Opcode, List<ServerPacket>>();
+
+        //MIRASU: snapshot the realmd session key here. Realm-swap (PTR<->Live) can null out
+        //        GetSession().AuthClient before Kronos sends AuthChallenge, causing a NRE in
+        //        SendAuthResponse. Capturing now decouples the handshake from AuthClient lifetime.
+        if (globalSession.AuthClient == null)
+        {
+            Log.Event("world.mangos.connect_no_authclient", new
+            {
+                realm_name = realm.Name,
+                username = globalSession.Username,
+            });
+            Log.Print(LogType.Error, "ConnectToWorldServer: AuthClient is null on session, cannot derive realmd session key. Aborting world connect.");
+            _isSuccessful = false;
+            return false;
+        }
+        _authSessionKey = globalSession.AuthClient.GetSessionKey();
+        if (_authSessionKey == null || _authSessionKey.Length == 0)
+        {
+            Log.Event("world.mangos.connect_empty_sessionkey", new
+            {
+                realm_name = realm.Name,
+                username = globalSession.Username,
+            });
+            Log.Print(LogType.Error, "ConnectToWorldServer: realmd session key is empty. Aborting world connect.");
+            _isSuccessful = false;
+            return false;
+        }
 
         Log.Print(LogType.Network, "Connecting to world server...");
         try
@@ -563,7 +591,7 @@ public partial class WorldClient
             BitConverter.GetBytes(zero),
             BitConverter.GetBytes(clientSeed),
             BitConverter.GetBytes(serverSeed),
-            GetSession().AuthClient.GetSessionKey()
+            _authSessionKey //MIRASU: was GetSession().AuthClient.GetSessionKey() — captured in ConnectToWorldServer to survive realm swaps
         );
 
         WorldPacket packet = new WorldPacket(Opcode.CMSG_AUTH_SESSION);
@@ -594,7 +622,7 @@ public partial class WorldClient
 
         SendPacket(packet);
 
-        InitializeEncryption(GetSession().AuthClient.GetSessionKey());
+        InitializeEncryption(_authSessionKey); //MIRASU: was GetSession().AuthClient.GetSessionKey()
     }
 
     private void HandleAuthResponse(WorldPacket packet)
