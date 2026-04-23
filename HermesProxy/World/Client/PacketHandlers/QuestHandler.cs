@@ -1,4 +1,5 @@
 ﻿using Framework;
+using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
@@ -393,16 +394,18 @@ public partial class WorldClient
         quest.QuestID = packet.ReadUInt32();
         SendPacketToClient(quest);
     }
-
     [PacketHandler(Opcode.SMSG_QUEST_UPDATE_ADD_ITEM)]
     void HandleQuestUpdateAddItem(WorldPacket packet)
     {
         uint itemId = packet.ReadUInt32();
-        uint count = packet.ReadUInt32();
+        uint count = packet.ReadUInt32(); //MIRASU - delta, not total
 
         QuestObjective? objective = GameData.GetQuestObjectiveForItem(itemId);
+        
+
         if (objective == null)
         {
+            //MIRASU - quest template not cached yet; fire off queries and bail. Next pickup will find it.
             var updateFields = GetSession().GameState.GetCachedObjectFieldsLegacy(GetSession().GameState.CurrentPlayerGuid);
             int questsCount = LegacyVersion.GetQuestLogSize();
             for (int i = 0; i < questsCount; i++)
@@ -418,7 +421,23 @@ public partial class WorldClient
                     SendPacketToServer(packet2);
                 }
             }
+            return;
         }
+
+        //MIRASU - track running total ourselves; legacy update-field cache isn't refreshed on partial updates
+        var key = (objective.QuestID, objective.StorageIndex);
+        GetSession().GameState.QuestItemObjectiveProgress.TryGetValue(key, out uint stored);
+        uint runningTotal = stored + count;
+        if (runningTotal > (uint)objective.Amount)
+            runningTotal = (uint)objective.Amount;
+        GetSession().GameState.QuestItemObjectiveProgress[key] = runningTotal;
+        
+        //MIRASU - use SIMPLE variant for item objectives; modern client auto-reads count from bags
+        QuestUpdateAddCreditSimple credit = new QuestUpdateAddCreditSimple();
+        credit.QuestID = objective.QuestID;
+        credit.ObjectID = (int)itemId;
+        credit.ObjectiveType = QuestObjectiveType.Item;
+        SendPacketToClient(credit);
     }
 
     [PacketHandler(Opcode.SMSG_QUEST_UPDATE_ADD_KILL)]

@@ -97,6 +97,8 @@ public sealed class GameSessionData
     public ClientCastRequest? CurrentClientAutoRepeatCast; // auto repeat spells (Auto Shot, Shoot, etc.)
     public ConcurrentQueue<ClientCastRequest> PendingPetCasts = new();  // pet spell casts (queue for proper FIFO handling)
     public WowGuid64 LastLootTargetGuid;
+    public Dictionary<(uint QuestID, sbyte StorageIndex), uint> QuestItemObjectiveProgress = new(); //MIRASU - proxy-local running totals for quest item pickups; legacy update-field cache isn't refreshed on partial updates, so we track ourselves
+    public uint CurrentLootCoins; //MIRASU - remembers coin amount from SMSG_LOOT_RESPONSE so proxy can synthesize SMSG_LOOT_MONEY_NOTIFY when client picks up gold (Kronos/TC-1.12 doesn't emit it)
     public List<WowGuid128>? MasterLootCandidates;
     public WowGuid64 LastMasterLootSentTarget;
     public List<int> ActionButtons = [];

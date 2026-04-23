@@ -1,4 +1,5 @@
 ﻿using Framework;
+using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
@@ -12,22 +13,27 @@ namespace HermesProxy.World.Client;
 public partial class WorldClient
 {
     // Handlers for SMSG opcodes coming the legacy world server
+    // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_LOOT_RESPONSE)]
     void HandleLootResponse(WorldPacket packet)
     {
         LootResponse loot = new();
-        GetSession().GameState.LastLootTargetGuid = packet.ReadGuid();
-        loot.Owner = GetSession().GameState.LastLootTargetGuid.To128(GetSession().GameState);
-        loot.LootObj = GetSession().GameState.LastLootTargetGuid.ToLootGuid();
+        WowGuid64 targetGuid = packet.ReadGuid(); //MIRASU - don't commit target to GameState until we know this isn't a failure
+        loot.Owner = targetGuid.To128(GetSession().GameState);
+        loot.LootObj = targetGuid.ToLootGuid();
         loot.AcquireReason = (LootType)packet.ReadUInt8();
         if (loot.AcquireReason == LootType.None)
         {
-            loot.FailureReason = (LootError)packet.ReadUInt8();
+            loot.FailureReason = (LootError)packet.ReadUInt8(); //MIRASU
+            loot.Acquired = false;                               //MIRASU - client gates red chat line on !Acquired
+            SendPacketToClient(loot);                            //MIRASU - was missing: failure never reached client, loot cursor hung
             return;
         }
+        GetSession().GameState.LastLootTargetGuid = targetGuid;  //MIRASU - only commit on success so failures don't poison subsequent LastLootTargetGuid consumers (LOOT_REMOVED / LOOT_CLEAR_MONEY / LOOT_MONEY_NOTIFY)
         loot.LootMethod = GetSession().GameState.GetCurrentLootMethod();
 
         loot.Coins = packet.ReadUInt32();
+        GetSession().GameState.CurrentLootCoins = loot.Coins; //MIRASU - stash for synthesizing SMSG_LOOT_MONEY_NOTIFY on pickup (Kronos/TC-1.12 doesn't send it)
 
         var itemsCount = packet.ReadUInt8();
         for (var i = 0; i < itemsCount; ++i)
@@ -76,6 +82,9 @@ public partial class WorldClient
         loot.Money = packet.ReadUInt32();
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
             loot.SoleLooter = packet.ReadBool();
+        else
+            loot.SoleLooter = true; //MIRASU - 1.12 only sends this packet to the looter; force bit so 1.14 client prints the chat line
+        Log.Print(LogType.Network, $"MIRASU LOOT_MONEY_NOTIFY got Money={loot.Money} SoleLooter={loot.SoleLooter}"); //MIRASU
         SendPacketToClient(loot);
     }
 
