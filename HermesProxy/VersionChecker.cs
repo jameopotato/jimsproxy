@@ -972,6 +972,14 @@ public static class ModernVersion
                 activeFlags |= 2;
             if (oldFlags.HasAnyFlag(AuraFlagsVanilla.EffectIndex2))
                 activeFlags |= 4;
+
+            //MIRASU: Vanilla can send toggle-style auras with only the Cancelable bit set and
+            //MIRASU: none of the EffectIndex bits, leaving ActiveFlags=0. The modern 1.14.2
+            //MIRASU: client treats ActiveFlags=0 as "aura has no active effects" and can skip
+            //MIRASU: client-side checks that read the visible aura list. Clamp to effect 0
+            //MIRASU: active so the client recognises at least the primary effect as live.
+            if (activeFlags == 0)
+                activeFlags = 1;
         }
         else if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V3_0_2_9056))
         {
