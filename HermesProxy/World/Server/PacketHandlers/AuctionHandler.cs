@@ -2,6 +2,7 @@
 using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World;
+using HermesProxy.World.Client;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
@@ -13,6 +14,9 @@ namespace HermesProxy.World.Server;
 
 public partial class WorldSocket
 {
+    // Track the last search time to mimic the Vanilla 6-second cooldown
+    private DateTime _lastSearchTime = DateTime.MinValue;
+
     [PacketHandler(Opcode.CMSG_AUCTION_HELLO_REQUEST)]
     void HandleAuctionHelloRequest(InteractWithNPC interact)
     {
@@ -46,6 +50,8 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_AUCTION_LIST_ITEMS)]
     void HandleAuctionListItems(AuctionListItems auction)
     {
+        
+
         WorldPacket packet = new WorldPacket(Opcode.CMSG_AUCTION_LIST_ITEMS);
         packet.WriteGuid(auction.Auctioneer.To64());
         packet.WriteUInt32(auction.Offset);
@@ -57,7 +63,7 @@ public partial class WorldSocket
         {
             if (auction.ClassFilters[0].SubClassFilters.Count == 1)
             {
-                packet.WriteInt32(ModernToLegacyInventorySlotType(auction.ClassFilters[0].SubClassFilters[0].InvTypeMask));
+                packet.WriteInt32(-1); // Force "Any Slot" so TrinityCore doesn't get confused!
                 packet.WriteInt32(auction.ClassFilters[0].ItemClass);
                 packet.WriteInt32(auction.ClassFilters[0].SubClassFilters[0].ItemSubclass);
             }
@@ -130,15 +136,22 @@ public partial class WorldSocket
 
         return -1;
     }
-
-    [PacketHandler(Opcode.CMSG_AUCTION_SELL_ITEM)]
-    void HandleAuctionSellItem(AuctionSellItem auction)
-    {
+    
+      
+        
+        [PacketHandler(Opcode.CMSG_AUCTION_SELL_ITEM)]
+        void HandleAuctionSellItem(AuctionSellItem auction)
+        {
+        
+        
+        
         uint expireTime = auction.ExpireTime;
 
-        // auction durations were increased in tbc
-        // server ignores packet if you send wrong duration
-        if (LegacyVersion.ExpansionVersion <= 1 &&
+            // auction durations were increased in tbc
+            // ... (the rest of the code continues down)
+
+            // server ignores packet if you send wrong duration
+            if (LegacyVersion.ExpansionVersion <= 1 &&
             ModernVersion.ExpansionVersion > 1)
         {
             switch (expireTime)
@@ -251,15 +264,37 @@ public partial class WorldSocket
                     }
                 }
 
-                WorldPacket packet = new WorldPacket(Opcode.CMSG_AUCTION_SELL_ITEM);
-                packet.WriteGuid(auction.Auctioneer.To64());
-                packet.WriteGuid(auctionItemGuid);
-                packet.WriteUInt32((uint)auction.MinBid);
-                packet.WriteUInt32((uint)auction.BuyoutPrice);
-                packet.WriteUInt32(expireTime);
-                SendPacketToServer(packet);
+                // --- BULK SELL LOOP ---
+                // Loop through every single item the 1.14 client wants to sell in this batch
+                foreach (var itemToSell in auction.Items)
+                {
+                    WorldPacket legacyPacket = new WorldPacket(Opcode.CMSG_AUCTION_SELL_ITEM);
 
-                // When splitting for multiple auctions, poll until the server
+                    // 1. Auctioneer GUID (8 bytes)
+                    legacyPacket.WriteGuid(auction.Auctioneer.To64());
+
+                    // 2. This specific Item's GUID (8 bytes)
+                    legacyPacket.WriteGuid(itemToSell.Guid.To64());
+
+                    // 3. Bid Price (4 bytes) - Downcast modern 64-bit to Vanilla 32-bit
+                    legacyPacket.WriteUInt32((uint)auction.MinBid);
+
+                    // 4. Buyout Price (4 bytes) - Downcast modern 64-bit to Vanilla 32-bit
+                    legacyPacket.WriteUInt32((uint)auction.BuyoutPrice);
+
+                    // 5. Translated Duration (4 bytes)
+                    legacyPacket.WriteUInt32(expireTime);
+
+                    // Send this single item to TrinityCore (28 bytes)
+                    SendPacketToServer(legacyPacket);
+
+                    // --- ANTI-SPAM DELAY ---
+                    // Pause the proxy thread for 50 milliseconds to let the server process
+                    System.Threading.Thread.Sleep(50);
+                }
+
+                // Kill-switch: Exit the function instantly so the old Hermes retail logic below doesn't run!
+                return;
                 // processes the auction and frees the temp slot for the next split
                 if (splitSlot != null && auction.Items.Count > 1)
                 {
