@@ -46,6 +46,11 @@ public sealed class SniffFile
     {
         lock (_lock)
         {
+            //MIRASU: If CloseFile() has already run (concurrent disconnect paths),
+            //MIRASU: _fileWriter is null and there's nothing to write — drop the packet
+            //MIRASU: silently rather than crashing the session on shutdown.
+            if (_fileWriter == null) return; //MIRASU
+
             byte direction = !isFromClient ? (byte)0xff : (byte)0x0;
             _fileWriter.Write(direction);
 
@@ -75,11 +80,21 @@ public sealed class SniffFile
 
     public void CloseFile()
     {
-        if (_fileWriter != null && _fileWriter.BaseStream != null && _fileWriter.BaseStream.CanWrite)
-        {
-            _fileWriter.Flush();
-            _fileWriter.Close();
-        }
-        _fileWriter = null!;
+        //MIRASU: Was crashing with NullReferenceException when two disconnect paths
+        //MIRASU: (CMSG_LOG_DISCONNECT in WorldSocket + OnDisconnect in GlobalSessionData)
+        //MIRASU: both called CloseFile concurrently during 2-box alt-F4. The null check
+        //MIRASU: on _fileWriter could pass on thread B while thread A was mid-Flush and
+        //MIRASU: about to null the field. Serialize with the same lock WritePacket uses,
+        //MIRASU: capture to a local, then null the field — classic swap-and-dispose pattern.
+        lock (_lock) //MIRASU
+        { //MIRASU
+            var writer = _fileWriter; //MIRASU: snapshot under lock
+            _fileWriter = null!; //MIRASU: nullify before dispose so concurrent WritePacket fails fast
+            if (writer != null && writer.BaseStream != null && writer.BaseStream.CanWrite) //MIRASU
+            { //MIRASU
+                writer.Flush(); //MIRASU
+                writer.Close(); //MIRASU
+            } //MIRASU
+        } //MIRASU
     }
 }

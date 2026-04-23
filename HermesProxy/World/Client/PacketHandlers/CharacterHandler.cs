@@ -206,6 +206,37 @@ public partial class WorldClient
         response.Data.BnetAccountID = GetSession().GetBnetAccountGuidForPlayer(response.Player);
         response.Data.VirtualRealmAddress = GetSession().RealmId.GetAddress();
         SendPacketToClient(response);
+
+        //MIRASU: If the resolved player is a current party member, re-send SMSG_PARTY_UPDATE
+        //MIRASU: with their corrected ClassId so the modern client repaints the party frame.
+        //MIRASU: Without this, a member whose name/class resolves AFTER the initial PartyUpdate
+        //MIRASU: stays rendered as "Unknown" because the 1.14 client updates nameplates from
+        //MIRASU: name-query responses but doesn't refresh party-frame entries. This is the
+        //MIRASU: 2-box cross-continent case where session B never saw session A's character
+        //MIRASU: before joining the party. See jsonl trace L1507 vs L1553 @ 2026-04-23T16:54:28.
+        for (int partyIndexM = 0; partyIndexM < 2; partyIndexM++) //MIRASU
+        { //MIRASU
+            var groupM = GetSession().GameState.CurrentGroups[partyIndexM]; //MIRASU
+            if (groupM == null) continue; //MIRASU
+            bool dirtyM = false; //MIRASU
+            for (int pM = 0; pM < groupM.PlayerList.Count; pM++) //MIRASU
+            { //MIRASU
+                if (groupM.PlayerList[pM].GUID == response.Player && //MIRASU
+                    groupM.PlayerList[pM].ClassId != cache.ClassId) //MIRASU
+                { //MIRASU
+                    var fixedM = groupM.PlayerList[pM]; //MIRASU
+                    fixedM.ClassId = cache.ClassId; //MIRASU
+                    fixedM.Name = cache.Name ?? fixedM.Name; //MIRASU
+                    groupM.PlayerList[pM] = fixedM; //MIRASU
+                    dirtyM = true; //MIRASU
+                } //MIRASU
+            } //MIRASU
+            if (dirtyM) //MIRASU
+            { //MIRASU
+                groupM.SequenceNum = GetSession().GameState.GroupUpdateCounter++; //MIRASU
+                SendPacketToClient(groupM); //MIRASU
+            } //MIRASU
+        } //MIRASU
     }
 
     [PacketHandler(Opcode.SMSG_LOGIN_VERIFY_WORLD)]

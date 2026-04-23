@@ -70,6 +70,11 @@ public static class KnownBenignOpcodes
         // GM v2 (Wrath reworked the ticket system)
         Opcode.CMSG_GM_TICKET_GET_CASE_STATUS,
 
+        //MIRASU: Cata+ live party-window update poll. Modern client sends this
+        //MIRASU: when the party UI opens; 1.12 servers push stats via SMSG_PARTY_MEMBER_*
+        //MIRASU: unsolicited, so there's nothing to translate. Silence it.
+        Opcode.CMSG_REQUEST_PARTY_JOIN_UPDATES,
+
         // Cooldown categories, forced reactions, countdown timers,
         // cemetery list UI — all introduced post-Wrath
         Opcode.CMSG_REQUEST_CATEGORY_COOLDOWNS,
