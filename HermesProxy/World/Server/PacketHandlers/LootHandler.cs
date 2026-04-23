@@ -43,6 +43,18 @@ public partial class WorldSocket
     {
         WorldPacket packet = new WorldPacket(Opcode.CMSG_LOOT_MONEY);
         SendPacketToServer(packet);
+
+        //MIRASU - Kronos/TC-1.12 doesn't send SMSG_LOOT_MONEY_NOTIFY back; synthesize it so the 1.14 client prints the chat line.
+        //MIRASU   The 1.12 client didn't need this because it printed the line locally when sending CMSG_LOOT_MONEY.
+        uint coins = GetSession().GameState.CurrentLootCoins;
+        if (coins > 0 && !LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
+        {
+            LootMoneyNotify notify = new();
+            notify.Money = coins;
+            notify.SoleLooter = true;
+            SendPacket(notify);
+            GetSession().GameState.CurrentLootCoins = 0; //MIRASU - consume so we don't double-print if client sends CMSG_LOOT_MONEY again
+        }
     }
 
     [PacketHandler(Opcode.CMSG_SET_LOOT_METHOD)]
