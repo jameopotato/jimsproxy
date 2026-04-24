@@ -71,8 +71,8 @@ jobs:
         run: |
           dotnet publish HermesProxy --configuration Release --runtime osx-arm64 -p:UsePublishBuildSettings=true
           dotnet publish HermesProxy --configuration Release --runtime osx-x64 -p:UsePublishBuildSettings=true
-          lipo ./HermesProxy/bin/Release/osx-arm64/publish/HermesProxy ./HermesProxy/bin/Release/osx-x64/publish/HermesProxy -create -output ./HermesProxy/bin/Release/osx-x64/publish/HermesProxy_universal
-          mv ./HermesProxy/bin/Release/osx-x64/publish/HermesProxy_universal ./HermesProxy/bin/Release/osx-x64/publish/HermesProxy
+          lipo ./HermesProxy/bin/Release/osx-arm64/publish/JimsProxy ./HermesProxy/bin/Release/osx-x64/publish/JimsProxy -create -output ./HermesProxy/bin/Release/osx-x64/publish/JimsProxy_universal
+          mv ./HermesProxy/bin/Release/osx-x64/publish/JimsProxy_universal ./HermesProxy/bin/Release/osx-x64/publish/JimsProxy
           rm -rf ./HermesProxy/bin/Release/osx-arm64
 
       - name: Copy files
@@ -80,7 +80,7 @@ jobs:
 
       - name: Mark as executable
         if: matrix.os != 'windows'
-        run: chmod a+x publish/HermesProxy
+        run: chmod a+x publish/JimsProxy
 
       - name: Make a tar.gz with permissions out of it (for Linux)
         if: matrix.os == 'ubuntu'
