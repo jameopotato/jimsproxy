@@ -102,6 +102,66 @@ public partial class WorldSocket
     {
         if (loadingScreenNotify.MapID >= 0)
             GetSession().GameState.CurrentMapId = loadingScreenNotify.MapID;
+
+        //MIRASU: /reload on the 1.14.2 client fires CMSG_LOADING_SCREEN_NOTIFY(Showing=true)
+        //MIRASU: then CMSG_LOADING_SCREEN_NOTIFY(Showing=false) with no client disconnect.
+        //MIRASU: During the window the client tears down its UI aura cache and expects the
+        //MIRASU: server to re-push via fresh SMSG_AURA_UPDATE. Retail servers honour this;
+        //MIRASU: Kronos (1.12) doesn't know what a /reload is (the opcode didn't exist in
+        //MIRASU: vanilla) so it never re-sends anything, leaving the player's buff bar empty
+        //MIRASU: until some later event re-dirties the aura update-fields. Mob debuffs and
+        //MIRASU: party buffs survive because the client rebuilds those from their UnitFrame
+        //MIRASU: data on /reload; only self-auras rely on the SMSG_AURA_UPDATE event stream.
+        //MIRASU: On Showing==false (reload done), we synthesize a full
+        //MIRASU: SMSG_AURA_UPDATE(updateAll=true) for the current player by walking our
+        //MIRASU: cached legacy update-fields for their own GUID. Mirrors the relog path
+        //MIRASU: (UpdateHandler.cs aura loop around line 2088) including the NoCaster clamp.
+        if (!loadingScreenNotify.Showing)
+        {
+            var state = GetSession().GameState;
+            var playerGuid = state.CurrentPlayerGuid;
+            var worldClient = GetSession().WorldClient;
+            if (playerGuid != default && worldClient != null)
+            {
+                var cachedFields = state.GetCachedObjectFieldsLegacy(playerGuid);
+                if (cachedFields != null)
+                {
+                    int UNIT_FIELD_AURA = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
+                    if (UNIT_FIELD_AURA > 0)
+                    {
+                        AuraUpdate auraUpdate = new AuraUpdate(playerGuid, true);
+                        int aurasCount = LegacyVersion.GetAuraSlotsCount();
+                        for (byte i = 0; i < aurasCount; i++)
+                        {
+                            var auraData = worldClient.ReadAuraSlot(i, playerGuid, cachedFields);
+                            if (auraData == null)
+                                continue;
+
+                            int durationLeft;
+                            int durationFull;
+                            state.GetAuraDuration(playerGuid, i, out durationLeft, out durationFull);
+                            if (durationLeft > 0 && durationFull > 0)
+                            {
+                                auraData.Flags |= AuraFlagsModern.Duration;
+                                auraData.Duration = durationFull;
+                                auraData.Remaining = durationLeft;
+                            }
+
+                            var castUnit = state.GetAuraCaster(playerGuid, i, auraData.SpellID);
+                            auraData.CastUnit = castUnit;
+                            if (castUnit == default)
+                                auraData.Flags |= AuraFlagsModern.NoCaster;
+
+                            AuraInfo aura = new AuraInfo();
+                            aura.Slot = i;
+                            aura.AuraData = auraData;
+                            auraUpdate.Auras.Add(aura);
+                        }
+                        worldClient.SendPacketToClient(auraUpdate);
+                    }
+                }
+            }
+        }
     }
 
     [PacketHandler(Opcode.CMSG_QUERY_PLAYER_NAME)]

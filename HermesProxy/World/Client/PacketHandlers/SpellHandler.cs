@@ -1181,6 +1181,21 @@ public partial class WorldClient
         aura.AuraData.Duration = duration;
         aura.AuraData.Remaining = duration;
 
+        //MIRASU: Populate CastUnit and set NoCaster when caster is unknown — same rule as
+        //MIRASU: the UpdateHandler aura loop. SMSG_UPDATE_AURA_DURATION arrives during login
+        //MIRASU: (Kronos refreshes durations on every player-own aura right after
+        //MIRASU: SMSG_UPDATE_OBJECT) and ReadAuraSlot doesn't fill CastUnit itself. Without
+        //MIRASU: this block the delta SMSG_AURA_UPDATE(updateAll=false) we emit writes
+        //MIRASU: CastUnit=default with NoCaster=false — which the 1.14.2 client silently
+        //MIRASU: mishandles in its /reload-survivable aura cache. Symptom is buff icons
+        //MIRASU: visible during the session but gone after /reload, until the next fresh
+        //MIRASU: cast repopulates UnitAuraCaster and a subsequent delta overwrites the
+        //MIRASU: polluted slot with a display-valid entry.
+        var castUnit = GetSession().GameState.GetAuraCaster(guid, slot, aura.AuraData.SpellID);
+        aura.AuraData.CastUnit = castUnit;
+        if (castUnit == default)
+            aura.AuraData.Flags |= AuraFlagsModern.NoCaster;
+
         AuraUpdate update = new AuraUpdate(guid, false);
         update.Auras.Add(aura);
         SendPacketToClient(update);
@@ -1220,7 +1235,15 @@ public partial class WorldClient
         if (aura.AuraData.SpellID != spellId)
             return;
 
-        aura.AuraData.CastUnit = GetSession().GameState.GetAuraCaster(guid, slot, spellId);
+        //MIRASU: Set NoCaster when caster lookup returns empty — same rule as the
+        //MIRASU: UpdateHandler aura loop and HandleUpdateAuraDuration. SMSG_SET_EXTRA_AURA_INFO
+        //MIRASU: is a TBC-style duration push that fires on target aura slots (mob debuffs,
+        //MIRASU: party buffs). Without the NoCaster flag on an empty-caster delta the modern
+        //MIRASU: client's /reload-survivable aura cache drops the entry.
+        var castUnit = GetSession().GameState.GetAuraCaster(guid, slot, spellId);
+        aura.AuraData.CastUnit = castUnit;
+        if (castUnit == default)
+            aura.AuraData.Flags |= AuraFlagsModern.NoCaster;
         aura.AuraData.Flags |= AuraFlagsModern.Duration;
         aura.AuraData.Duration = durationFull;
         aura.AuraData.Remaining = durationLeft;
