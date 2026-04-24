@@ -223,3 +223,41 @@ The current `analyze-jsonl.ps1` reports "88 of 97 casts >200ms to SMSG_SPELL_GO"
 ### Allowlist validation
 
 All 64 `packet.ignored` events in this session matched our KNOWN_BENIGN allowlist (Battle Pay, Calendar v2, telemetry, etc.) — confirming the post-rebase allowlist is sized correctly. New entries from Block 1 v2 (`CMSG_GET_ACCOUNT_NOTIFICATIONS`, `CMSG_GUILD_GET_RANKS`, `CMSG_MOVE_SET_COLLISION_HEIGHT_ACK`) all hit during this session, validating the additions.
+
+---
+
+2026-04-23 — Redemption Headpiece helm visual lost on zone-in — FIXED
+Sessions: `jimsproxy-20260423-203341.jsonl` through `jimsproxy-20260423-215903.jsonl` (6 traces across the investigation)
+Build: JimsProxy on Xian55 v4.2.4 + Mirasu fork tip + 5 rounds of `mirasu.helm.*` diagnostic instrumentation (since reverted; see `REVERT_DIAGNOSTICS.md`)
+Verdict: Hotfix-flow bug. Proxy fabricates a malformed `ItemAppearance` record whenever Kronos's `SMSG_ITEM_QUERY_SINGLE_RESPONSE` carries a `DisplayID` that has no corresponding row in the modern reference CSVs. This corrupts the client's item-visual attachment state for the affected item.
+Symptom in-game
+Paladin wearing Redemption Headpiece (item 22428, T3 head, Holy-glow item visual). Helmet mesh + glow render correctly on login. After any zone transition (Deeprun Tram was the consistent repro), the helmet model and its attached holy glow vanish from the local-player self-render. Other players continue to see the helmet normally. `/reload`, unequipping and re-equipping Redemption, or swapping to another helm and back all fail to restore the visual. Only a full relog clears it.
+The bug is item-ID specific, not class-wide or T3-wide:
+Redemption Headpiece (22428) — breaks every time.
+Avenger's Crown (21387, no item visual) — never breaks.
+Dreadnaught Helmet (22418, T3 with item visual) — never breaks.
+Bug does not reproduce on native 1.14.2 → Blizzard Classic Era. Bug does not reproduce on native 1.12 → same Kronos realm. Bug only reproduces on 1.14.2 → JimsProxy → Kronos. This cleanly placed the fault in the proxy pipeline rather than client or server.
+Root cause
+Kronos (TrinityCore-1.12-based) sends `DisplayID = 35612` for item 22428 in `SMSG_ITEM_QUERY_SINGLE_RESPONSE`. Modern reference data (`CSV/ItemIdToDisplayId1.csv`) maps item 22428 → `DisplayID = 36972`. The proxy treats this divergence as a signal that the client's baseline needs a hotfix update, and runs both appearance-family generators:
+`GameData.GenerateItemAppearanceUpdateIfNeeded` — called first per item-query. Looks up the Kronos-sent DisplayID in the modern `ItemAppearanceStore`. For display 35612 this lookup returns null (no `ItemAppearance` row in `CSV/ItemAppearance1.csv` references display 35612; it exists only in `CSV/ItemDisplayIdToFileDataId1.csv`). The `else` branch of this function then fabricates a brand-new `ItemAppearance` record via `AddItemAppearanceRecord(item)` → `UpdateItemAppearanceRecord`, which hard-codes `DisplayType = 11` (with the telling comment `// todo find out`; 11 is wrong — head-slot should be 0), sets `ItemDisplayInfoID` to Kronos's stale 35612, and pushes the fabricated record to the client as a `HotfixStatus.Valid` hotfix.
+`GameData.GenerateItemModifiedAppearanceUpdateIfNeeded` — called immediately after. Detects the Kronos↔CSV DisplayID mismatch, calls `UpdateItemModifiedAppearanceRecord` which repoints item 22428 at the freshly-fabricated appearance, and pushes that as a second hotfix.
+Net effect: the client receives two hotfixes that replace its correct CSV baseline (22428 → appearance 69172 → display 36972 → file 133117) with garbage (22428 → fabricated appearance → display 35612 → DisplayType 11). The client's item-visual attachment pipeline reads ItemDisplayInfo.m_itemVisual via the (now-broken) appearance chain, fails to resolve the glow, and additionally tears down the helmet geoset as collateral damage. Because the corruption lives in the client's hotfix-applied appearance state, nothing short of a session restart clears it — re-equip events re-read the same corrupted chain.
+Dreadnaught and other T3 items don't trigger the bug because Kronos's DisplayID for those items happens to match the modern reference data, so the fabrication branch never fires.
+Why wire-level diagnostics were misleading
+The `SMSG_UPDATE_OBJECT` for self-player on login vs zone-in is byte-identical except for legitimate state deltas (position, MoveTime, Resting flag — all expected). VisibleItems[0] = 22428 in both. Five rounds of increasingly-granular wire instrumentation (`mirasu.helm.visible_item_write`, `mirasu.helm.player_flags_translated`, `mirasu.helm.builder_write`, `mirasu.helm.raw_bytes`) all came back clean. The poisoning is in derived state (hotfix table entries flushed at startup/login), not in the packet stream that carries the update. The decisive diagnostic was `mirasu.helm.kronos_item_template` (Edit E in `QueryHandler.HandleItemQueryResponse`) which captured Kronos's DisplayID = 35612 directly and enabled the static CSV lookup that revealed no matching `ItemAppearance` row.
+Fix
+Two sibling edits in `HermesProxy/World/GameData.cs`, both `//MIRASU`-tagged:
+`GenerateItemAppearanceUpdateIfNeeded` (original logic at lines ~3290–3320) — added an early-return before `AddItemAppearanceRecord` that checks whether the item already has a valid `ItemModifiedAppearance` pointing at a resolvable `ItemAppearance` in the CSV baseline. If so, skip fabrication entirely and return null — the client's CSV baseline for this item is already correct and must not be overwritten by a fabricated record derived from Kronos's stale DisplayID.
+`GenerateItemModifiedAppearanceUpdateIfNeeded` (original logic at lines ~3322–3356) — added an early-return that verifies `GetItemAppearanceByDisplayId(item.DisplayID)` resolves before proceeding to `UpdateItemModifiedAppearanceRecord` + `UpdateHotfix` + `GenerateHotFixMessage`. If it doesn't resolve, skip the hotfix — same reasoning. This is defense-in-depth; the Appearance-side fix is what actually prevents the bug, but this also catches any future case where an existing fabricated appearance would otherwise trigger a re-point.
+Neither fix touches the normal path where Kronos and CSV agree (Dreadnaught, Avenger's Crown, the vast majority of items). Only the specific "Kronos-sent DisplayID has no matching ItemAppearance in modern reference data" failure mode is changed — from "fabricate and push" to "skip and keep client baseline".
+General bug class
+Any item where Kronos's (or any TrinityCore-1.12-based server's) `Item.DisplayID` has drifted from the value in the modern Classic Era reference CSVs and the Kronos value has no corresponding `ItemAppearance` row will hit the same fabrication path. Redemption Headpiece is the observed case; there are likely others, especially among 1.12-era items that received display-id reassignments in later Classic patches or 2019 Classic launch data.
+A startup-time scan comparing stored-item DisplayIDs to `ItemAppearanceStore` coverage would enumerate all affected items up-front. Not currently implemented; worth considering if the bug class recurs for other items.
+Evidence
+`jimsproxy-20260423-215356.jsonl` line 356: `mirasu.helm.kronos_item_template` for entry 22428 shows `displayId: 35612`.
+`CSV/ItemIdToDisplayId1.csv` line for entry 22428: `22428,36972`.
+`CSV/ItemAppearance1.csv`: no row with `ItemDisplayInfoID = 35612` (grep returns empty).
+`CSV/ItemDisplayIdToFileDataId1.csv`: row `35612,133117` exists — same FileDataID as 36972, suggesting 35612 is a legacy/redirect DisplayID that predates the appearance-table structure added in later expansions.
+`jimsproxy-20260423-215903.jsonl` (post-fix trace): only one `kronos_item_template` event per session, helmet visual survives tram zone transitions, no regression on Dreadnaught or other T3 items.
+Upstream relevance
+This bug exists in HermesProxy upstream and Xian55 fork as well — neither has the appearance-resolution guard in the relevant Generate functions. The JimsProxy Mirasu-fork fix is candidate for upstream contribution. Same symptoms would affect any item with a similar Kronos↔modern-reference DisplayID divergence on any TrinityCore-1.12-flavored private server routed through HermesProxy to a 1.14.x+ client.
