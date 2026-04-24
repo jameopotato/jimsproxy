@@ -3307,6 +3307,27 @@ public static partial class GameData
         }
         else
         {
+            //MIRASU: The Kronos-sent DisplayID has no matching ItemAppearance row in modern
+            //MIRASU: reference data. Before this check, the code would fabricate an
+            //MIRASU: ItemAppearance with DisplayType=11 (the original author's "todo find out"
+            //MIRASU: placeholder — wrong for head slot, which should be 0) and push it as a
+            //MIRASU: hotfix. The client then had a garbage appearance row keyed on the stale
+            //MIRASU: DisplayID, and the subsequent ItemModifiedAppearance hotfix would
+            //MIRASU: repoint the item at this garbage row. This caused items like Redemption
+            //MIRASU: Headpiece (22428) — where Kronos sends DisplayID 35612 but modern data
+            //MIRASU: expects 36972 — to lose their attached item visuals (ItemDisplayInfo
+            //MIRASU: m_itemVisual glows) after the first zone-in re-fires the hotfix flow.
+            //MIRASU: The CSV baseline bundles loaded at startup already have the correct
+            //MIRASU: mapping (22428 → appearance 69172 → display 36972 → file 133117), so
+            //MIRASU: doing nothing here preserves client-side correctness.
+            ItemModifiedAppearance? existingMod = GetItemModifiedAppearanceByItemId(item.Entry);
+            if (existingMod != null &&
+                ItemAppearanceStore.ContainsKey((uint)existingMod.ItemAppearanceID))
+            {
+                Log.Print(LogType.Storage, $"MIRASU: Skipping ItemAppearance fabrication for item #{item.Entry} — Kronos DisplayID #{item.DisplayID} has no matching ItemAppearance. Keeping client CSV baseline (ItemAppearanceID #{existingMod.ItemAppearanceID}).");
+                return null;
+            }
+
             // item appearance is missing so add new record
             //Log.Print(LogType.Storage, $"ItemAppearance for item #{item.Entry}, DisplayID #{item.DisplayID} needs to be created.");
             appearance = AddItemAppearanceRecord(item);
@@ -3328,6 +3349,25 @@ public static partial class GameData
             ItemAppearanceStore.TryGetValue((uint)modAppearance.ItemAppearanceID, out appearance);
             if (appearance == null || appearance.ItemDisplayInfoID != item.DisplayID)
             {
+                //MIRASU: Check whether the Kronos-sent DisplayID can actually resolve to a known
+                //MIRASU: ItemAppearance in the modern (CSV) reference data. If not, the server's
+                //MIRASU: 1.12 DB has a stale/divergent DisplayID (e.g. Redemption Headpiece 22428
+                //MIRASU: where Kronos reports 35612 but modern data has 36972). In that case,
+                //MIRASU: DO NOT push a hotfix — the CSV baseline the client already has is correct,
+                //MIRASU: and writing an "update" would either fail silently (no matching appearance
+                //MIRASU: to repoint at) or re-fire the same record with a new HotfixId, which
+                //MIRASU: causes the client to tear down attached item visuals (glows/particles from
+                //MIRASU: ItemDisplayInfo.m_itemVisual). Symptom was Redemption Headpiece's holy
+                //MIRASU: glow vanishing on zone-in after the zone-in item queries re-trigger the
+                //MIRASU: hotfix flow; helmet visual stays gone until relog because the client's
+                //MIRASU: appearance state is corrupted and neither /reload nor re-equip re-attach.
+                ItemAppearance? reachableAppearance = GetItemAppearanceByDisplayId(item.DisplayID);
+                if (reachableAppearance == null)
+                {
+                    Log.Print(LogType.Storage, $"MIRASU: Skipping ItemModifiedAppearance hotfix for item #{item.Entry} — Kronos DisplayID #{item.DisplayID} has no matching ItemAppearance in modern reference data. Keeping client baseline.");
+                    return null;
+                }
+
                 Log.Print(LogType.Storage, $"ItemModifiedAppearance #{modAppearance.Id} for item #{item.Entry} needs to be updated.");
 
                 if (appearance == null)
