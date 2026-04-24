@@ -803,6 +803,24 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         _worldCrypt.Initialize(_encryptKey);
         if (_connectType == ConnectionType.Realm)
         {
+            //MIRASU: During a realm swap, ConnectToWorldServer can fail (e.g. stale AuthClient on the session)
+            //        and tear down GetSession().WorldClient before the modern client's EnterEncryptedModeAck
+            //        arrives. Without this guard we NRE on GetSession().WorldClient!.GetQueuePosition()
+            //        and the client hangs on "Logging in to game server". Send a clean auth error so the
+            //        client bounces back to realm select instead.
+            if (GetSession().WorldClient == null || !GetSession().WorldClient!.IsConnected())
+            {
+                Log.Event("world.encrypted_mode_ack.no_worldclient", new
+                {
+                    username = GetSession().Username,
+                    had_worldclient = GetSession().WorldClient != null,
+                    was_connected = GetSession().WorldClient?.IsConnected() ?? false,
+                });
+                Log.Print(LogType.Error, "HandleEnterEncryptedModeAck: WorldClient is null or disconnected, sending auth error.");
+                SendAuthResponseError(BattlenetRpcErrorCode.BadServer);
+                return;
+            }
+
             SendAuthResponse(BattlenetRpcErrorCode.Ok, GetSession().WorldClient!.GetQueuePosition());
             SendSetTimeZoneInformation();
             SendFeatureSystemStatusGlueScreen();

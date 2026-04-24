@@ -34,10 +34,5 @@ public partial class WorldClient
         }
     }
 
-    [PacketHandler(Opcode.SMSG_WARDEN_DATA)]
-    void HandleWardenData(WorldPacket packet)
-    {
-        // The 1.14 client does not understand vanilla Warden payloads. Drop silently
-        // rather than forwarding (which would crash or disconnect the client).
-    }
+    
 }

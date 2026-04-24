@@ -1211,8 +1211,9 @@ public class GlobalSessionData
     public GlobalSessionData()
     {
         GameState = GameSessionData.CreateNewGameSessionData(this);
+        AuthClient = new AuthClient(this);
     }
-    
+
     public void StoreGuildRankNames(uint guildId, List<string> ranks)
     {
         GuildRanks[guildId] = ranks;

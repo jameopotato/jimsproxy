@@ -406,9 +406,34 @@ public static class LegacyVersion
     public static HitInfo ConvertHitInfoFlags(uint hitInfo)
     {
         if (RemovedInVersion(ClientVersionBuild.V3_0_2_9056))
-            return ((HitInfoVanilla)hitInfo).CastFlags<HitInfo>();
+        {
+            // --- Mirasu Crit & HitInfo Fix ---
+            // Bypasses the broken auto-translator to explicitly map Vanilla flags to Modern 1.14 flags
+            HitInfoVanilla vanillaFlags = (HitInfoVanilla)hitInfo;
+            HitInfo modernFlags = HitInfo.None;
+
+            if (vanillaFlags.HasFlag(HitInfoVanilla.AffectsVictim)) modernFlags |= HitInfo.AffectsVictim;
+            if (vanillaFlags.HasFlag(HitInfoVanilla.OffHand)) modernFlags |= HitInfo.OffHand;
+            if (vanillaFlags.HasFlag(HitInfoVanilla.Miss)) modernFlags |= HitInfo.Miss;
+            if (vanillaFlags.HasFlag(HitInfoVanilla.FullAbsorb)) modernFlags |= HitInfo.FullAbsorb;
+
+            // Explicitly map Vanilla 0x40 to Modern 0x80
+            if (vanillaFlags.HasFlag(HitInfoVanilla.FullResist)) modernFlags |= HitInfo.FullResist;
+
+            // The Critical Fix: Explicitly map Vanilla 0x80 to Modern 0x200
+            if (vanillaFlags.HasFlag(HitInfoVanilla.CriticalHit)) modernFlags |= HitInfo.CriticalHit;
+
+            // Try to map the rest if the names exist in the Modern client
+            if (vanillaFlags.HasFlag(HitInfoVanilla.Block)) modernFlags |= (HitInfo)0x00000800;
+            if (vanillaFlags.HasFlag(HitInfoVanilla.Glancing)) modernFlags |= (HitInfo)0x00004000;
+            if (vanillaFlags.HasFlag(HitInfoVanilla.Crushing)) modernFlags |= (HitInfo)0x00008000;
+
+            return modernFlags;
+        }
         else
+        {
             return (HitInfo)hitInfo;
+        }
     }
 
     public static uint ConvertSpellCastResult(uint result)
@@ -947,6 +972,14 @@ public static class ModernVersion
                 activeFlags |= 2;
             if (oldFlags.HasAnyFlag(AuraFlagsVanilla.EffectIndex2))
                 activeFlags |= 4;
+
+            //MIRASU: Vanilla can send toggle-style auras with only the Cancelable bit set and
+            //MIRASU: none of the EffectIndex bits, leaving ActiveFlags=0. The modern 1.14.2
+            //MIRASU: client treats ActiveFlags=0 as "aura has no active effects" and can skip
+            //MIRASU: client-side checks that read the visible aura list. Clamp to effect 0
+            //MIRASU: active so the client recognises at least the primary effect as live.
+            if (activeFlags == 0)
+                activeFlags = 1;
         }
         else if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V3_0_2_9056))
         {
