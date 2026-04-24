@@ -464,7 +464,16 @@ public partial class WorldClient
                     moveSpline.SplineFlags |= SplineFlagModern.Steering | SplineFlagModern.Unknown10;
             }
             else
+            {
                 moveSpline.SplineFlags = splineFlags.CastFlags<SplineFlagModern>();
+            }
+            // Hovering mobs: force native hover spline to prevent ground-bounce and barrel-roll
+            float hoverHeight = GetSession().GameState.GetLegacyFieldValueFloat(guid, UnitField.UNIT_FIELD_HOVERHEIGHT);
+            if (hoverHeight > 0.0f)
+            {
+                moveSpline.SplineFlags &= ~(SplineFlagModern.Unknown5 | SplineFlagModern.Falling | SplineFlagModern.FallingSlow | SplineFlagModern.SmoothGroundPath | SplineFlagModern.CatmullRom);
+                moveSpline.SplineFlags |= SplineFlagModern.Flying | SplineFlagModern.AnimTierHover;
+            }
         }
         else if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V3_0_2_9056))
         {
