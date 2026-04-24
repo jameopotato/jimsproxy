@@ -31,6 +31,10 @@ public static class Settings
     // JimsProxy: structured JSONL diagnostic logging
     public static bool StructuredLog;
     public static bool VerboseLog;
+    // JimsProxy (issue #43): how many ms before the local GCD expiry estimate the proxy
+    // releases a held cast. 0 = fire exactly at expiry (cast lands ~RTT late at server).
+    // Clamped to 0..50 in LoadAndVerifyFrom.
+    public static int SpellCastEarlyFireOffsetMs;
 
     public static bool LoadAndVerifyFrom(ConfigurationParser config)
     {
@@ -56,6 +60,7 @@ public static class Settings
         // JimsProxy: structured logging defaults on; toggle VerboseLog to enable per-packet Verbose console output
         StructuredLog = config.GetBoolean("StructuredLog", true);
         VerboseLog = config.GetBoolean("VerboseLog", false);
+        SpellCastEarlyFireOffsetMs = Math.Clamp(config.GetInt("SpellCastEarlyFireOffsetMs", 0), 0, 50);
         Log.StructuredLogEnabled = StructuredLog;
         Log.VerboseLogEnabled = VerboseLog;
         // Open the JSONL file now so session.start's payload can include the full path.

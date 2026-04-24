@@ -96,6 +96,24 @@ public sealed class GameSessionData
     public ClientCastRequest? CurrentClientNextMeleeCast; // next melee spells (Raptor Strike, Heroic Strike, etc.)
     public ClientCastRequest? CurrentClientAutoRepeatCast; // auto repeat spells (Auto Shot, Shoot, etc.)
     public ConcurrentQueue<ClientCastRequest> PendingPetCasts = new();  // pet spell casts (queue for proper FIFO handling)
+    // JimsProxy (issue #43): serializes the drain-filter-rebuild helpers below with the
+    // ThreadPool-thread Enqueue in WorldSocket.ForwardHeldGcdCast. Without this, the timer
+    // thread can enqueue a held cast mid-drain, causing the drain to observe the new item
+    // out-of-order and possibly return it as a FIFO match for an unrelated SMSG_SPELL_GO.
+    // Pre-existing Enqueues from the network-thread CMSG handlers stay lock-free (same-thread
+    // semantics as before this PR); only the new cross-thread path takes the lock.
+    internal readonly object PendingCastsLock = new();
+
+    // JimsProxy (issue #43): GCD hold-and-fire state. While the player is on a GCD (tracked
+    // from SMSG_SPELL_GO), new CMSG_CAST_SPELL presses are held in _heldGcdCast instead of
+    // flooding the server. At GCD expiry a Timer fires the most-recent held cast via the
+    // OnGcdHeldCastFire callback set by WorldSocket.
+    private readonly object _gcdLock = new();
+    private long _gcdExpireTimestampMs;                 // 0 = no GCD active; Environment.TickCount64 baseline
+    private ClientCastRequest? _heldGcdCast;            // most recently-pressed cast while GCD active (overwritten on new press)
+    private Timer? _gcdExpiryTimer;
+    private uint _gcdGeneration;                        // incremented each BeginGcd; callback compares against its captured generation to detect stale fires
+    public Action<ClientCastRequest>? OnGcdHeldCastFire; // set by WorldSocket at attach time; invoked on a ThreadPool thread at GCD expiry
     public WowGuid64 LastLootTargetGuid;
     public List<WowGuid128>? MasterLootCandidates;
     public WowGuid64 LastMasterLootSentTarget;
@@ -139,7 +157,7 @@ public sealed class GameSessionData
 
     private GameSessionData()
     {
-        
+
     }
 
     public static GameSessionData CreateNewGameSessionData(GlobalSessionData globalSession)
@@ -147,6 +165,16 @@ public sealed class GameSessionData
         var self = new GameSessionData();
         self.CurrentPlayerStorage = new CurrentPlayerStorage(globalSession);
         return self;
+    }
+
+    /// <summary>
+    /// Test-only factory — skips CurrentPlayerStorage initialization so tests that only need
+    /// the GCD hold state machine (issue #43) can construct a bare GameSessionData without
+    /// standing up a full GlobalSessionData graph.
+    /// </summary>
+    internal static GameSessionData CreateForTesting()
+    {
+        return new GameSessionData();
     }
     
     public uint GetCurrentGroupSize()
@@ -572,22 +600,25 @@ public sealed class GameSessionData
         var pending = new List<ClientCastRequest>();
         cast = null;
 
-        while (PendingNormalCasts.TryDequeue(out var current))
+        lock (PendingCastsLock)
         {
-            if (cast == null && CastMatchesSpellId(current, spellId))
+            while (PendingNormalCasts.TryDequeue(out var current))
             {
-                cast = current;
+                if (cast == null && CastMatchesSpellId(current, spellId))
+                {
+                    cast = current;
+                }
+                else
+                {
+                    pending.Add(current);
+                }
             }
-            else
-            {
-                pending.Add(current);
-            }
-        }
 
-        // Re-enqueue non-matching casts
-        foreach (var item in pending)
-        {
-            PendingNormalCasts.Enqueue(item);
+            // Re-enqueue non-matching casts
+            foreach (var item in pending)
+            {
+                PendingNormalCasts.Enqueue(item);
+            }
         }
 
         return cast != null;
@@ -630,7 +661,10 @@ public sealed class GameSessionData
     /// </summary>
     public void ClearPendingNormalCasts()
     {
-        while (PendingNormalCasts.TryDequeue(out _)) { }
+        lock (PendingCastsLock)
+        {
+            while (PendingNormalCasts.TryDequeue(out _)) { }
+        }
     }
 
     /// <summary>
@@ -657,18 +691,21 @@ public sealed class GameSessionData
         var cleared = new List<ClientCastRequest>();
         var keep = new List<ClientCastRequest>();
 
-        while (PendingNormalCasts.TryDequeue(out var current))
+        lock (PendingCastsLock)
         {
-            if (current.HasStarted)
-                keep.Add(current);
-            else
-                cleared.Add(current);
-        }
+            while (PendingNormalCasts.TryDequeue(out var current))
+            {
+                if (current.HasStarted)
+                    keep.Add(current);
+                else
+                    cleared.Add(current);
+            }
 
-        // Re-enqueue started casts
-        foreach (var item in keep)
-        {
-            PendingNormalCasts.Enqueue(item);
+            // Re-enqueue started casts
+            foreach (var item in keep)
+            {
+                PendingNormalCasts.Enqueue(item);
+            }
         }
 
         return cleared;
@@ -771,6 +808,123 @@ public sealed class GameSessionData
         return cleared;
     }
 
+    // JimsProxy (issue #43): GCD hold-and-fire helpers.
+
+    /// <summary>
+    /// Returns true if a GCD hold window is currently active (i.e. a subsequent cast should be held
+    /// rather than forwarded). Uses Environment.TickCount64 as the timebase.
+    /// </summary>
+    public bool IsGcdHoldActive()
+    {
+        lock (_gcdLock)
+        {
+            return _gcdExpireTimestampMs > Environment.TickCount64;
+        }
+    }
+
+    /// <summary>
+    /// Store <paramref name="cast"/> as the pending held cast for the current GCD window.
+    /// Returns true if the GCD is still active (cast was stored). Returns false if the GCD
+    /// already expired in the meantime (caller should forward immediately via the normal path).
+    /// If a previously-held cast existed, it's returned via <paramref name="displaced"/> so
+    /// the caller can decide how to handle it (today: silently drop).
+    /// </summary>
+    public bool TryHoldCastDuringGcd(ClientCastRequest cast, out ClientCastRequest? displaced)
+    {
+        displaced = null;
+        lock (_gcdLock)
+        {
+            if (_gcdExpireTimestampMs <= Environment.TickCount64)
+                return false;
+            displaced = _heldGcdCast;
+            _heldGcdCast = cast;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Start (or restart) a GCD hold window. The timer fires at <paramref name="fireAtTickMs"/>,
+    /// at which point any pending held cast is handed to OnGcdHeldCastFire on a ThreadPool thread.
+    /// expireAtTickMs and fireAtTickMs are Environment.TickCount64 timestamps.
+    /// </summary>
+    public void BeginGcd(long expireAtTickMs, long fireAtTickMs)
+    {
+        lock (_gcdLock)
+        {
+            _gcdExpiryTimer?.Dispose();
+            _gcdExpireTimestampMs = expireAtTickMs;
+            unchecked { _gcdGeneration++; }
+            uint myGeneration = _gcdGeneration;
+            long delayMs = Math.Max(0, fireAtTickMs - Environment.TickCount64);
+            // Timer.Dispose() does NOT wait for an already-queued callback, so a stale
+            // callback from a prior GCD window can race against a freshly-installed timer.
+            // We capture the generation counter into the callback's state arg and bail in
+            // OnGcdTimerElapsed if the generation no longer matches _gcdGeneration.
+            _gcdExpiryTimer = new Timer(OnGcdTimerElapsed, state: myGeneration, delayMs, Timeout.Infinite);
+        }
+    }
+
+    /// <summary>
+    /// Cancel the active GCD hold window and drop any held cast. Used on session teardown
+    /// or when the client cancels a cast while we're holding one for them. Returns the
+    /// previously-held cast (if any) so callers on a live session can route it through
+    /// SendCastRequestFailed to resolve the client's ClientGUID/ServerGUID tracking.
+    /// OnDisconnect and HandleLogoutComplete ignore the return value since the session is
+    /// going away.
+    /// </summary>
+    public ClientCastRequest? CancelGcdHold()
+    {
+        lock (_gcdLock)
+        {
+            ClientCastRequest? dropped = _heldGcdCast;
+            _gcdExpiryTimer?.Dispose();
+            _gcdExpiryTimer = null;
+            _gcdExpireTimestampMs = 0;
+            _heldGcdCast = null;
+            // Bump generation so any already-queued callback from the cancelled timer sees a
+            // stale generation and bails. Prevents post-cancel firing on session teardown.
+            unchecked { _gcdGeneration++; }
+            // Also null the fire delegate so a stale Invoke that escaped the lock (see the
+            // TOCTOU window in OnGcdTimerElapsed between the generation check and the
+            // post-lock Invoke) turns into a no-op instead of operating on a rotated GameState.
+            // HandleCastSpell re-registers the delegate on the next cast via its null check.
+            OnGcdHeldCastFire = null;
+            return dropped;
+        }
+    }
+
+    /// <summary>
+    /// Test-only: peek at the currently-held cast without consuming it. Returns null when none held.
+    /// </summary>
+    internal ClientCastRequest? PeekHeldGcdCast()
+    {
+        lock (_gcdLock)
+        {
+            return _heldGcdCast;
+        }
+    }
+
+    private void OnGcdTimerElapsed(object? state)
+    {
+        ClientCastRequest? toFire;
+        lock (_gcdLock)
+        {
+            // Reject stale fires: a queued callback from a prior BeginGcd can run after the
+            // current generation has moved on. Clobbering _heldGcdCast / _gcdExpireTimestampMs
+            // here would zero out state belonging to the new GCD window, silently disabling
+            // the hold for the rest of it.
+            if (state is not uint myGeneration || myGeneration != _gcdGeneration)
+                return;
+
+            toFire = _heldGcdCast;
+            _heldGcdCast = null;
+            _gcdExpireTimestampMs = 0;
+            // Don't null _gcdExpiryTimer here: a concurrent BeginGcd could have already replaced it.
+        }
+        if (toFire != null)
+            OnGcdHeldCastFire?.Invoke(toFire);
+    }
+
     /// <summary>
     /// Try to find and dequeue a pending cast by ItemGUID (for item use failures).
     /// Only matches casts that haven't started yet.
@@ -780,22 +934,25 @@ public sealed class GameSessionData
         var pending = new List<ClientCastRequest>();
         cast = null;
 
-        while (PendingNormalCasts.TryDequeue(out var current))
+        lock (PendingCastsLock)
         {
-            if (cast == null && !current.HasStarted && current.ItemGUID == itemGuid)
+            while (PendingNormalCasts.TryDequeue(out var current))
             {
-                cast = current;
+                if (cast == null && !current.HasStarted && current.ItemGUID == itemGuid)
+                {
+                    cast = current;
+                }
+                else
+                {
+                    pending.Add(current);
+                }
             }
-            else
-            {
-                pending.Add(current);
-            }
-        }
 
-        // Re-enqueue non-matching casts
-        foreach (var item in pending)
-        {
-            PendingNormalCasts.Enqueue(item);
+            // Re-enqueue non-matching casts
+            foreach (var item in pending)
+            {
+                PendingNormalCasts.Enqueue(item);
+            }
         }
 
         return cast != null;
@@ -1001,6 +1158,11 @@ public class ClientCastRequest
     public WowGuid128 ClientGUID;
     public WowGuid128 ServerGUID;
     public WowGuid128 ItemGUID;
+
+    // JimsProxy (issue #43): when a cast is HELD during a GCD hold window, we keep the
+    // fully-built CMSG_CAST_SPELL packet here so the timer callback can forward it
+    // verbatim at GCD expiry. Null for casts that were forwarded immediately (normal path).
+    public WorldPacket? HeldPacketForReplay;
 }
 public class ArenaTeamData
 {
@@ -1116,6 +1278,10 @@ public class GlobalSessionData
             had_modern_sniff = ModernSniff != null,
             account_login = AccountInfo?.Login,
         });
+
+        // JimsProxy (issue #43): cancel any held GCD cast and dispose its timer so it can't
+        // fire after InstanceSocket has been torn down.
+        GameState?.CancelGcdHold();
 
         if (ModernSniff != null)
         {

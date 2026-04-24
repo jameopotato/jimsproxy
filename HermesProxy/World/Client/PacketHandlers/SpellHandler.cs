@@ -474,6 +474,37 @@ public partial class WorldClient
                 prepare.ServerCastID = spell.Cast.CastID;
                 SendPacketToClient(prepare);
             }
+
+            // JimsProxy (issue #43): start the local GCD hold window only for INSTANT on-GCD
+            // player casts on vanilla. Matching a pending queue entry filters out proc /
+            // triggered SMSG_SPELL_GOs (e.g. Windfury Weapon, weapon enchant procs, Thunderfury
+            // chain lightning, Hand of Justice) — those have no CMSG_CAST_SPELL from the
+            // client, so PendingNormalCasts has no matching entry. Cast-time spells
+            // (HasStarted=true) had their server-side GCD start at SMSG_SPELL_START, so by the
+            // time SMSG_SPELL_GO arrives the GCD has already expired during the cast — starting
+            // a fresh 1500ms hold here would be a spurious post-cast delay. Finally, gating on
+            // ExpansionVersion==1 keeps this vanilla-only; the whitelist CSV is vanilla-only,
+            // and haste-adjusted GCDs on TBC+ would make the blanket 1500ms wrong.
+            // JimsProxy (issue #43): use the legacy (1.12) spell id for whitelist / GCD-duration
+            // lookups when the cast was SoM-renumbered. The rewrite at line ~466 already
+            // changed spell.Cast.SpellID to the modern id for the outbound packet, but
+            // OffGcdSpells and Spell1sGcd are keyed on legacy ids (the CSVs are vanilla Spell.dbc
+            // extracts). Without this, SoM on-use trinkets like Diamond Flask (17626 → 363880)
+            // miss the whitelist and get held 1500ms on every press.
+            uint gcdLookupId = pendingCast.LegacySpellId != 0
+                ? pendingCast.LegacySpellId
+                : (uint)spell.Cast.SpellID;
+
+            if (LegacyVersion.ExpansionVersion == 1 &&
+                !pendingCast.HasStarted &&
+                !GameData.IsOffGcd(gcdLookupId))
+            {
+                long gcdMs = GameData.GetGcdDurationMs(gcdLookupId);
+                long now = Environment.TickCount64;
+                long expireAt = now + gcdMs;
+                long fireAt = expireAt - Framework.Settings.SpellCastEarlyFireOffsetMs;
+                GetSession().GameState.BeginGcd(expireAt, fireAt);
+            }
         }
         else if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
             GetSession().GameState.CurrentClientNextMeleeCast != null &&

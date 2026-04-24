@@ -54,6 +54,15 @@ public static partial class GameData
     public static FrozenSet<uint> MountAuras = FrozenSet<uint>.Empty;
     public static FrozenSet<uint> NextMeleeSpells = FrozenSet<uint>.Empty;
     public static FrozenSet<uint> AutoRepeatSpells = FrozenSet<uint>.Empty;
+    // JimsProxy (issue #43): spells that don't trigger the global cooldown. These must
+    // bypass the GCD hold-and-fire path so the 1.14 client can fire them immediately
+    // (during a cast bar or during a GCD) exactly like a real 1.12 client would.
+    // Sourced from vanilla Spell.dbc where StartRecoveryCategory == 0 or StartRecoveryTime == 0.
+    public static FrozenSet<uint> OffGcdSpells = FrozenSet<uint>.Empty;
+    // JimsProxy (issue #43): spells that trigger a 1000ms GCD instead of the 1500ms default.
+    // Rogue energy-based abilities and feral-druid cat-form abilities use StartRecoveryTime=1000
+    // in vanilla Spell.dbc. Unknown spells default to 1500ms in GetGcdDurationMs.
+    public static FrozenSet<uint> Spell1sGcd = FrozenSet<uint>.Empty;
     public static FrozenSet<uint> AuraSpells = FrozenSet<uint>.Empty;
     public static FrozenDictionary<uint, int> AuraDurations = FrozenDictionary<uint, int>.Empty;
     public static FrozenDictionary<uint, TaxiPath> TaxiPaths = FrozenDictionary<uint, TaxiPath>.Empty;
@@ -308,6 +317,29 @@ public static partial class GameData
         if (SpellVisuals.TryGetValue(spellId, out visual))
             return visual;
         return 0;
+    }
+
+    /// <summary>
+    /// Returns true if the given spell does not trigger the global cooldown on
+    /// vanilla 1.12 servers. JimsProxy issue #43 — these spells bypass the
+    /// GCD hold-and-fire path so that a 1.14 client mashing Sprint/Trinket/etc
+    /// during a cast bar or GCD can still fire them immediately.
+    /// </summary>
+    public static bool IsOffGcd(uint spellId)
+    {
+        return OffGcdSpells.Contains(spellId);
+    }
+
+    /// <summary>
+    /// Returns the GCD duration in milliseconds triggered by the given spell on vanilla
+    /// 1.12 servers. Defaults to 1500ms; rogue energy abilities and feral-druid cat-form
+    /// abilities use 1000ms (loaded from Spell1sGcd1.csv). JimsProxy issue #43.
+    /// </summary>
+    public static long GetGcdDurationMs(uint spellId)
+    {
+        if (Spell1sGcd.Contains(spellId))
+            return 1000;
+        return 1500;
     }
 
     /// <summary>
@@ -596,6 +628,8 @@ public static partial class GameData
             LoadMountAuras,
             LoadMeleeSpells,
             LoadAutoRepeatSpells,
+            LoadOffGcdSpells,
+            LoadSpell1sGcd,
             LoadAuraSpells,
             LoadAuraDurations,
             LoadTaxiPaths,
@@ -1244,6 +1278,66 @@ public static partial class GameData
         }
         AutoRepeatSpells = set.ToFrozenSet();
     }
+
+    public static void LoadOffGcdSpells()
+    {
+        // JimsProxy (issues #34, #43): only relevant when playing against a vanilla emulator.
+        // Skip for TBC+ expansions — the file is vanilla-only and the hold-and-fire path
+        // is currently targeted at 1.12 Kronos. The CSV is generated from the 1.12 client's
+        // Spell.dbc; see scripts/extract-gcd-csv.py for the regeneration pipeline.
+        if (LegacyVersion.ExpansionVersion > 1)
+            return;
+
+        var path = Path.Combine("CSV", $"SpellOffGcd{LegacyVersion.ExpansionVersion}.csv");
+        if (!File.Exists(path))
+        {
+            // Loud warning so operators notice that the GCD hold-and-fire feature is degraded.
+            // With an empty whitelist, every off-GCD spell (Sprint/Evasion/Trinket/racials)
+            // gets held for the full 1500ms — the exact regression issue #43 was preventing.
+            Log.Print(LogType.Storage, $"WARNING: {path} not found — GCD hold-and-fire whitelist is empty. " +
+                                       "Off-GCD spells will be incorrectly delayed during GCD windows. " +
+                                       "Run scripts/extract-gcd-csv.py to regenerate from a vanilla 1.12 client.");
+            return;
+        }
+
+        using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+        var set = new HashSet<uint>(EstimateRowCount(path, 8));
+        foreach (var row in reader)
+        {
+            uint spellId = uint.Parse(row[0].Span);
+            set.Add(spellId);
+        }
+        OffGcdSpells = set.ToFrozenSet();
+    }
+
+    public static void LoadSpell1sGcd()
+    {
+        // JimsProxy (issue #43): vanilla-only companion to OffGcdSpells. Spells listed here
+        // use a 1000ms GCD (rogue energy abilities, feral-druid cat-form abilities, etc)
+        // instead of the default 1500ms. GetGcdDurationMs consults this set.
+        if (LegacyVersion.ExpansionVersion > 1)
+            return;
+
+        var path = Path.Combine("CSV", $"Spell1sGcd{LegacyVersion.ExpansionVersion}.csv");
+        if (!File.Exists(path))
+        {
+            // Without this list, rogue energy abilities and feral cat-form abilities default
+            // to a 1500ms GCD hold instead of their true 1000ms — a 500ms over-hold per cast.
+            Log.Print(LogType.Storage, $"WARNING: {path} not found — rogue/feral 1s-GCD abilities " +
+                                       "will be over-held by 500ms per cast.");
+            return;
+        }
+
+        using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+        var set = new HashSet<uint>(EstimateRowCount(path, 8));
+        foreach (var row in reader)
+        {
+            uint spellId = uint.Parse(row[0].Span);
+            set.Add(spellId);
+        }
+        Spell1sGcd = set.ToFrozenSet();
+    }
+
     public static void LoadAuraSpells()
     {
         var path = Path.Combine("CSV", $"AuraSpells{LegacyVersion.ExpansionVersion}.csv");

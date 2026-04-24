@@ -297,6 +297,11 @@ public partial class WorldClient
         LogoutComplete logout = new LogoutComplete();
         SendPacketToClient(logout);
 
+        // JimsProxy (issue #43): dispose the outgoing GameState's GCD hold timer before
+        // replacing the reference. Otherwise a still-armed timer would fire into the fresh
+        // GameState, leaking a ClientCastRequest into the new PendingNormalCasts and sending
+        // a ghost CMSG_CAST_SPELL to the server after logout. Mirrors OnDisconnect.
+        GetSession().GameState.CancelGcdHold();
         GetSession().GameState = GameSessionData.CreateNewGameSessionData(GetSession());
         GetSession().InstanceSocket.CloseSocket();
         GetSession().InstanceSocket = null!;
