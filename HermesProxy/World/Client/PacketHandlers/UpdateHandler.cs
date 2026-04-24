@@ -2896,9 +2896,12 @@ public partial class WorldClient
 
                 switch (updateData.ObjectData.EntryID)
                 {
+                    case tramSouthEastmost:
                     case tramNorthMiddle:
                     case tramSouthMiddle:
                     case tramSouthWestmost:
+                    case tramNorthWestmost:
+                    case tramNorthEastmost:
                     {
                         // Quaternion to rotate the pivot point of the transport movement by 180°
                         updateData.GameObjectData.ParentRotation = new float?[] { -4.371139E-08f, 0, 1, 0 };
