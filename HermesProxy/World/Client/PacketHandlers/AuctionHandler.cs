@@ -146,7 +146,7 @@ public partial class WorldClient
              auction.Command == AuctionHouseAction.Cancel))
         {
             WowGuid128 auctioneer = GetSession().GameState.CurrentInteractedWithNPC;
-            if (auctioneer != null && !auctioneer.IsEmpty())
+            if (!auctioneer.IsEmpty())
             {
                 WorldPacket refreshOwned = new WorldPacket(Opcode.CMSG_AUCTION_LIST_OWNED_ITEMS);
                 refreshOwned.WriteGuid(auctioneer.To64());
@@ -159,7 +159,7 @@ public partial class WorldClient
             auction.Command == AuctionHouseAction.Bid)
         {
             WowGuid128 auctioneer = GetSession().GameState.CurrentInteractedWithNPC;
-            if (auctioneer != null && !auctioneer.IsEmpty())
+            if (!auctioneer.IsEmpty())
             {
                 WorldPacket refreshBidder = new WorldPacket(Opcode.CMSG_AUCTION_LIST_BIDDED_ITEMS);
                 refreshBidder.WriteGuid(auctioneer.To64());
@@ -240,7 +240,7 @@ public partial class WorldClient
             //MIRASU: outbid by another player. Re-request the bidded items so the UI updates
             //MIRASU: in real-time (item disappears from "Bids" tab since money was refunded).
             WowGuid128 auctioneer = GetSession().GameState.CurrentInteractedWithNPC;
-            if (auctioneer != null && !auctioneer.IsEmpty())
+            if (!auctioneer.IsEmpty())
             {
                 WorldPacket refreshBidder = new WorldPacket(Opcode.CMSG_AUCTION_LIST_BIDDED_ITEMS);
                 refreshBidder.WriteGuid(auctioneer.To64());

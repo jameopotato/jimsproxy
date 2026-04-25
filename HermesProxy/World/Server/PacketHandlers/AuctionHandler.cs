@@ -97,49 +97,9 @@ public partial class WorldSocket
         }
 
         SendPacketToServer(packet);
-
-        int ModernToLegacyInventorySlotType(uint modernInventoryFlag)
-        {
-            // Modern client can technically search for multiple inventory types at the same time
-            // We just get the first bit and just search for this type
-
-            if (modernInventoryFlag == uint.MaxValue)
-                return -1;
-            
-            for (int i = 0; i < 32; i++)
-            {
-                if ((modernInventoryFlag & (1 << i)) > 0)
-                {
-                    return i;
-                }
-            }
-
-            return -1;
-        }
     }
 
-    int ModernToLegacyInventorySlotType(uint modernInventoryFlag)
-    {
-        // Modern client can technically search for multiple inventory types at the same time
-        // We just get the first bit and just search for this type
-
-        if (modernInventoryFlag == uint.MaxValue)
-            return -1;
-
-        for (byte i = 0; i < 32; i++)
-        {
-            if ((modernInventoryFlag & (1u << i)) > 0)
-            {
-                return i;
-            }
-        }
-
-        return -1;
-    }
-    
-      
-        
-        [PacketHandler(Opcode.CMSG_AUCTION_SELL_ITEM)]
+    [PacketHandler(Opcode.CMSG_AUCTION_SELL_ITEM)]
         void HandleAuctionSellItem(AuctionSellItem auction)
         {
         
@@ -293,19 +253,7 @@ public partial class WorldSocket
                     System.Threading.Thread.Sleep(50);
                 }
 
-                // Kill-switch: Exit the function instantly so the old Hermes retail logic below doesn't run!
                 return;
-                // processes the auction and frees the temp slot for the next split
-                if (splitSlot != null && auction.Items.Count > 1)
-                {
-                    for (int wait = 0; wait < 10; wait++)
-                    {
-                        Thread.Sleep(200);
-                        if (gameState.GetInventorySlotItem(
-                            splitSlot.Value.containerSlot, splitSlot.Value.slot) == WowGuid64.Empty)
-                            break;
-                    }
-                }
             }
         }
         else
