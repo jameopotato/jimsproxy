@@ -10,6 +10,34 @@ namespace HermesProxy.World.Client;
 
 public partial class WorldClient
 {
+    // Returns true if the mob should be treated as hovering. Detection is OR of:
+    //   - UNIT_FIELD_HOVERHEIGHT > 0 (works on cores that populate it)
+    //   - KnownHoveringMobs membership (seeded when we see Flying spline / FixedZ flag)
+    private bool IsHoveringMob(WowGuid128 guid)
+    {
+        if (GetSession().GameState.KnownHoveringMobs.Contains(guid))
+            return true;
+        return GetSession().GameState.GetLegacyFieldValueFloat(guid, UnitField.UNIT_FIELD_HOVERHEIGHT) > 0.0f;
+    }
+
+    // Strips Falling/FallingFar and forces DisableGravity on a hovering mob's movement
+    // flags. Call BEFORE casting WotLK flags to Modern. Vanilla servers don't have
+    // AnimTier/HoverHeight in their movement protocol, so hovering mobs bleed Falling
+    // into every heartbeat/spline-stop, causing the modern client to ground-snap and
+    // basketball-bounce them between flight legs.
+    private bool ApplyHoverOverrideIfNeeded(WowGuid128 guid, MovementInfo moveInfo)
+    {
+        if (!IsHoveringMob(guid))
+            return false;
+
+        moveInfo.Flags &= ~(uint)(MovementFlagWotLK.Falling | MovementFlagWotLK.FallingFar);
+        moveInfo.Flags |= (uint)MovementFlagWotLK.DisableGravity;
+        moveInfo.FallTime = 0;
+        moveInfo.JumpVerticalSpeed = 0.0f;
+        moveInfo.JumpHorizontalSpeed = 0.0f;
+        return true;
+    }
+
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.MSG_MOVE_START_FORWARD)]
     [PacketHandler(Opcode.MSG_MOVE_START_BACKWARD)]
@@ -53,6 +81,7 @@ public partial class WorldClient
         moveUpdate.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
         moveUpdate.MoveInfo = new();
         moveUpdate.MoveInfo.ReadMovementInfoLegacy(packet, GetSession().GameState);
+        ApplyHoverOverrideIfNeeded(moveUpdate.MoverGUID, moveUpdate.MoveInfo);
         moveUpdate.MoveInfo.Flags = (uint)(((MovementFlagWotLK)moveUpdate.MoveInfo.Flags).CastFlags<MovementFlagModern>());
         moveUpdate.MoveInfo.ValidateMovementInfo();
         SendPacketToClient(moveUpdate);
@@ -308,6 +337,7 @@ public partial class WorldClient
         speed.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
         speed.MoveInfo = new MovementInfo();
         speed.MoveInfo.ReadMovementInfoLegacy(packet, GetSession().GameState);
+        ApplyHoverOverrideIfNeeded(speed.MoverGUID, speed.MoveInfo);
         var newFlags = ((MovementFlagWotLK)speed.MoveInfo.Flags).CastFlags<MovementFlagModern>();
         speed.MoveInfo.Flags = (uint)(newFlags);
         speed.MoveInfo.ValidateMovementInfo();
@@ -436,6 +466,17 @@ public partial class WorldClient
             case SplineTypeLegacy.Stop:
             {
                 moveSpline.SplineType = SplineTypeModern.None;
+                // Hovering mobs: tell the client to settle in hover state on stop, otherwise
+                // it falls back to cached MovementInfo flags (which may still have Falling)
+                // and basketball-bounces between flight legs.
+                if (IsHoveringMob(guid))
+                {
+                    moveSpline.SplineFlags |= SplineFlagModern.Flying | SplineFlagModern.AnimTierHover;
+                    Framework.Logging.Log.Event("hover.spline_stop_override", new
+                    {
+                        guid = guid.ToString(),
+                    });
+                }
                 MonsterMove moveStop = new MonsterMove(guid, moveSpline);
                 SendPacketToClient(moveStop);
                 return;
@@ -454,6 +495,20 @@ public partial class WorldClient
             hasCatmullRom = splineFlags.HasAnyFlag(SplineFlagVanilla.Flying);
             hasTaxiFlightFlags = splineFlags == (SplineFlagVanilla.Runmode | SplineFlagVanilla.Flying);
 
+            // Seed hover detection: any vanilla spline with Flying flag means this is a
+            // hovering/flying mob. Mark it so all future packets (heartbeats, Stop, etc.)
+            // for this guid carry hover state, even if HOVERHEIGHT field is never set.
+            if (splineFlags.HasAnyFlag(SplineFlagVanilla.Flying) && guid != GetSession().GameState.CurrentPlayerGuid)
+            {
+                if (GetSession().GameState.KnownHoveringMobs.Add(guid))
+                {
+                    Framework.Logging.Log.Event("hover.detect_flying_spline", new
+                    {
+                        guid = guid.ToString(),
+                    });
+                }
+            }
+
             if (splineFlags == SplineFlagVanilla.Runmode) // Default spline flags used by Vanilla and TBC servers
             {
                 moveSpline.SplineFlags = SplineFlagModern.Unknown5;
@@ -467,12 +522,15 @@ public partial class WorldClient
             {
                 moveSpline.SplineFlags = splineFlags.CastFlags<SplineFlagModern>();
             }
-            // Hovering mobs: force native hover spline to prevent ground-bounce and barrel-roll
-            float hoverHeight = GetSession().GameState.GetLegacyFieldValueFloat(guid, UnitField.UNIT_FIELD_HOVERHEIGHT);
-            if (hoverHeight > 0.0f)
+            if (IsHoveringMob(guid))
             {
                 moveSpline.SplineFlags &= ~(SplineFlagModern.Unknown5 | SplineFlagModern.Falling | SplineFlagModern.FallingSlow | SplineFlagModern.SmoothGroundPath | SplineFlagModern.CatmullRom);
                 moveSpline.SplineFlags |= SplineFlagModern.Flying | SplineFlagModern.AnimTierHover;
+                Framework.Logging.Log.Event("hover.spline_override", new
+                {
+                    guid = guid.ToString(),
+                    spline_type = moveSpline.SplineType.ToString(),
+                });
             }
         }
         else if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V3_0_2_9056))

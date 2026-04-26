@@ -139,6 +139,12 @@ public sealed class GameSessionData
     public HashSet<uint> RequestedItemHotfixes = [];
     public HashSet<uint> RequestedItemSparseHotfixes = [];
 
+    // Mobs we've seen send Flying spline or FixedZ movement flags. Vanilla servers
+    // don't populate UNIT_FIELD_HOVERHEIGHT consistently (Twinstar e.g. leaves it at 0),
+    // so we need a server-agnostic hover signal. Once a guid lands here, all subsequent
+    // packets for it get the hover override regardless of HOVERHEIGHT.
+    public HashSet<WowGuid128> KnownHoveringMobs = [];
+
     private GameSessionData()
     {
         
