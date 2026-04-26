@@ -1,5 +1,4 @@
 ﻿using Framework;
-using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
@@ -84,7 +83,6 @@ public partial class WorldClient
             loot.SoleLooter = packet.ReadBool();
         else
             loot.SoleLooter = true; //MIRASU - 1.12 only sends this packet to the looter; force bit so 1.14 client prints the chat line
-        Log.Print(LogType.Network, $"MIRASU LOOT_MONEY_NOTIFY got Money={loot.Money} SoleLooter={loot.SoleLooter}"); //MIRASU
         SendPacketToClient(loot);
     }
 
