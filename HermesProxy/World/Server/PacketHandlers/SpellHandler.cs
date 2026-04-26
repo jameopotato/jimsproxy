@@ -193,8 +193,22 @@ public partial class WorldSocket
                 {
                     WorldPacket heldPacket = BuildCastSpellPacket(cast);
                     castRequest.HeldPacketForReplay = heldPacket;
+                    // Capture remaining GCD before TryHold so the diagnostic event reflects
+                    // the value at decision time, not after the hold was installed.
+                    long gcdRemainingBeforeHold = GetSession().GameState.GetGcdRemainingMs();
+                    castRequest.HeldAtTickMs = Environment.TickCount64;
                     if (GetSession().GameState.TryHoldCastDuringGcd(castRequest, out var displaced))
                     {
+                        // JimsProxy: spell.held — emit before the displaced/ack work so the
+                        // event sequence reads top-down: hold → displaced → ack.
+                        Log.Event("spell.held", new
+                        {
+                            spell_id = cast.Cast.SpellID,
+                            gcd_remaining_ms = gcdRemainingBeforeHold,
+                            displaced_spell_id = displaced?.SpellId ?? 0,
+                            client_cast_id = castRequest.ClientGUID.ToString(),
+                        });
+
                         // If mashing displaces a previously-held cast, we still need to resolve
                         // its ClientGUID/ServerGUID pair on the client (SpellPrepare was sent
                         // when it was first held). Silently dropping it leaks client-side cast
@@ -202,7 +216,19 @@ public partial class WorldSocket
                         // HandleSpellStart — reason is SpellInProgress, which the 1.14 client
                         // treats as "overridden by newer cast".
                         if (displaced != null)
+                        {
+                            // JimsProxy: spell.held_displaced — separate event so we can count
+                            // displacements (mashing rate) independent of holds (press rate).
+                            Log.Event("spell.held_displaced", new
+                            {
+                                displaced_spell_id = displaced.SpellId,
+                                replaced_by_spell_id = cast.Cast.SpellID,
+                                displaced_held_for_ms = displaced.HeldAtTickMs > 0
+                                    ? Environment.TickCount64 - displaced.HeldAtTickMs
+                                    : 0L,
+                            });
                             SendCastRequestFailed(displaced, false);
+                        }
 
                         // Acknowledge the keypress immediately so the 1.14 client's UI doesn't feel
                         // unresponsive while we hold the cast.
@@ -214,6 +240,14 @@ public partial class WorldSocket
                     }
                     // Else: GCD expired between IsGcdHoldActive() and TryHoldCastDuringGcd() —
                     // fall through and forward normally.
+                    // JimsProxy: spell.held_race_fallthrough — should be rare. If we see this
+                    // event firing often, the IsGcdHoldActive→TryHoldCastDuringGcd window is
+                    // tighter than expected and the 0ms fire offset is bleeding holds.
+                    Log.Event("spell.held_race_fallthrough", new
+                    {
+                        spell_id = cast.Cast.SpellID,
+                        gcd_remaining_ms_at_check = gcdRemainingBeforeHold,
+                    });
                 }
 
                 // Enqueue the cast - responses will be matched by SpellId in FIFO order
@@ -279,6 +313,14 @@ public partial class WorldSocket
         {
             gameState.PendingNormalCasts.Enqueue(cast);
         }
+        // JimsProxy: spell.held_fire — captures total hold duration (press → server forward).
+        // Compare against gcd_remaining_ms in the matching spell.held to reconstruct GCD timing.
+        Log.Event("spell.held_fire", new
+        {
+            spell_id = cast.SpellId,
+            held_for_ms = cast.HeldAtTickMs > 0 ? Environment.TickCount64 - cast.HeldAtTickMs : 0L,
+            client_cast_id = cast.ClientGUID.ToString(),
+        });
         SendPacketToServer(cast.HeldPacketForReplay);
     }
     [PacketHandler(Opcode.CMSG_PET_CAST_SPELL)]
@@ -362,7 +404,20 @@ public partial class WorldSocket
         // would leak the ClientGUID/ServerGUID mapping.
         ClientCastRequest? dropped = GetSession().GameState.CancelGcdHold();
         if (dropped != null)
+        {
+            // JimsProxy: spell.held_cancel — emitted when the client cancels a cast while
+            // we were still holding one. Lets us distinguish "user changed their mind during
+            // GCD" from genuine displacement/firing in bug bundles.
+            Log.Event("spell.held_cancel", new
+            {
+                dropped_spell_id = dropped.SpellId,
+                cancelled_spell_id = cast.SpellID,
+                held_for_ms = dropped.HeldAtTickMs > 0
+                    ? Environment.TickCount64 - dropped.HeldAtTickMs
+                    : 0L,
+            });
             SendCastRequestFailed(dropped, false);
+        }
 
         WorldPacket packet = new WorldPacket(Opcode.CMSG_CANCEL_CAST);
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))

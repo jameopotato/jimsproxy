@@ -825,6 +825,21 @@ public sealed class GameSessionData
     }
 
     /// <summary>
+    /// JimsProxy: ms remaining in the current GCD hold window, or 0 if no GCD is active.
+    /// Used by diagnostics to show how deep into the GCD a held/displaced press landed —
+    /// helps distinguish "user mashed early in GCD" from "user mashed in the natural
+    /// retail spell-queue window (last ~400ms)" without changing behavior.
+    /// </summary>
+    public long GetGcdRemainingMs()
+    {
+        lock (_gcdLock)
+        {
+            long remaining = _gcdExpireTimestampMs - Environment.TickCount64;
+            return remaining > 0 ? remaining : 0;
+        }
+    }
+
+    /// <summary>
     /// Store <paramref name="cast"/> as the pending held cast for the current GCD window.
     /// Returns true if the GCD is still active (cast was stored). Returns false if the GCD
     /// already expired in the meantime (caller should forward immediately via the normal path).
@@ -1165,6 +1180,17 @@ public class ClientCastRequest
     // fully-built CMSG_CAST_SPELL packet here so the timer callback can forward it
     // verbatim at GCD expiry. Null for casts that were forwarded immediately (normal path).
     public WorldPacket? HeldPacketForReplay;
+
+    // JimsProxy: TickCount64 timestamp when this cast was placed into the GCD hold slot.
+    // Diagnostic only — used by spell.held_fire to compute hold duration. 0 if never held.
+    public long HeldAtTickMs;
+
+    // JimsProxy: cast time (ms) reported by SMSG_SPELL_START. 0 means instant.
+    // Distinguishes truly cast-time spells (Frostbolt, Polymorph) from instants that
+    // *also* emit SMSG_SPELL_START on Kronos 1.12 (Arcane Explosion, Counterspell, etc.).
+    // The GCD hold gate in HandleSpellGo uses this instead of HasStarted so Kronos-flavored
+    // instants still trigger BeginGcd. See JimsProxy issue #43 follow-up.
+    public uint StartedCastTimeMs;
 }
 public class ArenaTeamData
 {

@@ -412,6 +412,10 @@ public partial class WorldClient
             // SoM-renumbered item: rewrite the legacy spell id back to the modern one the client expects.
             if (pendingCast.LegacySpellId != 0)
                 spell.Cast.SpellID = (int)pendingCast.SpellId;
+            // JimsProxy issue #43 follow-up: capture the wire-reported cast time so the
+            // GCD-hold gate in HandleSpellGo can tell instant casts (Kronos emits
+            // SMSG_SPELL_START even for these) apart from real cast-time spells.
+            pendingCast.StartedCastTimeMs = spell.Cast.CastTime;
 
             SpellPrepare prepare = new();
             prepare.ClientCastID = pendingCast.ClientGUID;
@@ -479,12 +483,20 @@ public partial class WorldClient
             // player casts on vanilla. Matching a pending queue entry filters out proc /
             // triggered SMSG_SPELL_GOs (e.g. Windfury Weapon, weapon enchant procs, Thunderfury
             // chain lightning, Hand of Justice) — those have no CMSG_CAST_SPELL from the
-            // client, so PendingNormalCasts has no matching entry. Cast-time spells
-            // (HasStarted=true) had their server-side GCD start at SMSG_SPELL_START, so by the
+            // client, so PendingNormalCasts has no matching entry. Real cast-time spells
+            // (CastTime > 0) had their server-side GCD start at SMSG_SPELL_START, so by the
             // time SMSG_SPELL_GO arrives the GCD has already expired during the cast — starting
             // a fresh 1500ms hold here would be a spurious post-cast delay. Finally, gating on
             // ExpansionVersion==1 keeps this vanilla-only; the whitelist CSV is vanilla-only,
             // and haste-adjusted GCDs on TBC+ would make the blanket 1500ms wrong.
+            //
+            // JimsProxy issue #43 follow-up: gate on StartedCastTimeMs == 0 (instant) instead
+            // of !HasStarted. Kronos 1.12 emits SMSG_SPELL_START even for instants (Arcane
+            // Explosion, Counterspell, etc.), so the old !HasStarted gate caused BeginGcd to
+            // be skipped for every instant cast → no GCD hold → mid-GCD mashes flooded Kronos
+            // and bounced back as SMSG_SPELL_FAILURE. Bug bundle showed 4 NOT_READY failures
+            // per AE GCD on 2026-04-26.
+            //
             // JimsProxy (issue #43): use the legacy (1.12) spell id for whitelist / GCD-duration
             // lookups when the cast was SoM-renumbered. The rewrite a few lines above already
             // changed spell.Cast.SpellID to the modern id for the outbound packet, but
@@ -498,7 +510,7 @@ public partial class WorldClient
                 : (uint)spell.Cast.SpellID;
 
             if (LegacyVersion.ExpansionVersion == 1 &&
-                !pendingCast.HasStarted &&
+                pendingCast.StartedCastTimeMs == 0 &&
                 !GameData.IsOffGcd(gcdLookupId))
             {
                 long gcdMs = GameData.GetGcdDurationMs(gcdLookupId);
@@ -506,6 +518,17 @@ public partial class WorldClient
                 long expireAt = now + gcdMs;
                 long fireAt = expireAt - Framework.Settings.SpellCastEarlyFireOffsetMs;
                 GetSession().GameState.BeginGcd(expireAt, fireAt);
+
+                // JimsProxy: gcd.begin — pairs with spell.held / spell.held_fire to reconstruct
+                // the full GCD timeline for a session. legacy_lookup_id is non-zero only for
+                // SoM-renumbered items so we can spot whitelist misses post-hoc.
+                Log.Event("gcd.begin", new
+                {
+                    spell_id = spell.Cast.SpellID,
+                    gcd_ms = gcdMs,
+                    fire_offset_ms = Framework.Settings.SpellCastEarlyFireOffsetMs,
+                    legacy_lookup_id = pendingCast.LegacySpellId,
+                });
             }
         }
         else if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
