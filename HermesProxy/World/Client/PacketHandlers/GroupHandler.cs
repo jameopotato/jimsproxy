@@ -4,7 +4,6 @@ using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
 using System;
-using Framework.Logging; //MIRASU: for structured packet.partial events
 using System.Collections.Generic;
 
 namespace HermesProxy.World.Client;
