@@ -70,6 +70,16 @@ public partial class WorldClient
 
                 if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
                     char1.VisualItems[j].DisplayEnchantId = packet.ReadUInt32();
+
+                // JimsProxy: Kronos 1.12 ships some DisplayIDs that have no matching
+                // ItemAppearance row in modern reference data, which the 1.14 char-select
+                // renderer requires. Substitute via the override map so affected slots
+                // render. See GameData.KronosDisplayIdOverrides.
+                if (char1.VisualItems[j].DisplayId != 0 &&
+                    GameData.TryGetKronosDisplayIdOverride(char1.VisualItems[j].DisplayId, out uint overrideDisplayId))
+                {
+                    char1.VisualItems[j].DisplayId = overrideDisplayId;
+                }
             }
 
             int bagCount = LegacyVersion.AddedInVersion(ClientVersionBuild.V3_3_3_11685) ? 4 : 1;
