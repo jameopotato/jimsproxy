@@ -196,6 +196,25 @@ public static partial class GameData
         return 0;
     }
 
+    // JimsProxy: Kronos 1.12 ships DisplayIDs for some items that have no matching
+    // ItemAppearance row in modern reference data. The 1.14 char-select renderer goes
+    // through ItemAppearance and silently drops the slot when resolution fails — visible
+    // as "helm not showing on the character login screen". This table maps Kronos's wire
+    // DisplayID to the modern reference DisplayID for the same item, so the
+    // SMSG_ENUM_CHARACTERS_RESULT handler can substitute before forwarding to the client.
+    // Promote to a CSV at HermesProxy/CSV/KronosDisplayIdOverrides{N}.csv if the list
+    // ever grows past a handful.
+    public static readonly FrozenDictionary<uint, uint> KronosDisplayIdOverrides =
+        new Dictionary<uint, uint>
+        {
+            { 35612, 36972 }, // Item 22428 "Redemption Headpiece" — paladin T2 helm
+        }.ToFrozenDictionary();
+
+    public static bool TryGetKronosDisplayIdOverride(uint kronosDisplayId, out uint modernDisplayId)
+    {
+        return KronosDisplayIdOverrides.TryGetValue(kronosDisplayId, out modernDisplayId);
+    }
+
     public static ItemAppearance? GetItemAppearanceByDisplayId(uint displayId)
     {
         foreach (var item in ItemAppearanceStore)
