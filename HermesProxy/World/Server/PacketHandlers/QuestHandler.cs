@@ -6,6 +6,7 @@ using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace HermesProxy.World.Server;
 
@@ -38,6 +39,25 @@ public partial class WorldSocket
         WorldPacket packet = new WorldPacket(Opcode.CMSG_QUEST_LOG_REMOVE_QUEST);
         packet.WriteUInt8(quest.Slot);
         SendPacketToServer(packet);
+
+        //MIRASU - clear running-total entries for the quest in this slot so a future re-accept of
+        //MIRASU   the same quest doesn't inherit stale progress (toast was reading 7/10 on first
+        //MIRASU   pickup of a freshly-accepted quest because the prior abandon left running totals
+        //MIRASU   in QuestItemObjectiveProgress). Slot index matches the legacy quest log slot.
+        var worldClient = GetSession().WorldClient;
+        if (worldClient == null)
+            return;
+        var updateFields = GetSession().GameState.GetCachedObjectFieldsLegacy(GetSession().GameState.CurrentPlayerGuid);
+        if (updateFields == null)
+            return;
+        var logEntry = worldClient.ReadQuestLogEntry(quest.Slot, null, updateFields);
+        if (logEntry?.QuestID == null)
+            return;
+
+        uint questId = (uint)logEntry.QuestID;
+        var progressMap = GetSession().GameState.QuestItemObjectiveProgress;
+        foreach (var k in progressMap.Keys.Where(k => k.QuestID == questId).ToList())
+            progressMap.Remove(k);
     }
     [PacketHandler(Opcode.CMSG_QUEST_GIVER_STATUS_QUERY)]
     void HandleQuestGiverStatusQuery(QuestGiverStatusQuery query)

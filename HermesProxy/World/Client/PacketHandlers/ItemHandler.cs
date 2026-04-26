@@ -58,27 +58,40 @@ public partial class WorldClient
             item.QuantityInInventory = packet.ReadUInt32();
         else
         {
-            uint currentCount = 0;
+            //MIRASU - Vanilla legacy SMSG_ITEM_PUSH_RESULT doesn't carry running QuantityInInventory.
+            //MIRASU   Original code read the count from the player's PLAYER_QUEST_LOG_x_3 cache, but
+            //MIRASU   Kronos never refreshes that field on item pickups -- so QuantityInInventory was
+            //MIRASU   always equal to the per-pickup delta (1), and the modern over-head quest toast
+            //MIRASU   rendered "Item: 1/N" forever. Prefer the proxy's QuestItemObjectiveProgress
+            //MIRASU   running total (kept in sync by HandleQuestUpdateAddItem, which fires before
+            //MIRASU   SMSG_ITEM_PUSH_RESULT in Kronos's pickup burst). Fall back to legacy cache +
+            //MIRASU   delta when the running total hasn't been populated yet (e.g. first pickup of
+            //MIRASU   a quest whose template wasn't cached).
+            uint quantityInInventory = item.Quantity;
             QuestObjective? objective = GameData.GetQuestObjectiveForItem(item.Item.ItemID);
             if (objective != null)
             {
-                var updateFields = GetSession().GameState.GetCachedObjectFieldsLegacy(GetSession().GameState.CurrentPlayerGuid);
-                int questsCount = LegacyVersion.GetQuestLogSize();
-                for (int i = 0; i < questsCount; i++)
+                var key = (objective.QuestID, objective.StorageIndex);
+                if (GetSession().GameState.QuestItemObjectiveProgress.TryGetValue(key, out uint runningTotal))
                 {
-                    QuestLog? logEntry = ReadQuestLogEntry(i, null, updateFields!);
-                    if (logEntry == null || logEntry.QuestID == null)
-                        continue;
-                    if (logEntry.QuestID != objective.QuestID)
-                        continue;
-                    if (logEntry.ObjectiveProgress[objective.StorageIndex] == null)
-                        continue;
-
-                    currentCount = (uint)logEntry.ObjectiveProgress[objective.StorageIndex]!;
-                    break;
+                    quantityInInventory = runningTotal;
+                }
+                else
+                {
+                    var updateFields = GetSession().GameState.GetCachedObjectFieldsLegacy(GetSession().GameState.CurrentPlayerGuid);
+                    int questsCount = LegacyVersion.GetQuestLogSize();
+                    for (int i = 0; i < questsCount; i++)
+                    {
+                        QuestLog? logEntry = ReadQuestLogEntry(i, null, updateFields!);
+                        if (logEntry == null || logEntry.QuestID != objective.QuestID)
+                            continue;
+                        if (logEntry.ObjectiveProgress[objective.StorageIndex] != null)
+                            quantityInInventory = item.Quantity + (uint)logEntry.ObjectiveProgress[objective.StorageIndex]!;
+                        break;
+                    }
                 }
             }
-            item.QuantityInInventory = item.Quantity + currentCount;
+            item.QuantityInInventory = quantityInInventory;
         }
 
         if (item.Slot == Enums.Classic.InventorySlots.Bag0 && item.SlotInBag >= 0 &&

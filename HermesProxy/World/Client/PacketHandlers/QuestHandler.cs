@@ -1,10 +1,10 @@
 ﻿using Framework;
-using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
 using System;
+using System.Linq;
 
 namespace HermesProxy.World.Client;
 
@@ -393,6 +393,14 @@ public partial class WorldClient
         QuestUpdateStatus quest = new QuestUpdateStatus(packet.GetUniversalOpcode(false));
         quest.QuestID = packet.ReadUInt32();
         SendPacketToClient(quest);
+
+        //MIRASU - clear our per-objective running totals for this quest so a future re-accept
+        //MIRASU   (or a parallel quest sharing the same item) starts fresh instead of inheriting
+        //MIRASU   stale counts. Applies to COMPLETE / FAILED / FAILED_TIMER -- in all three cases
+        //MIRASU   the quest is leaving the active log and any running total is no longer valid.
+        var progressMap = GetSession().GameState.QuestItemObjectiveProgress;
+        foreach (var k in progressMap.Keys.Where(k => k.QuestID == quest.QuestID).ToList())
+            progressMap.Remove(k);
     }
     [PacketHandler(Opcode.SMSG_QUEST_UPDATE_ADD_ITEM)]
     void HandleQuestUpdateAddItem(WorldPacket packet)
@@ -401,7 +409,6 @@ public partial class WorldClient
         uint count = packet.ReadUInt32(); //MIRASU - delta, not total
 
         QuestObjective? objective = GameData.GetQuestObjectiveForItem(itemId);
-        
 
         if (objective == null)
         {
@@ -426,17 +433,43 @@ public partial class WorldClient
 
         //MIRASU - track running total ourselves; legacy update-field cache isn't refreshed on partial updates
         var key = (objective.QuestID, objective.StorageIndex);
-        GetSession().GameState.QuestItemObjectiveProgress.TryGetValue(key, out uint stored);
+        if (!GetSession().GameState.QuestItemObjectiveProgress.TryGetValue(key, out uint stored))
+        {
+            //MIRASU - first time we see this objective: seed from the legacy quest log cache.
+            //MIRASU   The cache holds the accept-time progress (e.g. 3/10 if the player logged in
+            //MIRASU   mid-quest); without seeding, the running total starts at 0 and the toast
+            //MIRASU   would render "1/10" instead of "4/10" on the next pickup.
+            var updateFields = GetSession().GameState.GetCachedObjectFieldsLegacy(GetSession().GameState.CurrentPlayerGuid);
+            if (updateFields != null)
+            {
+                int questsCount = LegacyVersion.GetQuestLogSize();
+                for (int i = 0; i < questsCount; i++)
+                {
+                    QuestLog? logEntry = ReadQuestLogEntry(i, null, updateFields);
+                    if (logEntry == null || logEntry.QuestID != objective.QuestID)
+                        continue;
+                    if (logEntry.ObjectiveProgress[objective.StorageIndex] != null)
+                        stored = (uint)logEntry.ObjectiveProgress[objective.StorageIndex]!;
+                    break;
+                }
+            }
+        }
         uint runningTotal = stored + count;
         if (runningTotal > (uint)objective.Amount)
             runningTotal = (uint)objective.Amount;
         GetSession().GameState.QuestItemObjectiveProgress[key] = runningTotal;
-        
-        //MIRASU - use SIMPLE variant for item objectives; modern client auto-reads count from bags
-        QuestUpdateAddCreditSimple credit = new QuestUpdateAddCreditSimple();
+
+        //MIRASU - send full QuestUpdateAddCredit (not SIMPLE) so the over-head toast has explicit
+        //MIRASU   Count/Required values. SIMPLE makes the modern client read from the legacy
+        //MIRASU   UNIT_FIELD_QUEST_LOG_x cache, which Kronos doesn't refresh on partial item-pickup
+        //MIRASU   updates -- so the toast froze at whatever the cache held on quest accept (1/10).
+        QuestUpdateAddCredit credit = new QuestUpdateAddCredit();
         credit.QuestID = objective.QuestID;
         credit.ObjectID = (int)itemId;
         credit.ObjectiveType = QuestObjectiveType.Item;
+        credit.Count = (ushort)runningTotal;
+        credit.Required = (ushort)objective.Amount;
+        credit.VictimGUID = default; //MIRASU - no victim for item pickups; modern client ignores VictimGUID for Item objectives
         SendPacketToClient(credit);
     }
 
