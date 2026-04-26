@@ -264,12 +264,41 @@ public sealed class RealmManager
 
     public BattlenetRpcErrorCode JoinRealm(GlobalSessionData globalSession, uint realmAddress, uint build, IPAddress clientAddress, byte[] clientSecret, string accountName, Bgs.Protocol.GameUtilities.V1.ClientResponse response)
     {
+        // JimsProxy: realm-swap diagnostics. Snapshot the pre-swap state so the
+        // emitted event tells us (a) whether this is an actual swap or initial join,
+        // (b) whether the prior realm's WorldClient is still alive at swap time,
+        // and (c) what stale GameSessionData carries over (no reset happens here).
+        // hadPriorRealm is the right "is this a swap" signal — the old logic compared
+        // oldRealmId.Index against 0, but Index=0 is the Live realm, not "no realm".
+        // Using HadPlayerLogin OR a non-default RealmId would be cleaner; for now we
+        // gate on whether a WorldClient already exists, which only happens after the
+        // first realm has been picked.
+        var oldRealmId = globalSession.RealmId;
+        var oldGameState = globalSession.GameState;
+        bool hadWorldClient = globalSession.WorldClient != null;
+        bool hadPriorRealm = hadWorldClient;
+        bool worldClientWasConnected = globalSession.WorldClient?.IsConnected() ?? false;
+        bool worldClientWasAuthenticated = globalSession.WorldClient?.IsAuthenticated() ?? false;
+        bool authClientWasConnected = globalSession.AuthClient != null && globalSession.AuthClient.IsConnected();
+        string authKeyPrefix = SafeAuthKeyPrefixForRealm(globalSession.AuthClient);
+        string bnetKeyBefore = SafeKeyPrefix(globalSession.SessionKey);
+
         globalSession.RealmId = new RealmId(realmAddress);
         Realm? realm = GetRealm(globalSession.RealmId);
         if (realm != null)
         {
             if (realm.Flags.HasAnyFlag(RealmFlags.Offline) || realm.Build != build)
+            {
+                Framework.Logging.Log.Event("realm.swap.join_realm", new
+                {
+                    phase = "rejected_offline_or_build",
+                    new_realm_index = (uint)globalSession.RealmId.Index,
+                    realm_offline = realm.Flags.HasAnyFlag(RealmFlags.Offline),
+                    realm_build = realm.Build,
+                    client_build = build,
+                });
                 return BattlenetRpcErrorCode.UserServerNotPermittedOnRealm;
+            }
 
             RealmListServerIPAddresses serverAddresses = new RealmListServerIPAddresses();
             AddressFamily addressFamily = new AddressFamily();
@@ -290,6 +319,44 @@ public sealed class RealmManager
 
             globalSession.SessionKey = keyData;
 
+            // JimsProxy: emit AFTER setting the new BNet session key so we capture both
+            // the old and new prefixes. is_swap=true when old realm id != new id (a real
+            // PTR↔Live swap rather than initial join). gamestate.* fields surface stale
+            // state that JoinRealm intentionally does NOT reset today — useful for
+            // diagnosing carryover bugs (cached players from old realm, lingering auras,
+            // pending casts, etc.).
+            int pendingNormalCasts = oldGameState != null ? oldGameState.PendingNormalCasts.Count : 0;
+            int pendingPetCasts = oldGameState != null ? oldGameState.PendingPetCasts.Count : 0;
+            int cachedPlayers = oldGameState != null ? oldGameState.CachedPlayers.Count : 0;
+            int objectCacheLegacy = oldGameState != null ? oldGameState.ObjectCacheLegacy.Count : 0;
+            int objectCacheModern = oldGameState != null ? oldGameState.ObjectCacheModern.Count : 0;
+            uint? currentMapId = oldGameState?.CurrentMapId;
+            string playerGuid = oldGameState != null ? oldGameState.CurrentPlayerGuid.ToString() : "<null>";
+
+            Framework.Logging.Log.Event("realm.swap.join_realm", new
+            {
+                phase = "ok",
+                old_realm_index = (uint)oldRealmId.Index,
+                new_realm_index = (uint)globalSession.RealmId.Index,
+                new_realm_name = realm.Name,
+                is_swap = hadPriorRealm && oldRealmId.Index != globalSession.RealmId.Index,
+                is_reconnect = hadPriorRealm && oldRealmId.Index == globalSession.RealmId.Index,
+                had_world_client = hadWorldClient,
+                world_client_was_connected = worldClientWasConnected,
+                world_client_was_authenticated = worldClientWasAuthenticated,
+                auth_client_was_connected = authClientWasConnected,
+                auth_key_prefix = authKeyPrefix,
+                bnet_key_prefix_before = bnetKeyBefore,
+                bnet_key_prefix_after = SafeKeyPrefix(keyData),
+                gamestate_player_guid = playerGuid,
+                gamestate_current_map_id = currentMapId,
+                gamestate_cached_players = cachedPlayers,
+                gamestate_pending_normal_casts = pendingNormalCasts,
+                gamestate_pending_pet_casts = pendingPetCasts,
+                gamestate_object_cache_legacy = objectCacheLegacy,
+                gamestate_object_cache_modern = objectCacheModern,
+            });
+
             response.Attribute.AddBlob("Param_RealmJoinTicket", ByteString.CopyFrom(accountName, Encoding.UTF8));
             response.Attribute.AddBlob("Param_ServerAddresses", ByteString.CopyFrom(compressed));
             response.Attribute.AddBlob("Param_JoinSecret", ByteString.CopyFrom(serverSecret));
@@ -297,7 +364,36 @@ public sealed class RealmManager
             return BattlenetRpcErrorCode.Ok;
         }
 
+        Framework.Logging.Log.Event("realm.swap.join_realm", new
+        {
+            phase = "rejected_unknown_realm",
+            requested_realm_address = realmAddress,
+        });
         return BattlenetRpcErrorCode.UtilServerUnknownRealm;
+    }
+
+    // JimsProxy: 4-byte hex prefix of the SRP-derived auth-client session key.
+    // Mirrors the helper in WorldSocket.SessionHandler so realm.swap.* events
+    // produce comparable prefixes across the two emit sites.
+    private static string SafeAuthKeyPrefixForRealm(HermesProxy.Auth.AuthClient? authClient)
+    {
+        if (authClient == null) return "<null>";
+        try
+        {
+            var key = authClient.GetSessionKey();
+            return SafeKeyPrefix(key);
+        }
+        catch
+        {
+            return "<error>";
+        }
+    }
+
+    private static string SafeKeyPrefix(byte[]? key)
+    {
+        if (key == null || key.Length == 0) return "<empty>";
+        int n = Math.Min(4, key.Length);
+        return Convert.ToHexString(key, 0, n);
     }
 
     public ICollection<Realm> GetRealms() { return _realms.Values; }
