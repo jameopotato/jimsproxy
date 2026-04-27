@@ -96,6 +96,14 @@ public sealed class GameSessionData
     public ClientCastRequest? CurrentClientNextMeleeCast; // next melee spells (Raptor Strike, Heroic Strike, etc.)
     public ClientCastRequest? CurrentClientAutoRepeatCast; // auto repeat spells (Auto Shot, Shoot, etc.)
     public ConcurrentQueue<ClientCastRequest> PendingPetCasts = new();  // pet spell casts (queue for proper FIFO handling)
+    //MIRASU - Tracks the unique CastID assigned to in-flight non-player casts so SPELL_GO and
+    //MIRASU   SPELL_FAILED_OTHER can reference the same cast the SPELL_START introduced.
+    //MIRASU   Without this, mob casts reuse a deterministic CastID (spellId+casterCounter) on
+    //MIRASU   every cycle and the modern client treats consecutive casts as the same in-flight
+    //MIRASU   cast -- visuals/sounds drift and target-frame cast bars don't dismiss on kick.
+    public ConcurrentDictionary<(WowGuid128 caster, uint spellId), WowGuid128> OtherCasterActiveCastIds = new();
+    //MIRASU - monotonic sequence used to make non-player CastIDs unique per cast.
+    public int OtherCastSequenceCounter;
     public WowGuid64 LastLootTargetGuid;
     public Dictionary<(uint QuestID, sbyte StorageIndex), uint> QuestItemObjectiveProgress = new(); //MIRASU - proxy-local running totals for quest item pickups; legacy update-field cache isn't refreshed on partial updates, so we track ourselves
     public uint CurrentLootCoins; //MIRASU - remembers coin amount from SMSG_LOOT_RESPONSE so proxy can synthesize SMSG_LOOT_MONEY_NOTIFY when client picks up gold (Kronos/TC-1.12 doesn't emit it)
