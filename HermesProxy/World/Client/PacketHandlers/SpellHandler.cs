@@ -439,6 +439,7 @@ public partial class WorldClient
         uint spellVisual;
         bool dequeued = false;
         bool wasStarted = false;
+        bool foundActiveCastId = false;
         if (GetSession().GameState.CurrentPlayerGuid == casterUnit &&
             GetSession().GameState.TryDequeuePendingNormalCast(spellId, out var pendingNormal))
         {
@@ -480,7 +481,20 @@ public partial class WorldClient
         }
         else
         {
-            castId = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, spellId, spellId + casterUnit.GetCounter());
+            //MIRASU - Non-local caster (enemy player in PvP, or any third-party unit). Vanilla
+            //MIRASU   1.12 broadcasts SMSG_SPELL_FAILURE to ALL nearby observers via
+            //MIRASU   SendMessageToSet(true), not just the caster. So when you Counterspell/Kick
+            //MIRASU   an enemy player, this handler runs for THEIR cast. Pull the unique CastID
+            //MIRASU   minted at SPELL_START from OtherCasterActiveCastIds so the dismiss
+            //MIRASU   references the same in-flight cast the modern client is tracking;
+            //MIRASU   otherwise the deterministic seed mismatches and the target-frame cast bar
+            //MIRASU   keeps filling until movement triggers a separate dismiss path.
+            var activeKey = (casterUnit, spellId);
+            foundActiveCastId = GetSession().GameState.OtherCasterActiveCastIds.TryRemove(activeKey, out var trackedCastId);
+            if (foundActiveCastId)
+                castId = trackedCastId;
+            else
+                castId = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, spellId, spellId + casterUnit.GetCounter());
             spellVisual = GameData.GetSpellVisual(spellId);
         }
 
@@ -492,6 +506,38 @@ public partial class WorldClient
         spell.Reason = reason;
         SendPacketToClient(spell);
 
+        //MIRASU - Mirror the FAILED_OTHER interrupt synthesis for the broadcasted FAILURE path.
+        //MIRASU   PvP scenario: you Counterspell an enemy player -> Kronos broadcasts
+        //MIRASU   SMSG_SPELL_FAILURE for the victim to nearby observers. Without these synthesized
+        //MIRASU   modern packets the 1.14 target-frame cast bar doesn't dismiss until movement.
+        //MIRASU   Gate on foundActiveCastId so we don't double-fire if FAILED_OTHER already
+        //MIRASU   consumed the entry and synthesized the same packets.
+        bool casterIsPlayer = GetSession().GameState.CurrentPlayerGuid == casterUnit;
+        bool casterIsPet = GetSession().GameState.CurrentPetGuid == casterUnit;
+        bool sentInterruptLog = false;
+        bool sentCancelVisual = false;
+        uint resolvedSpellVisualId = 0;
+        if (reason == 61 /* Interrupted */ && foundActiveCastId && !casterIsPlayer && !casterIsPet)
+        {
+            SpellInterruptLog interruptLog = new SpellInterruptLog();
+            interruptLog.Caster = GetSession().GameState.CurrentPlayerGuid;
+            interruptLog.Victim = casterUnit;
+            interruptLog.InterruptedSpellID = (int)spellId;
+            interruptLog.BackfireSpellID = (int)spellId;
+            SendPacketToClient(interruptLog);
+            sentInterruptLog = true;
+
+            resolvedSpellVisualId = GameData.GetSpellVisualIdFromXSpellVisual(spellVisual);
+            if (resolvedSpellVisualId != 0)
+            {
+                CancelSpellVisual cancelVisual = new CancelSpellVisual();
+                cancelVisual.Source = casterUnit;
+                cancelVisual.SpellVisualID = (int)resolvedSpellVisualId;
+                SendPacketToClient(cancelVisual);
+                sentCancelVisual = true;
+            }
+        }
+
         Log.Event("spell.failure.routed", new
         {
             spellId,
@@ -500,6 +546,10 @@ public partial class WorldClient
             isPetCaster = GetSession().GameState.CurrentPetGuid == casterUnit,
             dequeued,
             wasStarted,
+            foundActiveCastId,
+            sentInterruptLog,
+            sentCancelVisual,
+            resolvedSpellVisualId,
         });
     }
 
