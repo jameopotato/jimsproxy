@@ -371,7 +371,7 @@ public partial class WorldClient
         {
             return; // was handled by us
         }
-        Console.WriteLine("RAW CHAT INTERCEPTED: " + msg);
+        Log.Print(LogType.Debug, "RAW CHAT INTERCEPTED: " + msg);
         msg = System.Text.RegularExpressions.Regex.Replace(msg, @"(\|Hitem:\d+)[^|]*(\|h)", "$1:0:0:0$2");
         WorldPacket packet = new WorldPacket(Opcode.CMSG_MESSAGECHAT);
         packet.WriteUInt32((uint)type);

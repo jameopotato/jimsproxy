@@ -177,9 +177,9 @@ public class MonsterMoveWriteTests
     {
         var spline = CreateSpline(SplineTypeModern.None);
         spline.SplineFlags = SplineFlagModern.UncompressedPath;
-        // Create more than MaxSplinePoints (16) points
+        // Create more than MaxSplinePoints (48) points
         spline.SplinePoints = new List<Vector3>();
-        for (int i = 0; i < 20; i++)
+        for (int i = 0; i < 64; i++)
             spline.SplinePoints.Add(new Vector3(i, i, i));
 
         var packet = new MonsterMove(TestGuid, spline);

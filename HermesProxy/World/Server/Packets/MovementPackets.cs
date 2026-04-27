@@ -64,9 +64,10 @@ public class MonsterMove : ServerPacket, ISpanWritable
 {
     // Practical cap for spline points - covers real-world movement patterns
     // Real usage: Points=0-2 (next destination), PackedDeltas=0-15 (obstacle smoothing)
-    // Reduced from 64 to 16 based on actual usage data (74-116 bytes observed)
+    // Bumped to 48 to absorb long city-guard patrol splines (Stormwind/Org) without
+    // tripping the slow fallback path on every populated-zone login.
     // If exceeded, WriteToSpan returns -1 to trigger fallback to Write()
-    private const int MaxSplinePoints = 16;
+    private const int MaxSplinePoints = 48;
 
     public MonsterMove(WowGuid128 guid, ServerSideMovement moveSpline) : base(Opcode.SMSG_ON_MONSTER_MOVE, ConnectionType.Instance)
     {

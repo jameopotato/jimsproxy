@@ -307,8 +307,10 @@ public class UnlearnedSpells : ServerPacket, ISpanWritable
 
 public class SendSpellHistory : ServerPacket, ISpanWritable
 {
-    // Practical cap for spell history at login
-    private const int MaxEntries = 64;
+    // Practical cap for spell history at login.
+    // Bumped to 128 so level-60 chars with full cooldown rotations don't trip the
+    // fallback path on every login.
+    private const int MaxEntries = 128;
     // Each entry: 6 fixed fields (24) + bits (1) = 25 bytes (unused optionals)
     private const int MaxEntrySize = 25;
 
@@ -320,7 +322,7 @@ public class SendSpellHistory : ServerPacket, ISpanWritable
         Entries.ForEach(p => p.Write(_worldPacket));
     }
 
-    // MaxSize: count (4) + 64 entries (25 each) = 1604
+    // MaxSize: count (4) + 128 entries (25 each) = 3204
     public int MaxSize => 4 + MaxEntries * MaxEntrySize;
 
     public int WriteToSpan(Span<byte> buffer)
