@@ -6,6 +6,7 @@ using HermesProxy.World.Server.Packets;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 
 namespace HermesProxy.World.Client;
 
@@ -268,6 +269,14 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_SPELL_FAILED_OTHER)]
     void HandleSpellFailedOther(WorldPacket packet)
     {
+        //MIRASU - capture raw payload for wire-format diagnosis (mob-cast-bar interrupt bug).
+        //MIRASU   GetData() returns the full body buffer; we hex-dump the first ~32 bytes so we
+        //MIRASU   can compare what Kronos sends vs what HandleSpellStartOrGo's packed-guid read
+        //MIRASU   was working with. If GUID format differs, the synthesized CastID won't match
+        //MIRASU   the cast bar's CastID and the modern client won't reset it.
+        byte[] rawData = packet.GetData() ?? Array.Empty<byte>();
+        string rawHex = Convert.ToHexString(rawData, 0, Math.Min(rawData.Length, 32));
+
         WowGuid128 casterUnit;
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
             casterUnit = packet.ReadPackedGuid().To128(GetSession().GameState);
@@ -304,9 +313,20 @@ public partial class WorldClient
         }
         else
         {
-            castId = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, spellId, spellId + casterUnit.GetCounter());
+            //MIRASU - Non-player caster: prefer the unique CastID minted at SPELL_START so
+            //MIRASU   the dismiss references the same in-flight cast the modern client is
+            //MIRASU   tracking. Falls back to the deterministic seed if no active cast was
+            //MIRASU   recorded (e.g. SPELL_START was missed or arrived out of order).
+            var activeKey = (casterUnit, spellId);
+            if (GetSession().GameState.OtherCasterActiveCastIds.TryRemove(activeKey, out var trackedCastId))
+                castId = trackedCastId;
+            else
+                castId = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, spellId, spellId + casterUnit.GetCounter());
             spellVisual = GameData.GetSpellVisual(spellId);
         }
+
+        bool casterIsPlayer = GetSession().GameState.CurrentPlayerGuid == casterUnit;
+        bool casterIsPet = GetSession().GameState.CurrentPetGuid == casterUnit;
 
         SpellFailure spell = new SpellFailure();
         spell.CasterUnit = casterUnit;
@@ -323,6 +343,56 @@ public partial class WorldClient
         spell2.SpellXSpellVisualID = spellVisual;
         spell2.Reason = reason;
         SendPacketToClient(spell2);
+
+        //MIRASU - For interrupted (kicked/counterspelled) mob casts, modern clients dismiss
+        //MIRASU   the target-frame cast bar via SMSG_SPELL_INTERRUPT_LOG and a
+        //MIRASU   SMSG_CANCEL_SPELL_VISUAL terminating the active visual kit. Vanilla 1.12
+        //MIRASU   has neither opcode -- the proxy synthesizes both. We attribute the
+        //MIRASU   interrupt to the local player (reliably the Kick/Counterspell source on
+        //MIRASU   the JSONL stream) and resolve the SpellVisualID from the wrapper ID via
+        //MIRASU   the SpellXSpellVisualToSpellVisual table loaded at startup.
+        bool sentInterruptLog = false;
+        bool sentCancelVisual = false;
+        uint resolvedSpellVisualId = 0;
+        if (reason == 61 /* Interrupted */ && !casterIsPlayer && !casterIsPet)
+        {
+            SpellInterruptLog interruptLog = new SpellInterruptLog();
+            interruptLog.Caster = GetSession().GameState.CurrentPlayerGuid;
+            interruptLog.Victim = casterUnit;
+            interruptLog.InterruptedSpellID = (int)spellId;
+            //MIRASU - BackfireSpellID is the school-lockout dummy spell in retail. We don't
+            //MIRASU   know the actual lockout ID from 1.12 wire (Kronos doesn't send it), so
+            //MIRASU   loop the interrupted spell back. Theory: client may gate the
+            //MIRASU   target-frame cast-bar dismiss on BackfireSpellID != 0, treating 0 as
+            //MIRASU   "informational interrupt" that doesn't actually break the bar.
+            interruptLog.BackfireSpellID = (int)spellId;
+            SendPacketToClient(interruptLog);
+            sentInterruptLog = true;
+
+            resolvedSpellVisualId = GameData.GetSpellVisualIdFromXSpellVisual(spellVisual);
+            if (resolvedSpellVisualId != 0)
+            {
+                CancelSpellVisual cancelVisual = new CancelSpellVisual();
+                cancelVisual.Source = casterUnit;
+                cancelVisual.SpellVisualID = (int)resolvedSpellVisualId;
+                SendPacketToClient(cancelVisual);
+                sentCancelVisual = true;
+            }
+        }
+
+        Log.Event("spell.failed_other.routed", new
+        {
+            spellId,
+            reason,
+            rawHex,
+            casterCounter = casterUnit.GetCounter(),
+            castIdCounter = castId.GetCounter(),
+            casterIsPlayer,
+            casterIsPet,
+            sentInterruptLog,
+            sentCancelVisual,
+            resolvedSpellVisualId,
+        });
     }
 
     // JimsProxy: SMSG_SPELL_FAILURE handler. Block 2 gameplay testing on Kronos
@@ -358,26 +428,55 @@ public partial class WorldClient
         if (packet.CanRead())
             reason = (byte)LegacyVersion.ConvertSpellCastResult(packet.ReadUInt8());
 
-        // Resolve cast/visual ID from pending cast bookkeeping (same lookup
-        // pattern as HandleSpellFailedOther so SoM-renumbered spells round-trip
-        // their LegacySpellId -> SpellId mapping correctly).
+        // Resolve cast/visual ID from pending cast bookkeeping. For the caster path,
+        // DEQUEUE the pending cast (don't peek): SMSG_SPELL_GO won't arrive for an
+        // interrupted/failed cast, so leaving it in the queue causes subsequent casts
+        // of the same spell to inherit the stale ServerGUID via FirstOrDefault FIFO
+        // matching -- the modern client's active cast bar (keyed on the NEW ServerGUID)
+        // then doesn't match the SpellFailure CastID and the bar finishes filling
+        // visually instead of resetting on interrupt. Mirrors HandleCastFailed.
         WowGuid128 castId;
         uint spellVisual;
+        bool dequeued = false;
+        bool wasStarted = false;
         if (GetSession().GameState.CurrentPlayerGuid == casterUnit &&
-            GetSession().GameState.PendingNormalCasts.FirstOrDefault(c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId)) is { } pendingNormal)
+            GetSession().GameState.TryDequeuePendingNormalCast(spellId, out var pendingNormal))
         {
-            castId = pendingNormal.ServerGUID;
+            castId = pendingNormal!.ServerGUID;
             spellVisual = pendingNormal.SpellXSpellVisualId;
             if (pendingNormal.LegacySpellId != 0)
                 spellId = pendingNormal.SpellId;
+            dequeued = true;
+            wasStarted = pendingNormal.HasStarted;
+
+            // Pre-cast failure (rare via SPELL_FAILURE -- usually goes through
+            // CAST_FAILED, but cover it for parity): client needs SpellPrepare
+            // to match the upcoming failure to its pending cast slot.
+            if (!pendingNormal.HasStarted)
+            {
+                SpellPrepare prepare = new();
+                prepare.ClientCastID = pendingNormal.ClientGUID;
+                prepare.ServerCastID = pendingNormal.ServerGUID;
+                SendPacketToClient(prepare);
+            }
         }
         else if (GetSession().GameState.CurrentPetGuid == casterUnit &&
-                 GetSession().GameState.PendingPetCasts.FirstOrDefault(c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId)) is { } pendingPet)
+                 GetSession().GameState.TryDequeuePendingPetCast(spellId, out var pendingPet))
         {
-            castId = pendingPet.ServerGUID;
+            castId = pendingPet!.ServerGUID;
             spellVisual = pendingPet.SpellXSpellVisualId;
             if (pendingPet.LegacySpellId != 0)
                 spellId = pendingPet.SpellId;
+            dequeued = true;
+            wasStarted = pendingPet.HasStarted;
+
+            if (!pendingPet.HasStarted)
+            {
+                SpellPrepare prepare = new();
+                prepare.ClientCastID = pendingPet.ClientGUID;
+                prepare.ServerCastID = pendingPet.ServerGUID;
+                SendPacketToClient(prepare);
+            }
         }
         else
         {
@@ -392,6 +491,16 @@ public partial class WorldClient
         spell.SpellXSpellVisualID = spellVisual;
         spell.Reason = reason;
         SendPacketToClient(spell);
+
+        Log.Event("spell.failure.routed", new
+        {
+            spellId,
+            reason,
+            isCaster = GetSession().GameState.CurrentPlayerGuid == casterUnit,
+            isPetCaster = GetSession().GameState.CurrentPetGuid == casterUnit,
+            dequeued,
+            wasStarted,
+        });
     }
 
     [PacketHandler(Opcode.SMSG_SPELL_START)]
@@ -605,7 +714,41 @@ public partial class WorldClient
 
         dbdata.SpellID = packet.ReadInt32();
         dbdata.SpellXSpellVisualID = GameData.GetSpellVisual((uint)dbdata.SpellID);
-        dbdata.CastID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, (uint)dbdata.SpellID, (ulong)dbdata.SpellID + dbdata.CasterUnit.GetCounter());
+
+        //MIRASU - For non-player/non-pet casters, we previously generated a deterministic
+        //MIRASU   CastID (spellId+casterCounter) which was identical for every cast of the
+        //MIRASU   same spell by the same mob. Modern clients assume CastIDs are unique per
+        //MIRASU   cast; reusing the ID caused visual chunks to drift, sounds to clip, and
+        //MIRASU   target-frame cast bars to ignore the dismiss on Kick interrupts.
+        //MIRASU   We now mint a unique CastID per SPELL_START and recall it on SPELL_GO so
+        //MIRASU   the entire cast lifecycle references one consistent ID.
+        var gameState = GetSession().GameState;
+        bool casterIsPlayer = dbdata.CasterUnit == gameState.CurrentPlayerGuid;
+        bool casterIsPet = dbdata.CasterUnit == gameState.CurrentPetGuid;
+        if (!casterIsPlayer && !casterIsPet)
+        {
+            var key = (dbdata.CasterUnit, (uint)dbdata.SpellID);
+            if (isSpellGo && gameState.OtherCasterActiveCastIds.TryRemove(key, out var existingCastId))
+            {
+                // Cast started before; reuse the same CastID assigned at SPELL_START.
+                dbdata.CastID = existingCastId;
+            }
+            else
+            {
+                // SPELL_START (or instant SPELL_GO with no prior start): mint a fresh unique ID.
+                uint sequence = (uint)Interlocked.Increment(ref gameState.OtherCastSequenceCounter);
+                ulong uniqueLow = ((ulong)sequence << 32) | (uint)((uint)dbdata.SpellID + dbdata.CasterUnit.GetCounter());
+                dbdata.CastID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)gameState.CurrentMapId!, (uint)dbdata.SpellID, uniqueLow);
+                if (!isSpellGo)
+                    gameState.OtherCasterActiveCastIds[key] = dbdata.CastID;
+            }
+        }
+        else
+        {
+            // Player/pet caster: keep deterministic seed; HandleSpellStart/Go will overwrite
+            // with the unique pendingCast.ServerGUID via the PendingNormalCasts queue.
+            dbdata.CastID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)gameState.CurrentMapId!, (uint)dbdata.SpellID, (ulong)dbdata.SpellID + dbdata.CasterUnit.GetCounter());
+        }
 
         // JimsProxy: emit structured spell.cast event so we can diagnose spell-ID
         // and visual-kit lookup issues without parsing .pkt files. Particularly
@@ -623,6 +766,8 @@ public partial class WorldClient
             visual_lookup_missing = dbdata.SpellXSpellVisualID == 0,
             caster_guid = dbdata.CasterGUID.ToString(),
             caster_is_player = dbdata.CasterGUID == GetSession().GameState.CurrentPlayerGuid,
+            casterCounter = dbdata.CasterUnit.GetCounter(), //MIRASU - lets us correlate with spell.failed_other.routed
+            castIdCounter = dbdata.CastID.GetCounter(),     //MIRASU - this is the CastID the modern client tracks
         });
 
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180) && LegacyVersion.RemovedInVersion(ClientVersionBuild.V3_0_2_9056) && !isSpellGo)

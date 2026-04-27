@@ -793,15 +793,21 @@ public partial class WorldClient
             moveInfo = new MovementInfo();
             moveInfo.ReadMovementInfoLegacy(packet, GetSession().GameState);
 
-            // Hovering mobs: strip falling flag so client doesn't trigger landing/ground-snap
-            float hoverHeight = GetSession().GameState.GetLegacyFieldValueFloat(guid, UnitField.UNIT_FIELD_HOVERHEIGHT);
-            if (hoverHeight > 0.0f)
+            // Vanilla 1.12 carries hover state via MovementFlagVanilla.FixedZ. Seed our
+            // hover registry from it, since some 1.12 cores never populate UNIT_FIELD_HOVERHEIGHT.
+            if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180) && moveInfo.Hover &&
+                guid != GetSession().GameState.CurrentPlayerGuid)
             {
-                moveInfo.Flags &= ~0x00000800u;
-                moveInfo.FallTime = 0;
-                moveInfo.JumpVerticalSpeed = 0.0f;
-                moveInfo.JumpHorizontalSpeed = 0.0f;
+                if (GetSession().GameState.KnownHoveringMobs.Add(guid))
+                {
+                    Framework.Logging.Log.Event("hover.detect_fixedz_flag", new
+                    {
+                        guid = guid.ToString(),
+                    });
+                }
             }
+
+            ApplyHoverOverrideIfNeeded(guid, moveInfo);
 
             var moveFlags = moveInfo.Flags;
 
@@ -1816,31 +1822,26 @@ public partial class WorldClient
                     updateData.UnitData.ShapeshiftForm = (byte)((updates[UNIT_FIELD_BYTES_1].UInt32Value >> 16) & 0xFF);
                     updateData.UnitData.VisFlags = (byte)((updates[UNIT_FIELD_BYTES_1].UInt32Value >> 24) & 0xFF);
                 }
-                // --- Mirasu Native Hover DNA ---
+                // Hovering mobs need AnimTier=Hover(2) on the modern client, otherwise
+                // the unit's anim falls back to Ground when not actively splined and
+                // basketball-bounces between flight legs. Vanilla doesn't carry AnimTier
+                // in BYTES_1, so we synthesize it from either UNIT_FIELD_HOVERHEIGHT (when
+                // the core sets it) or the KnownHoveringMobs registry (seeded from
+                // SplineFlagVanilla.Flying / MovementFlagVanilla.FixedZ).
                 float hoverHeight = 0.0f;
                 int hoverField = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_HOVERHEIGHT);
-
                 if (hoverField >= 0 && updateMaskArray[hoverField])
-                {
                     hoverHeight = updates[hoverField].FloatValue;
-                }
                 else
-                {
                     hoverHeight = Session.GameState.GetLegacyFieldValueFloat(guid, UnitField.UNIT_FIELD_HOVERHEIGHT);
-                }
 
-                if (hoverHeight > 0.0f)
+                bool isHovering = hoverHeight > 0.0f || Session.GameState.KnownHoveringMobs.Contains(guid);
+                if (isHovering)
                 {
-                    // 1. REVERT TO HOVER (2)
                     updateData.UnitData.AnimTier = 2;
-
-                    // 2. KEEP THE HOVER HEIGHT!
-                    // This naturally lifts the collision box off the NavMesh, 
-                    // permanently killing the upward bouncing panic!
-                    updateData.UnitData.HoverHeight = hoverHeight;
+                    if (hoverHeight > 0.0f)
+                        updateData.UnitData.HoverHeight = hoverHeight;
                 }
-                // -------------------------------------
-
             }
             int UNIT_FIELD_PETNUMBER = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_PETNUMBER);
             if (UNIT_FIELD_PETNUMBER >= 0 && updateMaskArray[UNIT_FIELD_PETNUMBER])

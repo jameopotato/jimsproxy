@@ -41,11 +41,9 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_LOOT_MONEY)]
     void HandleLootMoney(LootMoney loot)
     {
-        WorldPacket packet = new WorldPacket(Opcode.CMSG_LOOT_MONEY);
-        SendPacketToServer(packet);
-
-        //MIRASU - Kronos/TC-1.12 doesn't send SMSG_LOOT_MONEY_NOTIFY back; synthesize it so the 1.14 client prints the chat line.
-        //MIRASU   The 1.12 client didn't need this because it printed the line locally when sending CMSG_LOOT_MONEY.
+        //MIRASU - Synthesize SMSG_LOOT_MONEY_NOTIFY BEFORE forwarding to Kronos so the chat line isn't gated
+        //MIRASU   behind the synchronous encrypted write to the legacy server socket. Native 1.12 clients
+        //MIRASU   printed this line locally on CMSG send (zero latency); reordering here matches that timing.
         uint coins = GetSession().GameState.CurrentLootCoins;
         if (coins > 0 && !LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
         {
@@ -55,6 +53,9 @@ public partial class WorldSocket
             SendPacket(notify);
             GetSession().GameState.CurrentLootCoins = 0; //MIRASU - consume so we don't double-print if client sends CMSG_LOOT_MONEY again
         }
+
+        WorldPacket packet = new WorldPacket(Opcode.CMSG_LOOT_MONEY);
+        SendPacketToServer(packet);
     }
 
     [PacketHandler(Opcode.CMSG_SET_LOOT_METHOD)]

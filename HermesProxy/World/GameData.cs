@@ -40,6 +40,11 @@ public static partial class GameData
     public static Dictionary<uint, uint> LegacyToModernSpellId = [];
     public static FrozenDictionary<uint, uint> ItemEnchantVisuals = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, uint> SpellVisuals = FrozenDictionary<uint, uint>.Empty;
+    //MIRASU - SpellXSpellVisualID -> SpellVisualID. Needed by SMSG_CANCEL_SPELL_VISUAL,
+    //MIRASU   which references SpellVisual.dbc record IDs (e.g. 13 for the canonical
+    //MIRASU   Frostbolt visual), not the SpellXSpellVisual wrapper IDs we look up via
+    //MIRASU   GetSpellVisual. Used to dismiss target-frame cast bars on mob interrupts.
+    public static FrozenDictionary<uint, uint> SpellXSpellVisualToSpellVisual = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, uint> LearnSpells = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, uint> TotemSpells = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, uint> Gems = FrozenDictionary<uint, uint>.Empty;
@@ -191,6 +196,25 @@ public static partial class GameData
         return 0;
     }
 
+    // JimsProxy: Kronos 1.12 ships DisplayIDs for some items that have no matching
+    // ItemAppearance row in modern reference data. The 1.14 char-select renderer goes
+    // through ItemAppearance and silently drops the slot when resolution fails — visible
+    // as "helm not showing on the character login screen". This table maps Kronos's wire
+    // DisplayID to the modern reference DisplayID for the same item, so the
+    // SMSG_ENUM_CHARACTERS_RESULT handler can substitute before forwarding to the client.
+    // Promote to a CSV at HermesProxy/CSV/KronosDisplayIdOverrides{N}.csv if the list
+    // ever grows past a handful.
+    public static readonly FrozenDictionary<uint, uint> KronosDisplayIdOverrides =
+        new Dictionary<uint, uint>
+        {
+            { 35612, 36972 }, // Item 22428 "Redemption Headpiece" — paladin T2 helm
+        }.ToFrozenDictionary();
+
+    public static bool TryGetKronosDisplayIdOverride(uint kronosDisplayId, out uint modernDisplayId)
+    {
+        return KronosDisplayIdOverrides.TryGetValue(kronosDisplayId, out modernDisplayId);
+    }
+
     public static ItemAppearance? GetItemAppearanceByDisplayId(uint displayId)
     {
         foreach (var item in ItemAppearanceStore)
@@ -316,6 +340,16 @@ public static partial class GameData
         uint visual;
         if (SpellVisuals.TryGetValue(spellId, out visual))
             return visual;
+        return 0;
+    }
+
+    //MIRASU - Resolves a SpellXSpellVisualID (the wrapper ID emitted in SMSG_SPELL_START)
+    //MIRASU   into the underlying SpellVisualID (the value SMSG_CANCEL_SPELL_VISUAL needs).
+    //MIRASU   Returns 0 if no mapping is loaded for the current expansion.
+    public static uint GetSpellVisualIdFromXSpellVisual(uint spellXSpellVisualId)
+    {
+        if (SpellXSpellVisualToSpellVisual.TryGetValue(spellXSpellVisualId, out uint visualId))
+            return visualId;
         return 0;
     }
 
@@ -614,6 +648,7 @@ public static partial class GameData
             LoadChatChannels,
             LoadItemEnchantVisuals,
             LoadSpellVisuals,
+            LoadSpellVisualResolved,
             LoadLearnSpells,
             LoadTotemSpells,
             LoadGems,
@@ -1052,6 +1087,33 @@ public static partial class GameData
             dict.Add(spellId, visualId);
         }
         SpellVisuals = dict.ToFrozenDictionary();
+    }
+
+    //MIRASU - Loads the SpellXSpellVisualID -> SpellVisualID mapping used by
+    //MIRASU   SMSG_CANCEL_SPELL_VISUAL. The CSV is missing-tolerant: if the file
+    //MIRASU   isn't present for the current expansion (e.g. TBC/WotLK haven't been
+    //MIRASU   regenerated yet), the mapping stays empty and the cancel-visual path
+    //MIRASU   degrades to no-op rather than crashing.
+    //MIRASU   To regenerate against a newer Classic client build:
+    //MIRASU     1. Pull SpellXSpellVisual.<build>.csv from wago.tools / wow.tools
+    //MIRASU     2. awk -F',' 'NR==1{print "ID,SpellVisualID"} NR>1{print $1","$3}' \
+    //MIRASU          SpellXSpellVisual.<build>.csv > HermesProxy/CSV/SpellVisualResolved<exp>.csv
+    public static void LoadSpellVisualResolved()
+    {
+        var path = Path.Combine("CSV", $"SpellVisualResolved{ModernVersion.ExpansionVersion}.csv");
+        if (!File.Exists(path))
+            return;
+
+        using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+        var dict = new Dictionary<uint, uint>(EstimateRowCount(path, 18));
+
+        foreach (var row in reader)
+        {
+            uint xVisualId = uint.Parse(row[0].Span);
+            uint spellVisualId = uint.Parse(row[1].Span);
+            dict[xVisualId] = spellVisualId;
+        }
+        SpellXSpellVisualToSpellVisual = dict.ToFrozenDictionary();
     }
 
     public static void LoadLearnSpells()

@@ -447,11 +447,28 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             Log.PrintNet(LogType.Error, LogNetDir.P2C, $"Can't send {packet.GetUniversalOpcode()}, socket is closed!");
             if (GetSession() != null)
             {
-                if (GetSession().RealmSocket == this)
+                bool wasRealmSocket = GetSession().RealmSocket == this;
+                bool wasInstanceSocket = GetSession().InstanceSocket == this;
+                if (wasRealmSocket)
                     GetSession().RealmSocket = null!;
-                else if (GetSession().InstanceSocket == this)
+                else if (wasInstanceSocket)
                     GetSession().InstanceSocket = null!;
-                GetSession().OnDisconnect();
+                // JimsProxy realm-swap fix: previously GetSession().OnDisconnect() ran
+                // unconditionally here, tearing down AuthClient + WorldClient + GameState
+                // whenever ANY per-realm socket entered its send-on-closed path. The
+                // 2026-04-26 bundle showed this firing 153ms after the new realm's
+                // WorldClient came up during a PTR↔Live swap, killing the new connection
+                // mid-handshake. Per-realm-socket closure no longer cascades to global
+                // teardown; the BNet account session lives on so the swap can complete.
+                // Legitimate full-session teardown still runs from BnetSessionTicketStorage
+                // when the BNet TCP itself disconnects.
+                Log.Event("session.ondisconnect.suppressed", new
+                {
+                    reason = "worldsocket_send_on_closed",
+                    was_realm_socket = wasRealmSocket,
+                    was_instance_socket = wasInstanceSocket,
+                    packet = packet.GetUniversalOpcode().ToString(),
+                });
             }
             return;
         }
@@ -572,7 +589,14 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             SendAuthResponseError(BattlenetRpcErrorCode.BadVersion);
             Log.Print(LogType.Error, $"WorldSocket.HandleAuthSessionCallback: Missing auth seed for realm build {GetSession().Build} ({GetRemoteIpAddress()}).");
             CloseSocket();
-            GetSession().OnDisconnect();
+            // JimsProxy realm-swap fix: per-realm auth failure no longer tears down the
+            // BNet account session — modern client gets BadVersion and can pick a different
+            // realm without losing the BNet socket. See WorldSocket.SendPacket fix.
+            Log.Event("session.ondisconnect.suppressed", new
+            {
+                reason = "auth_session_missing_buildinfo",
+                realm_build = GetSession().Build,
+            });
             return;
         }
 
@@ -597,7 +621,12 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         {
             Log.Print(LogType.Error, $"WorldSocket.HandleAuthSession: Unknown OS for account: {GetSession().GameAccountInfo.Id} ('{authSession.RealmJoinTicket}') address: {address}");
             CloseSocket();
-            GetSession().OnDisconnect();
+            // JimsProxy realm-swap fix: see WorldSocket.SendPacket fix.
+            Log.Event("session.ondisconnect.suppressed", new
+            {
+                reason = "auth_session_unknown_os",
+                reported_os = GetSession().OS,
+            });
             return;
         }
         
@@ -609,7 +638,11 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             {
                 Log.Print(LogType.Error, $"WorldSocket.HandleAuthSession: Authentication failed for account: {GetSession().GameAccountInfo.Id} ('{authSession.RealmJoinTicket}') address: {address}");
                 CloseSocket();
-                GetSession().OnDisconnect();
+                // JimsProxy realm-swap fix: see WorldSocket.SendPacket fix.
+                Log.Event("session.ondisconnect.suppressed", new
+                {
+                    reason = "auth_session_hmac_failed",
+                });
                 return;
             }
         }
@@ -639,6 +672,23 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         Log.Print(LogType.Server, $"WorldSocket:HandleAuthSession: Client '{authSession.RealmJoinTicket}' authenticated successfully from {address}.");
 
         _realmId = new RealmId((byte)authSession.RegionID, (byte)authSession.BattlegroupID, authSession.RealmID);
+
+        // JimsProxy: realm-swap diagnostics. If a previous WorldClient is still attached
+        // to the session at this point, the proxy is creating a second one alongside it
+        // — the old one isn't disconnected anywhere on the swap path, so it lingers until
+        // GC or the legacy server times out. Surface this so the bundle shows whether
+        // orphan WorldClients are happening on real swaps.
+        var previousWorldClient = GetSession().WorldClient;
+        if (previousWorldClient != null)
+        {
+            Log.Event("realm.swap.worldclient_orphan", new
+            {
+                previous_was_connected = previousWorldClient.IsConnected(),
+                previous_was_authenticated = previousWorldClient.IsAuthenticated(),
+                new_realm_index = (uint)_realmId.Index,
+            });
+        }
+
         GetSession().WorldClient = new Client.WorldClient();
         if (!GetSession().WorldClient!.ConnectToWorldServer(GetSession().RealmManager.GetRealm(_realmId)!, GetSession()))
         {
@@ -646,7 +696,15 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             Log.Print(LogType.Error, "The WorldClient failed to connect to the selected world server!");
             Session.AccountMetaDataMgr.InvalidateLastSelectedCharacter();
             CloseSocket();
-            GetSession().OnDisconnect();
+            // JimsProxy realm-swap fix: dead WorldClient just got nulled in-place; don't
+            // tear down the rest of the BNet session. Modern client gets BadServer and
+            // can pick a different realm. See WorldSocket.SendPacket fix.
+            GetSession().WorldClient = null;
+            Log.Event("session.ondisconnect.suppressed", new
+            {
+                reason = "worldclient_connect_failed",
+                realm_index = (uint)_realmId.Index,
+            });
             return;
         }
 

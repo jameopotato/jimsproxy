@@ -228,7 +228,19 @@ public partial class WorldClient
         else
         {
             Disconnect();
-            GetSession().OnDisconnect();
+            // JimsProxy realm-swap fix: previously called GetSession().OnDisconnect()
+            // here, which tore down the entire BNet session including any newly-created
+            // WorldClient for a different realm during a swap. Now: only null our slot
+            // if it's still pointing at us (a fresh swap may have already replaced it
+            // with a new WorldClient — don't clobber that).
+            var session = GetSession();
+            if (session != null && ReferenceEquals(session.WorldClient, this))
+                session.WorldClient = null;
+            Log.Event("session.ondisconnect.suppressed", new
+            {
+                reason = "worldclient_legacy_disconnect",
+                disconnect_reason = reason,
+            });
         }
     }
 
@@ -281,7 +293,16 @@ public partial class WorldClient
             else
             {
                 Disconnect();
-                GetSession().OnDisconnect();
+                // JimsProxy realm-swap fix: see WorldClient.HandleDisconnect.
+                var session = GetSession();
+                if (session != null && ReferenceEquals(session.WorldClient, this))
+                    session.WorldClient = null;
+                Log.Event("session.ondisconnect.suppressed", new
+                {
+                    reason = "worldclient_receive_loop_exception",
+                    exception_type = e.GetType().Name,
+                    exception_message = e.Message,
+                });
             }
         }
     }

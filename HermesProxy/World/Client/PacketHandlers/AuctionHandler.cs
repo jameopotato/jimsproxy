@@ -1,4 +1,5 @@
-﻿using HermesProxy.Enums;
+﻿using Framework.Logging;
+using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
@@ -111,6 +112,22 @@ public partial class WorldClient
         auction.TotalItemsCount = packet.ReadInt32();
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_3_0_7561))
             auction.DesiredDelay = packet.ReadUInt32();
+
+        //MIRASU: Floor DesiredDelay at the proxy's own auction-search cooldown so the modern
+        //MIRASU: client's Search-button grey-out never re-enables before the proxy will
+        //MIRASU: actually accept the next query. Kronos's value (when present) tends to be
+        //MIRASU: lower than the canonical 6s vanilla cooldown we enforce.
+        const uint MinDesiredDelayMs = 6000;
+        if (auction.DesiredDelay < MinDesiredDelayMs)
+            auction.DesiredDelay = MinDesiredDelayMs;
+
+        Log.Event("auction.list.result", new
+        {
+            items_returned = auction.Items.Count,
+            total_items_count = auction.TotalItemsCount,
+            desired_delay_ms = auction.DesiredDelay,
+        });
+
         SendPacketToClient(auction);
     }
 
