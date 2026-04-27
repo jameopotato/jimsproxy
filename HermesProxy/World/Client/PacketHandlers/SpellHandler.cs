@@ -695,6 +695,13 @@ public partial class WorldClient
             }
         }
 
+        // Vanilla 1.12 doesn't include SpellCastLogData in SMSG_SPELL_GO, but the
+        // modern 1.14 client needs it present to populate CLEU spell IDs. Without it,
+        // CombatLogGetCurrentEventInfo() returns spellId=0 for non-self spells, breaking
+        // every addon that reads CLEU spell IDs (damage meters, cast bars, WeakAuras).
+        if (spell.LogData == null)
+            spell.LogData = new SpellCastLogData();
+
         SendPacketToClient(spell);
     }
 
@@ -1066,6 +1073,78 @@ public partial class WorldClient
         }
 
         SendPacketToClient(spell);
+    }
+
+    [PacketHandler(Opcode.SMSG_SPELL_EXECUTE_LOG)]
+    void HandleSpellExecuteLog(WorldPacket packet)
+    {
+        var casterGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
+        uint spellId = packet.ReadUInt32();
+        uint effectCount = packet.ReadUInt32();
+
+        Log.Print(LogType.Server, $"SpellExecuteLog: caster={casterGuid} spell={spellId} effects={effectCount}");
+
+        for (uint i = 0; i < effectCount; i++)
+        {
+            uint effectType = packet.ReadUInt32();
+            uint targetCount = packet.ReadUInt32();
+
+            Log.Print(LogType.Server, $"  Effect[{i}]: type={effectType} targets={targetCount}");
+
+            for (uint t = 0; t < targetCount; t++)
+            {
+                switch (effectType)
+                {
+                    case 8: // POWER_DRAIN
+                        var pdGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
+                        uint pdAmount = packet.ReadUInt32();
+                        uint pdPowerType = packet.ReadUInt32();
+                        float pdMultiplier = packet.ReadFloat();
+                        Log.Print(LogType.Server, $"PowerDrain: target={pdGuid} amount={pdAmount} power={pdPowerType}");
+                        break;
+                    case 10: // HEAL
+                        var hGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
+                        uint hAmount = packet.ReadUInt32();
+                        uint hCrit = packet.ReadUInt32();
+                        Log.Print(LogType.Server, $"Heal: target={hGuid} amount={hAmount} crit={hCrit}");
+                        break;
+                    case 30: // ENERGIZE
+                        var eGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
+                        uint eAmount = packet.ReadUInt32();
+                        uint ePowerType = packet.ReadUInt32();
+                        Log.Print(LogType.Server, $"Energize: target={eGuid} amount={eAmount} power={ePowerType}");
+                        break;
+                    case 32: // EXTRA_ATTACKS (vanilla value 32)
+                        var eaGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
+                        uint eaCount = packet.ReadUInt32();
+                        Log.Print(LogType.Server, $"ExtraAttacks: target={eaGuid} count={eaCount}");
+                        break;
+                    case 24: // CREATE_ITEM
+                        uint ciItemId = packet.ReadUInt32();
+                        Log.Print(LogType.Server, $"CreateItem: item={ciItemId}");
+                        break;
+                    case 41: // INTERRUPT_CAST
+                        var icGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
+                        uint icSpellId = packet.ReadUInt32();
+                        Log.Print(LogType.Server, $"InterruptCast: target={icGuid} spell={icSpellId}");
+                        break;
+                    case 101: // FEED_PET
+                        uint fpItemId = packet.ReadUInt32();
+                        Log.Print(LogType.Server, $"FeedPet: item={fpItemId}");
+                        break;
+                    case 113: // DURABILITY_DAMAGE
+                        var ddGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
+                        uint ddItemId = packet.ReadUInt32();
+                        uint ddAmount = packet.ReadUInt32();
+                        Log.Print(LogType.Server, $"DurabilityDmg: target={ddGuid} item={ddItemId} amount={ddAmount}");
+                        break;
+                    default: // INSTAKILL, RESURRECT, DISPEL, SUMMON, etc — just a GUID
+                        var defaultGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
+                        Log.Print(LogType.Server, $"Default(type={effectType}): target={defaultGuid}");
+                        break;
+                }
+            }
+        }
     }
 
     [PacketHandler(Opcode.SMSG_SPELL_HEAL_LOG)]
