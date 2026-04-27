@@ -216,7 +216,11 @@ public class AuctionListItemsResult : ServerPacket
 
     public List<AuctionItem> Items = new();
     public int TotalItemsCount;
-    public uint DesiredDelay = 5000;
+    //MIRASU: Match the proxy's AuctionSearchCooldownSeconds (6s) so the modern client's
+    //MIRASU: Search-button grey-out lines up with when the proxy will actually accept the
+    //MIRASU: next query. With a shorter delay the button re-enables early and a click
+    //MIRASU: inside the proxy cooldown window gets silently dropped, hanging the UI.
+    public uint DesiredDelay = 6000;
     public bool OnlyUsable;
 }
 

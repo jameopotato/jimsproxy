@@ -14,7 +14,11 @@ namespace HermesProxy.World.Server;
 
 public partial class WorldSocket
 {
-    // Track the last search time to mimic the Vanilla 6-second cooldown
+    // Track the last search time to mimic the Vanilla 6-second cooldown. Kronos enforces
+    // its own per-session cooldown server-side and will drop the WorldClient if too many
+    // rapid queries arrive (observed 5.7s spacing causing a kick). Use the canonical 6s
+    // window so we never trip Kronos's anti-flood.
+    private const double AuctionSearchCooldownSeconds = 6.0;
     private DateTime _lastSearchTime = DateTime.MinValue;
 
     [PacketHandler(Opcode.CMSG_AUCTION_HELLO_REQUEST)]
@@ -51,9 +55,92 @@ public partial class WorldSocket
     void HandleAuctionListItems(AuctionListItems auction)
     {
         var now = DateTime.UtcNow;
-        if ((now - _lastSearchTime).TotalSeconds < 4)
+        if ((now - _lastSearchTime).TotalSeconds < AuctionSearchCooldownSeconds)
             return;
         _lastSearchTime = now;
+
+        // Kronos has its own per-session search cooldown (canonical vanilla 6s) and
+        // silently drops queries that arrive too quickly — kicking the WorldClient if
+        // we keep hammering — so we can only ever send ONE CMSG_AUCTION_LIST_ITEMS per
+        // click. Translation rules for the legacy triple
+        // (inventorySlot, itemMainCategory, itemSubCategory):
+        //   - Armor sub-slot buttons (Head, Shoulders, Legs, Feet, Hands, Wrists, Waist,
+        //     Trinket, Cloak, Tabard, Shirt) — modern client sends a single-bit
+        //     InvTypeMask. We forward that bit as the legacy INVTYPE so the server
+        //     narrows correctly.
+        //   - Multi-bit slots (Chest = CHEST + ROBE, MainHand = WEAPON + 2HWEAPON +
+        //     WEAPONMAINHAND, OffHand, Ranged) — legacy server only takes one INVTYPE
+        //     and Kronos's throttle rules out splitting into multiple queries, so we
+        //     fall back to slot = -1 and accept that the result is broader than the
+        //     filter button suggests.
+        //   - Weapons categories — modern client sets InvTypeMask = 0xFFFFFFFF (any
+        //     slot), which trips the multi-bit fallback to -1; that's intentional and
+        //     matches the existing working behavior because the weapon ItemSubclass
+        //     (1H Sword, 2H Axe, etc.) is already specific enough on its own.
+        int legacyMainCategory = -1;
+        int legacySubCategory = -1;
+        int legacyInventorySlot = -1;
+        uint unionInvTypeMask = 0;
+
+        if (auction.ClassFilters.Count > 0)
+        {
+            var firstClass = auction.ClassFilters[0];
+            legacyMainCategory = firstClass.ItemClass;
+
+            if (firstClass.SubClassFilters.Count > 0)
+            {
+                int commonSubclass = firstClass.SubClassFilters[0].ItemSubclass;
+                foreach (var sub in firstClass.SubClassFilters)
+                {
+                    if (sub.ItemSubclass != commonSubclass)
+                        commonSubclass = -1;
+                    unionInvTypeMask |= sub.InvTypeMask;
+                }
+                legacySubCategory = commonSubclass;
+
+                // Single-bit mask -> use it as the legacy INVTYPE for proper slot
+                // narrowing. Multi-bit (or all-bits) -> leave -1 (any slot) by default.
+                if (unionInvTypeMask != 0 && (unionInvTypeMask & (unionInvTypeMask - 1)) == 0)
+                {
+                    legacyInventorySlot = BitOperations.TrailingZeroCount(unionInvTypeMask);
+                }
+                else
+                {
+                    // Targeted heuristic for the Armor "Chest" button which the modern
+                    // client sends as CHEST(5) | ROBE(20) = 0x100020. Kronos can't accept
+                    // both INVTYPEs in one query, so pick whichever is most likely to
+                    // hold the user's expected results given the chosen subclass:
+                    //   Cloth (subclass 1) -> INVTYPE_ROBE (vanilla cloth chests are
+                    //     overwhelmingly robes; misses the rare cloth INVTYPE_CHEST tunic)
+                    //   Leather/Mail/Plate -> INVTYPE_CHEST (the inverse — these almost
+                    //     never use INVTYPE_ROBE)
+                    // Other multi-bit masks (MainHand/OffHand/Ranged) keep the -1
+                    // fallback because there's no clean single-INVTYPE heuristic.
+                    const uint chestRobeMask = (1u << 5) | (1u << 20);
+                    if (unionInvTypeMask == chestRobeMask && legacyMainCategory == 4)
+                        legacyInventorySlot = (legacySubCategory == 1) ? 20 : 5;
+                }
+            }
+        }
+
+        Log.Event("auction.list.filter", new
+        {
+            modern_class_filters = auction.ClassFilters.Count,
+            modern_item_class = auction.ClassFilters.Count > 0
+                ? (int?)auction.ClassFilters[0].ItemClass : null,
+            modern_subclass_count = auction.ClassFilters.Count > 0
+                ? auction.ClassFilters[0].SubClassFilters.Count : 0,
+            modern_first_subclass = (auction.ClassFilters.Count > 0
+                                     && auction.ClassFilters[0].SubClassFilters.Count > 0)
+                ? (int?)auction.ClassFilters[0].SubClassFilters[0].ItemSubclass : null,
+            modern_invtype_mask_union = unionInvTypeMask,
+            legacy_inventory_slot = legacyInventorySlot,
+            legacy_main_category = legacyMainCategory,
+            legacy_sub_category = legacySubCategory,
+            quality = auction.Quality,
+            only_usable = auction.OnlyUsable,
+            name = auction.Name
+        });
 
         WorldPacket packet = new WorldPacket(Opcode.CMSG_AUCTION_LIST_ITEMS);
         packet.WriteGuid(auction.Auctioneer.To64());
@@ -61,29 +148,9 @@ public partial class WorldSocket
         packet.WriteCString(auction.Name);
         packet.WriteUInt8(auction.MinLevel);
         packet.WriteUInt8(auction.MaxLevel);
-
-        if (auction.ClassFilters.Count > 0)
-        {
-            if (auction.ClassFilters[0].SubClassFilters.Count == 1)
-            {
-                packet.WriteInt32(-1); // Force "Any Slot" so TrinityCore doesn't get confused!
-                packet.WriteInt32(auction.ClassFilters[0].ItemClass);
-                packet.WriteInt32(auction.ClassFilters[0].SubClassFilters[0].ItemSubclass);
-            }
-            else
-            {
-                packet.WriteInt32(-1); // inventorySlotId
-                packet.WriteInt32(auction.ClassFilters[0].ItemClass);
-                packet.WriteInt32(-1); // auctionSubCategory
-            }
-        }
-        else
-        {
-            packet.WriteInt32(-1); // inventorySlotId
-            packet.WriteInt32(-1); // auctionMainCategory
-            packet.WriteInt32(-1); // auctionSubCategory
-        }
-
+        packet.WriteInt32(legacyInventorySlot);
+        packet.WriteInt32(legacyMainCategory);
+        packet.WriteInt32(legacySubCategory);
         packet.WriteInt32(auction.Quality);
         packet.WriteBool(auction.OnlyUsable);
 
