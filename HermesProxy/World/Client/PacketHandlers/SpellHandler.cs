@@ -1219,6 +1219,17 @@ public partial class WorldClient
         channel.SpellID = packet.ReadUInt32();
         channel.SpellXSpellVisualID = GameData.GetSpellVisual(channel.SpellID);
         channel.Duration = packet.ReadUInt32();
+
+        //MIRASU - diagnostic so bundles can confirm whether vanilla emits MSG_CHANNEL_START
+        //MIRASU   for any non-self caster. Expected to always be self in 1.12.
+        Log.Event("channel.msg_start.received", new
+        {
+            caster_guid = channel.CasterGUID.ToString(),
+            spell_id = channel.SpellID,
+            duration_ms = channel.Duration,
+            is_self = channel.CasterGUID == GetSession().GameState.CurrentPlayerGuid,
+        });
+
         SendPacketToClient(channel);
     }
 

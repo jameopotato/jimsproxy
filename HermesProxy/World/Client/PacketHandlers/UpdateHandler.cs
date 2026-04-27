@@ -1884,6 +1884,78 @@ public partial class WorldClient
             {
                 int spellId = updates[UNIT_CHANNEL_SPELL].Int32Value;
                 updateData.UnitData.ChannelData = new UnitChannel(spellId, (int)GameData.GetSpellVisual((uint)spellId));
+
+                //MIRASU: Vanilla 1.12 sends MSG_CHANNEL_START only to the casting player.
+                //MIRASU   For other observers (you targeting a channeling player/NPC) the
+                //MIRASU   channel arrives only via UpdateField, but the modern 1.14 client
+                //MIRASU   gates the target-frame channel cast bar on SMSG_SPELL_CHANNEL_START.
+                //MIRASU   Detect 0<->spellId transitions on non-self units and synthesize
+                //MIRASU   the start packet so the cast bar renders. End/switch is implicit
+                //MIRASU   via the UpdateField clearing.
+                //MIRASU - Explicit Low+High comparison; we observed the auto-generated record
+                //MIRASU   `==` returning false for what looked like identical GUIDs in a prior
+                //MIRASU   bundle, so we compare the underlying scalars directly to be safe.
+                var cpg = GetSession().GameState.CurrentPlayerGuid;
+                bool isSelf = guid.Low == cpg.Low && guid.High == cpg.High;
+                bool isPlayerObject = objectType == ObjectType.Player || objectType == ObjectType.ActivePlayer;
+
+                var activeChannels = GetSession().GameState.OtherCasterActiveChannels;
+                activeChannels.TryGetValue(guid, out uint previousSpellId);
+                uint currentSpellId = (uint)spellId;
+
+                string transition = previousSpellId == 0 && currentSpellId != 0 ? "start"
+                                  : previousSpellId != 0 && currentSpellId == 0 ? "end"
+                                  : previousSpellId != currentSpellId ? "switch"
+                                  : "same";
+
+                Log.Event("channel.update_field.observed", new
+                {
+                    target_guid_low = guid.Low,
+                    target_guid_high = guid.High,
+                    cpg_low = cpg.Low,
+                    cpg_high = cpg.High,
+                    is_self = isSelf,
+                    is_player_object = isPlayerObject,
+                    object_type = objectType.ToString(),
+                    previous_spell_id = previousSpellId,
+                    current_spell_id = currentSpellId,
+                    transition,
+                });
+
+                if (!isSelf)
+                {
+                    if (currentSpellId == 0)
+                    {
+                        activeChannels.TryRemove(guid, out _);
+                    }
+                    else if (previousSpellId != currentSpellId)
+                    {
+                        // start or switch — emit a fresh SMSG_SPELL_CHANNEL_START
+                        int auraDuration = GameData.GetAuraSpellDuration(currentSpellId);
+                        int duration = auraDuration > 0 ? auraDuration : 5000;
+
+                        SpellChannelStart channelStart = new()
+                        {
+                            CasterGUID = guid,
+                            SpellID = currentSpellId,
+                            SpellXSpellVisualID = GameData.GetSpellVisual(currentSpellId),
+                            Duration = (uint)duration,
+                        };
+                        SendPacketToClient(channelStart);
+
+                        activeChannels[guid] = currentSpellId;
+
+                        Log.Event("channel.synthesized.start", new
+                        {
+                            target_guid_low = guid.Low,
+                            target_guid_high = guid.High,
+                            spell_id = currentSpellId,
+                            spell_visual_id = channelStart.SpellXSpellVisualID,
+                            duration_ms = duration,
+                            duration_was_fallback = auraDuration <= 0,
+                        });
+                    }
+                }
             }
             int UNIT_MOD_CAST_SPEED = LegacyVersion.GetUpdateField(UnitField.UNIT_MOD_CAST_SPEED);
             if (UNIT_MOD_CAST_SPEED >= 0 && updateMaskArray[UNIT_MOD_CAST_SPEED])

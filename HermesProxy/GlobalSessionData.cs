@@ -122,6 +122,13 @@ public sealed class GameSessionData
     public ConcurrentDictionary<(WowGuid128 caster, uint spellId), WowGuid128> OtherCasterActiveCastIds = new();
     //MIRASU - monotonic sequence used to make non-player CastIDs unique per cast.
     public int OtherCastSequenceCounter;
+    //MIRASU - Tracks the last-observed UNIT_CHANNEL_SPELL value per non-self unit so we can
+    //MIRASU   detect 0->spellId (start), spellId->0 (end), and spellId->different (switch)
+    //MIRASU   transitions. Vanilla 1.12 only sends MSG_CHANNEL_START to the casting player;
+    //MIRASU   for everyone else the channel state lives in UpdateFields. The modern 1.14 client
+    //MIRASU   gates the target-frame channel cast bar on receiving SMSG_SPELL_CHANNEL_START,
+    //MIRASU   not on UpdateField presence alone, so we synthesize it on observed transitions.
+    public ConcurrentDictionary<WowGuid128, uint> OtherCasterActiveChannels = new();
     public WowGuid64 LastLootTargetGuid;
     public Dictionary<(uint QuestID, sbyte StorageIndex), uint> QuestItemObjectiveProgress = new(); //MIRASU - proxy-local running totals for quest item pickups; legacy update-field cache isn't refreshed on partial updates, so we track ourselves
     public uint CurrentLootCoins; //MIRASU - remembers coin amount from SMSG_LOOT_RESPONSE so proxy can synthesize SMSG_LOOT_MONEY_NOTIFY when client picks up gold (Kronos/TC-1.12 doesn't emit it)
