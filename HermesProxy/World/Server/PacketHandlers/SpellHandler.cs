@@ -179,8 +179,31 @@ public partial class WorldSocket
             {
                 // Check if there's already a cast in progress - reject without forwarding to server
                 // This prevents interrupting the current cast (player gets "Another action is in progress")
-                if (GetSession().GameState.HasStartedNormalCast())
+                var inFlightCast = GetSession().GameState.GetStartedNormalCast();
+                if (inFlightCast != null)
                 {
+                    // JimsProxy: re-clicking the spell currently being cast (e.g. mount cancel).
+                    // Without this branch, the modern client locally dismisses its cast bar on the
+                    // CastFailed(SpellInProgress) reply, but Kronos never received any signal to
+                    // abort -- so the original cast continues to completion and the mount/spell
+                    // applies even though the bar already disappeared. Forward CMSG_CANCEL_CAST
+                    // to Kronos for the in-flight cast; the resulting SMSG_SPELL_FAILURE gets
+                    // routed back through the normal failure path to clean up server-side state.
+                    if (inFlightCast.SpellId == cast.Cast.SpellID)
+                    {
+                        WorldPacket cancelPacket = new WorldPacket(Opcode.CMSG_CANCEL_CAST);
+                        if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
+                            cancelPacket.WriteUInt8(0);
+                        cancelPacket.WriteUInt32((uint)cast.Cast.SpellID);
+                        SendPacketToServer(cancelPacket);
+
+                        Log.Event("spell.recast_cancel", new
+                        {
+                            spell_id = cast.Cast.SpellID,
+                            in_flight_held_for_ms = Environment.TickCount - inFlightCast.Timestamp,
+                        });
+                    }
+
                     SendCastRequestFailed(castRequest, false);
                     return;
                 }
@@ -374,6 +397,41 @@ public partial class WorldSocket
         uint legacySpellId = GetSession().GameState.GetLegacyItemSpellId(use.CastItem, use.Cast.SpellID);
         if (legacySpellId != 0)
             castRequest.LegacySpellId = legacySpellId;
+
+        // JimsProxy: re-clicking a mount/cast-time item while it's already being cast
+        // (e.g. clicking the mount tome twice during the 3s summon). Without this gate the
+        // proxy forwards both USE_ITEMs to Kronos, the second is rejected with
+        // SMSG_SPELL_FAILURE for the same SpellID, and HandleSpellFailure's FIFO
+        // TryDequeuePendingNormalCast dequeues the OLDEST match -- which is the in-flight
+        // cast, not the rejected duplicate. The modern client then receives SpellFailure
+        // bound to the first cast's IDs (cast bar dismisses), but Kronos's original mount
+        // cast was never cancelled and still completes -- the mount aura applies even
+        // though the bar disappeared. Fix: detect duplicate-spell-while-casting and cancel
+        // the in-flight cast server-side; fail the new attempt locally so its client-side
+        // cast tracking is released cleanly.
+        var inFlightCast = GetSession().GameState.GetStartedNormalCast();
+        if (inFlightCast != null &&
+            (inFlightCast.SpellId == use.Cast.SpellID ||
+             (inFlightCast.LegacySpellId != 0 && legacySpellId != 0 && inFlightCast.LegacySpellId == legacySpellId)))
+        {
+            uint cancelSpellId = legacySpellId != 0 ? legacySpellId : (uint)use.Cast.SpellID;
+            WorldPacket cancelPacket = new WorldPacket(Opcode.CMSG_CANCEL_CAST);
+            if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
+                cancelPacket.WriteUInt8(0);
+            cancelPacket.WriteUInt32(cancelSpellId);
+            SendPacketToServer(cancelPacket);
+
+            Log.Event("item.recast_cancel", new
+            {
+                spell_id = use.Cast.SpellID,
+                legacy_spell_id = legacySpellId,
+                cancel_spell_id = cancelSpellId,
+                in_flight_held_for_ms = Environment.TickCount - inFlightCast.Timestamp,
+            });
+
+            SendCastRequestFailed(castRequest, false);
+            return;
+        }
 
         // Enqueue the cast - responses will be matched by SpellId (or LegacySpellId) in FIFO order
         GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);

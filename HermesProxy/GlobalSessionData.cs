@@ -698,6 +698,21 @@ public sealed class GameSessionData
     }
 
     /// <summary>
+    /// Returns the in-flight (started) normal cast if any. Used by HandleCastSpell to
+    /// detect "user re-clicked the spell they're already casting" and translate that
+    /// into a server-side cancel rather than silently rejecting the duplicate press.
+    /// </summary>
+    public ClientCastRequest? GetStartedNormalCast()
+    {
+        foreach (var item in PendingNormalCasts)
+        {
+            if (item.HasStarted)
+                return item;
+        }
+        return null;
+    }
+
+    /// <summary>
     /// Clear only pending normal casts that haven't started yet.
     /// Keeps started casts so SPELL_GO can dequeue them later.
     /// Returns the cleared casts so they can be failed.
