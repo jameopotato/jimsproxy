@@ -177,13 +177,11 @@ public partial class WorldSocket
             // 1.12 client would fire these mid-cast-bar and mid-GCD, so we match that.
             if (!isOffGcd)
             {
-                // Check if there's already a cast in progress - reject without forwarding to server
-                // This prevents interrupting the current cast (player gets "Another action is in progress")
+                // Silently drop re-clicks while a cast is in progress. Sending
+                // CastFailed(SpellInProgress) causes the 1.14 client to dismiss
+                // the active cast bar even though the server-side cast continues.
                 if (GetSession().GameState.HasStartedNormalCast())
-                {
-                    SendCastRequestFailed(castRequest, false);
                     return;
-                }
 
                 // JimsProxy (issue #43): if we're inside a GCD hold window, build the CMSG_CAST_SPELL
                 // packet now but don't forward it — store it as the pending held cast. The Timer
@@ -367,6 +365,10 @@ public partial class WorldSocket
         castRequest.ClientGUID = use.Cast.CastID;
         castRequest.ServerGUID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, use.Cast.SpellID, 10000 + use.Cast.CastID.GetCounter());
         castRequest.ItemGUID = use.CastItem;
+
+        // Silently drop re-clicks while a cast is in progress (same as HandleCastSpell).
+        if (GetSession().GameState.HasStartedNormalCast())
+            return;
 
         // Some items had their on-use spell id renumbered in SoM 1.14.1+ (e.g. Diamond Flask 17626 → 363880).
         // The 1.12 emulator only knows the legacy id, so resolve it now and remember both
