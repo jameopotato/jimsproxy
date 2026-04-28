@@ -128,6 +128,7 @@ public sealed class GameSessionData
     public ConcurrentDictionary<WowGuid128, int> UnitChannelSpells = new();
     public WowGuid64 LastLootTargetGuid;
     public Dictionary<(uint QuestID, sbyte StorageIndex), uint> QuestItemObjectiveProgress = new(); //MIRASU - proxy-local running totals for quest item pickups; legacy update-field cache isn't refreshed on partial updates, so we track ourselves
+    public List<(uint ItemId, uint Count)> PendingQuestItemCredits = new(); //MIRASU - SMSG_QUEST_UPDATE_ADD_ITEM credits received before the QuestTemplate was cached; replayed on QueryQuestInfoResponse so the toast doesn't drop the first pickup of an unfamiliar quest item
     public uint CurrentLootCoins; //MIRASU - remembers coin amount from SMSG_LOOT_RESPONSE so proxy can synthesize SMSG_LOOT_MONEY_NOTIFY when client picks up gold (Kronos/TC-1.12 doesn't emit it)
     public List<WowGuid128>? MasterLootCandidates;
     public WowGuid64 LastMasterLootSentTarget;
@@ -1237,7 +1238,19 @@ public class GlobalSessionData
     public string OS = null!;
     public uint Build;
     public GameSessionData GameState;
-    
+
+    //MIRASU - GameState gets recreated on SMSG_LOGOUT_COMPLETE (CharacterHandler.HandleLogoutComplete)
+    //MIRASU   which wipes QuestItemObjectiveProgress. To preserve quest item running totals across a
+    //MIRASU   logout-to-charselect-relog flow, we snapshot the dict here keyed by character guid before
+    //MIRASU   the reset, and restore lazily on first item pickup post-relog if the new CurrentPlayerGuid
+    //MIRASU   matches. Char-switch (Char A → Char B) is handled naturally by the per-character key.
+    public Dictionary<WowGuid128, Dictionary<(uint QuestID, sbyte StorageIndex), uint>> SavedQuestItemProgressByCharacter = new();
+    //MIRASU - track restore by GameSessionData *instance* (reference equality), not by playerGuid.
+    //MIRASU   Logging out and back in to the SAME character produces a fresh GameSessionData with the
+    //MIRASU   same CurrentPlayerGuid; a guid-based guard would skip the restore on relog and the
+    //MIRASU   running totals would be lost. New GameState reference => restore runs once.
+    private GameSessionData? _lastRestoredForGameState;
+
     public RealmId RealmId;
     public RealmManager RealmManager = new();
     public Realm? Realm => RealmManager.GetRealm(RealmId);
@@ -1311,6 +1324,76 @@ public class GlobalSessionData
             return WowGuid128.Create(HighGuidType703.BNetAccount, AccountInfo.Id);
         else
             return WowGuid128.Create(HighGuidType703.BNetAccount, playerGuid.GetCounter());
+    }
+
+    //MIRASU - capture the current player's QuestItemObjectiveProgress before GameState is wiped,
+    //MIRASU   so we can restore it on re-login (logout-to-charselect-relog flow). Called from
+    //MIRASU   HandleLogoutComplete BEFORE the GameState reassignment, while CurrentPlayerGuid is
+    //MIRASU   still pointed at the outgoing character. Idempotent on default/empty guid (no-op).
+    public void SnapshotQuestItemProgressForRestore()
+    {
+        var guid = GameState.CurrentPlayerGuid;
+        if (guid == default)
+            return;
+
+        var live = GameState.QuestItemObjectiveProgress;
+        SavedQuestItemProgressByCharacter[guid] = new Dictionary<(uint QuestID, sbyte StorageIndex), uint>(live);
+
+        Framework.Logging.Log.Event("quest.progress.snapshot", new
+        {
+            player_guid_low = guid.Low,
+            player_guid_high = guid.High,
+            entries = live.Count,
+        });
+    }
+
+    //MIRASU - restore saved QuestItemObjectiveProgress entries for the current player on first call
+    //MIRASU   per (player, GameState) combination. Called from ProcessQuestItemCredit at the top of
+    //MIRASU   the live-pickup path so the very first item credit post-relog sees the running total
+    //MIRASU   from before the logout. After restore the live dict is authoritative -- subsequent
+    //MIRASU   abandon/COMPLETE clears (which already touch live + saved) keep both in sync.
+    public void EnsureQuestItemProgressRestored()
+    {
+        var guid = GameState.CurrentPlayerGuid;
+        //MIRASU - reference-equality on the GameSessionData instance is intentional: a relog
+        //MIRASU   produces a fresh GameState reference even when the playerGuid is identical,
+        //MIRASU   which is how we detect "first item credit of a new session" reliably.
+        if (guid == default || ReferenceEquals(_lastRestoredForGameState, GameState))
+            return;
+
+        _lastRestoredForGameState = GameState;
+        if (!SavedQuestItemProgressByCharacter.TryGetValue(guid, out var saved) || saved.Count == 0)
+        {
+            Framework.Logging.Log.Event("quest.progress.restore.empty", new
+            {
+                player_guid_low = guid.Low,
+                player_guid_high = guid.High,
+                saved_characters = SavedQuestItemProgressByCharacter.Count,
+            });
+            return;
+        }
+
+        var live = GameState.QuestItemObjectiveProgress;
+        int restored = 0;
+        foreach (var kvp in saved)
+        {
+            //MIRASU - don't clobber an entry the new GameState already saw (e.g. an SMSG_QUEST_UPDATE_ADD_ITEM
+            //MIRASU   that arrived before this restore call would have populated it -- shouldn't happen because
+            //MIRASU   restore runs at the top of ProcessQuestItemCredit, but defend anyway).
+            if (!live.ContainsKey(kvp.Key))
+            {
+                live[kvp.Key] = kvp.Value;
+                restored++;
+            }
+        }
+
+        Framework.Logging.Log.Event("quest.progress.restored", new
+        {
+            player_guid_low = guid.Low,
+            player_guid_high = guid.High,
+            saved_entries = saved.Count,
+            restored_entries = restored,
+        });
     }
 
     public void OnDisconnect()

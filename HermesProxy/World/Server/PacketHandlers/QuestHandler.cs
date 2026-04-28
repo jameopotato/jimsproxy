@@ -58,6 +58,11 @@ public partial class WorldSocket
         var progressMap = GetSession().GameState.QuestItemObjectiveProgress;
         foreach (var k in progressMap.Keys.Where(k => k.QuestID == questId).ToList())
             progressMap.Remove(k);
+        //MIRASU - also clear from the saved snapshot so a logout/login can't restore stale entries
+        //MIRASU   for an abandoned quest (otherwise a re-accept would inherit the pre-abandon total).
+        if (GetSession().SavedQuestItemProgressByCharacter.TryGetValue(GetSession().GameState.CurrentPlayerGuid, out var savedForPlayer))
+            foreach (var k in savedForPlayer.Keys.Where(k => k.QuestID == questId).ToList())
+                savedForPlayer.Remove(k);
     }
     [PacketHandler(Opcode.CMSG_QUEST_GIVER_STATUS_QUERY)]
     void HandleQuestGiverStatusQuery(QuestGiverStatusQuery query)

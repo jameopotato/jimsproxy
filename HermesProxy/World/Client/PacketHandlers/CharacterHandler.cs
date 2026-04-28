@@ -343,6 +343,11 @@ public partial class WorldClient
         // GameState, leaking a ClientCastRequest into the new PendingNormalCasts and sending
         // a ghost CMSG_CAST_SPELL to the server after logout. Mirrors OnDisconnect.
         GetSession().GameState.CancelGcdHold();
+        //MIRASU - capture quest item running totals before the GameState reset so they can be
+        //MIRASU   restored on re-login (logout-to-charselect-relog flow). Must run BEFORE the
+        //MIRASU   reassignment because we read CurrentPlayerGuid + QuestItemObjectiveProgress
+        //MIRASU   off the outgoing GameState.
+        GetSession().SnapshotQuestItemProgressForRestore();
         GetSession().GameState = GameSessionData.CreateNewGameSessionData(GetSession());
         GetSession().InstanceSocket.CloseSocket();
         GetSession().InstanceSocket = null!;

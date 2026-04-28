@@ -261,6 +261,11 @@ public partial class WorldClient
 
         GameData.StoreQuestTemplate(response.QuestID, quest);
         SendPacketToClient(response);
+
+        //MIRASU - any SMSG_QUEST_UPDATE_ADD_ITEM credits buffered while this template was missing
+        //MIRASU   can now resolve their QuestObjective. Replay them so the over-head toast doesn't
+        //MIRASU   drop the first pickup of an unfamiliar quest item (off-by-1 bug).
+        ReplayPendingQuestItemCredits();
     }
 
     [PacketHandler(Opcode.SMSG_QUERY_CREATURE_RESPONSE)]

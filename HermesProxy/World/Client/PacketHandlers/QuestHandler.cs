@@ -1,4 +1,5 @@
 ﻿using Framework;
+using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
@@ -398,9 +399,13 @@ public partial class WorldClient
         //MIRASU   (or a parallel quest sharing the same item) starts fresh instead of inheriting
         //MIRASU   stale counts. Applies to COMPLETE / FAILED / FAILED_TIMER -- in all three cases
         //MIRASU   the quest is leaving the active log and any running total is no longer valid.
+        //MIRASU   Clear from the saved snapshot too, so a logout/login can't restore stale entries.
         var progressMap = GetSession().GameState.QuestItemObjectiveProgress;
         foreach (var k in progressMap.Keys.Where(k => k.QuestID == quest.QuestID).ToList())
             progressMap.Remove(k);
+        if (GetSession().SavedQuestItemProgressByCharacter.TryGetValue(GetSession().GameState.CurrentPlayerGuid, out var savedForPlayer))
+            foreach (var k in savedForPlayer.Keys.Where(k => k.QuestID == quest.QuestID).ToList())
+                savedForPlayer.Remove(k);
     }
     [PacketHandler(Opcode.SMSG_QUEST_UPDATE_ADD_ITEM)]
     void HandleQuestUpdateAddItem(WorldPacket packet)
@@ -408,38 +413,93 @@ public partial class WorldClient
         uint itemId = packet.ReadUInt32();
         uint count = packet.ReadUInt32(); //MIRASU - delta, not total
 
-        QuestObjective? objective = GameData.GetQuestObjectiveForItem(itemId);
-
-        if (objective == null)
-        {
-            //MIRASU - quest template not cached yet; fire off queries and bail. Next pickup will find it.
-            var updateFields = GetSession().GameState.GetCachedObjectFieldsLegacy(GetSession().GameState.CurrentPlayerGuid);
-            int questsCount = LegacyVersion.GetQuestLogSize();
-            for (int i = 0; i < questsCount; i++)
-            {
-                QuestLog? logEntry = ReadQuestLogEntry(i, null, updateFields!);
-                if (logEntry == null || logEntry.QuestID == null)
-                    continue;
-
-                if (GameData.GetQuestTemplate((uint)logEntry.QuestID) == null)
-                {
-                    WorldPacket packet2 = new WorldPacket(Opcode.CMSG_QUERY_QUEST_INFO);
-                    packet2.WriteUInt32((uint)logEntry.QuestID);
-                    SendPacketToServer(packet2);
-                }
-            }
+        if (ProcessQuestItemCredit(itemId, count, replayed: false))
             return;
+
+        //MIRASU - quest template not cached yet. Buffer the credit so it can be replayed once the
+        //MIRASU   template arrives via SMSG_QUERY_QUEST_INFO_RESPONSE -- otherwise the toast count
+        //MIRASU   is permanently off-by-one for the first pickup of any unfamiliar quest item, since
+        //MIRASU   the legacy server only sends the credit packet once per pickup. Then fire the
+        //MIRASU   template queries (modeled on the original "Next pickup will find it" path).
+        GetSession().GameState.PendingQuestItemCredits.Add((itemId, count));
+        Log.Event("quest.item.add.buffered", new
+        {
+            item_id = itemId,
+            wire_count = count,
+            pending_count = GetSession().GameState.PendingQuestItemCredits.Count,
+        });
+
+        var pendingFields = GetSession().GameState.GetCachedObjectFieldsLegacy(GetSession().GameState.CurrentPlayerGuid);
+        int questsCount = LegacyVersion.GetQuestLogSize();
+        for (int i = 0; i < questsCount; i++)
+        {
+            QuestLog? logEntry = ReadQuestLogEntry(i, null, pendingFields!);
+            if (logEntry == null || logEntry.QuestID == null)
+                continue;
+
+            if (GameData.GetQuestTemplate((uint)logEntry.QuestID) == null)
+            {
+                WorldPacket packet2 = new WorldPacket(Opcode.CMSG_QUERY_QUEST_INFO);
+                packet2.WriteUInt32((uint)logEntry.QuestID);
+                SendPacketToServer(packet2);
+            }
         }
+    }
+
+    //MIRASU - replays any quest item credits that were buffered because their QuestTemplate hadn't
+    //MIRASU   arrived yet. Called from HandleQueryQuestInfoResponse after StoreQuestTemplate, so
+    //MIRASU   the now-cached objective metadata can produce the deferred toast credit. Re-buffers
+    //MIRASU   any (itemId, count) pair that still doesn't resolve (template was for a different
+    //MIRASU   quest) so it'll be tried again on the next QueryQuestInfoResponse.
+    public void ReplayPendingQuestItemCredits()
+    {
+        var pending = GetSession().GameState.PendingQuestItemCredits;
+        if (pending.Count == 0)
+            return;
+
+        var snapshot = pending.ToList();
+        pending.Clear();
+        foreach (var (itemId, count) in snapshot)
+        {
+            if (!ProcessQuestItemCredit(itemId, count, replayed: true))
+                pending.Add((itemId, count));
+        }
+    }
+
+    //MIRASU - shared credit-processing path used by both the live SMSG_QUEST_UPDATE_ADD_ITEM
+    //MIRASU   handler and the buffered-replay path. Returns true if the objective was resolved
+    //MIRASU   and the toast credit was sent; false if the QuestTemplate still isn't cached.
+    private bool ProcessQuestItemCredit(uint itemId, uint count, bool replayed)
+    {
+        QuestObjective? objective = GameData.GetQuestObjectiveForItem(itemId);
+        if (objective == null)
+            return false;
+
+        //MIRASU - restore saved per-character running totals if this is the first item credit since
+        //MIRASU   a logout-to-charselect relog. No-op if already restored or nothing was saved for
+        //MIRASU   the current player guid.
+        GetSession().EnsureQuestItemProgressRestored();
 
         //MIRASU - track running total ourselves; legacy update-field cache isn't refreshed on partial updates
         var key = (objective.QuestID, objective.StorageIndex);
+        bool seededFromCache = false;
+        uint cacheValue = 0;
+        bool updateFieldsPresent = false;
+        int updateFieldsCount = 0;
+        int matchedSlot = -1;
+        sbyte? matchedSlotProgressRaw = null;
         if (!GetSession().GameState.QuestItemObjectiveProgress.TryGetValue(key, out uint stored))
         {
-            //MIRASU - first time we see this objective: seed from the legacy quest log cache.
-            //MIRASU   The cache holds the accept-time progress (e.g. 3/10 if the player logged in
-            //MIRASU   mid-quest); without seeding, the running total starts at 0 and the toast
-            //MIRASU   would render "1/10" instead of "4/10" on the next pickup.
+            //MIRASU - first time we see this objective in this session: seed from the legacy quest log cache.
+            //MIRASU   The cache holds the server's last-persisted progress (e.g. 5/10 if the player logged
+            //MIRASU   in mid-quest with 5 items already collected). Without this seed, the running total
+            //MIRASU   starts at 0 after every relog and the toast would render "1/10" instead of "6/10" on
+            //MIRASU   the next pickup. NOTE: SavedQuestItemProgressByCharacter handles the proxy-internal
+            //MIRASU   relog persistence; this seed is the second line of defense that catches mid-quest
+            //MIRASU   logins where the proxy never saw the prior session at all (server-persisted progress).
             var updateFields = GetSession().GameState.GetCachedObjectFieldsLegacy(GetSession().GameState.CurrentPlayerGuid);
+            updateFieldsPresent = updateFields != null;
+            updateFieldsCount = updateFields?.Count ?? 0;
             if (updateFields != null)
             {
                 int questsCount = LegacyVersion.GetQuestLogSize();
@@ -448,21 +508,58 @@ public partial class WorldClient
                     QuestLog? logEntry = ReadQuestLogEntry(i, null, updateFields);
                     if (logEntry == null || logEntry.QuestID != objective.QuestID)
                         continue;
-                    if (logEntry.ObjectiveProgress[objective.StorageIndex] != null)
-                        stored = (uint)logEntry.ObjectiveProgress[objective.StorageIndex]!;
+                    matchedSlot = i;
+                    var progressNullable = logEntry.ObjectiveProgress[objective.StorageIndex];
+                    matchedSlotProgressRaw = progressNullable.HasValue ? (sbyte)progressNullable.Value : (sbyte?)null;
+                    if (progressNullable != null)
+                    {
+                        stored = (uint)progressNullable!;
+                        cacheValue = stored;
+                        seededFromCache = true;
+                    }
                     break;
                 }
             }
+            Log.Event("quest.item.seed.attempt", new
+            {
+                quest_id = objective.QuestID,
+                storage_index = (int)objective.StorageIndex,
+                item_id = itemId,
+                update_fields_present = updateFieldsPresent,
+                update_fields_count = updateFieldsCount,
+                quest_log_size = LegacyVersion.GetQuestLogSize(),
+                matched_slot = matchedSlot,
+                matched_slot_progress = matchedSlotProgressRaw,
+                seeded_from_cache = seededFromCache,
+                cache_value = cacheValue,
+            });
         }
         uint runningTotal = stored + count;
-        if (runningTotal > (uint)objective.Amount)
+        bool clamped = runningTotal > (uint)objective.Amount;
+        if (clamped)
             runningTotal = (uint)objective.Amount;
         GetSession().GameState.QuestItemObjectiveProgress[key] = runningTotal;
 
+        Log.Event("quest.item.add", new
+        {
+            item_id = itemId,
+            quest_id = objective.QuestID,
+            storage_index = (int)objective.StorageIndex,
+            wire_count = count,
+            stored_before = stored,
+            running_total = runningTotal,
+            required = objective.Amount,
+            seeded_from_cache = seededFromCache,
+            cache_value = cacheValue,
+            clamped,
+            replayed,
+        });
+
         //MIRASU - send full QuestUpdateAddCredit (not SIMPLE) so the over-head toast has explicit
-        //MIRASU   Count/Required values. SIMPLE makes the modern client read from the legacy
-        //MIRASU   UNIT_FIELD_QUEST_LOG_x cache, which Kronos doesn't refresh on partial item-pickup
-        //MIRASU   updates -- so the toast froze at whatever the cache held on quest accept (1/10).
+        //MIRASU   Count/Required values. SIMPLE makes the modern client increment its own internal
+        //MIRASU   counter, which (a) starts at 0 on every relog instead of the server's persisted
+        //MIRASU   progress, and (b) doesn't get re-seeded from PLAYER_QUEST_LOG_x_3 on login -- so
+        //MIRASU   after a logout/login the toast restarts at 1/N regardless of true progress.
         QuestUpdateAddCredit credit = new QuestUpdateAddCredit();
         credit.QuestID = objective.QuestID;
         credit.ObjectID = (int)itemId;
@@ -471,6 +568,7 @@ public partial class WorldClient
         credit.Required = (ushort)objective.Amount;
         credit.VictimGUID = default; //MIRASU - no victim for item pickups; modern client ignores VictimGUID for Item objectives
         SendPacketToClient(credit);
+        return true;
     }
 
     [PacketHandler(Opcode.SMSG_QUEST_UPDATE_ADD_KILL)]

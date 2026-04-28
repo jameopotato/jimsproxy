@@ -3120,10 +3120,10 @@ public static partial class GameData
         {
             if (//row.AllowableRace != item.AllowedRaces ||
                 !row.Description.Equals(item.Description) ||
-                !row.Name4.Equals(item.Name[3]) ||
-                !row.Name3.Equals(item.Name[2]) ||
-                !row.Name2.Equals(item.Name[1]) ||
-                !row.Name1.Equals(item.Name[0]) ||
+                !row.Name4.Equals(item.Name![3]) ||
+                !row.Name3.Equals(item.Name![2]) ||
+                !row.Name2.Equals(item.Name![1]) ||
+                !row.Name1.Equals(item.Name![0]) ||
                 row.DurationInInventory != item.Duration ||
                 row.BagFamily != item.BagFamily ||
                 row.RangeMod != item.RangedMod ||
@@ -3214,14 +3214,14 @@ public static partial class GameData
 
                 if (!row.Description.Equals(item.Description))
                     Log.Print(LogType.Storage, $"Description \"{row.Description}\" vs \"{item.Description}\"");
-                if (!row.Name4.Equals(item.Name[3]))
-                    Log.Print(LogType.Storage, $"Name4 \"{row.Name4}\" vs \"{item.Name[3]}\"");
-                if (!row.Name3.Equals(item.Name[2]))
-                    Log.Print(LogType.Storage, $"Name3 \"{row.Name3}\" vs \"{item.Name[2]}\"");
-                if (!row.Name2.Equals(item.Name[1]))
-                    Log.Print(LogType.Storage, $"Name2 \"{row.Name2}\" vs \"{item.Name[1]}\"");
-                if (!row.Name1.Equals(item.Name[0]))
-                    Log.Print(LogType.Storage, $"Name1 \"{row.Name1}\" vs \"{item.Name[0]}\"");
+                if (!row.Name4.Equals(item.Name![3]))
+                    Log.Print(LogType.Storage, $"Name4 \"{row.Name4}\" vs \"{item.Name![3]}\"");
+                if (!row.Name3.Equals(item.Name![2]))
+                    Log.Print(LogType.Storage, $"Name3 \"{row.Name3}\" vs \"{item.Name![2]}\"");
+                if (!row.Name2.Equals(item.Name![1]))
+                    Log.Print(LogType.Storage, $"Name2 \"{row.Name2}\" vs \"{item.Name![1]}\"");
+                if (!row.Name1.Equals(item.Name![0]))
+                    Log.Print(LogType.Storage, $"Name1 \"{row.Name1}\" vs \"{item.Name![0]}\"");
                 if (row.DurationInInventory != item.Duration)
                     Log.Print(LogType.Storage, $"DurationInInventory {row.DurationInInventory} vs {item.Duration}");
                 if (row.BagFamily != item.BagFamily)
