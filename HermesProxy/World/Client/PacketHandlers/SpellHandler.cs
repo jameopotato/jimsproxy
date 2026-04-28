@@ -503,6 +503,19 @@ public partial class WorldClient
         });
     }
 
+    // Warrior gap-closers (Charge ranks 1-3, Intercept ranks 1-3). The modern
+    // Classic 1.14 SpellXSpellVisual records for these include impact camera-shake
+    // events that vanilla 1.12 didn't have. Diagnostic gate for the "interface
+    // randomly shakes after Charge/Intercept" report -- emit one event per
+    // SPELL_START / SPELL_GO / PLAY_SPELL_VISUAL on these spells so a JSONL
+    // bundle reveals whether the visual is being kicked twice (SPELL_START +
+    // SPELL_GO both forwarded) or whether PLAY_SPELL_VISUAL is doubling up.
+    private static bool IsWarriorGapCloser(uint spellId) => spellId switch
+    {
+        100 or 6178 or 11578 or 20252 or 20616 or 20617 => true,
+        _ => false,
+    };
+
     [PacketHandler(Opcode.SMSG_SPELL_START)]
     void HandleSpellStart(WorldPacket packet)
     {
@@ -554,6 +567,39 @@ public partial class WorldClient
             var failedPetCasts = GetSession().GameState.ClearNonStartedPetCasts();
             foreach (var failed in failedPetCasts)
                 GetSession().InstanceSocket.SendCastRequestFailed(failed, true);
+        }
+
+        if (IsWarriorGapCloser((uint)spell.Cast.SpellID))
+        {
+            Log.Event("spell.gap_closer.start", new
+            {
+                spell_id = spell.Cast.SpellID,
+                cast_time_ms = spell.Cast.CastTime,
+                caster_is_local_player = GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit,
+                spell_x_visual_id = spell.Cast.SpellXSpellVisualID,
+            });
+        }
+
+        // Twinstar/Kronos emit SMSG_SPELL_START even for instants (CastTime=0). The modern
+        // Classic 1.14 client treats SPELL_START as "begin visual" and SPELL_GO as "go visual";
+        // for cast-time spells those are different stages, but on instants they collapse to the
+        // same kit kick — so the client plays the SpellVisualKit twice ~1ms apart, including
+        // any impact camera-shake events (e.g. Charge/Intercept), reading as "the interface
+        // randomly shakes". vmangos doesn't send SPELL_START for instants — match that here by
+        // suppressing the forward for local player/pet instants. All bookkeeping above
+        // (TryMarkPendingNormalCastStarted, SpellPrepare, ClearNonStartedNormalCasts,
+        // StartedCastTimeMs) still runs, so SPELL_GO's downstream paths behave identically.
+        bool casterIsLocalPlayer = GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit;
+        bool casterIsLocalPet = GetSession().GameState.CurrentPetGuid == spell.Cast.CasterUnit;
+        if ((casterIsLocalPlayer || casterIsLocalPet) && spell.Cast.CastTime == 0)
+        {
+            Log.Event("spell.start.instant_suppressed", new
+            {
+                spell_id = spell.Cast.SpellID,
+                is_pet = casterIsLocalPet,
+                spell_x_visual_id = spell.Cast.SpellXSpellVisualID,
+            });
+            return;
         }
 
         SendPacketToClient(spell);
@@ -693,6 +739,17 @@ public partial class WorldClient
 
                 GetSession().GameState.StoreLastAuraCasterOnTarget(target, spellId, spell.Cast.CasterUnit);
             }
+        }
+
+        if (IsWarriorGapCloser((uint)spell.Cast.SpellID))
+        {
+            Log.Event("spell.gap_closer.go", new
+            {
+                spell_id = spell.Cast.SpellID,
+                caster_is_local_player = GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit,
+                spell_x_visual_id = spell.Cast.SpellXSpellVisualID,
+                hit_target_count = spell.Cast.HitTargets.Count,
+            });
         }
 
         SendPacketToClient(spell);
@@ -1350,6 +1407,18 @@ public partial class WorldClient
         PlaySpellVisualKit spell = new();
         spell.Unit = packet.ReadGuid().To128(GetSession().GameState);
         spell.KitRecID = packet.ReadUInt32();
+
+        // Pair with spell.gap_closer.start / .go to detect double-fired visuals.
+        // If KitRecID fires twice in the same ~1s window after a Charge/Intercept,
+        // that's the smoking gun for the screen-shake report.
+        if (GetSession().GameState.CurrentPlayerGuid == spell.Unit)
+        {
+            Log.Event("spell.play_visual.local_player", new
+            {
+                kit_rec_id = spell.KitRecID,
+            });
+        }
+
         SendPacketToClient(spell);
     }
 
