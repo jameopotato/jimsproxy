@@ -557,6 +557,19 @@ public partial class WorldClient
         }
 
         SendPacketToClient(spell);
+
+        // Send cast-time sideband for non-self casters so the addon gets
+        // the server-reported cast time instead of GetSpellInfo() which
+        // returns the observer's own modified value (wrong rank/talents).
+        if (spell.Cast.CasterUnit != GetSession().GameState.CurrentPlayerGuid &&
+            spell.Cast.CasterUnit != GetSession().GameState.CurrentPetGuid &&
+            spell.Cast.CastTime > 0)
+        {
+            string guidStr = spell.Cast.CasterUnit.ToClientGuidString();
+            var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                $"JP_CS:{guidStr}:{spell.Cast.SpellID}:{spell.Cast.CastTime}");
+            SendPacketToClient(chatPkt);
+        }
     }
 
     [PacketHandler(Opcode.SMSG_SPELL_GO)]

@@ -1883,7 +1883,33 @@ public partial class WorldClient
             if (UNIT_CHANNEL_SPELL >= 0 && updateMaskArray[UNIT_CHANNEL_SPELL])
             {
                 int spellId = updates[UNIT_CHANNEL_SPELL].Int32Value;
-                updateData.UnitData.ChannelData = new UnitChannel(spellId, (int)GameData.GetSpellVisual((uint)spellId));
+                uint spellVisual = GameData.GetSpellVisual((uint)spellId);
+                updateData.UnitData.ChannelData = new UnitChannel(spellId, (int)spellVisual);
+
+                if (guid != GetSession().GameState.CurrentPlayerGuid)
+                {
+                    var channelSpells = GetSession().GameState.UnitChannelSpells;
+                    int oldSpellId = channelSpells.GetValueOrDefault(guid, 0);
+                    if (spellId != oldSpellId)
+                    {
+                        string guidStr = guid.ToClientGuidString();
+                        Log.Print(LogType.Server, $"UNIT_CHANNEL_SPELL {guidStr}: {oldSpellId} -> {spellId}");
+                        if (spellId != 0)
+                        {
+                            channelSpells[guid] = spellId;
+                            var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                                $"JP_CH:S:{guidStr}:{spellId}");
+                            SendPacketToClient(chatPkt);
+                        }
+                        else
+                        {
+                            channelSpells.TryRemove(guid, out _);
+                            var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                                $"JP_CH:X:{guidStr}");
+                            SendPacketToClient(chatPkt);
+                        }
+                    }
+                }
             }
             int UNIT_MOD_CAST_SPEED = LegacyVersion.GetUpdateField(UnitField.UNIT_MOD_CAST_SPEED);
             if (UNIT_MOD_CAST_SPEED >= 0 && updateMaskArray[UNIT_MOD_CAST_SPEED])

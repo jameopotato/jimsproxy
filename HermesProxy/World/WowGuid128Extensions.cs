@@ -90,6 +90,16 @@ public static class WowGuid128Extensions
 
         public WowGuid128 To128(GameSessionData gameState) => guid;
 
+        public string ToClientGuidString() => guid.GetHighType() switch
+        {
+            HighGuidType.Player =>
+                $"Player-{guid.GetRealmId()}-{guid.GetCounter():X8}",
+            HighGuidType.Creature or HighGuidType.Vehicle or HighGuidType.Pet =>
+                $"Creature-0-{guid.GetRealmId()}-{guid.GetMapId()}-{guid.GetServerId()}-{guid.GetEntry()}-{guid.GetCounter():X10}",
+            _ =>
+                $"0x{guid.High:X16}{guid.Low:X16}",
+        };
+
         public string ToString()
         {
             if (guid.Low == 0 && guid.High == 0)
