@@ -38,6 +38,15 @@ public partial class WorldClient
     uint _keepAlivePingSerial;
     const int KeepAliveIntervalMs = 30_000;
 
+    // JimsProxy: last-inbound-opcode tracking for disconnect diagnostics. When
+    // the legacy connection dies unexpectedly (zombie state, AFK DC), capturing
+    // the most recent server-to-proxy opcode + its arrival tick narrows down
+    // whether the death was idle (no traffic in N seconds), correlated with a
+    // specific opcode (parser bug), or mid-flight on a known packet.
+    Opcode _lastInboundOpcode;
+    uint _lastInboundOpcodeRaw;
+    int _lastInboundOpcodeTick;
+
     // packet order is not always the same as new client, sometimes we need to delay packet until another one
     Dictionary<Opcode, List<WorldPacket>> _delayedPacketsToServer = null!;
     Dictionary<Opcode, List<ServerPacket>> _delayedPacketsToClient = null!;
@@ -240,6 +249,9 @@ public partial class WorldClient
             {
                 reason = "worldclient_legacy_disconnect",
                 disconnect_reason = reason,
+                last_opcode = _lastInboundOpcode.ToString(),
+                last_opcode_raw = _lastInboundOpcodeRaw,
+                ms_since_last_opcode = _lastInboundOpcodeTick == 0 ? -1 : Environment.TickCount - _lastInboundOpcodeTick,
             });
         }
     }
@@ -302,6 +314,9 @@ public partial class WorldClient
                     reason = "worldclient_receive_loop_exception",
                     exception_type = e.GetType().Name,
                     exception_message = e.Message,
+                    last_opcode = _lastInboundOpcode.ToString(),
+                    last_opcode_raw = _lastInboundOpcodeRaw,
+                    ms_since_last_opcode = _lastInboundOpcodeTick == 0 ? -1 : Environment.TickCount - _lastInboundOpcodeTick,
                 });
             }
         }
@@ -477,6 +492,9 @@ public partial class WorldClient
     private void HandlePacket(WorldPacket packet)
     {
         Opcode universalOpcode = packet.GetUniversalOpcode(false);
+        _lastInboundOpcode = universalOpcode;
+        _lastInboundOpcodeRaw = packet.GetOpcode();
+        _lastInboundOpcodeTick = Environment.TickCount;
         Log.PrintNet(LogType.Debug, LogNetDir.S2P, $"Received opcode {universalOpcode} ({packet.GetOpcode()}).");
 
         // JimsProxy: structured packet.in (s2c — from legacy server)
