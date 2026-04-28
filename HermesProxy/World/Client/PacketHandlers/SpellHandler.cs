@@ -435,6 +435,30 @@ public partial class WorldClient
         // matching -- the modern client's active cast bar (keyed on the NEW ServerGUID)
         // then doesn't match the SpellFailure CastID and the bar finishes filling
         // visually instead of resetting on interrupt. Mirrors HandleCastFailed.
+        // JimsProxy: vmangos / Twinstar's Spell::SendInterrupted hardcodes the SMSG_SPELL_FAILURE
+        // reason byte to 0 (a generic "interrupted" signal) and follows it ~0-5ms later with a
+        // SMSG_CAST_FAILED carrying the real reason. On the modern 1.14 client, SMSG_SPELL_FAILURE
+        // for the LOCAL caster is interpreted as "in-flight cast was interrupted" -- which latches
+        // the action-bar GCD anticipation as committed. By the time SMSG_CAST_FAILED arrives with
+        // pre-cast-failure semantics that would cancel the GCD, the lock has already been
+        // committed and the button stays greyed for the full 1.5s. Skip the SpellFailure forward
+        // for local-player/pet casts so the canonical SMSG_CAST_FAILED is the only signal the
+        // client receives -- it dismisses the cast bar AND cancels the GCD anticipation. Other
+        // casters (mobs, remote players) still flow through; the mob-interrupt fix from PR #65
+        // depends on that path for target-frame cast-bar dismiss on Kick / Counterspell.
+        bool casterIsLocalPlayer = GetSession().GameState.CurrentPlayerGuid == casterUnit;
+        bool casterIsLocalPet    = GetSession().GameState.CurrentPetGuid    == casterUnit;
+        if (casterIsLocalPlayer || casterIsLocalPet)
+        {
+            Log.Event("spell.failure.suppressed_for_caster", new
+            {
+                spellId,
+                raw_reason_byte = reason,
+                is_pet = casterIsLocalPet,
+            });
+            return;
+        }
+
         WowGuid128 castId;
         uint spellVisual;
         bool dequeued = false;
@@ -512,8 +536,11 @@ public partial class WorldClient
         SpellStart spell = new SpellStart();
         spell.Cast = HandleSpellStartOrGo(packet, false);
 
+        bool casterIsLocalPlayer = GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit;
+        bool casterIsLocalPet    = GetSession().GameState.CurrentPetGuid    == spell.Cast.CasterUnit;
+
         // Mark pending cast as started (queue-based, FIFO order)
-        if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
+        if (casterIsLocalPlayer &&
             GetSession().GameState.TryMarkPendingNormalCastStarted((uint)spell.Cast.SpellID, out var pendingCast))
         {
             spell.Cast.CastID = pendingCast!.ServerGUID;
@@ -537,7 +564,7 @@ public partial class WorldClient
             foreach (var failed in failedCasts)
                 GetSession().InstanceSocket.SendCastRequestFailed(failed, false);
         }
-        else if (GetSession().GameState.CurrentPetGuid == spell.Cast.CasterUnit &&
+        else if (casterIsLocalPet &&
                  GetSession().GameState.TryMarkPendingPetCastStarted((uint)spell.Cast.SpellID, out var pendingPetCast))
         {
             spell.Cast.CastID = pendingPetCast!.ServerGUID;
@@ -554,6 +581,29 @@ public partial class WorldClient
             var failedPetCasts = GetSession().GameState.ClearNonStartedPetCasts();
             foreach (var failed in failedPetCasts)
                 GetSession().InstanceSocket.SendCastRequestFailed(failed, true);
+        }
+
+        // JimsProxy: suppress SMSG_SPELL_START forward for the LOCAL player/pet's INSTANT
+        // casts (CastTime == 0). Twinstar / vmangos emit SPELL_START before running the
+        // LoS / range / target validation that ultimately rejects the cast a few hundred
+        // ms later; once the modern 1.14 client processes a SPELL_START for an in-flight
+        // cast it commits the action-bar GCD anticipation and won't roll it back when the
+        // subsequent SMSG_CAST_FAILED arrives. By withholding SPELL_START for instants
+        // we let the failure path (HandleCastFailed → SpellPrepare + CastFailed) cancel
+        // the GCD cleanly. Successful instants still apply real GCD via SPELL_GO. Cast-
+        // time spells (CastTime > 0) and NPC casts forward as before — for them, GCD has
+        // genuinely been committed server-side and the cast-bar visual is needed.
+        bool suppressInstantStart = (casterIsLocalPlayer || casterIsLocalPet) && spell.Cast.CastTime == 0;
+        if (suppressInstantStart)
+        {
+            Log.Event("spell.start.instant_suppressed", new
+            {
+                spell_id = spell.Cast.SpellID,
+                cast_time_ms = spell.Cast.CastTime,
+                caster_is_player = casterIsLocalPlayer,
+                caster_is_pet = casterIsLocalPet,
+            });
+            return;
         }
 
         SendPacketToClient(spell);
