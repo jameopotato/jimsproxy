@@ -69,9 +69,19 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_GROUP_LIST, ClientVersionBuild.Zero, ClientVersionBuild.V2_0_1_6180)]
     void HandleGroupListVanilla(WorldPacket packet)
     {
-
-        GetSession().GameState.MasterLootCandidates = null;
-        GetSession().GameState.LastMasterLootSentTarget = default;
+        // JimsProxy: master-loot state used to be cleared unconditionally here, which
+        // meant every SMSG_GROUP_LIST -- raid leader change, instance re-entry resync,
+        // member join/leave -- would null out MasterLootCandidates and reset
+        // LastMasterLootSentTarget. The vanilla server only emits SMSG_LOOT_MASTER_LIST
+        // once per corpse (to whoever opens loot first; see comment in HandleLootMasterList),
+        // so after the clear the next SMSG_LOOT_RESPONSE for that corpse fell back to
+        // group.PlayerList -- the entire 40-player raid, not the real in-range candidate
+        // list -- and re-emitted LootList for an already-displayed corpse, auto-opening
+        // the popup for a stale item. Net effect: leader can't distribute loot after
+        // promotion or instance re-entry. The natural lifecycle (LOOT_RELEASE clears the
+        // sent-target, fresh SMSG_LOOT_MASTER_LIST overwrites candidates) covers cleanup
+        // for active sessions; we only need to reset when the group is fully destroyed
+        // (membersCount == 0 branch below).
         PartyUpdate party = new PartyUpdate();
         party.SequenceNum = GetSession().GameState.GroupUpdateCounter++;
         bool isRaid = packet.ReadBool();
@@ -181,6 +191,11 @@ public partial class WorldClient
             party.MyIndex = -1;
             GetSession().GameState.CurrentGroups[party.PartyIndex] = null;
 
+            // JimsProxy: group fully destroyed (kick / disband / leave) -- drop any cached
+            // master-loot state so a future group doesn't inherit stale candidates.
+            GetSession().GameState.MasterLootCandidates = null;
+            GetSession().GameState.LastMasterLootSentTarget = default;
+
             if (hadActiveGroupM && !GetSession().GameState.WeWantToLeaveGroup) //MIRASU - was: if (!WeWantToLeaveGroup)
                 SendPacketToClient(new GroupUninvite()); // Send kick message
 
@@ -198,8 +213,9 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_GROUP_LIST, ClientVersionBuild.V2_0_1_6180)]
     void HandleGroupListTBC(WorldPacket packet)
     {
-        GetSession().GameState.MasterLootCandidates = null;
-        GetSession().GameState.LastMasterLootSentTarget = default;
+        // JimsProxy: see HandleGroupListVanilla -- master-loot state clear moved into
+        // the membersCount == 0 (group destroyed) branch so leader change / instance
+        // re-entry don't break an active master-loot session.
         PartyUpdate party = new PartyUpdate();
         party.SequenceNum = GetSession().GameState.GroupUpdateCounter++;
         bool isRaid = packet.ReadBool();
@@ -291,6 +307,11 @@ public partial class WorldClient
             party.LeaderGUID = WowGuid128.Empty;
             party.MyIndex = -1;
             GetSession().GameState.CurrentGroups[party.PartyIndex] = null;
+
+            // JimsProxy: group fully destroyed -- drop cached master-loot state so a future
+            // group doesn't inherit stale candidates. See HandleGroupListVanilla for full note.
+            GetSession().GameState.MasterLootCandidates = null;
+            GetSession().GameState.LastMasterLootSentTarget = default;
 
             if (hadActiveGroupM && !GetSession().GameState.WeWantToLeaveGroup) //MIRASU
                 SendPacketToClient(new GroupUninvite()); // Send kick message
