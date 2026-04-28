@@ -650,6 +650,12 @@ public partial class WorldClient
     {
         AuthResult result = (AuthResult)packet.ReadUInt8();
 
+        // Billing/expansion fields are only present on the *first* SMSG_AUTH_RESPONSE
+        // (the full one). CMaNGOS/VMaNGOS-style 1.12 servers send subsequent
+        // queue-update packets in a stripped form: just uint8(result) + uint32(position).
+        // If a Kronos build sends billing on every packet, this branch will read
+        // the wrong bytes — flag this if launch-day logs show queue positions
+        // jumping into the millions.
         if (_isSuccessful == null)
         {
             uint billingTimeRemaining = packet.ReadUInt32();
@@ -665,10 +671,29 @@ public partial class WorldClient
         if (result == AuthResult.AUTH_OK)
         {
             Log.Print(LogType.Network, "Authentication succeeded!");
-            if (_queuePosition != 0 && GetSession().RealmSocket != null)
+            // Race fix: previously _queuePosition reset and WaitQueueFinish were
+            // BOTH gated on RealmSocket != null. If Kronos released us from queue
+            // before the modern client's EnterEncryptedModeAck arrived (which is
+            // what sets RealmSocket), _queuePosition stayed at the stale value
+            // and the next SendAuthResponse(Ok, GetQueuePosition()) embedded a
+            // bogus WaitInfo — modern client showed permanent queue UI with no
+            // follow-up WaitQueueFinish to dismiss it.
+            //
+            // Now: always reset _queuePosition. Only send WaitQueueFinish if
+            // RealmSocket exists (meaning the AuthResponse was already sent and
+            // queue UI may already be on screen). If RealmSocket is null, the
+            // deferred AuthResponse will go out with queuePos=0 and no queue UI
+            // is ever shown — no Finish needed.
+            bool wasQueued = _queuePosition != 0;
+            _queuePosition = 0;
+            if (wasQueued)
             {
-                _queuePosition = 0;
-                GetSession().RealmSocket.SendAuthWaitQue(_queuePosition);
+                var realmSocket = GetSession().RealmSocket;
+                Log.Event("auth.queue.released", new
+                {
+                    had_realm_socket = realmSocket != null,
+                });
+                realmSocket?.SendAuthWaitQue(0);
             }
             _isSuccessful = true;
             StartKeepAliveTimer();
@@ -677,8 +702,16 @@ public partial class WorldClient
         {
             _queuePosition = packet.ReadUInt32();
             Log.Print(LogType.Network, $"Position in queue is {_queuePosition}.");
-            if (_isSuccessful != null && GetSession().RealmSocket != null)
-                GetSession().RealmSocket.SendAuthWaitQue(_queuePosition);
+            bool isInitial = _isSuccessful == null;
+            var realmSocket = GetSession().RealmSocket;
+            Log.Event("auth.queue.position", new
+            {
+                position = _queuePosition,
+                is_initial = isInitial,
+                had_realm_socket = realmSocket != null,
+            });
+            if (!isInitial)
+                realmSocket?.SendAuthWaitQue(_queuePosition);
             _isSuccessful = true;
         }
         else

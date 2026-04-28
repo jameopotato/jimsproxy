@@ -1030,6 +1030,12 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             response.WaitInfo.WaitCount = queuePos;
         }
 
+        Log.Event("auth.response_sent", new
+        {
+            result = code.ToString(),
+            queue_position = queuePos,
+            has_wait_info = response.WaitInfo != null,
+        });
         SendPacket(response);
     }
 
@@ -1041,10 +1047,14 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             waitQueueUpdate.WaitInfo.WaitCount = position;
             waitQueueUpdate.WaitInfo.WaitTime = 0;
             waitQueueUpdate.WaitInfo.HasFCM = false;
+            Log.Event("auth.queue.update_sent", new { position = position });
             SendPacket(waitQueueUpdate);
         }
         else
+        {
+            Log.Event("auth.queue.finish_sent", new { });
             SendPacket(new WaitQueueFinish());
+        }
     }
 
     public void SendSetTimeZoneInformation()
