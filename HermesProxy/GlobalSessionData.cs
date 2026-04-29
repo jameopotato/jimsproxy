@@ -71,6 +71,15 @@ public sealed class GameSessionData
     public uint LastEnteredAreaTrigger;
     public uint LastDispellSpellId;
     public Dictionary<WowGuid128, uint[]> CachedPlayerEnchants = new();
+    // JimsProxy: pet creature family cache. SMSG_PET_SPELLS_MESSAGE on pre-3.1
+    // servers doesn't carry the family on the wire — we derive it from the
+    // creature template via GetItemId(petGuid). For quest-tame pets the
+    // GUID→entry mapping can drop out of cache between updates, so a follow-up
+    // SMSG_PET_SPELLS_MESSAGE comes through with creature_family=0. The modern
+    // client's PetPaperDollFrame_SetStats then calls strupper on a nil family
+    // name and errors. This cache stickies the first successful family lookup
+    // so we always send a valid family, cleared only on explicit pet dismiss.
+    public ConcurrentDictionary<WowGuid128, ushort> CachedPetCreatureFamily = new();
     public string LeftChannelName = "";
     public bool IsPassingOnLoot;
     public int GroupUpdateCounter;

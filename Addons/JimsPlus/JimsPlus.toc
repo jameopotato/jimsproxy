@@ -7,6 +7,7 @@
 ## Version: 1.0.1
 
 Core.lua
+PetFix.lua
 castbars/PoolManager.lua
 castbars/AnchorManager.lua
 castbars/Data.lua

@@ -109,11 +109,36 @@ public partial class WorldSocket
             SendPacket(failed);
         }    
     }
+    // JimsProxy: Hunter tame-class spell IDs in vanilla — used to log tame attempts
+    // for the pet deep-dive. 1515 = "Tame Beast" player ability; the rest are
+    // quest-tame variants ("Capture Beast Aspects" etc.) that target specific
+    // creature families. List is not exhaustive; if we see new tame variants in
+    // the wild, add them here.
+    private static readonly System.Collections.Generic.HashSet<uint> TameSpellIds = new()
+    {
+        1515u,   // Tame Beast (Hunter)
+        13481u,  // Tame Hyena (quest variant)
+        19484u,  // Tame Wolf (quest variant)
+        19597u, 19676u, 19677u, 19678u, // Tame quest variants
+        19684u, 19685u, 19686u, 19687u, // Confirmed quest tame variants on Kronos
+        19688u, 19689u, 19690u, 19691u, 19692u, 19693u,
+        19694u, 19696u, 19697u, 19698u, 19699u, 19700u,
+    };
+
     [PacketHandler(Opcode.CMSG_CAST_SPELL)]
     void HandleCastSpell(CastSpell cast)
     {
         if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
             GetSession().GameState.LastDispellSpellId = (uint)cast.Cast.SpellID;
+
+        if (TameSpellIds.Contains(cast.Cast.SpellID))
+        {
+            Log.Event("pet.tame.cast", new
+            {
+                spell_id = cast.Cast.SpellID,
+                cast_id_counter = cast.Cast.CastID.GetCounter(),
+            });
+        }
 
         bool isNextMelee = GameData.NextMeleeSpells.Contains(cast.Cast.SpellID);
         bool isAutoRepeat = GameData.AutoRepeatSpells.Contains(cast.Cast.SpellID);

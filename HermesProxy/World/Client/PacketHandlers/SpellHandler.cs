@@ -448,7 +448,18 @@ public partial class WorldClient
         // depends on that path for target-frame cast-bar dismiss on Kick / Counterspell.
         bool casterIsLocalPlayer = GetSession().GameState.CurrentPlayerGuid == casterUnit;
         bool casterIsLocalPet    = GetSession().GameState.CurrentPetGuid    == casterUnit;
-        if (casterIsLocalPlayer || casterIsLocalPet)
+        // Ranged auto-attack exception (mirrors the SPELL_START allowlist in
+        // HandleSpellStart): for Auto Shot (75) / Shoot (5019), the modern
+        // client requires SMSG_SPELL_FAILURE to cancel the bow-draw / wand-aim
+        // animation. Suppressing it leaves the bow drawn forever after a single
+        // out-of-range / LoS rejection, which the user sees as
+        //   "animation ready but the shot never fires".
+        // CAST_FAILED + CANCEL_AUTO_REPEAT alone are not enough to retract the
+        // ranged-attack visual on 1.14 — observed in the 2026-04-28 hunter
+        // bundle where every Auto Shot SPELL_START was paired with a suppressed
+        // SPELL_FAILURE reason=1 and the bow stuck drawn.
+        bool isRangedAutoAttack = spellId == 75 || spellId == 5019;
+        if ((casterIsLocalPlayer || casterIsLocalPet) && !isRangedAutoAttack)
         {
             Log.Event("spell.failure.suppressed_for_caster", new
             {
@@ -457,6 +468,15 @@ public partial class WorldClient
                 is_pet = casterIsLocalPet,
             });
             return;
+        }
+        if (isRangedAutoAttack && (casterIsLocalPlayer || casterIsLocalPet))
+        {
+            Log.Event("spell.failure.ranged_auto_forwarded", new
+            {
+                spellId,
+                raw_reason_byte = reason,
+                is_pet = casterIsLocalPet,
+            });
         }
 
         WowGuid128 castId;
@@ -643,7 +663,17 @@ public partial class WorldClient
         // the GCD cleanly. Successful instants still apply real GCD via SPELL_GO. Cast-
         // time spells (CastTime > 0) and NPC casts forward as before — for them, GCD has
         // genuinely been committed server-side and the cast-bar visual is needed.
-        bool suppressInstantStart = (casterIsLocalPlayer || casterIsLocalPet) && spell.Cast.CastTime == 0;
+        // Ranged auto-attack exception: spells like Auto Shot (75) and Shoot (5019)
+        // are instant casts where SMSG_SPELL_START is what plays the visible bow
+        // draw / wand aim animation. Suppressing it leaves the player firing
+        // invisibly — the shots still hit (via SPELL_GO) but the character never
+        // animates, which is what the user observed for Hunter Auto Shot.
+        // Whitelist these so they bypass the issue-#43 instant-suppression.
+        bool isRangedAutoAttack = spell.Cast.SpellID == 75      // Auto Shot
+                                  || spell.Cast.SpellID == 5019; // Shoot (Wand)
+        bool suppressInstantStart = (casterIsLocalPlayer || casterIsLocalPet)
+                                    && spell.Cast.CastTime == 0
+                                    && !isRangedAutoAttack;
         if (suppressInstantStart)
         {
             Log.Event("spell.start.instant_suppressed", new
@@ -654,6 +684,15 @@ public partial class WorldClient
                 caster_is_pet = casterIsLocalPet,
             });
             return;
+        }
+        if (isRangedAutoAttack && (casterIsLocalPlayer || casterIsLocalPet) && spell.Cast.CastTime == 0)
+        {
+            Log.Event("spell.start.ranged_auto_forwarded", new
+            {
+                spell_id = spell.Cast.SpellID,
+                caster_is_player = casterIsLocalPlayer,
+                caster_is_pet = casterIsLocalPet,
+            });
         }
 
         SendPacketToClient(spell);
@@ -1284,6 +1323,16 @@ public partial class WorldClient
                                  // spells. Like DUMMY, the real mechanic is server-side; no
                                  // per-target payload on the wire.
                             Log.Print(LogType.Server, $"ScriptEffect(type={effectType}): no target payload");
+                            break;
+                        case 56:  // SUMMON_PET — pet summon, server-side, no per-target payload
+                                  // (observed for spell 883 = Call Pet).
+                        case 63:  // TAMECREATURE (Kronos numbering) — observed for spell 1515 =
+                                  // Tame Beast. The tamed creature is summoned via the normal
+                                  // pet path; this log entry has no per-target payload.
+                        case 102: // observed for spell 2641 = Dismiss Pet — server-side, no payload.
+                        case 104: // observed for spell 14311 / various Hunter abilities — Kronos
+                                  // emits these without a per-target GUID payload.
+                            Log.Print(LogType.Server, $"NoPayload(type={effectType}): no target payload");
                             break;
                         case 101: // FEED_PET
                             uint fpItemId = packet.ReadUInt32();
