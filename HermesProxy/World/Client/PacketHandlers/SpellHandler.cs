@@ -1191,72 +1191,134 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_SPELL_EXECUTE_LOG)]
     void HandleSpellExecuteLog(WorldPacket packet)
     {
-        var casterGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
-        uint spellId = packet.ReadUInt32();
-        uint effectCount = packet.ReadUInt32();
-
-        Log.Print(LogType.Server, $"SpellExecuteLog: caster={casterGuid} spell={spellId} effects={effectCount}");
-
-        for (uint i = 0; i < effectCount; i++)
+        // SMSG_SPELL_EXECUTE_LOG is diagnostic-only — nothing here is forwarded to
+        // the modern client. So if any byte misalignment / unknown effect format
+        // trips a parse exception, we MUST NOT let it bubble up — it would tear
+        // down the entire ReceiveLoop and force a random disconnect.
+        //
+        // Two known triggers found in the wild, both effects that report targetCount
+        // > 0 on the wire but emit no per-target payload — falling through to the
+        // default GUID-read branch reads off the end of the packet:
+        //   - Effect 50 (TRANS_DOOR): Priest Lightwell, Mage portals, etc.
+        //   - Effect 69 (DISTRACT): Rogue spell 1725 — anyone in range casting it
+        //     would DC every other player.
+        // Try/catch wrapper is the durable fix for the next surprise effect type;
+        // explicit cases just keep the error log clean.
+        // Breadcrumbs for the parse-failed event — capture as much state as we
+        // got through before the exception so future captures tell us which spell
+        // / effect type we need to whitelist next.
+        uint dbgSpellId = 0;
+        uint dbgEffectIndex = 0;
+        uint dbgEffectType = 0;
+        uint dbgTargetCount = 0;
+        uint dbgTargetIndex = 0;
+        try
         {
-            uint effectType = packet.ReadUInt32();
-            uint targetCount = packet.ReadUInt32();
+            var casterGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
+            uint spellId = packet.ReadUInt32();
+            dbgSpellId = spellId;
+            uint effectCount = packet.ReadUInt32();
 
-            Log.Print(LogType.Server, $"  Effect[{i}]: type={effectType} targets={targetCount}");
+            Log.Print(LogType.Server, $"SpellExecuteLog: caster={casterGuid} spell={spellId} effects={effectCount}");
 
-            for (uint t = 0; t < targetCount; t++)
+            for (uint i = 0; i < effectCount; i++)
             {
-                switch (effectType)
+                dbgEffectIndex = i;
+                uint effectType = packet.ReadUInt32();
+                uint targetCount = packet.ReadUInt32();
+                dbgEffectType = effectType;
+                dbgTargetCount = targetCount;
+
+                Log.Print(LogType.Server, $"  Effect[{i}]: type={effectType} targets={targetCount}");
+
+                for (uint t = 0; t < targetCount; t++)
                 {
-                    case 8: // POWER_DRAIN
-                        var pdGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
-                        uint pdAmount = packet.ReadUInt32();
-                        uint pdPowerType = packet.ReadUInt32();
-                        float pdMultiplier = packet.ReadFloat();
-                        Log.Print(LogType.Server, $"PowerDrain: target={pdGuid} amount={pdAmount} power={pdPowerType}");
-                        break;
-                    case 10: // HEAL
-                        var hGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
-                        uint hAmount = packet.ReadUInt32();
-                        uint hCrit = packet.ReadUInt32();
-                        Log.Print(LogType.Server, $"Heal: target={hGuid} amount={hAmount} crit={hCrit}");
-                        break;
-                    case 30: // ENERGIZE
-                        var eGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
-                        uint eAmount = packet.ReadUInt32();
-                        uint ePowerType = packet.ReadUInt32();
-                        Log.Print(LogType.Server, $"Energize: target={eGuid} amount={eAmount} power={ePowerType}");
-                        break;
-                    case 32: // EXTRA_ATTACKS (vanilla value 32)
-                        var eaGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
-                        uint eaCount = packet.ReadUInt32();
-                        Log.Print(LogType.Server, $"ExtraAttacks: target={eaGuid} count={eaCount}");
-                        break;
-                    case 24: // CREATE_ITEM
-                        uint ciItemId = packet.ReadUInt32();
-                        Log.Print(LogType.Server, $"CreateItem: item={ciItemId}");
-                        break;
-                    case 41: // INTERRUPT_CAST
-                        var icGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
-                        uint icSpellId = packet.ReadUInt32();
-                        Log.Print(LogType.Server, $"InterruptCast: target={icGuid} spell={icSpellId}");
-                        break;
-                    case 101: // FEED_PET
-                        uint fpItemId = packet.ReadUInt32();
-                        Log.Print(LogType.Server, $"FeedPet: item={fpItemId}");
-                        break;
-                    case 113: // DURABILITY_DAMAGE
-                        var ddGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
-                        uint ddItemId = packet.ReadUInt32();
-                        uint ddAmount = packet.ReadUInt32();
-                        Log.Print(LogType.Server, $"DurabilityDmg: target={ddGuid} item={ddItemId} amount={ddAmount}");
-                        break;
-                    default: // INSTAKILL, RESURRECT, DISPEL, SUMMON, etc — just a GUID
-                        var defaultGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
-                        Log.Print(LogType.Server, $"Default(type={effectType}): target={defaultGuid}");
-                        break;
+                    dbgTargetIndex = t;
+                    switch (effectType)
+                    {
+                        case 8: // POWER_DRAIN
+                            var pdGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
+                            uint pdAmount = packet.ReadUInt32();
+                            uint pdPowerType = packet.ReadUInt32();
+                            float pdMultiplier = packet.ReadFloat();
+                            Log.Print(LogType.Server, $"PowerDrain: target={pdGuid} amount={pdAmount} power={pdPowerType}");
+                            break;
+                        case 10: // HEAL
+                            var hGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
+                            uint hAmount = packet.ReadUInt32();
+                            uint hCrit = packet.ReadUInt32();
+                            Log.Print(LogType.Server, $"Heal: target={hGuid} amount={hAmount} crit={hCrit}");
+                            break;
+                        case 30: // ENERGIZE
+                            var eGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
+                            uint eAmount = packet.ReadUInt32();
+                            uint ePowerType = packet.ReadUInt32();
+                            Log.Print(LogType.Server, $"Energize: target={eGuid} amount={eAmount} power={ePowerType}");
+                            break;
+                        case 32: // EXTRA_ATTACKS (vanilla value 32)
+                            var eaGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
+                            uint eaCount = packet.ReadUInt32();
+                            Log.Print(LogType.Server, $"ExtraAttacks: target={eaGuid} count={eaCount}");
+                            break;
+                        case 24: // CREATE_ITEM
+                            uint ciItemId = packet.ReadUInt32();
+                            Log.Print(LogType.Server, $"CreateItem: item={ciItemId}");
+                            break;
+                        case 41: // INTERRUPT_CAST
+                            var icGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
+                            uint icSpellId = packet.ReadUInt32();
+                            Log.Print(LogType.Server, $"InterruptCast: target={icGuid} spell={icSpellId}");
+                            break;
+                        case 3: // DUMMY — server-side script triggers the real mechanic.
+                                // Paladin Holy Shock (20930), various Judgements, etc.
+                                // No per-target payload follows.
+                            Log.Print(LogType.Server, $"Dummy(type={effectType}): no target payload");
+                            break;
+                        case 50: // TRANS_DOOR — Lightwell, Mage Portal, etc. No per-target payload.
+                            Log.Print(LogType.Server, $"TransDoor(type={effectType}): no target payload");
+                            break;
+                        case 69: // DISTRACT — positional spell, no per-target payload.
+                            Log.Print(LogType.Server, $"Distract(type={effectType}): no target payload");
+                            break;
+                        case 77: // SCRIPT_EFFECT — Judgement (20271) and many other script-driven
+                                 // spells. Like DUMMY, the real mechanic is server-side; no
+                                 // per-target payload on the wire.
+                            Log.Print(LogType.Server, $"ScriptEffect(type={effectType}): no target payload");
+                            break;
+                        case 101: // FEED_PET
+                            uint fpItemId = packet.ReadUInt32();
+                            Log.Print(LogType.Server, $"FeedPet: item={fpItemId}");
+                            break;
+                        case 113: // DURABILITY_DAMAGE
+                            var ddGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
+                            uint ddItemId = packet.ReadUInt32();
+                            uint ddAmount = packet.ReadUInt32();
+                            Log.Print(LogType.Server, $"DurabilityDmg: target={ddGuid} item={ddItemId} amount={ddAmount}");
+                            break;
+                        default: // INSTAKILL, RESURRECT, DISPEL, SUMMON, etc — just a GUID
+                            var defaultGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
+                            Log.Print(LogType.Server, $"Default(type={effectType}): target={defaultGuid}");
+                            break;
+                    }
                 }
             }
+        }
+        catch (Exception ex)
+        {
+            // SMSG_SPELL_EXECUTE_LOG is read for diagnostic logging only; an unknown
+            // effect format here must never disconnect the player. Log and drop.
+            Log.Print(LogType.Error, $"SpellExecuteLog parse failed (non-fatal, packet dropped): spell={dbgSpellId} effectType={dbgEffectType} {ex.GetType().Name}: {ex.Message}");
+            Log.Event("combat.execute_log.parse_failed", new
+            {
+                exception_type = ex.GetType().Name,
+                exception_message = ex.Message,
+                spell_id = dbgSpellId,
+                effect_index = dbgEffectIndex,
+                effect_type = dbgEffectType,
+                target_count = dbgTargetCount,
+                target_index = dbgTargetIndex,
+                packet_size = packet.GetSize(),
+            });
         }
     }
 
