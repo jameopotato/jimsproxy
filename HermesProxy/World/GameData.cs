@@ -670,7 +670,8 @@ public static partial class GameData
             LoadTaxiPaths,
             LoadTaxiPathNodesGraph,
             LoadQuestBits,
-            LoadHotfixes
+            LoadHotfixes,
+            LanguageScrambler.Load
         );
 
         // Must run sequentially AFTER Parallel.Invoke: reads+overwrites SpellVisuals,

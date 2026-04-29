@@ -227,6 +227,8 @@ public partial class WorldClient
         if (!ChatPkt.CheckAddonPrefix(GetSession().GameState.AddonPrefixes, ref language, ref text, ref addonPrefix))
             return;
 
+        text = MaybeScrambleForeignLanguage(text, language);
+
         ChatMessageTypeModern chatTypeModern = chatType.CastEnum<ChatMessageTypeModern>();
         ChatPkt chat = new ChatPkt(GetSession(), chatTypeModern, text, language, sender, senderName, receiver, "", channelName, chatFlags, addonPrefix);
         SendPacketToClient(chat);
@@ -360,9 +362,44 @@ public partial class WorldClient
         if (!ChatPkt.CheckAddonPrefix(GetSession().GameState.AddonPrefixes, ref language, ref text, ref addonPrefix))
             return;
 
+        text = MaybeScrambleForeignLanguage(text, language);
+
         ChatMessageTypeModern chatTypeModern = chatType.CastEnum<ChatMessageTypeModern>();
         ChatPkt chat = new ChatPkt(GetSession(), chatTypeModern, text, language, sender, senderName, receiver, receiverName, channelName, chatFlags, addonPrefix, achievementId);
         SendPacketToClient(chat);
+    }
+
+    //MIRASU - Resolves the local player's racial language list and scrambles the chat body when
+    //MIRASU   the language being broadcast isn't one the receiver should be able to read. Vanilla
+    //MIRASU   1.12 emulators ship plain text + language ID and depend on the legacy 1.12 client
+    //MIRASU   to scramble; the modern 1.14 client doesn't honour that for legacy IDs, so without
+    //MIRASU   this hook foreign-faction speech leaks through unobfuscated. See HermesProxy issues
+    //MIRASU   #100 (cross-faction comprehension) and #213 (unknown languages plain).
+    private string MaybeScrambleForeignLanguage(string text, uint language)
+    {
+        if (string.IsNullOrEmpty(text))
+            return text;
+
+        var localPlayer = GetSession().GameState.CurrentPlayerInfo;
+        if (localPlayer == null)
+            return text;
+
+        if (LanguageScrambler.CanUnderstand(localPlayer.RaceId, localPlayer.ClassId, language))
+            return text;
+
+        if (!LanguageScrambler.HasSyllabary(language))
+        {
+            Log.Event("chat.scramble.skipped", new
+            {
+                reason = "no_syllabary",
+                language,
+                receiverRace = localPlayer.RaceId.ToString(),
+                receiverClass = localPlayer.ClassId.ToString(),
+            });
+            return text;
+        }
+
+        return LanguageScrambler.Scramble(text, language);
     }
 
     public void SendMessageChatVanilla(ChatMessageTypeVanilla type, uint lang, string msg, string channel, string to)
