@@ -81,6 +81,12 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CHAT_MESSAGE_AFK)]
     void HandleChatMessageAFK(ChatMessageAFK afk)
     {
+        if (GetSession().WorldClient == null)
+        {
+            LogChatDroppedNoWorldClient("CMSG_CHAT_MESSAGE_AFK");
+            return;
+        }
+
         var toBeSentTextParts = ConvertTextMessageIntoMaxLengthParts(afk.Text);
         if (toBeSentTextParts.Count < 1)
             return;
@@ -94,6 +100,12 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CHAT_MESSAGE_DND)]
     void HandleChatMessageDND(ChatMessageDND dnd)
     {
+        if (GetSession().WorldClient == null)
+        {
+            LogChatDroppedNoWorldClient("CMSG_CHAT_MESSAGE_DND");
+            return;
+        }
+
         var toBeSentTextParts = ConvertTextMessageIntoMaxLengthParts(dnd.Text);
         if (toBeSentTextParts.Count < 1)
             return;
@@ -107,6 +119,12 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CHAT_MESSAGE_CHANNEL)]
     void HandleChatMessageChannel(ChatMessageChannel channel)
     {
+        if (GetSession().WorldClient == null)
+        {
+            LogChatDroppedNoWorldClient("CMSG_CHAT_MESSAGE_CHANNEL");
+            return;
+        }
+
         var toBeSentTextParts = ConvertTextMessageIntoMaxLengthParts(channel.Text);
         foreach (string text in toBeSentTextParts)
         {
@@ -120,6 +138,12 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CHAT_MESSAGE_WHISPER)]
     void HandleChatMessageWhisper(ChatMessageWhisper whisper)
     {
+        if (GetSession().WorldClient == null)
+        {
+            LogChatDroppedNoWorldClient("CMSG_CHAT_MESSAGE_WHISPER");
+            return;
+        }
+
         var toBeSentTextParts = ConvertTextMessageIntoMaxLengthParts(whisper.Text);
         foreach (string text in toBeSentTextParts)
         {
@@ -133,6 +157,12 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CHAT_MESSAGE_EMOTE)]
     void HandleChatMessageEmote(ChatMessageEmote emote)
     {
+        if (GetSession().WorldClient == null)
+        {
+            LogChatDroppedNoWorldClient("CMSG_CHAT_MESSAGE_EMOTE");
+            return;
+        }
+
         var toBeSentTextParts = ConvertTextMessageIntoMaxLengthParts(emote.Text);
         if (toBeSentTextParts.Count < 1)
             return;
@@ -153,6 +183,12 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CHAT_MESSAGE_INSTANCE_CHAT)]
     void HandleChatMessage(ChatMessage packet)
     {
+        if (GetSession().WorldClient == null)
+        {
+            LogChatDroppedNoWorldClient(packet.GetUniversalOpcode().ToString());
+            return;
+        }
+
         ChatMessageTypeModern type;
 
         switch (packet.GetUniversalOpcode())
@@ -208,6 +244,12 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CHAT_ADDON_MESSAGE)]
     void HandleAddonMessage(ChatAddonMessage packet)
     {
+        if (GetSession().WorldClient == null)
+        {
+            LogChatDroppedNoWorldClient("CMSG_CHAT_ADDON_MESSAGE");
+            return;
+        }
+
         uint language = (uint)Language.Addon;
         string text = packet.Params.Prefix + '\t' + packet.Params.Text;
 
@@ -226,6 +268,12 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CHAT_ADDON_MESSAGE_TARGETED)]
     void HandleAddonMessageTargeted(ChatAddonMessageTargeted packet)
     {
+        if (GetSession().WorldClient == null)
+        {
+            LogChatDroppedNoWorldClient("CMSG_CHAT_ADDON_MESSAGE_TARGETED");
+            return;
+        }
+
         uint language = (uint)Language.Addon;
         string text = packet.Params.Prefix + '\t' + packet.Params.Text;
         string channelName = packet.ChannelGuid.IsEmpty() ? "" :
@@ -264,6 +312,16 @@ public partial class WorldSocket
     void HandleChatUnregisterAllAddonPrefixes(EmptyClientPacket addons)
     {
         GetSession().GameState.AddonPrefixes.Clear();
+    }
+
+    private void LogChatDroppedNoWorldClient(string opcode)
+    {
+        Log.Event("packet.dropped", new
+        {
+            direction = "c2s",
+            opcode_universal = opcode,
+            reason = "no_worldclient",
+        });
     }
 
     private static List<string> ConvertTextMessageIntoMaxLengthParts(string originalTextMessage)
