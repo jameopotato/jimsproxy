@@ -1261,6 +1261,49 @@ public partial class WorldClient
 
     private void AfterStoreObjectUpdateHook(WowGuid128 guid, ObjectType objectType, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, AuraUpdate auraUpdate, PowerUpdate? powerUpdate, bool isCreate, ObjectUpdate updateData, BitArray changedValuesMask)
     {
+        // JimsProxy: comprehensive pet diagnostics for the Hunter-Pet-Stealth-Stuck
+        // investigation. Fires on every UPDATE_OBJECT block targeting a pet GUID
+        // OR the current pet (covers quest-tamed creatures which have a Creature/
+        // Unit GUID encoding rather than HighGuidType.Pet).
+        var currentPetGuid = GetSession().GameState.CurrentPetGuid;
+        bool isPetGuid = guid.GetHighType() == HighGuidType.Pet
+                         || (!currentPetGuid.IsEmpty() && guid == currentPetGuid);
+        if (isPetGuid)
+        {
+            {
+                var auraSummary = new System.Collections.Generic.List<object>();
+                if (auraUpdate != null && auraUpdate.Auras != null)
+                {
+                    foreach (var a in auraUpdate.Auras)
+                    {
+                        auraSummary.Add(new
+                        {
+                            slot = a.Slot,
+                            spell_id = a.AuraData != null ? a.AuraData.SpellID : 0,
+                            removed = a.AuraData == null,
+                            applications = a.AuraData != null ? a.AuraData.Applications : (byte)0,
+                        });
+                    }
+                }
+                Log.Event("pet.update_object", new
+                {
+                    guid = guid.ToString(),
+                    is_create = isCreate,
+                    entry_id = updateData.ObjectData.EntryID,
+                    display_id = updateData.UnitData.DisplayID,
+                    vis_flags = updateData.UnitData.VisFlags,
+                    stand_state = updateData.UnitData.StandState,
+                    shapeshift_form = updateData.UnitData.ShapeshiftForm,
+                    flags = updateData.UnitData.Flags,
+                    health = updateData.UnitData.Health,
+                    max_health = updateData.UnitData.MaxHealth,
+                    aura_full_update = auraUpdate?.UpdateAll ?? false,
+                    aura_count = auraSummary.Count,
+                    auras = auraSummary,
+                });
+            }
+        }
+
         if (objectType == ObjectType.Player || objectType == ObjectType.ActivePlayer)
         {
             int UNIT_FIELD_NATIVEDISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_NATIVEDISPLAYID);
@@ -1613,6 +1656,45 @@ public partial class WorldClient
 
                 if (guid.GetHighType() == HighGuidType.Pet && updateData.UnitData.DisplayPower == (uint)PowerType.Focus)
                     GetSession().GameState.HunterPetGuids.Add(guid);
+
+                // Pet ClassId fallback: Vanilla Kronos sends ClassId=0 (or an invalid
+                // value outside 1..MAX_CLASSES) for pets. The 1.14 client's
+                // PetPaperDollFrame_SetStats does
+                //   classFileName = select(2, UnitClass("pet"))   → nil
+                //   classStatText = _G[strupper(classFileName)..] → strupper(nil) ERROR
+                // killing the paper-doll frame with "bad argument #1 to 'strupper'".
+                // Clamp to 1 (Warrior) — guaranteed to resolve to a real class file name.
+                // Modern servers (3.0+) send a valid pet class so this only fires on legacy.
+                var currentPetGuid = GetSession().GameState.CurrentPetGuid;
+                bool isPetUnit = guid.GetHighType() == HighGuidType.Pet
+                                 || (!currentPetGuid.IsEmpty() && guid == currentPetGuid)
+                                 || GetSession().GameState.HunterPetGuids.Contains(guid);
+                byte rawClassId = (byte)((updates[UNIT_FIELD_BYTES_0].UInt32Value >> 8) & 0xFF);
+                if (isPetUnit)
+                {
+                    Log.Event("pet.bytes0.observed", new
+                    {
+                        guid = guid.ToString(),
+                        high_type = guid.GetHighType().ToString(),
+                        bytes0_raw = updates[UNIT_FIELD_BYTES_0].UInt32Value,
+                        race_id = updateData.UnitData.RaceId,
+                        class_id = rawClassId,
+                        sex_id = updateData.UnitData.SexId,
+                        display_power = updateData.UnitData.DisplayPower,
+                    });
+                }
+                if (isPetUnit && (rawClassId < 1 || rawClassId > 12))
+                {
+                    Log.Event("pet.class_id.fallback", new
+                    {
+                        guid = guid.ToString(),
+                        original_class_id = rawClassId,
+                        defaulted_to = 1,
+                        race_id = updateData.UnitData.RaceId,
+                        display_power = updateData.UnitData.DisplayPower,
+                    });
+                    updateData.UnitData.ClassId = 1; // Warrior — guaranteed non-nil class file name
+                }
 
                 if (objectType == ObjectType.Unit)
                     GetSession().GameState.StoreCreatureClass(guid.GetEntry(), (Class)updateData.UnitData.ClassId);

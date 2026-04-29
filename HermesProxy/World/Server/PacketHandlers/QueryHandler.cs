@@ -60,6 +60,13 @@ public partial class WorldSocket
         WorldPacket packet = new WorldPacket(Opcode.CMSG_QUERY_PET_NAME);
         packet.WriteUInt32(queryName.UnitGUID.GetEntry());
         packet.WriteGuid(queryName.UnitGUID.To64());
+        Framework.Logging.Log.Event("pet.name_query.sent", new
+        {
+            client_guid = queryName.UnitGUID.ToString(),
+            entry = queryName.UnitGUID.GetEntry(),
+            counter = queryName.UnitGUID.GetCounter(),
+            high_type = queryName.UnitGUID.GetHighType().ToString(),
+        });
         SendPacketToServer(packet);
     }
     [PacketHandler(Opcode.CMSG_WHO)]

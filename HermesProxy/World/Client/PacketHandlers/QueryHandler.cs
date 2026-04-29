@@ -552,6 +552,14 @@ public partial class WorldClient
     {
         uint petNumber = packet.ReadUInt32();
         WowGuid128 guid = GetSession().GameState.GetPetGuidByNumber(petNumber);
+        string name = packet.ReadCString();
+        Log.Event("pet.name_query.response", new
+        {
+            pet_number = petNumber,
+            resolved_guid = guid == default ? "(none)" : guid.ToString(),
+            name_empty = name.Length == 0,
+            name = name,
+        });
         if (guid == default)
         {
             Log.Print(LogType.Error, $"Pet name query response for unknown pet {petNumber}!");
@@ -560,11 +568,15 @@ public partial class WorldClient
 
         QueryPetNameResponse response = new QueryPetNameResponse();
         response.UnitGUID = guid;
-        response.Name = packet.ReadCString();
+        response.Name = name;
         if (response.Name.Length == 0)
         {
+            // Legacy server returned empty name (typically a petnumber/guid mismatch in
+            // the CMSG). Still forward the response with Allow=false so the modern client
+            // stops retrying — without a response it spins on the query and the unit
+            // frame stays at "Unknown".
             response.Allow = false;
-            packet.ReadBytes(7); // 0s
+            SendPacketToClient(response);
             return;
         }
 
