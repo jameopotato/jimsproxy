@@ -332,8 +332,9 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
 
                 break;
             case Opcode.CMSG_ENABLE_NAGLE:
-                SetNoDelay(false);
-                GetSession()?.WorldClient?.SetNoDelay(false);
+                // Intentionally ignored. The 1.14 client sends this after entering
+                // world, re-enabling Nagle's ~200ms write coalescing on both sockets.
+                // Proxy needs low-latency forwarding; keep TCP_NODELAY=true permanently.
                 break;
             case Opcode.CMSG_CONNECT_TO_FAILED:
                 ConnectToFailed connectToFailed = new(packet);
