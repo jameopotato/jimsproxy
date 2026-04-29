@@ -71,6 +71,11 @@ public sealed class GameSessionData
     public uint LastEnteredAreaTrigger;
     public uint LastDispellSpellId;
     public Dictionary<WowGuid128, uint[]> CachedPlayerEnchants = new();
+    // JimsProxy: per-unit HP cache used to compute overhealing on legacy servers
+    // that don't include OverHeal in SMSG_SPELL_HEAL_LOG (1.12 vanilla). Authoritative
+    // source is UNIT_FIELD_HEALTH / UNIT_FIELD_MAXHEALTH from SMSG_UPDATE_OBJECT;
+    // we also bump current HP forward on heal events to stay accurate between pushes.
+    public ConcurrentDictionary<WowGuid128, (int Hp, int MaxHp)> UnitHealthCache = new();
     public string LeftChannelName = "";
     public bool IsPassingOnLoot;
     public int GroupUpdateCounter;

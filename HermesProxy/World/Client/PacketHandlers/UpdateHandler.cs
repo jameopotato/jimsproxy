@@ -1566,14 +1566,31 @@ public partial class WorldClient
                 updateData.UnitData.ChannelObject = GetGuidValue(updates, UnitField.UNIT_FIELD_CHANNEL_OBJECT).To128(GetSession().GameState);
             }
             int UNIT_FIELD_HEALTH = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_HEALTH);
-            if (UNIT_FIELD_HEALTH >= 0 && updateMaskArray[UNIT_FIELD_HEALTH])
+            bool healthUpdated = UNIT_FIELD_HEALTH >= 0 && updateMaskArray[UNIT_FIELD_HEALTH];
+            if (healthUpdated)
             {
                 updateData.UnitData.Health = updates[UNIT_FIELD_HEALTH].Int32Value;
             }
             int UNIT_FIELD_MAXHEALTH = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_MAXHEALTH);
-            if (UNIT_FIELD_MAXHEALTH >= 0 && updateMaskArray[UNIT_FIELD_MAXHEALTH])
+            bool maxHealthUpdated = UNIT_FIELD_MAXHEALTH >= 0 && updateMaskArray[UNIT_FIELD_MAXHEALTH];
+            if (maxHealthUpdated)
             {
                 updateData.UnitData.MaxHealth = updates[UNIT_FIELD_MAXHEALTH].Int32Value;
+            }
+            // JimsProxy: feed our HP cache so SpellHandler.HandleSpellHealLog can compute
+            // overhealing on 1.12 servers (which don't carry it on the wire). The server
+            // is authoritative — every push here resets any drift accumulated by our
+            // post-heal optimistic updates.
+            if (healthUpdated || maxHealthUpdated)
+            {
+                var cache = GetSession().GameState.UnitHealthCache;
+                cache.AddOrUpdate(guid,
+                    _ => (
+                        healthUpdated ? updates[UNIT_FIELD_HEALTH].Int32Value : 0,
+                        maxHealthUpdated ? updates[UNIT_FIELD_MAXHEALTH].Int32Value : 0),
+                    (_, existing) => (
+                        healthUpdated ? updates[UNIT_FIELD_HEALTH].Int32Value : existing.Hp,
+                        maxHealthUpdated ? updates[UNIT_FIELD_MAXHEALTH].Int32Value : existing.MaxHp));
             }
             int UNIT_FIELD_LEVEL = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_LEVEL);
             if (UNIT_FIELD_LEVEL >= 0 && updateMaskArray[UNIT_FIELD_LEVEL])

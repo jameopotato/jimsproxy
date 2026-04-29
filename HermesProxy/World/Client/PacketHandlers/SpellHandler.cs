@@ -1332,10 +1332,13 @@ public partial class WorldClient
         spell.HealAmount = packet.ReadInt32();
         spell.OriginalHealAmount = spell.HealAmount;
 
-        if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_3_9183))
+        bool wireHasOverheal = LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_3_9183);
+        bool wireHasAbsorbed = LegacyVersion.AddedInVersion(ClientVersionBuild.V3_2_0_10192);
+
+        if (wireHasOverheal)
             spell.OverHeal = packet.ReadUInt32();
 
-        if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_2_0_10192))
+        if (wireHasAbsorbed)
             spell.Absorbed = packet.ReadUInt32();
 
         spell.Crit = packet.ReadBool();
@@ -1350,7 +1353,66 @@ public partial class WorldClient
             }
         }
 
+        ComputeOverHealFromCache(spell.TargetGUID, spell.HealAmount, wireHasOverheal,
+            out uint computedOverHeal, out bool cacheHit, out int cachedHp, out int cachedMaxHp);
+        if (!wireHasOverheal)
+            spell.OverHeal = computedOverHeal;
+
+        Log.Event("combat.heal.log", new
+        {
+            spell_id = spell.SpellID,
+            target = spell.TargetGUID.ToString(),
+            caster = spell.CasterGUID.ToString(),
+            heal_amount = spell.HealAmount,
+            over_heal_sent = spell.OverHeal,
+            absorbed_sent = spell.Absorbed,
+            crit = spell.Crit,
+            wire_has_overheal = wireHasOverheal,
+            wire_has_absorbed = wireHasAbsorbed,
+            cache_hit = cacheHit,
+            cached_hp = cachedHp,
+            cached_max_hp = cachedMaxHp,
+        });
+
         SendPacketToClient(spell);
+    }
+
+    // Computes overhealing for a heal event by looking up the target's current HP
+    // in our cache (populated from SMSG_UPDATE_OBJECT). On 1.12 servers the wire
+    // doesn't carry overheal, so we synthesize it: overheal = max(0, heal - (maxHp - hp)).
+    // After computing, we bump the cached HP forward by the effective amount so
+    // back-to-back heals (faster than UPDATE_OBJECT can resync) compute accurately.
+    // If the cache has no entry for the target (e.g., never received a UPDATE_OBJECT
+    // for them), we leave overheal at 0 and don't touch the cache.
+    private void ComputeOverHealFromCache(
+        WowGuid128 target, int healAmount, bool wireHadOverheal,
+        out uint computedOverHeal, out bool cacheHit, out int cachedHp, out int cachedMaxHp)
+    {
+        computedOverHeal = 0;
+        cacheHit = false;
+        cachedHp = 0;
+        cachedMaxHp = 0;
+
+        if (wireHadOverheal || healAmount <= 0)
+            return;
+
+        var cache = GetSession().GameState.UnitHealthCache;
+        if (!cache.TryGetValue(target, out var state) || state.MaxHp <= 0)
+            return;
+
+        cacheHit = true;
+        cachedHp = state.Hp;
+        cachedMaxHp = state.MaxHp;
+
+        int missing = state.MaxHp - state.Hp;
+        if (missing < 0) missing = 0;
+        int effective = Math.Min(healAmount, missing);
+        int overheal = healAmount - effective;
+        computedOverHeal = (uint)overheal;
+
+        int newHp = state.Hp + effective;
+        if (newHp > state.MaxHp) newHp = state.MaxHp;
+        cache[target] = (newHp, state.MaxHp);
     }
 
     [PacketHandler(Opcode.SMSG_SPELL_PERIODIC_AURA_LOG)]
@@ -1400,7 +1462,9 @@ public partial class WorldClient
                         effect.Amount = packet.ReadInt32();
                         effect.OriginalDamage = effect.Amount;
 
-                        if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
+                        bool wireHasOverhealHot = LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056);
+
+                        if (wireHasOverhealHot)
                             effect.OverHealOrKill = packet.ReadUInt32();
 
                         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_3_0_10958))
@@ -1409,6 +1473,26 @@ public partial class WorldClient
 
                         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_1_2_9901))
                             effect.Crit = packet.ReadBool();
+
+                        ComputeOverHealFromCache(spell.TargetGUID, effect.Amount, wireHasOverhealHot,
+                            out uint computedOverHealHot, out bool cacheHitHot, out int cachedHpHot, out int cachedMaxHotHp);
+                        if (!wireHasOverhealHot)
+                            effect.OverHealOrKill = computedOverHealHot;
+
+                        Log.Event("combat.heal.periodic", new
+                        {
+                            spell_id = spell.SpellID,
+                            target = spell.TargetGUID.ToString(),
+                            caster = spell.CasterGUID.ToString(),
+                            aura = aura.ToString(),
+                            amount = effect.Amount,
+                            over_heal_sent = effect.OverHealOrKill,
+                            crit = effect.Crit,
+                            wire_has_overheal = wireHasOverhealHot,
+                            cache_hit = cacheHitHot,
+                            cached_hp = cachedHpHot,
+                            cached_max_hp = cachedMaxHotHp,
+                        });
 
                         spell.Effects.Add(effect);
                         break;
