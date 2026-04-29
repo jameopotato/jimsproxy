@@ -245,6 +245,18 @@ public static partial class GameData
         return 0;
     }
 
+    // Resolves which DisplayID to use for 1.14 client appearance hotfixes.
+    // The server's DisplayID may not exist in modern ItemDisplayInfo (e.g.
+    // Tabard of Flame/Frost, items with legacy-only display entries). When
+    // that happens, fall back to the CSV-mapped DisplayID by item entry.
+    public static uint ResolveItemDisplayIdForClient(ItemTemplate item)
+    {
+        if (GetItemIconFileDataIdByDisplayId(item.DisplayID) != 0)
+            return item.DisplayID;
+        uint csvDisplayId = GetItemDisplayId(item.Entry);
+        return csvDisplayId != 0 ? csvDisplayId : item.DisplayID;
+    }
+
     public static ItemModifiedAppearance? GetItemModifiedAppearanceByDisplayId(uint displayId)
     {
         ItemAppearance? appearance = GetItemAppearanceByDisplayId(displayId);
@@ -3446,7 +3458,8 @@ public static partial class GameData
 
     public static Server.Packets.HotFixMessage? GenerateItemAppearanceUpdateIfNeeded(ItemTemplate item)
     {
-        ItemAppearance? appearance = GetItemAppearanceByDisplayId(item.DisplayID);
+        uint displayId = ResolveItemDisplayIdForClient(item);
+        ItemAppearance? appearance = GetItemAppearanceByDisplayId(displayId);
         if (appearance != null)
         {
             // never can happen, should not edit existing ItemAppearance as can affect other items
@@ -3504,9 +3517,10 @@ public static partial class GameData
         {
             ItemAppearance? appearance;
             ItemAppearanceStore.TryGetValue((uint)modAppearance.ItemAppearanceID, out appearance);
-            if (appearance == null || appearance.ItemDisplayInfoID != item.DisplayID)
+            uint displayId = ResolveItemDisplayIdForClient(item);
+            if (appearance == null || appearance.ItemDisplayInfoID != (int)displayId)
             {
-                //MIRASU: Check whether the Kronos-sent DisplayID can actually resolve to a known
+                //MIRASU: Check whether the resolved DisplayID can actually resolve to a known
                 //MIRASU: ItemAppearance in the modern (CSV) reference data. If not, the server's
                 //MIRASU: 1.12 DB has a stale/divergent DisplayID (e.g. Redemption Headpiece 22428
                 //MIRASU: where Kronos reports 35612 but modern data has 36972). In that case,
@@ -3518,10 +3532,10 @@ public static partial class GameData
                 //MIRASU: glow vanishing on zone-in after the zone-in item queries re-trigger the
                 //MIRASU: hotfix flow; helmet visual stays gone until relog because the client's
                 //MIRASU: appearance state is corrupted and neither /reload nor re-equip re-attach.
-                ItemAppearance? reachableAppearance = GetItemAppearanceByDisplayId(item.DisplayID);
+                ItemAppearance? reachableAppearance = GetItemAppearanceByDisplayId(displayId);
                 if (reachableAppearance == null)
                 {
-                    Log.Print(LogType.Storage, $"MIRASU: Skipping ItemModifiedAppearance hotfix for item #{item.Entry} — Kronos DisplayID #{item.DisplayID} has no matching ItemAppearance in modern reference data. Keeping client baseline.");
+                    Log.Print(LogType.Storage, $"MIRASU: Skipping ItemModifiedAppearance hotfix for item #{item.Entry} — resolved DisplayID #{displayId} (server: {item.DisplayID}) has no matching ItemAppearance in modern reference data. Keeping client baseline.");
                     return null;
                 }
 
@@ -3529,8 +3543,8 @@ public static partial class GameData
 
                 if (appearance == null)
                     Log.Print(LogType.Storage, $"ItemAppearance #{modAppearance.ItemAppearanceID} missing.");
-                else if (appearance.ItemDisplayInfoID != item.DisplayID)
-                    Log.Print(LogType.Storage, $"DisplayID {appearance.ItemDisplayInfoID} vs {item.DisplayID}");
+                else if (appearance.ItemDisplayInfoID != (int)displayId)
+                    Log.Print(LogType.Storage, $"DisplayID {appearance.ItemDisplayInfoID} vs {displayId}");
 
                 // something is different so update current data
                 UpdateItemModifiedAppearanceRecord(modAppearance, item);
@@ -3824,10 +3838,11 @@ public static partial class GameData
 
     public static void UpdateItemAppearanceRecord(ItemAppearance appearance, ItemTemplate item)
     {
-        int fileDataId = (int)GetItemIconFileDataIdByDisplayId(item.DisplayID);
+        uint displayId = ResolveItemDisplayIdForClient(item);
+        int fileDataId = (int)GetItemIconFileDataIdByDisplayId(displayId);
 
         appearance.DisplayType = 11; // todo find out
-        appearance.ItemDisplayInfoID = (int)item.DisplayID;
+        appearance.ItemDisplayInfoID = (int)displayId;
         appearance.DefaultIconFileDataID = fileDataId;
         appearance.UiOrder = 0;
 
@@ -3855,10 +3870,11 @@ public static partial class GameData
 
     public static void UpdateItemModifiedAppearanceRecord(ItemModifiedAppearance modAppearance, ItemTemplate item)
     {
-        ItemAppearance? appearance = GetItemAppearanceByDisplayId(item.DisplayID);
+        uint displayId = ResolveItemDisplayIdForClient(item);
+        ItemAppearance? appearance = GetItemAppearanceByDisplayId(displayId);
         if (appearance == null) // should not happen
         {
-            Log.Print(LogType.Error, $"ItemModifiedAppearance #{modAppearance.Id} update failed: no ItemAppearance for DisplayID #{item.DisplayID}");
+            Log.Print(LogType.Error, $"ItemModifiedAppearance #{modAppearance.Id} update failed: no ItemAppearance for DisplayID #{displayId}");
             return;
         }
 
