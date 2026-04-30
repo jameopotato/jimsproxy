@@ -204,11 +204,11 @@ public partial class WorldSocket
             {
                 // JimsProxy (Mount-Button-Stuck-Lit): drop re-clicks but resolve the modern
                 // client's tracking via the duplicate's own unique ClientGUID/ServerGUID. The
-                // earlier silent-drop approach (commit 8998c39) avoided dismissing the running
-                // cast bar but left the duplicate's action-button state pending forever. Sending
-                // SpellPrepare + CastFailed(DontReport) bound to the DUPLICATE's IDs releases the
-                // queued state without showing an error toast. The running cast's ServerCastID is
-                // distinct, so its cast bar should be unaffected.
+                // earlier silent-drop approach (commit 8998c39) left the duplicate's action-button
+                // state pending forever. Reason is SpellInProgress (matches the displaced-hold
+                // path below) — the 1.14 client treats it as "overridden by newer cast" and
+                // releases the duplicate's queued/lit state. The running cast's ServerCastID is
+                // distinct, so its cast bar is unaffected.
                 bool gateStarted = GetSession().GameState.HasStartedNormalCast();
                 bool gateInFlight = GetSession().GameState.HasInFlightNormalCastForSpell((uint)cast.Cast.SpellID);
                 if (gateStarted || gateInFlight)
@@ -220,7 +220,7 @@ public partial class WorldSocket
                         client_cast_id = cast.Cast.CastID.ToString(),
                         queue_depth = GetSession().GameState.PendingNormalCasts.Count,
                     });
-                    SendCastRequestFailed(castRequest, false, SpellCastResultClassic.DontReport);
+                    SendCastRequestFailed(castRequest, false);
                     return;
                 }
 
@@ -313,6 +313,30 @@ public partial class WorldSocket
                     heldPrepare.ClientCastID = castRequest.ClientGUID;
                     heldPrepare.ServerCastID = castRequest.ServerGUID;
                     SendPacket(heldPrepare);
+
+                    // JimsProxy (Macro-GCD-Fix): macro-batched `/use 13 /use 14 /cast SS` lands all
+                    // three CMSGs in the same ms; SS gets held_pending while a trinket is in flight.
+                    // SpellPrepare acks the click but the modern 1.14 client's GCD swipe doesn't
+                    // start until SS's own SMSG_SPELL_GO arrives — a ~300ms gap (trinket RTT + SS RTT)
+                    // where the action button is queued/lit without a sweep. Synthesize a
+                    // SMSG_COOLDOWN_EVENT so the client's swipe starts immediately at ack time.
+                    // SMSG_SPELL_COOLDOWN with ForcedCooldown was tried earlier (stash 0) and got
+                    // "anticipated-then-canceled" by the macro evaluator; SMSG_COOLDOWN_EVENT lets
+                    // the client compute the GCD locally from the spell's DBC StartRecoveryTime.
+                    // Vanilla-only: TBC+ haste-adjusted GCDs would make this wrong, and the GCD-hold
+                    // mechanism (gated on ExpansionVersion==1 in HandleSpellGo) is vanilla-only too.
+                    if (LegacyVersion.ExpansionVersion == 1)
+                    {
+                        CooldownEvent cdEvent = new();
+                        cdEvent.SpellID = (uint)cast.Cast.SpellID;
+                        cdEvent.IsPet = false;
+                        SendPacket(cdEvent);
+                        Log.Event("gcd.cooldown.synth_held", new
+                        {
+                            spell_id = cast.Cast.SpellID,
+                            client_cast_id = castRequest.ClientGUID.ToString(),
+                        });
+                    }
                     return;
                 }
 
@@ -436,12 +460,12 @@ public partial class WorldSocket
 
         // JimsProxy (Mount-Button-Stuck-Lit): drop the duplicate USE_ITEM but resolve the modern
         // client's per-click tracking so the action button doesn't stay "queued/lit" forever.
-        // Bind SpellPrepare + CastFailed to the DUPLICATE's unique ClientGUID/ServerGUID (built
-        // a few lines above with `10000 + use.Cast.CastID.GetCounter()`); the running cast (if
-        // any) has its OWN distinct ServerCastID, so the modern client should resolve only the
-        // duplicate's tracking and leave the active cast bar alone. Reason=DontReport suppresses
-        // the "Another action is in progress" error toast — silent drop semantics, but now with
-        // the IDs the client needs to release the queued state.
+        // Bind CastFailed to the DUPLICATE's unique ClientGUID/ServerGUID (built a few lines
+        // above with `10000 + use.Cast.CastID.GetCounter()`); the running cast (if any) has its
+        // OWN distinct ServerCastID, so the modern client resolves only the duplicate's tracking
+        // and leaves the active cast bar alone. Reason is SpellInProgress (matches the displaced-
+        // hold path) — the 1.14 client treats it as "overridden by newer cast" and releases the
+        // duplicate's queued/lit state cleanly.
         bool gateStarted = GetSession().GameState.HasStartedNormalCast();
         bool gateInFlight = GetSession().GameState.HasInFlightNormalCastForSpell((uint)use.Cast.SpellID);
         if (gateStarted || gateInFlight)
@@ -454,7 +478,7 @@ public partial class WorldSocket
                 item_guid = use.CastItem.ToString(),
                 queue_depth = GetSession().GameState.PendingNormalCasts.Count,
             });
-            SendCastRequestFailed(castRequest, false, SpellCastResultClassic.DontReport);
+            SendCastRequestFailed(castRequest, false);
             return;
         }
 
