@@ -715,6 +715,7 @@ public partial class WorldClient
             }
             _isSuccessful = true;
             StartKeepAliveTimer();
+            SendRttProbes();
         }
         else if (result == AuthResult.AUTH_WAIT_QUEUE)
         {
@@ -766,6 +767,12 @@ public partial class WorldClient
     {
         uint serial = Interlocked.Increment(ref _keepAlivePingSerial);
         SendPing(serial | 0x80000000, 0);
+    }
+
+    private void SendRttProbes()
+    {
+        for (int i = 0; i < 3; i++)
+            new Timer(_ => SendKeepAlivePing(null), null, i * 1000, Timeout.Infinite);
     }
 
     public void InitializePacketHandlers()
