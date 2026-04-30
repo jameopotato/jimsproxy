@@ -748,6 +748,7 @@ public partial class WorldClient
         packet.WriteUInt32(ping);
         packet.WriteUInt32(latency);
         SendPacket(packet);
+        GetSession().GameState?.RecordPingSent(ping);
     }
 
     private void StartKeepAliveTimer()

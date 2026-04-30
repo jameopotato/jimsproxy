@@ -273,6 +273,33 @@ public partial class WorldSocket
                     });
                 }
 
+                // Guard 3: a cast was forwarded to the server but hasn't received
+                // SPELL_START/SPELL_GO yet. Hold the new press so it fires when the
+                // server responds (BeginGcd creates a new timer that picks it up).
+                // NOTE: PR #86's HasInFlightNormalCastForSpell() guard belongs AFTER
+                // this block (position 4). GCD hold checks must run first so instant-
+                // cast spam is held rather than dropped.
+                if (GetSession().GameState.HasForwardedPendingCast())
+                {
+                    WorldPacket heldPacket = BuildCastSpellPacket(cast);
+                    castRequest.HeldPacketForReplay = heldPacket;
+                    castRequest.HeldAtTickMs = Environment.TickCount64;
+                    var displaced = GetSession().GameState.ForceHoldCast(castRequest);
+                    Log.Event("spell.held_pending", new
+                    {
+                        spell_id = cast.Cast.SpellID,
+                        displaced_spell_id = displaced?.SpellId ?? 0,
+                        client_cast_id = castRequest.ClientGUID.ToString(),
+                    });
+                    if (displaced != null)
+                        SendCastRequestFailed(displaced, false);
+                    SpellPrepare heldPrepare = new SpellPrepare();
+                    heldPrepare.ClientCastID = castRequest.ClientGUID;
+                    heldPrepare.ServerCastID = castRequest.ServerGUID;
+                    SendPacket(heldPrepare);
+                    return;
+                }
+
                 // Enqueue the cast - responses will be matched by SpellId in FIFO order
                 GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
             }
