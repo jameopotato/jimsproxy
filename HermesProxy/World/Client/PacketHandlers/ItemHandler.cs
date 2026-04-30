@@ -72,9 +72,24 @@ public partial class WorldClient
             if (objective != null)
             {
                 var key = (objective.QuestID, objective.StorageIndex);
+                //MIRASU - if SMSG_QUEST_UPDATE_ADD_ITEM was buffered (template not cached at the
+                //MIRASU   moment it arrived), the credit is sitting in PendingQuestItemCredits and
+                //MIRASU   QuestItemObjectiveProgress reflects PRE-pickup state (or is empty). Sum
+                //MIRASU   any matching pending deltas so quantityInInventory reflects the POST-
+                //MIRASU   pickup count even when the credit is still buffered.
+                uint pendingDeltaForThisItem = 0;
+                lock (GetSession().GameState.PendingQuestItemCreditsLock)
+                {
+                    foreach (var pending in GetSession().GameState.PendingQuestItemCredits)
+                    {
+                        if (pending.ItemId == item.Item.ItemID)
+                            pendingDeltaForThisItem += pending.Count;
+                    }
+                }
+
                 if (GetSession().GameState.QuestItemObjectiveProgress.TryGetValue(key, out uint runningTotal))
                 {
-                    quantityInInventory = runningTotal;
+                    quantityInInventory = runningTotal + pendingDeltaForThisItem;
                 }
                 else
                 {
@@ -99,7 +114,45 @@ public partial class WorldClient
             item.ItemGUID = GetSession().GameState.GetInventorySlotItem(item.SlotInBag).To128(GetSession().GameState);
         else
             item.ItemGUID = WowGuid128.Empty;
-        
+
+        //MIRASU - if this is a quest item whose template wasn't cached yet (objective lookup failed
+        //MIRASU   above) AND its credit is sitting in PendingQuestItemCredits, defer the inventory
+        //MIRASU   packet. ReplayPendingQuestItemCredits will replay it after the credit is processed
+        //MIRASU   (template cached, dict populated). Forwarding now would render the modern over-head
+        //MIRASU   quest toast as "1/N" until the buffered credit catches up ~150ms later -- the
+        //MIRASU   exact post-cold-start flicker the user sees.
+        if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+        {
+            QuestObjective? itemObjective = GameData.GetQuestObjectiveForItem(item.Item.ItemID);
+            if (itemObjective == null)
+            {
+                bool isPendingQuestItem;
+                lock (GetSession().GameState.PendingQuestItemCreditsLock)
+                {
+                    isPendingQuestItem = false;
+                    foreach (var pending in GetSession().GameState.PendingQuestItemCredits)
+                    {
+                        if (pending.ItemId == item.Item.ItemID)
+                        {
+                            isPendingQuestItem = true;
+                            break;
+                        }
+                    }
+                }
+                if (isPendingQuestItem)
+                {
+                    lock (GetSession().GameState.PendingItemPushResultsLock)
+                        GetSession().GameState.PendingItemPushResults.Add(item);
+                    Framework.Logging.Log.Event("item.push.deferred", new
+                    {
+                        item_id = item.Item.ItemID,
+                        reason = "objective_template_not_cached_credit_pending",
+                    });
+                    return;
+                }
+            }
+        }
+
         SendPacketToClient(item);
     }
     [PacketHandler(Opcode.SMSG_READ_ITEM_RESULT_OK)]

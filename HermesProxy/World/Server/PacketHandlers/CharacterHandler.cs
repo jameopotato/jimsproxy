@@ -218,6 +218,15 @@ public partial class WorldSocket
         GetSession().GameState.CurrentPlayerInfo = GetSession().GameState.OwnCharacters.Single(x => x.CharacterGuid == playerLogin.Guid);
         GetSession().GameState.CurrentPlayerStorage.LoadCurrentPlayer();
 
+        //MIRASU - eager disk-load of quest item running totals so the dict is hot before the
+        //MIRASU   first item pickup of the session. Otherwise, if SMSG_QUEST_UPDATE_ADD_ITEM
+        //MIRASU   arrives buffered (template not cached), SMSG_ITEM_PUSH_RESULT processes
+        //MIRASU   ~150ms earlier with an empty dict and Kronos's null cache progress -- the
+        //MIRASU   over-head quest toast then renders "1/N" until the buffered credit replays
+        //MIRASU   and updates it to the correct count. Eager load ensures dict[key]=stored_before
+        //MIRASU   at the moment ITEM_PUSH_RESULT fires, eliminating the flicker.
+        GetSession().EnsureQuestItemProgressRestored();
+
         WorldPacket packet = new WorldPacket(Opcode.CMSG_PLAYER_LOGIN);
         packet.WriteGuid(playerLogin.Guid.To64());
         SendPacketToServer(packet);

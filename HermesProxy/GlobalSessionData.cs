@@ -154,6 +154,16 @@ public sealed class GameSessionData
     //MIRASU   credit can't be replayed against a re-accept (or a different quest sharing the item).
     public List<(uint ItemId, uint Count)> PendingQuestItemCredits = new();
     public readonly object PendingQuestItemCreditsLock = new();
+    //MIRASU - SMSG_ITEM_PUSH_RESULT for quest items that arrive in the same pickup burst as a
+    //MIRASU   buffered SMSG_QUEST_UPDATE_ADD_ITEM (template not cached). The objective lookup
+    //MIRASU   would fail at HandleItemPushResult time, so the inventory packet is held here and
+    //MIRASU   replayed after the buffered credit is replayed (template cached, dict populated).
+    //MIRASU   Held packet is the fully-built ItemPushResult; replay just recomputes
+    //MIRASU   QuantityInInventory and sends. Lock-guarded -- HandleItemPushResult and
+    //MIRASU   ReplayPendingQuestItemCredits run on the WorldClient thread, but the lock pattern
+    //MIRASU   matches PendingQuestItemCredits and survives any future cross-thread caller.
+    internal List<HermesProxy.World.Server.Packets.ItemPushResult> PendingItemPushResults = new();
+    public readonly object PendingItemPushResultsLock = new();
     public uint CurrentLootCoins; //MIRASU - remembers coin amount from SMSG_LOOT_RESPONSE so proxy can synthesize SMSG_LOOT_MONEY_NOTIFY when client picks up gold (Kronos/TC-1.12 doesn't emit it)
     public List<WowGuid128>? MasterLootCandidates;
     public WowGuid64 LastMasterLootSentTarget;
@@ -1525,6 +1535,39 @@ public class GlobalSessionData
         //MIRASU   which is how we detect "first item credit of a new session" reliably.
         if (guid == default || ReferenceEquals(_lastRestoredForGameState, GameState))
             return;
+
+        //MIRASU - verify disk-load preconditions BEFORE latching _lastRestoredForGameState. On a
+        //MIRASU   cold proxy start, AccountMetaDataMgr/OwnCharacters/Realm can lag behind
+        //MIRASU   CurrentPlayerGuid: the first item credit may arrive while charInfo is still
+        //MIRASU   incomplete. If we latched the gate first and the disk load silently failed,
+        //MIRASU   every subsequent credit in this GameState would skip restore and the toast
+        //MIRASU   would render against stored=0 forever (post-restart "1/N" first-toast bug).
+        //MIRASU   Returning without latching lets the next credit retry once preconditions are met.
+        if (AccountMetaDataMgr == null)
+        {
+            Framework.Logging.Log.Event("quest.progress.restore.deferred", new
+            {
+                player_guid_low = guid.Low,
+                player_guid_high = guid.High,
+                reason = "account_meta_data_mgr_null",
+            });
+            return;
+        }
+        var charInfo = GameState.OwnCharacters.FirstOrDefault(c => c.CharacterGuid == guid);
+        if (charInfo == null || string.IsNullOrEmpty(charInfo.Name) || charInfo.Realm == null || string.IsNullOrEmpty(charInfo.Realm.Name))
+        {
+            Framework.Logging.Log.Event("quest.progress.restore.deferred", new
+            {
+                player_guid_low = guid.Low,
+                player_guid_high = guid.High,
+                reason = charInfo == null ? "char_not_in_own_characters" : "char_info_incomplete",
+                own_characters = GameState.OwnCharacters.Count,
+                char_name_empty = charInfo == null || string.IsNullOrEmpty(charInfo.Name),
+                realm_null = charInfo == null || charInfo.Realm == null,
+                realm_name_empty = charInfo?.Realm == null || string.IsNullOrEmpty(charInfo.Realm.Name),
+            });
+            return;
+        }
 
         _lastRestoredForGameState = GameState;
         //MIRASU - if no in-memory snapshot exists for this player yet (cold proxy start, or first

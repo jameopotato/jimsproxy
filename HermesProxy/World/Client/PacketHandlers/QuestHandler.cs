@@ -527,6 +527,46 @@ public partial class WorldClient
             lock (gameState.PendingQuestItemCreditsLock)
                 gameState.PendingQuestItemCredits.AddRange(unresolved);
         }
+
+        //MIRASU - any SMSG_ITEM_PUSH_RESULT packets that were deferred because their objective
+        //MIRASU   template wasn't cached at arrival time can now be replayed. Drain under lock,
+        //MIRASU   recompute QuantityInInventory from the now-populated dict, send. Items whose
+        //MIRASU   objective STILL doesn't resolve (template was for a different quest) are
+        //MIRASU   re-buffered so a subsequent QUERY_QUEST_INFO_RESPONSE catches them.
+        List<HermesProxy.World.Server.Packets.ItemPushResult> heldPushResults;
+        lock (gameState.PendingItemPushResultsLock)
+        {
+            if (gameState.PendingItemPushResults.Count == 0)
+                return;
+            heldPushResults = new List<HermesProxy.World.Server.Packets.ItemPushResult>(gameState.PendingItemPushResults);
+            gameState.PendingItemPushResults.Clear();
+        }
+        var unresolvedPushResults = new List<HermesProxy.World.Server.Packets.ItemPushResult>();
+        foreach (var heldItem in heldPushResults)
+        {
+            QuestObjective? heldObjective = GameData.GetQuestObjectiveForItem(heldItem.Item.ItemID);
+            if (heldObjective == null)
+            {
+                unresolvedPushResults.Add(heldItem);
+                continue;
+            }
+            var heldKey = (heldObjective.QuestID, heldObjective.StorageIndex);
+            if (gameState.QuestItemObjectiveProgress.TryGetValue(heldKey, out uint heldRunningTotal))
+                heldItem.QuantityInInventory = heldRunningTotal;
+            Framework.Logging.Log.Event("item.push.replayed", new
+            {
+                item_id = heldItem.Item.ItemID,
+                quantity_in_inventory = heldItem.QuantityInInventory,
+                quest_id = heldObjective.QuestID,
+                storage_index = (int)heldObjective.StorageIndex,
+            });
+            SendPacketToClient(heldItem);
+        }
+        if (unresolvedPushResults.Count > 0)
+        {
+            lock (gameState.PendingItemPushResultsLock)
+                gameState.PendingItemPushResults.AddRange(unresolvedPushResults);
+        }
     }
 
     //MIRASU - shared credit-processing path used by both the live SMSG_QUEST_UPDATE_ADD_ITEM
