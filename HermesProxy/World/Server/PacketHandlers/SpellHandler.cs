@@ -81,7 +81,7 @@ public partial class WorldSocket
         if (targetFlags.HasAnyFlag(SpellCastTargetFlags.String))
             packet.WriteCString(target.Name);
     }
-    public void SendCastRequestFailed(ClientCastRequest castRequest, bool isPet)
+    public void SendCastRequestFailed(ClientCastRequest castRequest, bool isPet, SpellCastResultClassic reason = SpellCastResultClassic.SpellInProgress)
     {
         if (!castRequest.HasStarted)
         {
@@ -95,7 +95,7 @@ public partial class WorldSocket
         {
             PetCastFailed failed = new();
             failed.SpellID = castRequest.SpellId;
-            failed.Reason = (uint)SpellCastResultClassic.SpellInProgress;
+            failed.Reason = (uint)reason;
             failed.CastID = castRequest.ServerGUID;
             SendPacket(failed);
         }
@@ -104,10 +104,10 @@ public partial class WorldSocket
             CastFailed failed = new();
             failed.SpellID = castRequest.SpellId;
             failed.SpellXSpellVisualID = castRequest.SpellXSpellVisualId;
-            failed.Reason = (uint)SpellCastResultClassic.SpellInProgress;
+            failed.Reason = (uint)reason;
             failed.CastID = castRequest.ServerGUID;
             SendPacket(failed);
-        }    
+        }
     }
     // JimsProxy: Hunter tame-class spell IDs in vanilla — used to log tame attempts
     // for the pet deep-dive. 1515 = "Tame Beast" player ability; the rest are
@@ -202,11 +202,27 @@ public partial class WorldSocket
             // 1.12 client would fire these mid-cast-bar and mid-GCD, so we match that.
             if (!isOffGcd)
             {
-                // Silently drop re-clicks while a cast is in progress. Sending
-                // CastFailed(SpellInProgress) causes the 1.14 client to dismiss
-                // the active cast bar even though the server-side cast continues.
-                if (GetSession().GameState.HasStartedNormalCast())
+                // JimsProxy (Mount-Button-Stuck-Lit): drop re-clicks but resolve the modern
+                // client's tracking via the duplicate's own unique ClientGUID/ServerGUID. The
+                // earlier silent-drop approach (commit 8998c39) avoided dismissing the running
+                // cast bar but left the duplicate's action-button state pending forever. Sending
+                // SpellPrepare + CastFailed(DontReport) bound to the DUPLICATE's IDs releases the
+                // queued state without showing an error toast. The running cast's ServerCastID is
+                // distinct, so its cast bar should be unaffected.
+                bool gateStarted = GetSession().GameState.HasStartedNormalCast();
+                bool gateInFlight = GetSession().GameState.HasInFlightNormalCastForSpell((uint)cast.Cast.SpellID);
+                if (gateStarted || gateInFlight)
+                {
+                    Log.Event("cast.dropped.duplicate", new
+                    {
+                        spell_id = cast.Cast.SpellID,
+                        reason = gateInFlight ? "in_flight_same_spell_cast_spell" : "another_cast_started",
+                        client_cast_id = cast.Cast.CastID.ToString(),
+                        queue_depth = GetSession().GameState.PendingNormalCasts.Count,
+                    });
+                    SendCastRequestFailed(castRequest, false, SpellCastResultClassic.DontReport);
                     return;
+                }
 
                 // JimsProxy (issue #43): if we're inside a GCD hold window, build the CMSG_CAST_SPELL
                 // packet now but don't forward it — store it as the pending held cast. The Timer
@@ -418,9 +434,29 @@ public partial class WorldSocket
         castRequest.ServerGUID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, use.Cast.SpellID, 10000 + use.Cast.CastID.GetCounter());
         castRequest.ItemGUID = use.CastItem;
 
-        // Silently drop re-clicks while a cast is in progress (same as HandleCastSpell).
-        if (GetSession().GameState.HasStartedNormalCast())
+        // JimsProxy (Mount-Button-Stuck-Lit): drop the duplicate USE_ITEM but resolve the modern
+        // client's per-click tracking so the action button doesn't stay "queued/lit" forever.
+        // Bind SpellPrepare + CastFailed to the DUPLICATE's unique ClientGUID/ServerGUID (built
+        // a few lines above with `10000 + use.Cast.CastID.GetCounter()`); the running cast (if
+        // any) has its OWN distinct ServerCastID, so the modern client should resolve only the
+        // duplicate's tracking and leave the active cast bar alone. Reason=DontReport suppresses
+        // the "Another action is in progress" error toast — silent drop semantics, but now with
+        // the IDs the client needs to release the queued state.
+        bool gateStarted = GetSession().GameState.HasStartedNormalCast();
+        bool gateInFlight = GetSession().GameState.HasInFlightNormalCastForSpell((uint)use.Cast.SpellID);
+        if (gateStarted || gateInFlight)
+        {
+            Log.Event("cast.dropped.duplicate", new
+            {
+                spell_id = use.Cast.SpellID,
+                reason = gateInFlight ? "in_flight_same_spell_use_item" : "another_cast_started",
+                client_cast_id = use.Cast.CastID.ToString(),
+                item_guid = use.CastItem.ToString(),
+                queue_depth = GetSession().GameState.PendingNormalCasts.Count,
+            });
+            SendCastRequestFailed(castRequest, false, SpellCastResultClassic.DontReport);
             return;
+        }
 
         // Some items had their on-use spell id renumbered in SoM 1.14.1+ (e.g. Diamond Flask 17626 → 363880).
         // The 1.12 emulator only knows the legacy id, so resolve it now and remember both
