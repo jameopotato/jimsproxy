@@ -68,6 +68,10 @@ public static partial class GameData
     // Rogue energy-based abilities and feral-druid cat-form abilities use StartRecoveryTime=1000
     // in vanilla Spell.dbc. Unknown spells default to 1500ms in GetGcdDurationMs.
     public static FrozenSet<uint> Spell1sGcd = FrozenSet<uint>.Empty;
+    // JimsProxy (issue #91): channeled spells report CastTime==0 on the wire but need
+    // SMSG_SPELL_START forwarded so the modern client can initialize the channel bar.
+    // Sourced from SpellMisc DBC (Attributes_1 & 0x44), same data as JimsPlus castbars.
+    public static FrozenSet<uint> ChanneledSpells = FrozenSet<uint>.Empty;
     public static FrozenSet<uint> AuraSpells = FrozenSet<uint>.Empty;
     public static FrozenDictionary<uint, int> AuraDurations = FrozenDictionary<uint, int>.Empty;
     public static FrozenDictionary<uint, TaxiPath> TaxiPaths = FrozenDictionary<uint, TaxiPath>.Empty;
@@ -376,6 +380,11 @@ public static partial class GameData
         return OffGcdSpells.Contains(spellId);
     }
 
+    public static bool IsChanneledSpell(uint spellId)
+    {
+        return ChanneledSpells.Contains(spellId);
+    }
+
     /// <summary>
     /// Returns the GCD duration in milliseconds triggered by the given spell on vanilla
     /// 1.12 servers. Defaults to 1500ms; rogue energy abilities and feral-druid cat-form
@@ -677,6 +686,7 @@ public static partial class GameData
             LoadAutoRepeatSpells,
             LoadOffGcdSpells,
             LoadSpell1sGcd,
+            LoadChanneledSpells,
             LoadAuraSpells,
             LoadAuraDurations,
             LoadTaxiPaths,
@@ -1417,6 +1427,29 @@ public static partial class GameData
             set.Add(spellId);
         }
         Spell1sGcd = set.ToFrozenSet();
+    }
+
+    public static void LoadChanneledSpells()
+    {
+        if (LegacyVersion.ExpansionVersion > 1)
+            return;
+
+        var path = Path.Combine("CSV", $"SpellChanneled{LegacyVersion.ExpansionVersion}.csv");
+        if (!File.Exists(path))
+        {
+            Log.Print(LogType.Storage, $"WARNING: {path} not found — channeled spell detection " +
+                                       "is disabled. Channeled spell bars may start partially depleted.");
+            return;
+        }
+
+        using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+        var set = new HashSet<uint>(EstimateRowCount(path, 8));
+        foreach (var row in reader)
+        {
+            uint spellId = uint.Parse(row[0].Span);
+            set.Add(spellId);
+        }
+        ChanneledSpells = set.ToFrozenSet();
     }
 
     public static void LoadAuraSpells()
