@@ -158,6 +158,18 @@ public partial class WorldClient
         if (packet.CanRead())
             arg2 = packet.ReadInt32();
 
+        // JimsProxy: MC-Quintessence-Investigation. Pair with spell.use_item.target_dump in the
+        // bundle to see exactly why a server-side cast was rejected (range/LOS/wrong-target/etc).
+        // Reason is the raw 1.12 SpellCastResult enum value; resolve via SpellCastResultClassic.
+        Log.Event("spell.cast_failed.diag", new
+        {
+            spell_id = spellId,
+            reason_raw = reason,
+            reason_name = ((SpellCastResultClassic)reason).ToString(),
+            arg1,
+            arg2,
+        });
+
         // Check special casts first - try next melee, then auto repeat
         ClientCastRequest? specialCast = null;
         bool isAutoRepeat = false;

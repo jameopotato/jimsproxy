@@ -504,6 +504,34 @@ public partial class WorldSocket
         // Enqueue the cast - responses will be matched by SpellId (or LegacySpellId) in FIFO order
         GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
 
+        // JimsProxy: MC-Quintessence-Investigation. Item-on-GameObject casts are the suspect path
+        // for the long-standing "out of range" bug on Aqual/Eternal Quintessence vs. Runes of
+        // Warding (WowLegacyCore/HermesProxy#374). If the modern client refuses to send CMSG_USE_ITEM
+        // at all (client-side range pre-check failure), this event will be ABSENT from the bundle —
+        // itself a strong diagnostic signal pointing at the modern client's Spell.dbc range data.
+        // Narrowly gated to GameObject targets to keep noise low.
+        if (use.Cast.Target.Flags.HasFlag(SpellCastTargetFlags.GameObject))
+        {
+            uint targetEntry = use.Cast.Target.Unit.IsEmpty() ? 0u : use.Cast.Target.Unit.GetEntry();
+            Log.Event("spell.use_item.target_dump", new
+            {
+                spell_id = use.Cast.SpellID,
+                legacy_spell_id = legacySpellId,
+                client_cast_id = use.Cast.CastID.ToString(),
+                item_guid_128 = use.CastItem.ToString(),
+                item_guid_64 = use.CastItem.To64().ToString(),
+                item_id = GetSession().GameState.GetItemId(use.CastItem),
+                target_unit_128 = use.Cast.Target.Unit.ToString(),
+                target_unit_64 = use.Cast.Target.Unit.To64().ToString(),
+                target_entry = targetEntry,
+                target_flags = (uint)use.Cast.Target.Flags,
+                target_flags_translated = (uint)ConvertSpellTargetFlags(use.Cast.Target),
+                src_loc = use.Cast.Target.SrcLocation?.Location.ToString() ?? "null",
+                dst_loc = use.Cast.Target.DstLocation?.Location.ToString() ?? "null",
+                target_name = use.Cast.Target.Name ?? "",
+            });
+        }
+
         WorldPacket packet = new WorldPacket(Opcode.CMSG_USE_ITEM);
         byte containerSlot = use.PackSlot != Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(use.PackSlot) : use.PackSlot;
         byte slot = use.PackSlot == Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(use.Slot) : use.Slot;
