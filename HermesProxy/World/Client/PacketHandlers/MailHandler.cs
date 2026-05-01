@@ -1,4 +1,5 @@
-﻿using HermesProxy.Enums;
+﻿using Framework.Logging;
+using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
@@ -14,19 +15,38 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_NOTIFY_RECEIVED_MAIL)]
     void HandleNotifyReceivedMail(WorldPacket packet)
     {
+        uint rawSize = packet.GetSize();
+        string rawHex = Convert.ToHexString(packet.GetData(), 0, (int)Math.Min(rawSize, 64));
+
         NotifyReceivedMail mail = new NotifyReceivedMail();
         mail.Delay = packet.ReadFloat();
+        Log.Event("mail.notify.received", new
+        {
+            delay = mail.Delay,
+            legacy_size = rawSize,
+            legacy_hex = rawHex
+        });
         SendPacketToClient(mail);
     }
 
     [PacketHandler(Opcode.MSG_QUERY_NEXT_MAIL_TIME)]
     void HandleQueryNextMailTime(WorldPacket packet)
     {
+        // Capture raw payload for diagnostics before any reads consume bytes.
+        uint rawSize = packet.GetSize();
+        string rawHex = Convert.ToHexString(packet.GetData(), 0, (int)Math.Min(rawSize, 64));
+
         MailQueryNextTimeResult result = new MailQueryNextTimeResult();
         result.NextMailTime = packet.ReadFloat();
+        bool synthesizedEntry = false;
         if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_3_0_7561))
         {
-            if (result.NextMailTime == 0)
+            // 1.12 mangos/Kronos signals "mail available now" with a value at/near zero
+            // (Kronos sends a denormal float ~7e-41, not exactly 0) and "no mail" with
+            // float(-DAY) = -86400. Real future deliveries are seconds-until-next, e.g.
+            // 3600. Treat anything within +/-1s of zero as "have mail now" to drive the
+            // modern client's minimap indicator (which keys off Mails.Count > 0).
+            if (Math.Abs(result.NextMailTime) < 1.0f)
             {
                 MailNextTimeEntry mail = new MailNextTimeEntry();
                 mail.SenderGuid = GetSession().GameState.CurrentPlayerGuid;
@@ -35,6 +55,8 @@ public partial class WorldClient
                 mail.StationeryID = 41;
                 mail.TimeLeft = 3600;
                 result.Mails.Add(mail);
+                result.NextMailTime = 0f;
+                synthesizedEntry = true;
             }
         }
         else
@@ -51,6 +73,14 @@ public partial class WorldClient
                 result.Mails.Add(mail);
             }
         }
+        Log.Event("mail.query.next.time", new
+        {
+            next_mail_time = result.NextMailTime,
+            mails_count = result.Mails.Count,
+            synthesized = synthesizedEntry,
+            legacy_size = rawSize,
+            legacy_hex = rawHex
+        });
         SendPacketToClient(result);
     }
 
