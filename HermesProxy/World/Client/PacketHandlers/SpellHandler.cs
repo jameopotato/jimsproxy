@@ -481,70 +481,45 @@ public partial class WorldClient
         // ranged-attack visual on 1.14 — observed in the 2026-04-28 hunter
         // bundle where every Auto Shot SPELL_START was paired with a suppressed
         // SPELL_FAILURE reason=1 and the bow stuck drawn.
-        bool isRangedAutoAttack = spellId == 75 || spellId == 5019;
-        if ((casterIsLocalPlayer || casterIsLocalPet) && !isRangedAutoAttack)
-        {
-            Log.Event("spell.failure.suppressed_for_caster", new
-            {
-                spellId,
-                raw_reason_byte = reason,
-                is_pet = casterIsLocalPet,
-            });
-            return;
-        }
-        if (isRangedAutoAttack && (casterIsLocalPlayer || casterIsLocalPet))
-        {
-            Log.Event("spell.failure.ranged_auto_forwarded", new
-            {
-                spellId,
-                raw_reason_byte = reason,
-                is_pet = casterIsLocalPet,
-            });
-        }
+        // SPELL_FAILURE is now forwarded for all casters including local player (matches
+        // upstream Xian55/HermesProxy). The client needs it to cancel the animation that
+        // SPELL_START started. PR #72 originally suppressed this for local player, but the
+        // GCD-lock bug was caused by the dequeue (now changed to peek), not the forwarding.
 
         WowGuid128 castId;
         uint spellVisual;
         bool dequeued = false;
         bool wasStarted = false;
         bool foundActiveCastId = false;
+        // Local player/pet: PEEK (don't dequeue) — CAST_FAILED arrives ~5ms later and
+        // needs the pending cast still in the queue to dequeue, send CastFailed to the
+        // client, and fire any held GCD cast. Previously this dequeued, which consumed the
+        // entry before CAST_FAILED arrived — CAST_FAILED was silently dropped, the client
+        // never got the GCD-cancel signal, and the action bar stayed locked for 1.5s.
+        // Matches upstream Xian55/HermesProxy behavior (FirstOrDefault = peek).
         if (GetSession().GameState.CurrentPlayerGuid == casterUnit &&
-            GetSession().GameState.TryDequeuePendingNormalCast(spellId, out var pendingNormal))
+            GetSession().GameState.PendingNormalCasts.FirstOrDefault(
+                c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId))
+            is { } pendingNormal)
         {
-            castId = pendingNormal!.ServerGUID;
+            castId = pendingNormal.ServerGUID;
             spellVisual = pendingNormal.SpellXSpellVisualId;
             if (pendingNormal.LegacySpellId != 0)
                 spellId = pendingNormal.SpellId;
-            dequeued = true;
             wasStarted = pendingNormal.HasStarted;
-
-            // Pre-cast failure (rare via SPELL_FAILURE -- usually goes through
-            // CAST_FAILED, but cover it for parity): client needs SpellPrepare
-            // to match the upcoming failure to its pending cast slot.
-            if (!pendingNormal.HasStarted)
-            {
-                SpellPrepare prepare = new();
-                prepare.ClientCastID = pendingNormal.ClientGUID;
-                prepare.ServerCastID = pendingNormal.ServerGUID;
-                SendPacketToClient(prepare);
-            }
+            // Don't dequeue — let HandleCastFailed do it.
+            // Don't send SpellPrepare — HandleCastFailed handles that too.
         }
         else if (GetSession().GameState.CurrentPetGuid == casterUnit &&
-                 GetSession().GameState.TryDequeuePendingPetCast(spellId, out var pendingPet))
+                 GetSession().GameState.PendingPetCasts.FirstOrDefault(
+                     c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId))
+                 is { } pendingPet)
         {
-            castId = pendingPet!.ServerGUID;
+            castId = pendingPet.ServerGUID;
             spellVisual = pendingPet.SpellXSpellVisualId;
             if (pendingPet.LegacySpellId != 0)
                 spellId = pendingPet.SpellId;
-            dequeued = true;
             wasStarted = pendingPet.HasStarted;
-
-            if (!pendingPet.HasStarted)
-            {
-                SpellPrepare prepare = new();
-                prepare.ClientCastID = pendingPet.ClientGUID;
-                prepare.ServerCastID = pendingPet.ServerGUID;
-                SendPacketToClient(prepare);
-            }
         }
         else
         {
@@ -695,21 +670,11 @@ public partial class WorldClient
         bool isRangedAutoAttack = spell.Cast.SpellID == 75      // Auto Shot
                                   || spell.Cast.SpellID == 5019; // Shoot (Wand)
         bool isChanneled = GameData.IsChanneledSpell((uint)spell.Cast.SpellID);
-        bool suppressInstantStart = (casterIsLocalPlayer || casterIsLocalPet)
-                                    && spell.Cast.CastTime == 0
-                                    && !isRangedAutoAttack
-                                    && !isChanneled;
-        if (suppressInstantStart)
-        {
-            Log.Event("spell.start.instant_suppressed", new
-            {
-                spell_id = spell.Cast.SpellID,
-                cast_time_ms = spell.Cast.CastTime,
-                caster_is_player = casterIsLocalPlayer,
-                caster_is_pet = casterIsLocalPet,
-            });
-            return;
-        }
+        // PR #72 originally suppressed SPELL_START for local player instants to prevent
+        // GCD-lock-on-failure. Root cause was HandleSpellFailure dequeuing the pending cast
+        // before CAST_FAILED could reach the client. Fixed by changing SPELL_FAILURE to peek
+        // instead of dequeue. SPELL_START is now forwarded for all spells (matches upstream
+        // Xian55/HermesProxy) — instant animations play immediately instead of ~RTT/2 late.
         if (isRangedAutoAttack && (casterIsLocalPlayer || casterIsLocalPet) && spell.Cast.CastTime == 0)
         {
             Log.Event("spell.start.ranged_auto_forwarded", new
