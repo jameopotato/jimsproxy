@@ -824,6 +824,27 @@ public partial class WorldClient
                     legacy_lookup_id = pendingCast.LegacySpellId,
                 });
             }
+
+            // JimsProxy (Pickpocket-Macros): off-GCD instants (Pickpocket, Distract, etc.)
+            // skip BeginGcd, so a follow-up cast held by HasForwardedPendingCast() never gets
+            // a release signal on success — it sat in the held slot until the next press
+            // displaced it. Mirror HandleCastFailed's TakeHeldCastIfReady release on success.
+            // TakeHeldCastIfReady self-guards against active GCDs, so when an on-GCD cast
+            // just called BeginGcd above, this is a no-op and the timer handles the release.
+            var gameStateAfter = GetSession().GameState;
+            if (!gameStateAfter.HasForwardedPendingCast())
+            {
+                var heldCast = gameStateAfter.TakeHeldCastIfReady();
+                if (heldCast != null)
+                {
+                    Log.Event("spell.held_fire_on_success", new
+                    {
+                        success_spell_id = spell.Cast.SpellID,
+                        held_spell_id = heldCast.SpellId,
+                    });
+                    gameStateAfter.OnGcdHeldCastFire?.Invoke(heldCast);
+                }
+            }
         }
         else if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
             GetSession().GameState.CurrentClientNextMeleeCast != null &&
