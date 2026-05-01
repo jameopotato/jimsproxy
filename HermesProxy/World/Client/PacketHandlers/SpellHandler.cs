@@ -701,41 +701,32 @@ public partial class WorldClient
                                     && !isChanneled;
         if (suppressInstantStart)
         {
-            if (Framework.Settings.DebugOutput)
+            Log.Event("spell.start.instant_suppressed", new
             {
-                Log.Event("spell.start.instant_suppressed", new
-                {
-                    spell_id = spell.Cast.SpellID,
-                    cast_time_ms = spell.Cast.CastTime,
-                    caster_is_player = casterIsLocalPlayer,
-                    caster_is_pet = casterIsLocalPet,
-                });
-            }
+                spell_id = spell.Cast.SpellID,
+                cast_time_ms = spell.Cast.CastTime,
+                caster_is_player = casterIsLocalPlayer,
+                caster_is_pet = casterIsLocalPet,
+            });
             return;
         }
         if (isRangedAutoAttack && (casterIsLocalPlayer || casterIsLocalPet) && spell.Cast.CastTime == 0)
         {
-            if (Framework.Settings.DebugOutput)
+            Log.Event("spell.start.ranged_auto_forwarded", new
             {
-                Log.Event("spell.start.ranged_auto_forwarded", new
-                {
-                    spell_id = spell.Cast.SpellID,
-                    caster_is_player = casterIsLocalPlayer,
-                    caster_is_pet = casterIsLocalPet,
-                });
-            }
+                spell_id = spell.Cast.SpellID,
+                caster_is_player = casterIsLocalPlayer,
+                caster_is_pet = casterIsLocalPet,
+            });
         }
         if (isChanneled && (casterIsLocalPlayer || casterIsLocalPet) && spell.Cast.CastTime == 0)
         {
-            if (Framework.Settings.DebugOutput)
+            Log.Event("spell.start.channel_forwarded", new
             {
-                Log.Event("spell.start.channel_forwarded", new
-                {
-                    spell_id = spell.Cast.SpellID,
-                    caster_is_player = casterIsLocalPlayer,
-                    caster_is_pet = casterIsLocalPet,
-                });
-            }
+                spell_id = spell.Cast.SpellID,
+                caster_is_player = casterIsLocalPlayer,
+                caster_is_pet = casterIsLocalPet,
+            });
         }
 
         SendPacketToClient(spell);
@@ -970,21 +961,18 @@ public partial class WorldClient
         // bubble visual; on Ashen-wow it does. If spell_visual_id=0 here, the
         // CSV lookup failed (either wrong spellId from server or missing row).
         // Emitted for both SMSG_SPELL_START and SMSG_SPELL_GO (shared codepath).
-        if (Framework.Settings.DebugOutput)
+        Log.Event("spell.cast", new
         {
-            Log.Event("spell.cast", new
-            {
-                direction = "s2c",
-                phase = isSpellGo ? "go" : "start",
-                spell_id = dbdata.SpellID,
-                spell_visual_id = dbdata.SpellXSpellVisualID,
-                visual_lookup_missing = dbdata.SpellXSpellVisualID == 0,
-                caster_guid = dbdata.CasterGUID.ToString(),
-                caster_is_player = dbdata.CasterGUID == GetSession().GameState.CurrentPlayerGuid,
-                casterCounter = dbdata.CasterUnit.GetCounter(), //MIRASU - lets us correlate with spell.failed_other.routed
-                castIdCounter = dbdata.CastID.GetCounter(),     //MIRASU - this is the CastID the modern client tracks
-            });
-        }
+            direction = "s2c",
+            phase = isSpellGo ? "go" : "start",
+            spell_id = dbdata.SpellID,
+            spell_visual_id = dbdata.SpellXSpellVisualID,
+            visual_lookup_missing = dbdata.SpellXSpellVisualID == 0,
+            caster_guid = dbdata.CasterGUID.ToString(),
+            caster_is_player = dbdata.CasterGUID == GetSession().GameState.CurrentPlayerGuid,
+            casterCounter = dbdata.CasterUnit.GetCounter(), //MIRASU - lets us correlate with spell.failed_other.routed
+            castIdCounter = dbdata.CastID.GetCounter(),     //MIRASU - this is the CastID the modern client tracks
+        });
 
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180) && LegacyVersion.RemovedInVersion(ClientVersionBuild.V3_0_2_9056) && !isSpellGo)
             packet.ReadUInt8(); // cast count
@@ -1464,24 +1452,21 @@ public partial class WorldClient
         if (!wireHasOverheal)
             spell.OverHeal = computedOverHeal;
 
-        if (Framework.Settings.DebugOutput)
+        Log.Event("combat.heal.log", new
         {
-            Log.Event("combat.heal.log", new
-            {
-                spell_id = spell.SpellID,
-                target = spell.TargetGUID.ToString(),
-                caster = spell.CasterGUID.ToString(),
-                heal_amount = spell.HealAmount,
-                over_heal_sent = spell.OverHeal,
-                absorbed_sent = spell.Absorbed,
-                crit = spell.Crit,
-                wire_has_overheal = wireHasOverheal,
-                wire_has_absorbed = wireHasAbsorbed,
-                cache_hit = cacheHit,
-                cached_hp = cachedHp,
-                cached_max_hp = cachedMaxHp,
-            });
-        }
+            spell_id = spell.SpellID,
+            target = spell.TargetGUID.ToString(),
+            caster = spell.CasterGUID.ToString(),
+            heal_amount = spell.HealAmount,
+            over_heal_sent = spell.OverHeal,
+            absorbed_sent = spell.Absorbed,
+            crit = spell.Crit,
+            wire_has_overheal = wireHasOverheal,
+            wire_has_absorbed = wireHasAbsorbed,
+            cache_hit = cacheHit,
+            cached_hp = cachedHp,
+            cached_max_hp = cachedMaxHp,
+        });
 
         SendPacketToClient(spell);
     }
@@ -1535,19 +1520,13 @@ public partial class WorldClient
         // JimsProxy (Rupture-DoT-Lingering-Icon): tag every periodic tick with spell + target so
         // we can pinpoint last-tick-timestamp vs aura-removal-timestamp in the bundle. Remove
         // once the lingering bug is rooted.
-        if (Framework.Settings.DebugOutput)
+        Framework.Logging.Log.Event("aura.tick", new
         {
-            if (Framework.Settings.DebugOutput)
-            {
-                Framework.Logging.Log.Event("aura.tick", new
-                {
-                    target_low = spell.TargetGUID.GetCounter(),
-                    caster_low = spell.CasterGUID.GetCounter(),
-                    spell_id = spell.SpellID,
-                    caster_is_player = spell.CasterGUID == GetSession().GameState.CurrentPlayerGuid,
-                });
-            }
-        }
+            target_low = spell.TargetGUID.GetCounter(),
+            caster_low = spell.CasterGUID.GetCounter(),
+            spell_id = spell.SpellID,
+            caster_is_player = spell.CasterGUID == GetSession().GameState.CurrentPlayerGuid,
+        });
 
         var count = packet.ReadInt32();
         for (var i = 0; i < count; i++)
@@ -1605,23 +1584,20 @@ public partial class WorldClient
                         if (!wireHasOverhealHot)
                             effect.OverHealOrKill = computedOverHealHot;
 
-                        if (Framework.Settings.DebugOutput)
+                        Log.Event("combat.heal.periodic", new
                         {
-                            Log.Event("combat.heal.periodic", new
-                            {
-                                spell_id = spell.SpellID,
-                                target = spell.TargetGUID.ToString(),
-                                caster = spell.CasterGUID.ToString(),
-                                aura = aura.ToString(),
-                                amount = effect.Amount,
-                                over_heal_sent = effect.OverHealOrKill,
-                                crit = effect.Crit,
-                                wire_has_overheal = wireHasOverhealHot,
-                                cache_hit = cacheHitHot,
-                                cached_hp = cachedHpHot,
-                                cached_max_hp = cachedMaxHotHp,
-                            });
-                        }
+                            spell_id = spell.SpellID,
+                            target = spell.TargetGUID.ToString(),
+                            caster = spell.CasterGUID.ToString(),
+                            aura = aura.ToString(),
+                            amount = effect.Amount,
+                            over_heal_sent = effect.OverHealOrKill,
+                            crit = effect.Crit,
+                            wire_has_overheal = wireHasOverhealHot,
+                            cache_hit = cacheHitHot,
+                            cached_hp = cachedHpHot,
+                            cached_max_hp = cachedMaxHotHp,
+                        });
 
                         spell.Effects.Add(effect);
                         break;
