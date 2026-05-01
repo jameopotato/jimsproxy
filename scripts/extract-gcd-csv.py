@@ -1,11 +1,13 @@
 """
-extract-gcd-csv.py -- regenerate HermesProxy/CSV/SpellOffGcd1.csv and Spell1sGcd1.csv
-from a vanilla 1.12 client's Spell.dbc. JimsProxy issue #43.
+extract-gcd-csv.py -- regenerate HermesProxy/CSV/SpellOffGcd1.csv, Spell1sGcd1.csv,
+and SpellChanneled1.csv from a vanilla 1.12 client's Spell.dbc.
 
-These CSVs drive the GCD hold-and-fire logic in jimsproxy:
-  - SpellOffGcd1.csv  : spells that bypass the GCD hold entirely (off-GCD)
-  - Spell1sGcd1.csv   : spells that trigger a 1000ms GCD (rogue energy, feral cat-form)
-                        instead of the default 1500ms
+These CSVs drive the GCD hold-and-fire and channeled-spell logic in jimsproxy:
+  - SpellOffGcd1.csv      : spells that bypass the GCD hold entirely (off-GCD, issue #43)
+  - Spell1sGcd1.csv       : spells that trigger a 1000ms GCD (rogue energy, feral cat-form)
+                            instead of the default 1500ms (issue #43)
+  - SpellChanneled1.csv   : channeled spells (AttributesEx & 0x44) whose SPELL_START must
+                            be forwarded to the client for channel bar timing (issue #91)
 
 HOW TO RUN
 
@@ -56,6 +58,7 @@ import sys
 
 IDX_ID = 0
 IDX_ATTRIBUTES = 6
+IDX_ATTRIBUTES_EX = 7
 IDX_EFFECT = [61, 62, 63]
 IDX_NAME_ENUS = 120
 IDX_START_RECOVERY_CATEGORY = 157
@@ -63,6 +66,8 @@ IDX_START_RECOVERY_TIME = 158
 
 ATTR_PASSIVE = 0x00000040
 ATTR_HIDDEN_CLIENTSIDE = 0x00000080
+ATTR_EX_CHANNELED_1 = 0x00000004
+ATTR_EX_CHANNELED_2 = 0x00000040
 
 HEADER_SIZE = 20
 
@@ -113,15 +118,17 @@ def parse(blob: bytes):
 
     off_gcd: list[int] = []
     one_s_gcd: list[int] = []
+    channeled: list[int] = []
     filtered = {'passive': 0, 'hidden': 0, 'no_effect': 0, 'no_name': 0, 'zero_id': 0}
 
     for i in range(record_count):
         base = HEADER_SIZE + i * record_size
-        sid   = struct.unpack_from('<I', blob, base + IDX_ID * 4)[0]
-        attrs = struct.unpack_from('<I', blob, base + IDX_ATTRIBUTES * 4)[0]
-        effects = [struct.unpack_from('<I', blob, base + ix * 4)[0] for ix in IDX_EFFECT]
+        sid      = struct.unpack_from('<I', blob, base + IDX_ID * 4)[0]
+        attrs    = struct.unpack_from('<I', blob, base + IDX_ATTRIBUTES * 4)[0]
+        attrs_ex = struct.unpack_from('<I', blob, base + IDX_ATTRIBUTES_EX * 4)[0]
+        effects  = [struct.unpack_from('<I', blob, base + ix * 4)[0] for ix in IDX_EFFECT]
         name_ofs = struct.unpack_from('<I', blob, base + IDX_NAME_ENUS * 4)[0]
-        rec_cat = struct.unpack_from('<i', blob, base + IDX_START_RECOVERY_CATEGORY * 4)[0]
+        rec_cat  = struct.unpack_from('<i', blob, base + IDX_START_RECOVERY_CATEGORY * 4)[0]
         rec_time = struct.unpack_from('<i', blob, base + IDX_START_RECOVERY_TIME * 4)[0]
 
         if sid == 0: filtered['zero_id'] += 1; continue
@@ -134,8 +141,10 @@ def parse(blob: bytes):
             off_gcd.append(sid)
         if rec_time == 1000:
             one_s_gcd.append(sid)
+        if attrs_ex & (ATTR_EX_CHANNELED_1 | ATTR_EX_CHANNELED_2):
+            channeled.append(sid)
 
-    return off_gcd, one_s_gcd, filtered, record_count
+    return off_gcd, one_s_gcd, channeled, filtered, record_count
 
 
 def write_csv(path: str, ids: list[int]) -> None:
@@ -154,21 +163,25 @@ def main():
     args = parser.parse_args()
 
     blob = load_spell_dbc(args.client, args.dbc)
-    off_gcd, one_s_gcd, filtered, total = parse(blob)
+    off_gcd, one_s_gcd, channeled, filtered, total = parse(blob)
 
     print(f"Total records:          {total:,}", file=sys.stderr)
     for k, v in filtered.items():
         print(f"  filtered {k:<10} {v:>6,}", file=sys.stderr)
     print(f"Off-GCD (castable):     {len(off_gcd):,}", file=sys.stderr)
     print(f"1s-GCD (castable):      {len(one_s_gcd):,}", file=sys.stderr)
+    print(f"Channeled (castable):   {len(channeled):,}", file=sys.stderr)
 
     os.makedirs(args.out_dir, exist_ok=True)
     off_gcd_path = os.path.join(args.out_dir, 'SpellOffGcd1.csv')
     one_s_gcd_path = os.path.join(args.out_dir, 'Spell1sGcd1.csv')
+    channeled_path = os.path.join(args.out_dir, 'SpellChanneled1.csv')
     write_csv(off_gcd_path, off_gcd)
     write_csv(one_s_gcd_path, one_s_gcd)
+    write_csv(channeled_path, channeled)
     print(f"Wrote {off_gcd_path}", file=sys.stderr)
     print(f"Wrote {one_s_gcd_path}", file=sys.stderr)
+    print(f"Wrote {channeled_path}", file=sys.stderr)
 
 
 if __name__ == '__main__':

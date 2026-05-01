@@ -694,9 +694,11 @@ public partial class WorldClient
         // Whitelist these so they bypass the issue-#43 instant-suppression.
         bool isRangedAutoAttack = spell.Cast.SpellID == 75      // Auto Shot
                                   || spell.Cast.SpellID == 5019; // Shoot (Wand)
+        bool isChanneled = GameData.IsChanneledSpell((uint)spell.Cast.SpellID);
         bool suppressInstantStart = (casterIsLocalPlayer || casterIsLocalPet)
                                     && spell.Cast.CastTime == 0
-                                    && !isRangedAutoAttack;
+                                    && !isRangedAutoAttack
+                                    && !isChanneled;
         if (suppressInstantStart)
         {
             Log.Event("spell.start.instant_suppressed", new
@@ -711,6 +713,15 @@ public partial class WorldClient
         if (isRangedAutoAttack && (casterIsLocalPlayer || casterIsLocalPet) && spell.Cast.CastTime == 0)
         {
             Log.Event("spell.start.ranged_auto_forwarded", new
+            {
+                spell_id = spell.Cast.SpellID,
+                caster_is_player = casterIsLocalPlayer,
+                caster_is_pet = casterIsLocalPet,
+            });
+        }
+        if (isChanneled && (casterIsLocalPlayer || casterIsLocalPet) && spell.Cast.CastTime == 0)
+        {
+            Log.Event("spell.start.channel_forwarded", new
             {
                 spell_id = spell.Cast.SpellID,
                 caster_is_player = casterIsLocalPlayer,
