@@ -1,4 +1,4 @@
-## Interface: 11400
+## Interface: 11402
 ## Title: JimsPlus
 ## Notes: Bundled client-side fixes for JimsProxy / Classic WoW 1.14 Launcher
 ## SavedVariables: JimsPlusDB, JimsPlusCastbarsDB

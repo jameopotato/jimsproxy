@@ -130,6 +130,14 @@ public sealed class GameSessionData
     private Timer? _gcdExpiryTimer;
     private uint _gcdGeneration;                        // incremented each BeginGcd; callback compares against its captured generation to detect stale fires
     public Action<ClientCastRequest>? OnGcdHeldCastFire; // set by WorldSocket at attach time; invoked on a ThreadPool thread at GCD expiry
+
+    // JimsProxy: proxy→server RTT measurement for adaptive GCD fire offset.
+    private readonly object _rttLock = new();
+    private long _lastPingSendTickMs;
+    private uint _lastPingSerial;
+    private double _smoothedRttMs;
+    private int _rttSampleCount;
+
     //MIRASU - Tracks the unique CastID assigned to in-flight non-player casts so SPELL_GO and
     //MIRASU   SPELL_FAILED_OTHER can reference the same cast the SPELL_START introduced.
     //MIRASU   Without this, mob casts reuse a deterministic CastID (spellId+casterCounter) on
@@ -730,14 +738,7 @@ public sealed class GameSessionData
     /// <summary>
     /// JimsProxy (Mount-Button-Stuck-Lit): returns true if any pending normal cast — started OR
     /// merely in flight to the legacy server — matches the given SpellId (or its LegacySpellId
-    /// for SoM-renumbered USE_ITEMs). HasStartedNormalCast only catches duplicates AFTER
-    /// SMSG_SPELL_START matches the queue entry; rapid mashing within the c→s→c round-trip slips
-    /// past it and the duplicate USE_ITEM/CAST_SPELL gets forwarded. The legacy server then rejects
-    /// the duplicate with SpellInProgress, and the FIFO dequeue (TryDequeuePendingNormalCast picks
-    /// the oldest match) binds the failure to the in-flight cast's IDs — the bug commit 7b9e8aa
-    /// originally fixed and that resurfaced when 8998c39 switched HandleUseItem to silent-drop
-    /// gated on HasStartedNormalCast only. Used by HandleCastSpell and HandleUseItem to silent-drop
-    /// the in-flight same-spell duplicate before it ever reaches the queue.
+    /// for SoM-renumbered USE_ITEMs).
     /// </summary>
     public bool HasInFlightNormalCastForSpell(uint spellId)
     {
@@ -747,6 +748,99 @@ public sealed class GameSessionData
                 return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// Returns true if any pending normal cast has been forwarded to the legacy server but
+    /// hasn't received SMSG_SPELL_START yet. Covers the post-GCD-expiry window where
+    /// IsGcdHoldActive() returns false but the server hasn't confirmed the forwarded cast.
+    /// </summary>
+    public bool HasForwardedPendingCast()
+    {
+        foreach (var item in PendingNormalCasts)
+        {
+            if (!item.HasStarted)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Store a cast in the held slot unconditionally (even if GCD has expired). Used by the
+    /// HasForwardedPendingCast guard to hold casts during the post-GCD window while waiting
+    /// for the server to respond. Returns any displaced cast.
+    /// </summary>
+    public ClientCastRequest? ForceHoldCast(ClientCastRequest cast)
+    {
+        lock (_gcdLock)
+        {
+            var displaced = _heldGcdCast;
+            _heldGcdCast = cast;
+            return displaced;
+        }
+    }
+
+    /// <summary>
+    /// Take the held cast if the GCD has expired and no forwarded cast is pending. Used by
+    /// failure handlers to fire the held cast immediately when the server rejects a cast.
+    /// Returns null if GCD is still active (timer will handle it) or if no cast is held.
+    /// </summary>
+    public ClientCastRequest? TakeHeldCastIfReady()
+    {
+        lock (_gcdLock)
+        {
+            if (_heldGcdCast == null)
+                return null;
+            if (_gcdExpireTimestampMs > Environment.TickCount64)
+                return null;
+            var cast = _heldGcdCast;
+            _heldGcdCast = null;
+            return cast;
+        }
+    }
+
+    // ── RTT measurement and adaptive GCD offset ───────────────────────
+
+    public void RecordPingSent(uint serial)
+    {
+        lock (_rttLock)
+        {
+            _lastPingSerial = serial;
+            _lastPingSendTickMs = Environment.TickCount64;
+        }
+    }
+
+    public void RecordPongReceived(uint serial)
+    {
+        lock (_rttLock)
+        {
+            if (serial != _lastPingSerial || _lastPingSendTickMs == 0) return;
+            long rttMs = Environment.TickCount64 - _lastPingSendTickMs;
+            _lastPingSendTickMs = 0;
+            if (rttMs > 5000) return;
+            const double alpha = 0.2;
+            _smoothedRttMs = _rttSampleCount == 0 ? rttMs : (_smoothedRttMs * (1 - alpha) + rttMs * alpha);
+            _rttSampleCount++;
+            Log.Event("rtt.sample", new { serial, raw_ms = rttMs, smoothed_ms = Math.Round(_smoothedRttMs, 1), samples = _rttSampleCount });
+        }
+    }
+
+    public int GetAdaptiveFireOffsetMs()
+    {
+        lock (_rttLock)
+        {
+            if (_rttSampleCount < 3)
+                return Framework.Settings.SpellCastEarlyFireOffsetMs;
+            return (int)Math.Clamp(Math.Round(_smoothedRttMs * 0.5), 0, 100);
+        }
+    }
+
+    public double GetSmoothedRttMs()
+    {
+        lock (_rttLock)
+        {
+            return Math.Round(_smoothedRttMs, 1);
+        }
     }
 
     /// <summary>
@@ -1001,7 +1095,10 @@ public sealed class GameSessionData
 
             toFire = _heldGcdCast;
             _heldGcdCast = null;
-            _gcdExpireTimestampMs = 0;
+            // Keep _gcdExpireTimestampMs alive — presses between fireAt and expireAt are still
+            // caught by IsGcdHoldActive() and stored in the now-empty _heldGcdCast slot. The
+            // next BeginGcd (from SPELL_GO) picks them up. Clearing it here created an unguarded
+            // RTT window where spam-presses bypassed all guards and doubled casts to the server.
             // Don't null _gcdExpiryTimer here: a concurrent BeginGcd could have already replaced it.
         }
         if (toFire != null)

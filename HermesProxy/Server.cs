@@ -249,7 +249,7 @@ partial class Server
     {
         var commitDate = DateTime.Parse(GitVersionInformation.CommitDate, CultureInfo.InvariantCulture).ToUniversalTime();
 
-        string version = $"{commitDate:yyyy-MM-dd} {_buildTag}{GitVersionInformation.MajorMinorPatch}";
+        string version = $"{commitDate:yyyy-MM-dd} {_buildTag}{GitVersionInformation.SemVer}";
         if (GitVersionInformation.CommitsSinceVersionSource != "0")
             version += $"+{GitVersionInformation.CommitsSinceVersionSource}({GitVersionInformation.ShortSha})";
         if (GitVersionInformation.UncommittedChanges != "0")

@@ -201,6 +201,21 @@ public partial class WorldClient
             failed.FailedArg1 = arg1;
             failed.FailedArg2 = arg2;
             SendPacketToClient(failed);
+
+            var gameState = GetSession().GameState;
+            if (!gameState.IsGcdHoldActive() && !gameState.HasForwardedPendingCast())
+            {
+                var heldCast = gameState.TakeHeldCastIfReady();
+                if (heldCast != null)
+                {
+                    Log.Event("spell.held_fire_on_failure", new
+                    {
+                        failed_spell_id = spellId,
+                        held_spell_id = heldCast.SpellId,
+                    });
+                    gameState.OnGcdHeldCastFire?.Invoke(heldCast);
+                }
+            }
         }
     }
 
@@ -777,17 +792,16 @@ public partial class WorldClient
                 long gcdMs = GameData.GetGcdDurationMs(gcdLookupId);
                 long now = Environment.TickCount64;
                 long expireAt = now + gcdMs;
-                long fireAt = expireAt - Framework.Settings.SpellCastEarlyFireOffsetMs;
+                int adaptiveOffset = GetSession().GameState.GetAdaptiveFireOffsetMs();
+                long fireAt = expireAt - adaptiveOffset;
                 GetSession().GameState.BeginGcd(expireAt, fireAt);
 
-                // JimsProxy: gcd.begin — pairs with spell.held / spell.held_fire to reconstruct
-                // the full GCD timeline for a session. legacy_lookup_id is non-zero only for
-                // SoM-renumbered items so we can spot whitelist misses post-hoc.
                 Log.Event("gcd.begin", new
                 {
                     spell_id = spell.Cast.SpellID,
                     gcd_ms = gcdMs,
-                    fire_offset_ms = Framework.Settings.SpellCastEarlyFireOffsetMs,
+                    fire_offset_ms = adaptiveOffset,
+                    smoothed_rtt_ms = GetSession().GameState.GetSmoothedRttMs(),
                     legacy_lookup_id = pendingCast.LegacySpellId,
                 });
             }

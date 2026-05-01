@@ -298,7 +298,9 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
                 Ping ping = new(packet);
                 ping.Read();
                 if (_connectType == ConnectionType.Realm && GetSession().WorldClient != null && GetSession().WorldClient!.IsConnected() && GetSession().WorldClient!.IsAuthenticated())
+                {
                     GetSession().WorldClient!.SendPing(ping.Serial, ping.Latency);
+                }
                 else
                     HandlePing(ping);
                 break;
@@ -332,8 +334,10 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
 
                 break;
             case Opcode.CMSG_ENABLE_NAGLE:
-                SetNoDelay(false);
-                GetSession()?.WorldClient?.SetNoDelay(false);
+                // Ignore: the proxy always needs TCP_NODELAY=true for low-latency
+                // forwarding. The packet is still processed (AES-GCM nonce stays in
+                // sync) but we don't obey the client's request to re-enable Nagle.
+                // Sent when the user unchecks "Optimize Network for Speed" in WoW.
                 break;
             case Opcode.CMSG_CONNECT_TO_FAILED:
                 ConnectToFailed connectToFailed = new(packet);
