@@ -82,6 +82,9 @@ public partial class WorldClient
         moveUpdate.MoveInfo = new();
         moveUpdate.MoveInfo.ReadMovementInfoLegacy(packet, GetSession().GameState);
         ApplyHoverOverrideIfNeeded(moveUpdate.MoverGUID, moveUpdate.MoveInfo);
+        // JimsProxy (Tallstrider-Fix): cache facing for the spline-angle check.
+        if (!moveUpdate.MoverGUID.IsEmpty())
+            GetSession().GameState.LastKnownOrientation[moveUpdate.MoverGUID] = moveUpdate.MoveInfo.Orientation;
         moveUpdate.MoveInfo.Flags = (uint)(((MovementFlagWotLK)moveUpdate.MoveInfo.Flags).CastFlags<MovementFlagModern>());
         moveUpdate.MoveInfo.ValidateMovementInfo();
         SendPacketToClient(moveUpdate);
@@ -487,6 +490,12 @@ public partial class WorldClient
         bool hasTrajectory;
         bool hasCatmullRom;
         bool hasTaxiFlightFlags;
+        // JimsProxy (Tallstrider-Fix): true if this is a vanilla default-Runmode spline
+        // for a non-combat Normal-type move. Steering is held in suspense until path
+        // points are parsed below; we only apply it when SplineCount > 1 (multi-segment
+        // patrol path), never on point-to-point direct moves which are typical of
+        // aggro/state transitions where the legacy server hasn't yet pushed InCombat.
+        bool steeringCandidate = false;
         if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
         {
             var splineFlags = (SplineFlagVanilla)packet.ReadUInt32();
@@ -516,7 +525,7 @@ public partial class WorldClient
                 if (unitFlags.HasFlag(UnitFlagsVanilla.CanSwim))
                     moveSpline.SplineFlags |= SplineFlagModern.CanSwim;
                 if (type == SplineTypeLegacy.Normal && !unitFlags.HasFlag(UnitFlagsVanilla.InCombat))
-                    moveSpline.SplineFlags |= SplineFlagModern.Steering | SplineFlagModern.Unknown10;
+                    steeringCandidate = true; // resolved after path parsing — see Steering apply block below
             }
             else
             {
@@ -604,6 +613,46 @@ public partial class WorldClient
                     vec = moveSpline.EndPosition - vec;
 
                 moveSpline.SplinePoints.Add(vec);
+            }
+        }
+
+        // JimsProxy (Tallstrider-Fix): decide Steering using two gates that together
+        // separate patrol corners (Steering = smooth, looks vanilla) from aggro chases
+        // (no Steering = snap to heading, also looks vanilla).
+        //
+        //   Gate 1 — angle change at first segment, threshold 90°. Patrol corner
+        //   turns at intersections rarely exceed this; large state-transition turns
+        //   (creature was facing N, now charges S to reach player) blow past it.
+        //
+        //   Gate 2 — total path distance, threshold 20 yd. Patrol segments are short
+        //   (~5-10 yd between waypoints); aggro chases are typically 15-40 yd to the
+        //   target. The distance gate catches aggro paths whose first-segment angle
+        //   happens to be small (creature already facing-ish toward player) — those
+        //   would otherwise pass Gate 1 and re-trigger the sideways-running bug.
+        //
+        // Fallback: skip Steering when we have no cached orientation. Snap is the
+        // vanilla default and the safer mis-classification.
+        if (steeringCandidate && moveSpline.SplineCount >= 1)
+        {
+            Vector3 firstSegmentEnd = moveSpline.SplinePoints.Count > 0
+                ? moveSpline.SplinePoints[0]
+                : moveSpline.EndPosition;
+            Vector3 firstDelta = firstSegmentEnd - moveSpline.StartPosition;
+            Vector3 totalDelta = moveSpline.EndPosition - moveSpline.StartPosition;
+            float firstDist2D = MathF.Sqrt(firstDelta.X * firstDelta.X + firstDelta.Y * firstDelta.Y);
+            float totalDist2D = MathF.Sqrt(totalDelta.X * totalDelta.X + totalDelta.Y * totalDelta.Y);
+            const float STEERING_ANGLE_THRESHOLD_RAD = 1.5708f; // 90°
+            const float STEERING_DISTANCE_THRESHOLD_YD = 20.0f;
+            if (firstDist2D > 0.1f
+                && totalDist2D < STEERING_DISTANCE_THRESHOLD_YD
+                && GetSession().GameState.LastKnownOrientation.TryGetValue(guid, out float currentOri))
+            {
+                float pathHeading = MathF.Atan2(firstDelta.Y, firstDelta.X);
+                float diff = pathHeading - currentOri;
+                while (diff > MathF.PI) diff -= 2 * MathF.PI;
+                while (diff < -MathF.PI) diff += 2 * MathF.PI;
+                if (MathF.Abs(diff) < STEERING_ANGLE_THRESHOLD_RAD)
+                    moveSpline.SplineFlags |= SplineFlagModern.Steering | SplineFlagModern.Unknown10;
             }
         }
 
