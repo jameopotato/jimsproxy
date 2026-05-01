@@ -782,6 +782,28 @@ public sealed class GameSessionData
     }
 
     /// <summary>
+    /// JimsProxy (Mount-Button-Stuck-Lit): returns true if any pending normal cast — started OR
+    /// merely in flight to the legacy server — matches the given SpellId (or its LegacySpellId
+    /// for SoM-renumbered USE_ITEMs). HasStartedNormalCast only catches duplicates AFTER
+    /// SMSG_SPELL_START matches the queue entry; rapid mashing within the c→s→c round-trip slips
+    /// past it and the duplicate USE_ITEM/CAST_SPELL gets forwarded. The legacy server then rejects
+    /// the duplicate with SpellInProgress, and the FIFO dequeue (TryDequeuePendingNormalCast picks
+    /// the oldest match) binds the failure to the in-flight cast's IDs — the bug commit 7b9e8aa
+    /// originally fixed and that resurfaced when 8998c39 switched HandleUseItem to silent-drop
+    /// gated on HasStartedNormalCast only. Used by HandleCastSpell and HandleUseItem to silent-drop
+    /// the in-flight same-spell duplicate before it ever reaches the queue.
+    /// </summary>
+    public bool HasInFlightNormalCastForSpell(uint spellId)
+    {
+        foreach (var item in PendingNormalCasts)
+        {
+            if (CastMatchesSpellId(item, spellId))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
     /// Store a cast in the held slot unconditionally (even if GCD has expired). Used by the
     /// HasForwardedPendingCast guard to hold casts during the post-GCD window while waiting
     /// for the server to respond. Returns any displaced cast.
