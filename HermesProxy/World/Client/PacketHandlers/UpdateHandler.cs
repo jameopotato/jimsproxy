@@ -793,6 +793,14 @@ public partial class WorldClient
             moveInfo = new MovementInfo();
             moveInfo.ReadMovementInfoLegacy(packet, GetSession().GameState);
 
+            // JimsProxy (Tallstrider-Fix): cache the creature's current facing for the
+            // angle-change check in MovementHandler.HandleMonsterMove. Updated on every
+            // ObjectUpdate movement block (spawn, position correction, heartbeat-style
+            // refresh) so the value is reasonably fresh when the next MONSTER_MOVE
+            // arrives.
+            if (!guid.IsEmpty())
+                GetSession().GameState.LastKnownOrientation[guid] = moveInfo.Orientation;
+
             // Vanilla 1.12 carries hover state via MovementFlagVanilla.FixedZ. Seed our
             // hover registry from it, since some 1.12 cores never populate UNIT_FIELD_HOVERHEIGHT.
             if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180) && moveInfo.Hover &&

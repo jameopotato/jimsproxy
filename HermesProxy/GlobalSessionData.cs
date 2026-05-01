@@ -209,6 +209,15 @@ public sealed class GameSessionData
     // packets for it get the hover override regardless of HOVERHEIGHT.
     public HashSet<WowGuid128> KnownHoveringMobs = [];
 
+    // JimsProxy (Tallstrider-Fix): per-GUID last-known facing orientation, populated from
+    // any MovementInfo we observe (spawn, heartbeat, ObjectUpdate movement block). Used by
+    // MovementHandler.HandleMonsterMove to compare the creature's current facing against
+    // the spline's first-segment direction — if the angle change is large, we treat the
+    // move as a state-transition (aggro/turn-to-target) and skip SplineFlagModern.Steering
+    // so the modern client snaps to the new heading instead of slowly rotating the body
+    // through the path. Small angle changes get Steering for smooth patrol corners.
+    public Dictionary<WowGuid128, float> LastKnownOrientation = new();
+
     private GameSessionData()
     {
 
