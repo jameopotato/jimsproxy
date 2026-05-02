@@ -321,12 +321,9 @@ public partial class WorldSocket
                             SendCastRequestFailed(displaced, false);
                         }
 
-                        // Acknowledge the keypress immediately so the 1.14 client's UI doesn't feel
-                        // unresponsive while we hold the cast.
-                        SpellPrepare heldPrepare = new SpellPrepare();
-                        heldPrepare.ClientCastID = castRequest.ClientGUID;
-                        heldPrepare.ServerCastID = castRequest.ServerGUID;
-                        SendPacket(heldPrepare);
+                        // Don't send SpellPrepare here — hide the queue from the client.
+                        // SpellPrepare will be sent at SPELL_GO time (Client/SpellHandler.cs
+                        // line 734-739) so button, animation, and GCD sweep all start together.
                         return;
                     }
                     // Else: GCD expired between IsGcdHoldActive() and TryHoldCastDuringGcd() —
@@ -373,10 +370,7 @@ public partial class WorldSocket
                     });
                     if (displaced != null)
                         SendCastRequestFailed(displaced, false);
-                    SpellPrepare heldPrepare = new SpellPrepare();
-                    heldPrepare.ClientCastID = castRequest.ClientGUID;
-                    heldPrepare.ServerCastID = castRequest.ServerGUID;
-                    SendPacket(heldPrepare);
+                    // Don't send SpellPrepare — hide the queue from the client.
                     return;
                 }
 
