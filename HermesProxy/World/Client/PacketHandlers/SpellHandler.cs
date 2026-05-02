@@ -825,23 +825,24 @@ public partial class WorldClient
                 });
             }
 
-            // JimsProxy (Macro-GCD-Fix): off-GCD completions (trinkets, racials, etc.) don't
-            // trigger BeginGcd, so a cast held via spell.held_pending while the off-GCD cast
-            // was in flight gets stranded — _heldGcdCast sits until the next press/failure.
-            // Bundle 20260430-150846 showed SS held 7563ms after a trinket completed. If the
-            // queue is now drained and no GCD is active, release the held cast immediately.
-            var gameState = GetSession().GameState;
-            if (!gameState.IsGcdHoldActive() && !gameState.HasForwardedPendingCast())
+            // JimsProxy (Pickpocket-Macros): off-GCD instants (Pickpocket, Distract, etc.)
+            // skip BeginGcd, so a follow-up cast held by HasForwardedPendingCast() never gets
+            // a release signal on success — it sat in the held slot until the next press
+            // displaced it. Mirror HandleCastFailed's TakeHeldCastIfReady release on success.
+            // TakeHeldCastIfReady self-guards against active GCDs, so when an on-GCD cast
+            // just called BeginGcd above, this is a no-op and the timer handles the release.
+            var gameStateAfter = GetSession().GameState;
+            if (!gameStateAfter.HasForwardedPendingCast())
             {
-                var heldCast = gameState.TakeHeldCastIfReady();
+                var heldCast = gameStateAfter.TakeHeldCastIfReady();
                 if (heldCast != null)
                 {
-                    Log.Event("spell.held_fire_on_go", new
+                    Log.Event("spell.held_fire_on_success", new
                     {
-                        completed_spell_id = spell.Cast.SpellID,
+                        success_spell_id = spell.Cast.SpellID,
                         held_spell_id = heldCast.SpellId,
                     });
-                    gameState.OnGcdHeldCastFire?.Invoke(heldCast);
+                    gameStateAfter.OnGcdHeldCastFire?.Invoke(heldCast);
                 }
             }
         }
