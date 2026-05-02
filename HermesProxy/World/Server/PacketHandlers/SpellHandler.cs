@@ -272,6 +272,22 @@ public partial class WorldSocket
                     // the value at decision time, not after the hold was installed.
                     long gcdRemainingBeforeHold = GetSession().GameState.GetGcdRemainingMs();
                     castRequest.HeldAtTickMs = Environment.TickCount64;
+
+                    // Same-spell skip: if the held cast is already the same spell,
+                    // the outcome is identical (same spell fires at GCD expiry). Just
+                    // ACK the keypress and reject the duplicate. Avoids displacement
+                    // bookkeeping and reduces client packet noise during rapid spam.
+                    var peeked = GetSession().GameState.PeekHeldGcdCast();
+                    if (peeked != null && peeked.SpellId == cast.Cast.SpellID)
+                    {
+                        SpellPrepare skipPrepare = new SpellPrepare();
+                        skipPrepare.ClientCastID = castRequest.ClientGUID;
+                        skipPrepare.ServerCastID = castRequest.ServerGUID;
+                        SendPacket(skipPrepare);
+                        SendCastRequestFailed(castRequest, false);
+                        return;
+                    }
+
                     if (GetSession().GameState.TryHoldCastDuringGcd(castRequest, out var displaced))
                     {
                         // JimsProxy: spell.held — emit before the displaced/ack work so the
