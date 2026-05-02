@@ -140,6 +140,42 @@ public partial class WorldSocket
             });
         }
 
+        // JimsProxy (Rupture-DoT-Lingering-Icon): snapshot CP for vanilla CP-scaling
+        // finishers before the server consumes them. The legacy server applies
+        // (base + perCp × CP) ms duration server-side and never echoes it back for enemy
+        // debuffs, so the proxy synthesizes the correct duration locally on aura apply.
+        // Snapshotting on the keypress (before any GCD-hold path) covers both immediate
+        // forwards and held-then-released casts. TTL on the lookup side bounds staleness.
+        uint castSpellId = (uint)cast.Cast.SpellID;
+        if (GameData.IsComboPointFinisher(castSpellId))
+        {
+            byte cp = GetSession().GameState.CurrentComboPoints;
+            WowGuid128 target = cast.Cast.Target.Unit;
+            bool targetEmpty = target.IsEmpty();
+            // Unconditional diagnostic so we can see which guard failed when no snapshot fires.
+            Log.Event("finisher.cmsg_cast", new
+            {
+                spell_id = castSpellId,
+                combo_points = cp,
+                target_low = targetEmpty ? 0 : target.GetCounter(),
+                target_empty = targetEmpty,
+                target_flags = (uint)cast.Cast.Target.Flags,
+                cached_combo_target_low = GetSession().GameState.CurrentComboTarget.IsEmpty()
+                    ? 0
+                    : GetSession().GameState.CurrentComboTarget.GetCounter(),
+            });
+            if (cp > 0 && !targetEmpty)
+            {
+                GetSession().GameState.StorePendingFinisherCast(castSpellId, target, cp);
+                Log.Event("finisher.snapshot", new
+                {
+                    spell_id = castSpellId,
+                    target_low = target.GetCounter(),
+                    combo_points = cp,
+                });
+            }
+        }
+
         bool isNextMelee = GameData.NextMeleeSpells.Contains(cast.Cast.SpellID);
         bool isAutoRepeat = GameData.AutoRepeatSpells.Contains(cast.Cast.SpellID);
         // JimsProxy (issue #43): the GCD hold-and-fire path is vanilla-only. On TBC+ the
@@ -313,30 +349,6 @@ public partial class WorldSocket
                     heldPrepare.ClientCastID = castRequest.ClientGUID;
                     heldPrepare.ServerCastID = castRequest.ServerGUID;
                     SendPacket(heldPrepare);
-
-                    // JimsProxy (Macro-GCD-Fix): macro-batched `/use 13 /use 14 /cast SS` lands all
-                    // three CMSGs in the same ms; SS gets held_pending while a trinket is in flight.
-                    // SpellPrepare acks the click but the modern 1.14 client's GCD swipe doesn't
-                    // start until SS's own SMSG_SPELL_GO arrives — a ~300ms gap (trinket RTT + SS RTT)
-                    // where the action button is queued/lit without a sweep. Synthesize a
-                    // SMSG_COOLDOWN_EVENT so the client's swipe starts immediately at ack time.
-                    // SMSG_SPELL_COOLDOWN with ForcedCooldown was tried earlier (stash 0) and got
-                    // "anticipated-then-canceled" by the macro evaluator; SMSG_COOLDOWN_EVENT lets
-                    // the client compute the GCD locally from the spell's DBC StartRecoveryTime.
-                    // Vanilla-only: TBC+ haste-adjusted GCDs would make this wrong, and the GCD-hold
-                    // mechanism (gated on ExpansionVersion==1 in HandleSpellGo) is vanilla-only too.
-                    if (LegacyVersion.ExpansionVersion == 1)
-                    {
-                        CooldownEvent cdEvent = new();
-                        cdEvent.SpellID = (uint)cast.Cast.SpellID;
-                        cdEvent.IsPet = false;
-                        SendPacket(cdEvent);
-                        Log.Event("gcd.cooldown.synth_held", new
-                        {
-                            spell_id = cast.Cast.SpellID,
-                            client_cast_id = castRequest.ClientGUID.ToString(),
-                        });
-                    }
                     return;
                 }
 

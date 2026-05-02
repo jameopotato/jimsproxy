@@ -826,21 +826,6 @@ public sealed class GameSessionData
     }
 
     /// <summary>
-    /// JimsProxy (Mount-Button-Stuck-Lit): returns true if any pending normal cast — started OR
-    /// merely in flight to the legacy server — matches the given SpellId (or its LegacySpellId
-    /// for SoM-renumbered USE_ITEMs).
-    /// </summary>
-    public bool HasInFlightNormalCastForSpell(uint spellId)
-    {
-        foreach (var item in PendingNormalCasts)
-        {
-            if (CastMatchesSpellId(item, spellId))
-                return true;
-        }
-        return false;
-    }
-
-    /// <summary>
     /// Returns true if any pending normal cast has been forwarded to the legacy server but
     /// hasn't received SMSG_SPELL_START yet. Covers the post-GCD-expiry window where
     /// IsGcdHoldActive() returns false but the server hasn't confirmed the forwarded cast.
@@ -929,11 +914,38 @@ public sealed class GameSessionData
             if (serial != _lastPingSerial || _lastPingSendTickMs == 0) return;
             long rttMs = Environment.TickCount64 - _lastPingSendTickMs;
             _lastPingSendTickMs = 0;
-            if (rttMs > 5000) return;
+            // Reject outliers above 300ms: any sample that high is connection-setup
+            // overhead (TCP handshake + auth + world-entry on a fresh WorldClient connect
+            // or realm swap), not a real GCD-relevant network RTT. The previous 5000ms
+            // ceiling let realm-swap startup pings poison the EMA — measured 672ms then
+            // 641ms on a realm swap, smoothing pinned at 588ms for the rest of the session.
+            if (rttMs > 300)
+            {
+                Log.Event("rtt.sample.rejected", new { serial, raw_ms = rttMs, reason = "outlier_above_300ms" });
+                return;
+            }
             const double alpha = 0.2;
             _smoothedRttMs = _rttSampleCount == 0 ? rttMs : (_smoothedRttMs * (1 - alpha) + rttMs * alpha);
             _rttSampleCount++;
             Log.Event("rtt.sample", new { serial, raw_ms = rttMs, smoothed_ms = Math.Round(_smoothedRttMs, 1), samples = _rttSampleCount });
+        }
+    }
+
+    /// <summary>
+    /// Reset RTT smoothing state. Called when the proxy connects/reconnects to the legacy
+    /// world server (login, realm swap) so accumulated bad samples from the prior connection
+    /// don't pollute the new session — particularly the cap-bound 100ms fire offset that
+    /// becomes unsafe when applied with a stale-high smoothed RTT.
+    /// </summary>
+    public void ResetRttSmoothing()
+    {
+        lock (_rttLock)
+        {
+            _smoothedRttMs = 0;
+            _rttSampleCount = 0;
+            _lastPingSendTickMs = 0;
+            _lastPingSerial = 0;
+            Log.Event("rtt.smoothing.reset", new { });
         }
     }
 
@@ -943,7 +955,23 @@ public sealed class GameSessionData
         {
             if (_rttSampleCount < 3)
                 return Framework.Settings.SpellCastEarlyFireOffsetMs;
-            return (int)Math.Clamp(Math.Round(_smoothedRttMs * 0.5), 0, 100);
+            // Max safe offset is full RTT: cast leaves proxy at gcd_expire-X, arrives at server
+            // at gcd_expire-X+rtt/2; server's GCD ended rtt/2 before client's, so X<=rtt is safe.
+            // Server-side margin = RTT - offset; we want a CONSTANT 10ms minimum margin to
+            // absorb server-processing jitter regardless of RTT. The earlier multiplier formula
+            // (RTT * 0.95) gave 0.05*RTT margin — fine at high RTT but only ~2ms at 35ms RTT
+            // where Twinstar's ~30ms jitter would flood NOT_READY for low-latency euro players.
+            // Predictive SMSG_SPELL_GO synth was tried to push past this floor but caused
+            // legacy-server DCs (see memory/project_predictive_spell_go_synth_dc.md).
+            const int safetyMs = 10;
+            // Cap at 100ms: realm-swap startup pings can briefly inflate smoothed RTT to
+            // 500ms+ (EMA α=0.2 recovers slowly), and a high cap with bogus RTT fires the
+            // held cast far before the server's GCD ends — the legacy server then queues
+            // the cast and replies late, producing the "stuck button" perceived as sluggish
+            // even with zero NOT_READY events. 100ms keeps the worst-case early-arrival
+            // bounded to roughly safe territory at all realistic actual RTTs.
+            double offset = _smoothedRttMs - safetyMs;
+            return (int)Math.Clamp(Math.Round(offset), 0, 100);
         }
     }
 

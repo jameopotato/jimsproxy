@@ -113,6 +113,10 @@ public partial class WorldClient
                 port = (int)realm.Port,
                 realm_name = realm.Name,
             });
+            // JimsProxy: clear stale RTT smoothing on every connect so realm-swap
+            // startup pings (TCP+auth+world-entry overhead) don't pollute the new
+            // session's adaptive fire offset.
+            globalSession.GameState.ResetRttSmoothing();
             _clientSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             // Connect to the specified host.
             var endPoint = new IPEndPoint(ip, realm.Port);
