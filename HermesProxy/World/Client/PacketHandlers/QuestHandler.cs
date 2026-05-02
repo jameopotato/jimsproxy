@@ -339,19 +339,37 @@ public partial class WorldClient
 
         quest.ItemReward.ItemID = itemId;
 
+        // JimsProxy: LaunchQuest must default to FALSE. The previous logic kept it true
+        // whenever the QuestTemplate was missing (which is the common 1.14-client case,
+        // since the modern client doesn't issue CMSG_QUERY_QUEST_INFO before turn-in —
+        // see the OfferedRewardChoiceItems comment above). LaunchQuest=true tells the
+        // modern client "another quest dialog is coming, keep the giver UI live"; when
+        // no follow-up data arrives the client retries the entire HELLO → COMPLETE →
+        // REQUEST_REWARD → CHOOSE_REWARD chain at ~100ms intervals to recover, which
+        // looks like spam to anti-flood-equipped servers (Twinstar/Kronos drops the
+        // socket after ~15 retries in <2s). Bundle 2026-05-02 073927 captured this
+        // exact pattern. Now: default false; opt in to true only when QuestTemplate
+        // confirms a follow-up quest exists.
         QuestTemplate? questTemplate = GameData.GetQuestTemplate((uint)quest.QuestID);
-        if (questTemplate != null && questTemplate.RewardNextQuest == 0)
-        {
-            quest.LaunchQuest = false;
+        bool hasFollowUpQuest = questTemplate != null && questTemplate.RewardNextQuest != 0;
+        quest.LaunchQuest = hasFollowUpQuest;
 
-            if (GetSession().GameState.CurrentInteractedWithNPC != default)
-            {
-                uint npcFlags = GetSession().GameState.GetLegacyFieldValueUInt32(GetSession().GameState.CurrentInteractedWithNPC, UnitField.UNIT_NPC_FLAGS);
-                if (npcFlags.HasAnyFlag(NPCFlags.Gossip))
-                    quest.LaunchGossip = true;
-            }
+        if (!hasFollowUpQuest && GetSession().GameState.CurrentInteractedWithNPC != default)
+        {
+            uint npcFlags = GetSession().GameState.GetLegacyFieldValueUInt32(GetSession().GameState.CurrentInteractedWithNPC, UnitField.UNIT_NPC_FLAGS);
+            if (npcFlags.HasAnyFlag(NPCFlags.Gossip))
+                quest.LaunchGossip = true;
         }
-        
+
+        Log.Event("quest.complete.launch_decision", new
+        {
+            quest_id = quest.QuestID,
+            has_quest_template = questTemplate != null,
+            reward_next_quest = questTemplate?.RewardNextQuest ?? 0,
+            launch_quest = quest.LaunchQuest,
+            launch_gossip = quest.LaunchGossip,
+        });
+
         SendPacketToClient(quest);
 
         DisplayToast toast = new();

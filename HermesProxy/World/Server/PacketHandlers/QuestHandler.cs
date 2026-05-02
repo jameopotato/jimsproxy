@@ -12,6 +12,39 @@ namespace HermesProxy.World.Server;
 
 public partial class WorldSocket
 {
+    // JimsProxy: c2s coalescing for the quest-giver CMSG family. The modern (1.14)
+    // retail client can spam the entire HELLO → COMPLETE_QUEST → REQUEST_REWARD →
+    // CHOOSE_REWARD chain at ~100ms intervals when it doesn't recognize the legacy
+    // turn-in confirmation as final (see WorldClient.HandleQuestGiverQuestComplete
+    // for the LaunchQuest fix). Twinstar/Kronos drops the socket as anti-flood after
+    // ~15 retries in <2s — bundle 2026-05-02 073927 captured this. Even with the
+    // LaunchQuest fix in place, defense-in-depth: never relay more than one of the
+    // same (opcode, NPC, quest) tuple per cooldown window. Cooldown is 750ms — wider
+    // than any plausible double-click but short enough that a legitimate "user closed
+    // dialog and reopened" still goes through.
+    private readonly Dictionary<(Opcode op, ulong npcGuidLow, uint questId), long> _questCmsgLastSent = new();
+    private const int QuestCmsgCoalesceWindowMs = 750;
+
+    private bool TryCoalesceQuestCmsg(Opcode op, WowGuid128 npcGuid, uint questId)
+    {
+        var key = (op, npcGuid.Low, questId);
+        long now = Environment.TickCount64;
+        if (_questCmsgLastSent.TryGetValue(key, out long last) && now - last < QuestCmsgCoalesceWindowMs)
+        {
+            Log.Event("quest.cmsg.coalesced", new
+            {
+                opcode = op.ToString(),
+                npc_guid_low = key.Item2,
+                quest_id = questId,
+                ms_since_last = now - last,
+                window_ms = QuestCmsgCoalesceWindowMs,
+            });
+            return true;
+        }
+        _questCmsgLastSent[key] = now;
+        return false;
+    }
+
     // Handlers for CMSG opcodes coming from the modern client
     [PacketHandler(Opcode.CMSG_QUEST_GIVER_QUERY_QUEST)]
     void HandleQuestGiverQueryQuest(QuestGiverQueryQuest quest)
@@ -117,6 +150,8 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_QUEST_GIVER_HELLO)]
     void HandleQuestGiverHello(QuestGiverHello hello)
     {
+        if (TryCoalesceQuestCmsg(Opcode.CMSG_QUEST_GIVER_HELLO, hello.QuestGiverGUID, 0))
+            return;
         WorldPacket packet = new WorldPacket(Opcode.CMSG_QUEST_GIVER_HELLO);
         packet.WriteGuid(hello.QuestGiverGUID.To64());
         SendPacketToServer(packet);
@@ -124,6 +159,8 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_QUEST_GIVER_REQUEST_REWARD)]
     void HandleQuestGiverRequestReward(QuestGiverRequestReward quest)
     {
+        if (TryCoalesceQuestCmsg(Opcode.CMSG_QUEST_GIVER_REQUEST_REWARD, quest.QuestGiverGUID, quest.QuestID))
+            return;
         WorldPacket packet = new WorldPacket(Opcode.CMSG_QUEST_GIVER_REQUEST_REWARD);
         packet.WriteGuid(quest.QuestGiverGUID.To64());
         packet.WriteUInt32(quest.QuestID);
@@ -132,6 +169,8 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_QUEST_GIVER_CHOOSE_REWARD)]
     void HandleQuestGiverChooseReward(QuestGiverChooseReward quest)
     {
+        if (TryCoalesceQuestCmsg(Opcode.CMSG_QUEST_GIVER_CHOOSE_REWARD, quest.QuestGiverGUID, quest.QuestID))
+            return;
         int choiceIndex = 0;
 
         if (quest.Choice.Item.ItemID != 0)
@@ -189,6 +228,8 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_QUEST_GIVER_COMPLETE_QUEST)]
     void HandleQuestGiverCompleteQuest(QuestGiverCompleteQuest quest)
     {
+        if (TryCoalesceQuestCmsg(Opcode.CMSG_QUEST_GIVER_COMPLETE_QUEST, quest.QuestGiverGUID, quest.QuestID))
+            return;
         WorldPacket packet = new WorldPacket(Opcode.CMSG_QUEST_GIVER_COMPLETE_QUEST);
         packet.WriteGuid(quest.QuestGiverGUID.To64());
         packet.WriteUInt32(quest.QuestID);
