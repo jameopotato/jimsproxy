@@ -341,6 +341,18 @@ public partial class WorldSocket
                     });
                 }
 
+                // Late same-spell drop: if the timer already fired the same spell,
+                // don't forward a duplicate — server would just reject with NOT_READY.
+                if (GetSession().GameState.ShouldDropLateSameSpell((uint)cast.Cast.SpellID))
+                {
+                    SpellPrepare dropPrepare = new SpellPrepare();
+                    dropPrepare.ClientCastID = castRequest.ClientGUID;
+                    dropPrepare.ServerCastID = castRequest.ServerGUID;
+                    SendPacket(dropPrepare);
+                    SendCastRequestFailed(castRequest, false);
+                    return;
+                }
+
                 // Guard 3: a cast was forwarded to the server but hasn't received
                 // SPELL_START/SPELL_GO yet. Hold the new press so it fires when the
                 // server responds (BeginGcd creates a new timer that picks it up).

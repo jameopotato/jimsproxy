@@ -161,6 +161,7 @@ public sealed class GameSessionData
     private Timer? _gcdExpiryTimer;
     private uint _gcdGeneration;                        // incremented each BeginGcd; callback compares against its captured generation to detect stale fires
     private bool _gcdTimerHasFired;                     // true after OnGcdTimerElapsed runs; prevents orphaned holds
+    private uint _lastFiredSpellId;                     // spell ID forwarded by the timer; used to drop same-spell late presses
     public Action<ClientCastRequest>? OnGcdHeldCastFire; // set by WorldSocket at attach time; invoked on a ThreadPool thread at GCD expiry
 
     // JimsProxy: proxy→server RTT measurement for adaptive GCD fire offset.
@@ -1113,6 +1114,19 @@ public sealed class GameSessionData
     }
 
     /// <summary>
+    /// Returns true if the GCD timer already fired and the spell it forwarded matches
+    /// the given spell ID. Used to silently drop same-spell late presses that would
+    /// just get NOT_READY from the server.
+    /// </summary>
+    public bool ShouldDropLateSameSpell(uint spellId)
+    {
+        lock (_gcdLock)
+        {
+            return _gcdTimerHasFired && _lastFiredSpellId == spellId;
+        }
+    }
+
+    /// <summary>
     /// Start (or restart) a GCD hold window. The timer fires at <paramref name="fireAtTickMs"/>,
     /// at which point any pending held cast is handed to OnGcdHeldCastFire on a ThreadPool thread.
     /// expireAtTickMs and fireAtTickMs are Environment.TickCount64 timestamps.
@@ -1191,6 +1205,7 @@ public sealed class GameSessionData
             toFire = _heldGcdCast;
             _heldGcdCast = null;
             _gcdTimerHasFired = true;
+            _lastFiredSpellId = toFire?.SpellId ?? 0;
             // Keep _gcdExpireTimestampMs alive — but presses after timer fires should NOT be
             // held (no timer to release them). TryHoldCastDuringGcd checks _gcdTimerHasFired
             // and returns false so the caller forwards immediately instead of orphaning.
