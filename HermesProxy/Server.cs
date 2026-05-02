@@ -55,6 +55,10 @@ partial class Server
             Log.Print(LogType.Server, "Latency metrics collection enabled");
         Log.Start();
 
+        // JimsProxy: install crash/signal hooks early so any exception during the
+        // rest of startup gets a process.crash event with a flushed JSONL.
+        ShutdownHooks.Install();
+
         if (Environment.CurrentDirectory != Path.GetDirectoryName(AppContext.BaseDirectory))
         {
             Log.Print(LogType.Storage, "Switching working directory");
