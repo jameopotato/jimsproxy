@@ -160,6 +160,7 @@ public sealed class GameSessionData
     private ClientCastRequest? _heldGcdCast;            // most recently-pressed cast while GCD active (overwritten on new press)
     private Timer? _gcdExpiryTimer;
     private uint _gcdGeneration;                        // incremented each BeginGcd; callback compares against its captured generation to detect stale fires
+    private bool _gcdTimerHasFired;                     // true after OnGcdTimerElapsed runs; prevents orphaned holds
     public Action<ClientCastRequest>? OnGcdHeldCastFire; // set by WorldSocket at attach time; invoked on a ThreadPool thread at GCD expiry
 
     // JimsProxy: proxy→server RTT measurement for adaptive GCD fire offset.
@@ -1103,6 +1104,8 @@ public sealed class GameSessionData
         {
             if (_gcdExpireTimestampMs <= Environment.TickCount64)
                 return false;
+            if (_gcdTimerHasFired)
+                return false; // Timer already fired — no one to release this cast. Forward immediately.
             displaced = _heldGcdCast;
             _heldGcdCast = cast;
             return true;
@@ -1120,6 +1123,7 @@ public sealed class GameSessionData
         {
             _gcdExpiryTimer?.Dispose();
             _gcdExpireTimestampMs = expireAtTickMs;
+            _gcdTimerHasFired = false;
             unchecked { _gcdGeneration++; }
             uint myGeneration = _gcdGeneration;
             long delayMs = Math.Max(0, fireAtTickMs - Environment.TickCount64);
@@ -1147,6 +1151,7 @@ public sealed class GameSessionData
             _gcdExpiryTimer?.Dispose();
             _gcdExpiryTimer = null;
             _gcdExpireTimestampMs = 0;
+            _gcdTimerHasFired = false;
             _heldGcdCast = null;
             // Bump generation so any already-queued callback from the cancelled timer sees a
             // stale generation and bails. Prevents post-cancel firing on session teardown.
@@ -1185,10 +1190,10 @@ public sealed class GameSessionData
 
             toFire = _heldGcdCast;
             _heldGcdCast = null;
-            // Keep _gcdExpireTimestampMs alive — presses between fireAt and expireAt are still
-            // caught by IsGcdHoldActive() and stored in the now-empty _heldGcdCast slot. The
-            // next BeginGcd (from SPELL_GO) picks them up. Clearing it here created an unguarded
-            // RTT window where spam-presses bypassed all guards and doubled casts to the server.
+            _gcdTimerHasFired = true;
+            // Keep _gcdExpireTimestampMs alive — but presses after timer fires should NOT be
+            // held (no timer to release them). TryHoldCastDuringGcd checks _gcdTimerHasFired
+            // and returns false so the caller forwards immediately instead of orphaning.
             // Don't null _gcdExpiryTimer here: a concurrent BeginGcd could have already replaced it.
         }
         if (toFire != null)
