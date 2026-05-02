@@ -909,7 +909,11 @@ public sealed class GameSessionData
             if (serial != _lastPingSerial || _lastPingSendTickMs == 0) return;
             long rttMs = Environment.TickCount64 - _lastPingSendTickMs;
             _lastPingSendTickMs = 0;
-            if (rttMs > 5000) return;
+            if (rttMs > 300)
+            {
+                Log.Event("rtt.sample.rejected", new { serial, raw_ms = rttMs, reason = "outlier_above_300ms" });
+                return;
+            }
             const double alpha = 0.2;
             _smoothedRttMs = _rttSampleCount == 0 ? rttMs : (_smoothedRttMs * (1 - alpha) + rttMs * alpha);
             _rttSampleCount++;
@@ -923,7 +927,19 @@ public sealed class GameSessionData
         {
             if (_rttSampleCount < 3)
                 return Framework.Settings.SpellCastEarlyFireOffsetMs;
-            return (int)Math.Clamp(Math.Round(_smoothedRttMs * 0.5), 0, 100);
+            return (int)Math.Clamp(Math.Round(_smoothedRttMs - 10), 0, 100);
+        }
+    }
+
+    public void ResetRttSmoothing()
+    {
+        lock (_rttLock)
+        {
+            _smoothedRttMs = 0;
+            _rttSampleCount = 0;
+            _lastPingSendTickMs = 0;
+            _lastPingSerial = 0;
+            Log.Event("rtt.smoothing.reset", new { });
         }
     }
 
