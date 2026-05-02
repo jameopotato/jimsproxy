@@ -530,13 +530,32 @@ public partial class WorldClient
                 // to actually apply the corrected ItemEffect record in the running session.
                 // Without this, SoM 1.14.1+ renumbered on-use spells (e.g. Diamond Flask) stay
                 // bound to their modern spell id even after the hotfix is sent.
+                //
+                // JimsProxy: mirror the hotfix's Status into the DBReply instead of hard-coding
+                // Valid. For slot-remap items (CSV record at modern slot N, legacy server places
+                // the spell at slot M ≠ N) the hotfix is RecordRemoved with empty content; the
+                // old behavior trailed it with a contradictory DBReply (Status=Valid, empty
+                // content) which is simply wrong on the wire even if 1.14.x clients tolerate
+                // it. Mirroring keeps removals as removals end-to-end while Valid updates
+                // (Diamond Flask path) continue unchanged.
+                var hotfix = reply.Hotfixes[0];
                 Server.Packets.DBReply replyA = new();
-                replyA.Status = HotfixStatus.Valid;
+                replyA.Status = hotfix.Status;
                 replyA.Timestamp = (uint)Time.UnixTime;
-                replyA.RecordID = reply.Hotfixes[0].RecordId;
-                replyA.TableHash = reply.Hotfixes[0].TableHash;
-                replyA.Data = reply.Hotfixes[0].HotfixContent;
+                replyA.RecordID = hotfix.RecordId;
+                replyA.TableHash = hotfix.TableHash;
+                replyA.Data = hotfix.HotfixContent;
                 SendPacketToClient(replyA);
+
+                Log.Event("hotfix.itemeffect.dbreply", new
+                {
+                    item_entry = item.Entry,
+                    slot = i,
+                    record_id = hotfix.RecordId,
+                    table_hash = hotfix.TableHash.ToString(),
+                    status = hotfix.Status.ToString(),
+                    content_size = hotfix.HotfixContent.GetSize(),
+                });
             }
         }
 
