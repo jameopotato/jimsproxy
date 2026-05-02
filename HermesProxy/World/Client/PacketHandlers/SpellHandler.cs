@@ -824,6 +824,26 @@ public partial class WorldClient
                     legacy_lookup_id = pendingCast.LegacySpellId,
                 });
             }
+
+            // JimsProxy (Macro-GCD-Fix): off-GCD completions (trinkets, racials, etc.) don't
+            // trigger BeginGcd, so a cast held via spell.held_pending while the off-GCD cast
+            // was in flight gets stranded — _heldGcdCast sits until the next press/failure.
+            // Bundle 20260430-150846 showed SS held 7563ms after a trinket completed. If the
+            // queue is now drained and no GCD is active, release the held cast immediately.
+            var gameState = GetSession().GameState;
+            if (!gameState.IsGcdHoldActive() && !gameState.HasForwardedPendingCast())
+            {
+                var heldCast = gameState.TakeHeldCastIfReady();
+                if (heldCast != null)
+                {
+                    Log.Event("spell.held_fire_on_go", new
+                    {
+                        completed_spell_id = spell.Cast.SpellID,
+                        held_spell_id = heldCast.SpellId,
+                    });
+                    gameState.OnGcdHeldCastFire?.Invoke(heldCast);
+                }
+            }
         }
         else if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
             GetSession().GameState.CurrentClientNextMeleeCast != null &&
