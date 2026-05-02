@@ -109,6 +109,19 @@ public partial class WorldSocket
             SendPacket(failed);
         }
     }
+    // Send CastFailed WITHOUT SpellPrepare, using the client's own CastID.
+    // The client can match its own pending press by ClientCastID and release
+    // the button state. No SpellPrepare means no GCD sweep interference.
+    public void SendCastFailedWithoutPrepare(ClientCastRequest castRequest, SpellCastResultClassic reason = SpellCastResultClassic.DontReport)
+    {
+        CastFailed failed = new();
+        failed.SpellID = castRequest.SpellId;
+        failed.SpellXSpellVisualID = castRequest.SpellXSpellVisualId;
+        failed.Reason = (uint)reason;
+        failed.CastID = castRequest.ClientGUID;
+        SendPacket(failed);
+    }
+
     // JimsProxy: Hunter tame-class spell IDs in vanilla — used to log tame attempts
     // for the pet deep-dive. 1515 = "Tame Beast" player ability; the rest are
     // quest-tame variants ("Capture Beast Aspects" etc.) that target specific
@@ -252,7 +265,7 @@ public partial class WorldSocket
                         client_cast_id = cast.Cast.CastID.ToString(),
                         queue_depth = GetSession().GameState.PendingNormalCasts.Count,
                     });
-                    SendCastRequestFailed(castRequest, false, SpellCastResultClassic.DontReport);
+                    SendCastFailedWithoutPrepare(castRequest);
                     return;
                 }
 
@@ -276,7 +289,7 @@ public partial class WorldSocket
                     var peeked = GetSession().GameState.PeekHeldGcdCast();
                     if (peeked != null && peeked.SpellId == cast.Cast.SpellID)
                     {
-                        SendCastRequestFailed(castRequest, false, SpellCastResultClassic.DontReport);
+                        SendCastFailedWithoutPrepare(castRequest);
                         return;
                     }
 
@@ -302,7 +315,7 @@ public partial class WorldSocket
                                     ? Environment.TickCount64 - displaced.HeldAtTickMs
                                     : 0L,
                             });
-                            SendCastRequestFailed(displaced, false, SpellCastResultClassic.DontReport);
+                            SendCastFailedWithoutPrepare(displaced);
                         }
 
                         // Don't send SpellPrepare here — hide the queue from the client.
@@ -326,7 +339,7 @@ public partial class WorldSocket
                 // don't forward a duplicate — server would just reject with NOT_READY.
                 if (GetSession().GameState.ShouldDropLateSameSpell((uint)cast.Cast.SpellID))
                 {
-                    SendCastRequestFailed(castRequest, false, SpellCastResultClassic.DontReport);
+                    SendCastFailedWithoutPrepare(castRequest);
                     return;
                 }
 
@@ -349,7 +362,7 @@ public partial class WorldSocket
                         client_cast_id = castRequest.ClientGUID.ToString(),
                     });
                     if (displaced != null)
-                        SendCastRequestFailed(displaced, false, SpellCastResultClassic.DontReport);
+                        SendCastFailedWithoutPrepare(displaced);
                     // Don't send SpellPrepare for the NEW hold — hide the queue from the client.
                     return;
                 }
@@ -486,7 +499,7 @@ public partial class WorldSocket
                 item_guid = use.CastItem.ToString(),
                 queue_depth = GetSession().GameState.PendingNormalCasts.Count,
             });
-            SendCastRequestFailed(castRequest, false, SpellCastResultClassic.DontReport);
+            SendCastFailedWithoutPrepare(castRequest);
             return;
         }
 
@@ -532,7 +545,7 @@ public partial class WorldSocket
                     ? Environment.TickCount64 - dropped.HeldAtTickMs
                     : 0L,
             });
-            SendCastRequestFailed(dropped, false, SpellCastResultClassic.DontReport);
+            SendCastFailedWithoutPrepare(dropped);
         }
 
         WorldPacket packet = new WorldPacket(Opcode.CMSG_CANCEL_CAST);
