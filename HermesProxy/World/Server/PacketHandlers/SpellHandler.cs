@@ -282,11 +282,16 @@ public partial class WorldSocket
                     long gcdRemainingBeforeHold = GetSession().GameState.GetGcdRemainingMs();
                     castRequest.HeldAtTickMs = Environment.TickCount64;
 
-                    // Same-spell skip: discard silently — client never received
-                    // SpellPrepare, so no state to clean up.
+                    // Same-spell skip: if the held cast is already the same spell,
+                    // the outcome is identical (same spell fires at GCD expiry). Just
+                    // ACK the keypress and reject the duplicate. Avoids displacement
+                    // bookkeeping and reduces client packet noise during rapid spam.
                     var peeked = GetSession().GameState.PeekHeldGcdCast();
                     if (peeked != null && peeked.SpellId == cast.Cast.SpellID)
+                    {
+                        SendCastFailedWithoutPrepare(castRequest);
                         return;
+                    }
 
                     if (GetSession().GameState.TryHoldCastDuringGcd(castRequest, out var displaced))
                     {
@@ -310,6 +315,7 @@ public partial class WorldSocket
                                     ? Environment.TickCount64 - displaced.HeldAtTickMs
                                     : 0L,
                             });
+                            SendCastFailedWithoutPrepare(displaced);
                         }
 
                         // Don't send SpellPrepare here — hide the queue from the client.
@@ -332,7 +338,10 @@ public partial class WorldSocket
                 // Late same-spell drop: if the timer already fired the same spell,
                 // don't forward a duplicate — server would just reject with NOT_READY.
                 if (GetSession().GameState.ShouldDropLateSameSpell((uint)cast.Cast.SpellID))
+                {
+                    SendCastFailedWithoutPrepare(castRequest);
                     return;
+                }
 
                 // Guard 3: a cast was forwarded to the server but hasn't received
                 // SPELL_START/SPELL_GO yet. Hold the new press so it fires when the
@@ -352,6 +361,8 @@ public partial class WorldSocket
                         displaced_spell_id = displaced?.SpellId ?? 0,
                         client_cast_id = castRequest.ClientGUID.ToString(),
                     });
+                    if (displaced != null)
+                        SendCastFailedWithoutPrepare(displaced);
                     // Don't send SpellPrepare for the NEW hold — hide the queue from the client.
                     return;
                 }
@@ -521,8 +532,8 @@ public partial class WorldSocket
     void HandleCancelCast(CancelCast cast)
     {
         // JimsProxy (issue #43): if the client cancels while we have a held cast waiting for
-        // GCD expiry, drop the held cast so it doesn't fire after the cancel. Silent —
-        // client never received SpellPrepare for the held cast.
+        // GCD expiry, drop the held cast so it doesn't fire after the cancel. Resolve the
+        // client's button state with DontReport.
         ClientCastRequest? dropped = GetSession().GameState.CancelGcdHold();
         if (dropped != null)
         {
@@ -534,6 +545,7 @@ public partial class WorldSocket
                     ? Environment.TickCount64 - dropped.HeldAtTickMs
                     : 0L,
             });
+            SendCastFailedWithoutPrepare(dropped);
         }
 
         WorldPacket packet = new WorldPacket(Opcode.CMSG_CANCEL_CAST);
