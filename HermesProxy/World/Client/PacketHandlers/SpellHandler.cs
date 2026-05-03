@@ -788,6 +788,27 @@ public partial class WorldClient
                     smoothed_rtt_ms = GetSession().GameState.GetSmoothedRttMs(),
                     legacy_lookup_id = pendingCast.LegacySpellId,
                 });
+
+                // GCD sweep drift fix: synthesize SMSG_SPELL_COOLDOWN with INCLUDE_GCD
+                // to force the client to anchor GCD start to NOW instead of chaining
+                // gcd_start = old_start + 1500ms across queued casts.
+                var gcdCooldown = new SpellCooldownPkt();
+                gcdCooldown.Caster = spell.Cast.CasterUnit;
+                gcdCooldown.Flags = 0x01; // SPELL_COOLDOWN_FLAG_INCLUDE_GCD
+                gcdCooldown.SpellCooldowns.Add(new SpellCooldownStruct
+                {
+                    SpellID = (uint)spell.Cast.SpellID,
+                    ForcedCooldown = (uint)gcdMs,
+                    ModRate = 1.0f,
+                });
+                SendPacketToClient(gcdCooldown);
+
+                Log.Event("gcd.cooldown_synth", new
+                {
+                    spell_id = spell.Cast.SpellID,
+                    forced_cooldown_ms = gcdMs,
+                    flags = 0x01,
+                });
             }
         }
         else if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
