@@ -1,5 +1,6 @@
 ﻿//#define DEBUG_UPDATES
 
+using Framework;
 using Framework.GameMath;
 using Framework.Logging;
 using Framework.Util;
@@ -3560,6 +3561,86 @@ public partial class WorldClient
             if (CORPSE_FIELD_DYNAMIC_FLAGS >= 0 && updateMaskArray[CORPSE_FIELD_DYNAMIC_FLAGS])
             {
                 updateData.CorpseData.DynamicFlags = updates[CORPSE_FIELD_DYNAMIC_FLAGS].UInt32Value;
+            }
+        }
+
+        // JimsProxy (pet-scale-vanilla-parity): the local player's pet (warlock or hunter)
+        // renders visibly smaller in modern 1.14 Classic than the vanilla 1.12 reference,
+        // even though CreatureDisplayInfo and CreatureModelData scale data is byte-
+        // identical between the two builds (extracted both sets and diffed — only 39 of
+        // ~10,500 DisplayIDs differ in CreatureModelScale, none of them pet display IDs).
+        // Root cause unverified — likely an undocumented client-side scale modifier on
+        // local-player pet units in modern Classic. A flat global multiplier doesn't work
+        // because the modern client compounds it with the per-display CreatureModelScale:
+        // a Felhunter (CMS 0.5) at 1.5× still renders too small while a Dire Wolf (CMS
+        // 1.5) at 1.5× ends up at ~2.2 effective and looks ridiculous.
+        //
+        // Inverse-CMS scaling cancels that variance: emit (wire / CreatureModelScale) × K
+        // so the modern client's wire × ModelScale × CMS multiply collapses to wire ×
+        // ModelScale × K — every pet gets a uniform K bump regardless of its CMS quirks.
+        // K = 1.5 is the empirical "felt right at 1.12" tuning value for hunter pets.
+        //
+        // Server-side combat reach and bounding radius are untouched, so range checks,
+        // melee hit detection, and ability targeting are unchanged. Only the visual scale
+        // forwarded to the client is modified; click hitbox grows with the visual.
+        //
+        // Detection: prefer CurrentPetGuid match (set when SMSG_PET_SPELLS_MESSAGE arrives,
+        // typically before the pet's first CREATE_OBJECT). Fallback to SUMMONEDBY in this
+        // update matching CurrentPlayerGuid so the first CREATE_OBJECT for a pet (which
+        // carries SUMMONEDBY) gets normalized even if CurrentPetGuid hasn't latched yet.
+        // Only fires when SCALE_X is present in this update (Scale != null) — a delta
+        // values update without SCALE_X leaves the already-normalized scale sticky on the
+        // client and avoids compounding multiplications across updates.
+        const float PetScaleK = 1.5f;
+        if (LegacyVersion.ExpansionVersion == 1
+            && updateData.ObjectData.Scale != null
+            && (objectType == ObjectType.Unit || objectType == ObjectType.Player || objectType == ObjectType.ActivePlayer))
+        {
+            var localPlayerGuid = Session.GameState.CurrentPlayerGuid;
+            var currentPetGuid = Session.GameState.CurrentPetGuid;
+            bool isLocalPet = (currentPetGuid != default && guid == currentPetGuid)
+                              || (localPlayerGuid != default
+                                  && updateData.UnitData.SummonedBy != null
+                                  && (WowGuid128)updateData.UnitData.SummonedBy == localPlayerGuid);
+
+            if (isLocalPet)
+            {
+                // DisplayID for CMS lookup. Prefer current update (most up-to-date for
+                // shapeshift/morph cases); fall back to GameState cache for delta updates.
+                int displayId = 0;
+                int UNIT_FIELD_DISPLAYID_idx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_DISPLAYID);
+                if (UNIT_FIELD_DISPLAYID_idx >= 0
+                    && UNIT_FIELD_DISPLAYID_idx < updateMaskArray.Length
+                    && updateMaskArray[UNIT_FIELD_DISPLAYID_idx])
+                    displayId = updates[UNIT_FIELD_DISPLAYID_idx].Int32Value;
+                else
+                    displayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
+
+                float rawScale = (float)updateData.ObjectData.Scale;
+                float cms = 0f;
+                if (displayId > 0)
+                    cms = GameData.GetDisplayInfo((uint)displayId).DisplayScale;
+
+                // Skip normalization if CMS data is missing/invalid — fall back to a flat
+                // K multiply so the pet still gets a size bump rather than passing through
+                // un-modified (and rendering small).
+                float emit = (cms > 0)
+                    ? (rawScale / cms) * PetScaleK
+                    : rawScale * PetScaleK;
+
+                updateData.ObjectData.Scale = emit;
+
+                Log.Event("unit.pet_scale.applied", new
+                {
+                    guid = guid.ToString(),
+                    display_id = displayId,
+                    creature_model_scale = cms,
+                    k = PetScaleK,
+                    raw_scale = rawScale,
+                    emitted_scale = emit,
+                    matched_via = (currentPetGuid != default && guid == currentPetGuid) ? "current_pet_guid" : "summoned_by",
+                    cms_fallback = cms <= 0,
+                });
             }
         }
     }
