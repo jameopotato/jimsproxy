@@ -243,8 +243,9 @@ public partial class WorldClient
             // if it's still pointing at us (a fresh swap may have already replaced it
             // with a new WorldClient — don't clobber that).
             var session = GetSession();
-            if (session != null && ReferenceEquals(session.WorldClient, this))
-                session.WorldClient = null;
+            bool wasActiveWorldClient = session != null && ReferenceEquals(session.WorldClient, this);
+            if (wasActiveWorldClient)
+                session!.WorldClient = null;
             Log.Event("session.ondisconnect.suppressed", new
             {
                 reason = "worldclient_legacy_disconnect",
@@ -252,7 +253,15 @@ public partial class WorldClient
                 last_opcode = _lastInboundOpcode.ToString(),
                 last_opcode_raw = _lastInboundOpcodeRaw,
                 ms_since_last_opcode = _lastInboundOpcodeTick == 0 ? -1 : Environment.TickCount - _lastInboundOpcodeTick,
+                was_active_world_client = wasActiveWorldClient,
             });
+            // JimsProxy (unplanned-dc-auto-reconnect): when this is a genuinely
+            // unplanned DC (we were the active client, no realm swap is replacing us),
+            // try one cached-key reconnect. If that fails, propagate cleanly to the
+            // modern client. Realm-swap path (wasActiveWorldClient == false) skips this
+            // — the new WorldClient is already in flight and will handle continuity.
+            if (wasActiveWorldClient)
+                session!.TryUnplannedReconnectAndPropagate(this);
         }
     }
 
@@ -307,8 +316,9 @@ public partial class WorldClient
                 Disconnect();
                 // JimsProxy realm-swap fix: see WorldClient.HandleDisconnect.
                 var session = GetSession();
-                if (session != null && ReferenceEquals(session.WorldClient, this))
-                    session.WorldClient = null;
+                bool wasActiveWorldClient = session != null && ReferenceEquals(session.WorldClient, this);
+                if (wasActiveWorldClient)
+                    session!.WorldClient = null;
                 Log.Event("session.ondisconnect.suppressed", new
                 {
                     reason = "worldclient_receive_loop_exception",
@@ -317,7 +327,15 @@ public partial class WorldClient
                     last_opcode = _lastInboundOpcode.ToString(),
                     last_opcode_raw = _lastInboundOpcodeRaw,
                     ms_since_last_opcode = _lastInboundOpcodeTick == 0 ? -1 : Environment.TickCount - _lastInboundOpcodeTick,
+                    was_active_world_client = wasActiveWorldClient,
                 });
+                // JimsProxy (unplanned-dc-auto-reconnect): same logic as HandleDisconnect.
+                // Bundle 20260503-195159 showed Kronos PTR forcibly closing the proxy's
+                // TCP socket mid-combat (TCP RST, last_opcode SMSG_ON_MONSTER_MOVE), then
+                // 37s of frozen ghost world before the player gave up and logged out.
+                // Now: try one reconnect, fall back to clean DC.
+                if (wasActiveWorldClient)
+                    session!.TryUnplannedReconnectAndPropagate(this);
             }
         }
     }
