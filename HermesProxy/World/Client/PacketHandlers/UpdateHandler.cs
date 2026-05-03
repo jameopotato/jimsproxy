@@ -1919,7 +1919,32 @@ public partial class WorldClient
             int UNIT_FIELD_MOUNTDISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_MOUNTDISPLAYID);
             if (UNIT_FIELD_MOUNTDISPLAYID >= 0 && updateMaskArray[UNIT_FIELD_MOUNTDISPLAYID])
             {
-                updateData.UnitData.MountDisplayID = updates[UNIT_FIELD_MOUNTDISPLAYID].Int32Value;
+                // JimsProxy (mount-and-quest-diagnostics): log mount display transitions so
+                // open bugs like the Aean Swiftriver Outrunner cat-mount persistence (cat
+                // doesn't dismount on rider aggro) can be triaged from a single JSONL
+                // bundle. Reads cached old value before overwriting; flags transitions as
+                // mounted (0→non-zero), dismounted (non-zero→0), or swapped (non-zero→
+                // different non-zero). Vanilla's cmangos `m_dismountOnAggro` is observed
+                // wire-side as a values update writing MOUNTDISPLAYID = 0 on the rider.
+                int oldMountDisplayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_MOUNTDISPLAYID);
+                int newMountDisplayId = updates[UNIT_FIELD_MOUNTDISPLAYID].Int32Value;
+                updateData.UnitData.MountDisplayID = newMountDisplayId;
+
+                if (oldMountDisplayId != newMountDisplayId)
+                {
+                    string transition = (oldMountDisplayId == 0 && newMountDisplayId != 0) ? "mounted"
+                                      : (oldMountDisplayId != 0 && newMountDisplayId == 0) ? "dismounted"
+                                      : "swapped";
+                    Log.Event("unit.mount.changed", new
+                    {
+                        guid = guid.ToString(),
+                        entry = updateData.ObjectData.EntryID,
+                        old_mount_display_id = oldMountDisplayId,
+                        new_mount_display_id = newMountDisplayId,
+                        transition = transition,
+                        is_create = isCreate,
+                    });
+                }
             }
             if (ShouldClearMountDisplayOnDeadNonPlayerUnit(guid, objectType, updateData, updates, UNIT_FIELD_MOUNTDISPLAYID))
             {
@@ -2012,7 +2037,14 @@ public partial class WorldClient
             int UNIT_DYNAMIC_FLAGS = LegacyVersion.GetUpdateField(UnitField.UNIT_DYNAMIC_FLAGS);
             if (UNIT_DYNAMIC_FLAGS >= 0 && updateMaskArray[UNIT_DYNAMIC_FLAGS])
             {
-                UnitDynamicFlagsLegacy flags = (UnitDynamicFlagsLegacy)(updates[UNIT_DYNAMIC_FLAGS].UInt32Value);
+                // JimsProxy (mount-and-quest-diagnostics): log dynamic-flag transitions —
+                // these carry quest-relevant state (Lootable, Dead, TrackUnit, ReferAFriend,
+                // SpecialInfo). Useful for triaging "kill credit didn't fire", "loot icon
+                // missing", "quest objective marker absent" reports from JSONL bundles.
+                uint oldDynFlags = (uint)Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_DYNAMIC_FLAGS);
+                uint newDynFlagsRaw = updates[UNIT_DYNAMIC_FLAGS].UInt32Value;
+
+                UnitDynamicFlagsLegacy flags = (UnitDynamicFlagsLegacy)newDynFlagsRaw;
                 if (flags.HasFlag(UnitDynamicFlagsLegacy.Tapped) && flags.HasFlag(UnitDynamicFlagsLegacy.TappedByPlayer))
                     flags &= ~(UnitDynamicFlagsLegacy.Tapped | UnitDynamicFlagsLegacy.TappedByPlayer);
                 updateData.ObjectData.DynamicFlags = (uint)flags.CastFlags<UnitDynamicFlagsModern>();
@@ -2023,6 +2055,18 @@ public partial class WorldClient
                         updateData.UnitData.Flags2 = (uint)UnitFlags2.RegeneratePower;
                     if (flags.HasAnyFlag(UnitDynamicFlagsLegacy.AppearDead))
                         updateData.UnitData.Flags2 |= (uint)UnitFlags2.FeignDeath;
+                }
+
+                if (oldDynFlags != newDynFlagsRaw)
+                {
+                    Log.Event("unit.dynamic_flags.changed", new
+                    {
+                        guid = guid.ToString(),
+                        entry = updateData.ObjectData.EntryID,
+                        old_flags = oldDynFlags,
+                        new_flags = newDynFlagsRaw,
+                        is_create = isCreate,
+                    });
                 }
             }
             int UNIT_CHANNEL_SPELL = LegacyVersion.GetUpdateField(UnitField.UNIT_CHANNEL_SPELL);
@@ -2086,14 +2130,35 @@ public partial class WorldClient
             int UNIT_NPC_FLAGS = LegacyVersion.GetUpdateField(UnitField.UNIT_NPC_FLAGS);
             if (UNIT_NPC_FLAGS >= 0 && updateMaskArray[UNIT_NPC_FLAGS])
             {
+                // JimsProxy (mount-and-quest-diagnostics): log NPC-flag transitions. These
+                // bits control gossip availability, quest-giver status (QuestGiver, Vendor,
+                // Trainer, FlightMaster, etc). When a quest report says "I can't talk to
+                // the NPC" or "no quest exclamation showing", a flag transition log line
+                // tells us whether the legacy server even sent the gossip/quest bit.
+                uint oldNpcFlags = (uint)Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_NPC_FLAGS);
+                uint newNpcFlagsRaw = updates[UNIT_NPC_FLAGS].UInt32Value;
+
                 if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
                 {
-                    NPCFlagsVanilla vanillaFlags = (NPCFlagsVanilla)updates[UNIT_NPC_FLAGS].UInt32Value;
+                    NPCFlagsVanilla vanillaFlags = (NPCFlagsVanilla)newNpcFlagsRaw;
                     updateData.UnitData.NpcFlags[0] = (uint)(vanillaFlags.CastFlags<NPCFlags>());
                 }
                 else
                 {
-                    updateData.UnitData.NpcFlags[0] = updates[UNIT_NPC_FLAGS].UInt32Value;
+                    updateData.UnitData.NpcFlags[0] = newNpcFlagsRaw;
+                }
+
+                if (oldNpcFlags != newNpcFlagsRaw)
+                {
+                    Log.Event("unit.npc_flags.changed", new
+                    {
+                        guid = guid.ToString(),
+                        entry = updateData.ObjectData.EntryID,
+                        old_flags = oldNpcFlags,
+                        new_flags = newNpcFlagsRaw,
+                        translated_modern_flags = updateData.UnitData.NpcFlags[0],
+                        is_create = isCreate,
+                    });
                 }
             }
             int UNIT_NPC_EMOTESTATE = LegacyVersion.GetUpdateField(UnitField.UNIT_NPC_EMOTESTATE);
