@@ -113,6 +113,7 @@ public partial class WorldClient
                 port = (int)realm.Port,
                 realm_name = realm.Name,
             });
+            globalSession.GameState.ResetRttSmoothing();
             _clientSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             // Connect to the specified host.
             var endPoint = new IPEndPoint(ip, realm.Port);
