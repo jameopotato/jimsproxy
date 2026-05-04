@@ -1,6 +1,7 @@
 ﻿using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
+using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
 using System;
 using System.Collections.Generic;
@@ -153,6 +154,29 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CHAT_MESSAGE_INSTANCE_CHAT)]
     void HandleChatMessage(ChatMessage packet)
     {
+        // JimsProxy threat-translation Phase 1 smoke test. The 1.12 vanilla server
+        // does not broadcast threat data; we plan to calculate threat client-side
+        // (port of LibThreatClassic2) and synthesize SMSG_THREAT_UPDATE for the
+        // modern client. Before committing to the full engine port, prove the
+        // client accepts synthesized threat opcodes by firing a hardcoded threat
+        // value when the player /says one of these debug commands:
+        //   "jpthreattest"  -> emit SMSG_THREAT_UPDATE on current target
+        //   "jpthreatclear" -> emit SMSG_THREAT_CLEAR  on current target
+        // Doesn't forward the chat to the legacy server. Drop these handlers
+        // (and the SMSG packet writers stay) once the engine port lands.
+        string chatText = packet.Text ?? string.Empty;
+        string trimmed = chatText.Trim();
+        if (trimmed.Equals("jpthreattest", StringComparison.OrdinalIgnoreCase))
+        {
+            FireThreatSmokeTest(clear: false);
+            return;
+        }
+        if (trimmed.Equals("jpthreatclear", StringComparison.OrdinalIgnoreCase))
+        {
+            FireThreatSmokeTest(clear: true);
+            return;
+        }
+
         ChatMessageTypeModern type;
 
         switch (packet.GetUniversalOpcode())
@@ -189,7 +213,7 @@ public partial class WorldSocket
                 return;
         }
 
-        var toBeSentTextParts = ConvertTextMessageIntoMaxLengthParts(packet.Text);
+        var toBeSentTextParts = ConvertTextMessageIntoMaxLengthParts(chatText);
         foreach (string text in toBeSentTextParts)
         {
             if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
@@ -300,5 +324,107 @@ public partial class WorldSocket
         }
 
         return toBeSendTextParts;
+    }
+
+    private void FireThreatSmokeTest(bool clear)
+    {
+        var session = GetSession();
+        if (session?.WorldClient == null)
+        {
+            Log.Print(LogType.Warn, "jpthreat smoke test: no WorldClient yet");
+            return;
+        }
+
+        var gameState = session.GameState;
+        var playerGuid = gameState.CurrentPlayerGuid;
+        if (playerGuid.GetCounter() == 0)
+        {
+            SendDebugChat("jpthreat: no player GUID yet");
+            return;
+        }
+
+        // Resolve the player's current target via UNIT_FIELD_TARGET on the cached
+        // legacy fields. This is the entity the WoW client considers "target" — the
+        // mob the player has selected and is hopefully attacking.
+        var fields = gameState.GetCachedObjectFieldsLegacy(playerGuid);
+        if (fields == null)
+        {
+            SendDebugChat("jpthreat: no cached fields for player");
+            return;
+        }
+
+        int targetFieldIdx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_TARGET);
+        if (targetFieldIdx < 0)
+        {
+            SendDebugChat("jpthreat: UNIT_FIELD_TARGET not mapped");
+            return;
+        }
+
+        WowGuid64 targetGuid64 = fields.GetGuidValue(targetFieldIdx);
+        if (targetGuid64 == WowGuid64.Empty)
+        {
+            SendDebugChat("jpthreat: no target selected");
+            return;
+        }
+
+        WowGuid128 targetGuid128 = targetGuid64.To128(gameState);
+
+        Framework.Logging.Log.Event("threat.smoke_test", new
+        {
+            mode = clear ? "clear" : "update",
+            player_guid = playerGuid.ToString(),
+            target_guid = targetGuid128.ToString(),
+        });
+
+        if (clear)
+        {
+            var pkt = new ThreatClearPkt
+            {
+                UnitGUID = targetGuid128,
+            };
+            session.WorldClient.SendPacketToClient(pkt);
+            SendDebugChat($"jpthreat: sent SMSG_THREAT_CLEAR for {targetGuid128}");
+            return;
+        }
+
+        // Synthesize a threat list with just the player at 12345 raw threat.
+        // Modern wire format packs threat × 100, so emitting 1234500 should
+        // surface as 12345 in the addons that divide by 100. Useful sanity
+        // signal: the number 12345 is recognizable in TinyThreat / Skada.
+        var update = new ThreatUpdatePkt
+        {
+            UnitGUID = targetGuid128,
+        };
+        update.ThreatList.Add(new ThreatInfo
+        {
+            ThreaterGUID = playerGuid,
+            Threat = 1234500u,
+        });
+        session.WorldClient.SendPacketToClient(update);
+
+        // Also emit HIGHEST_THREAT_UPDATE so any addon that listens specifically
+        // for "you are top threat" sees it. The player is the only threater so
+        // they're necessarily highest.
+        var highest = new HighestThreatUpdatePkt
+        {
+            UnitGUID = targetGuid128,
+            HighestThreatGUID = playerGuid,
+        };
+        highest.ThreatList.Add(new ThreatInfo
+        {
+            ThreaterGUID = playerGuid,
+            Threat = 1234500u,
+        });
+        session.WorldClient.SendPacketToClient(highest);
+
+        SendDebugChat($"jpthreat: sent SMSG_THREAT_UPDATE + HIGHEST for {targetGuid128} (12345 raw / 1234500 wire)");
+    }
+
+    private void SendDebugChat(string text)
+    {
+        var session = GetSession();
+        if (session?.WorldClient == null) return;
+        var msg = new ChatPkt(session, ChatMessageTypeModern.System, text);
+        session.WorldClient.SendPacketToClient(msg);
     }
 }
