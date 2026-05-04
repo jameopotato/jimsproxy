@@ -3375,7 +3375,47 @@ public partial class WorldClient
             int GAMEOBJECT_FLAGS = LegacyVersion.GetUpdateField(GameObjectField.GAMEOBJECT_FLAGS);
             if (GAMEOBJECT_FLAGS >= 0 && updateMaskArray[GAMEOBJECT_FLAGS])
             {
-                updateData.GameObjectData.Flags = updates[GAMEOBJECT_FLAGS].UInt32Value;
+                uint legacyRaw = updates[GAMEOBJECT_FLAGS].UInt32Value;
+                var legacyFlags = (GameObjectFlagsLegacy)legacyRaw;
+                var modernFlags = legacyFlags.ToModern();
+
+                // MC Runes of Warding (176951-176957): vanilla GO_FLAG_NO_INTERACT did NOT block
+                // spell-cursor OPEN_LOCK targeting (Quintessence dousing). Modern NOT_SELECTABLE
+                // does. The Flames Circle linkedTrap GOs (178187-178193) handle gating instead —
+                // they cover the rune until the boss dies. Strip NOT_SELECTABLE so the modern
+                // client can acquire the rune as a Quintessence target. Static INTERACT_COND
+                // also blocks cursor acquisition (verified empirically), so we instead inject
+                // the dynamic LO_NO_INTERACT bit (modern 0x080) — which TrinityCore uses for
+                // depleted gathering nodes (visible-but-inert). Closest analog to vanilla
+                // NO_INTERACT semantics and our best chance to suppress hover/right-click
+                // target-frame acquisition while keeping the OPEN_LOCK cursor working.
+                // Without the NotSelectable strip the modern 1.14 client refuses cursor
+                // acquisition entirely and the cast fails as "Out of range" before any
+                // packet leaves the client. See HermesProxy issue #374.
+                int? entry = updateData.ObjectData.EntryID;
+                bool isMcRune = entry.HasValue && entry.Value >= 176951 && entry.Value <= 176957;
+                bool dynNoInteractInjected = false;
+                if (isMcRune)
+                {
+                    modernFlags &= ~GameObjectFlagsModern.NotSelectable;
+
+                    uint existingDynFlags = updateData.ObjectData.DynamicFlags ?? 0;
+                    updateData.ObjectData.DynamicFlags = existingDynFlags | (uint)GameObjectDynamicFlagsModern.NoInteract;
+                    dynNoInteractInjected = true;
+                }
+
+                updateData.GameObjectData.Flags = (uint)modernFlags;
+
+                Log.Event("gameobject.flags.translated", new
+                {
+                    guid = guid.ToString(),
+                    entry = entry,
+                    legacy_raw = legacyRaw,
+                    legacy_flags = legacyFlags.ToString(),
+                    modern_flags = modernFlags.ToString(),
+                    mc_rune_override_applied = isMcRune,
+                    dyn_no_interact_injected = dynNoInteractInjected,
+                });
             }
             int GAMEOBJECT_ROTATION = LegacyVersion.GetUpdateField(GameObjectField.GAMEOBJECT_ROTATION);
             if (GAMEOBJECT_ROTATION >= 0 && updateData.CreateData != null && updateData.CreateData.MoveInfo != null)
