@@ -193,7 +193,7 @@ internal static class ThreatModules
             if (!amounts.TryGetValue(spellId, out double amount)) return;
 
             var target = hitTargets[0];
-            tracker.AddThreat(target, caster, amount);
+            tracker.AddModifiedThreat(target, caster, amount);
 
             Log.Event("threat.spell." + eventTag, new
             {
@@ -211,7 +211,7 @@ internal static class ThreatModules
             if (!amounts.TryGetValue(spellId, out double amount)) return;
 
             var target = hitTargets[0];
-            tracker.AddThreat(target, caster, amount);
+            tracker.AddModifiedThreat(target, caster, amount);
 
             Log.Event("threat.spell." + eventTag, new
             {

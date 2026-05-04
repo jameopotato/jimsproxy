@@ -46,9 +46,28 @@ public sealed class ThreatTracker
 
     private readonly GlobalSessionData _session;
 
+    // Passive threat multiplier cache. Recomputed on every threat operation
+    // (cheap) but the threat.passive_modifier event only emits on change,
+    // so testers can spot stance / form transitions without spamming logs.
+    private double _cachedPassiveModifier = 1.0;
+    private uint _cachedStanceFormAuraId = 0;
+
     public ThreatTracker(GlobalSessionData session)
     {
         _session = session;
+    }
+
+    // Adds threat with the local player's stance / form / class passive
+    // modifier applied. Use for ability-driven flat threat (Sunder, Distracting
+    // Shot, etc.) and damage threat. Set / multiply / set-to-top operations
+    // bypass this — those encode their own absolute values.
+    //
+    // Pet attacks always pass through unmodified (modifier = 1.0). Non-local
+    // threaters never reach here in the first place.
+    public void AddModifiedThreat(WowGuid128 mob, WowGuid128 threater, double rawAmount)
+    {
+        double modifier = GetPassiveModifier(threater);
+        AddThreat(mob, threater, rawAmount * modifier);
     }
 
     // Add (or subtract, if amount is negative) raw threat from a threater
@@ -141,15 +160,18 @@ public sealed class ThreatTracker
     // already in combat with the player (Cleanse, Remove Lesser Curse, etc.).
     // No-op for mobs the threater isn't already on — vanilla doesn't generate
     // threat against unrelated mobs from these casts.
-    public void AddThreatToAllMobs(WowGuid128 threater, double amount)
+    public void AddThreatToAllMobs(WowGuid128 threater, double rawAmount)
     {
-        if (threater == default || amount == 0) return;
+        if (threater == default || rawAmount == 0) return;
+
+        double modifier = GetPassiveModifier(threater);
+        double scaledAmount = rawAmount * modifier;
 
         foreach (var (mob, list) in _threatLists)
         {
             if (!list.TryGetValue(threater, out double existing))
                 continue;
-            double updated = existing + amount;
+            double updated = existing + scaledAmount;
             if (updated < 0) updated = 0;
             list[threater] = updated;
             _dirty.Add(mob);
@@ -326,7 +348,9 @@ public sealed class ThreatTracker
         if (!IsLocalThreater(attacker)) return;
         if (victim == default) return;
 
-        AddThreat(victim, attacker, rawDamage);
+        double modifier = GetPassiveModifier(attacker);
+        double scaledThreat = rawDamage * modifier;
+        AddThreat(victim, attacker, scaledThreat);
 
         if (_threatLists.TryGetValue(victim, out var list) &&
             list.TryGetValue(attacker, out double newTotal))
@@ -337,6 +361,8 @@ public sealed class ThreatTracker
                 attacker_is_player = attacker == _session.GameState.CurrentPlayerGuid,
                 victim_low = victim.GetCounter(),
                 damage = (long)rawDamage,
+                modifier,
+                threat_added = (long)scaledThreat,
                 new_total = (long)newTotal,
                 threater_count = list.Count,
             });
@@ -382,6 +408,137 @@ public sealed class ThreatTracker
 
         WowGuid128 summonedBy128 = summonedBy64.To128(_session.GameState);
         return summonedBy128 == playerGuid;
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5 — passive threat multipliers from class + stance / form.
+    //
+    // Vanilla LibThreatClassic2 reads GetShapeshiftForm() and class talents to
+    // compute a `passiveThreatModifiers` value applied to every flat-add threat
+    // operation. We can't introspect talents from the proxy side (they live in
+    // the client), so we ship the no-talent baselines:
+    //
+    //   Warrior:
+    //     Defensive Stance (71)   → 1.30  (no Defiance)
+    //     Berserker Stance (2458) → 0.80
+    //     Battle Stance (2457) /
+    //       no stance             → 0.80  (matches the lib's quirk; lib treats
+    //                                      non-Defensive warriors as 0.8, see
+    //                                      ClassModules/Classic/Warrior.lua)
+    //
+    //   Druid:
+    //     Bear / Dire Bear Form
+    //       (5487 / 9634)         → 1.30  (no Feral Instinct)
+    //     Cat (768) /
+    //       Travel (783) /
+    //       Aquatic (1066)        → 0.71
+    //     Caster                  → 1.00
+    //
+    //   Rogue:                    → 0.71  (always; passive at ClassEnable)
+    //   All other classes:        → 1.00
+    //
+    // Future Phase 6+ will layer talent reads (Defiance, Feral Instinct,
+    // Subtlety, Shadow Affinity, Improved PWS) on top — those need the proxy
+    // to start mirroring talent state from CMSG_LEARN_TALENT and
+    // SMSG_INITIALIZE_FACTIONS-era talent data. Until then, these baselines
+    // run ~3-9% under the actual server-side numbers for talented characters.
+
+    // Stance / form spell IDs we watch on the player's aura table. HashSet so
+    // the per-event scan is O(slots) with O(1) per-slot membership check.
+    private static readonly HashSet<uint> StanceFormAuras = new()
+    {
+        71,    // Warrior — Defensive Stance
+        2457,  // Warrior — Battle Stance
+        2458,  // Warrior — Berserker Stance
+        5487,  // Druid — Bear Form
+        9634,  // Druid — Dire Bear Form
+        768,   // Druid — Cat Form
+        783,   // Druid — Travel Form
+        1066,  // Druid — Aquatic Form
+    };
+
+    // Returns the passive multiplier to apply to threater's flat-add threat.
+    // Pet (and other local threaters that aren't the player) always return 1.0
+    // since vanilla pets carry no stance / form / class modifier.
+    //
+    // Side effect: emits threat.passive_modifier on every value change so
+    // testers can correlate stance switches with threat shifts in the JSONL.
+    private double GetPassiveModifier(WowGuid128 threater)
+    {
+        if (threater != _session.GameState.CurrentPlayerGuid)
+            return 1.0;
+
+        uint formAura = ScanPlayerStanceFormAura();
+        var playerClass = (Class)_session.GameState.CurrentPlayerClass;
+        double modifier = ComputePassiveModifier(playerClass, formAura);
+
+        if (formAura != _cachedStanceFormAuraId || modifier != _cachedPassiveModifier)
+        {
+            Log.Event("threat.passive_modifier", new
+            {
+                player_class = (byte)playerClass,
+                stance_form_spell = formAura,
+                modifier,
+                previous_modifier = _cachedPassiveModifier,
+                previous_stance_form_spell = _cachedStanceFormAuraId,
+            });
+            _cachedStanceFormAuraId = formAura;
+            _cachedPassiveModifier = modifier;
+        }
+
+        return modifier;
+    }
+
+    private uint ScanPlayerStanceFormAura()
+    {
+        var fields = _session.GameState.GetCachedObjectFieldsLegacy(_session.GameState.CurrentPlayerGuid);
+        if (fields == null) return 0;
+
+        int unitFieldAura = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
+        if (unitFieldAura < 0) return 0;
+
+        int slots = LegacyVersion.GetAuraSlotsCount();
+        for (int i = 0; i < slots; i++)
+        {
+            if (!fields.TryGetValue(unitFieldAura + i, out var field))
+                continue;
+            uint spellId = field.UInt32Value;
+            if (spellId != 0 && StanceFormAuras.Contains(spellId))
+                return spellId;
+        }
+        return 0;
+    }
+
+    private static double ComputePassiveModifier(Class playerClass, uint stanceFormAura)
+    {
+        switch (playerClass)
+        {
+            case Class.Rogue:
+                return 0.71;
+
+            case Class.Warrior:
+                return stanceFormAura switch
+                {
+                    71   => 1.30, // Defensive Stance
+                    2458 => 0.80, // Berserker Stance
+                    2457 => 0.80, // Battle Stance — matches lib's quirk
+                    _    => 0.80, // no stance — matches lib's else branch
+                };
+
+            case Class.Druid:
+                return stanceFormAura switch
+                {
+                    5487 => 1.30, // Bear Form
+                    9634 => 1.30, // Dire Bear Form
+                    768  => 0.71, // Cat Form
+                    783  => 0.71, // Travel Form
+                    1066 => 0.71, // Aquatic Form
+                    _    => 1.00, // caster form
+                };
+
+            default:
+                return 1.0;
+        }
     }
 
     private static long ToWireThreat(double rawThreat)
