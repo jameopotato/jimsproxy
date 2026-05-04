@@ -427,6 +427,10 @@ public partial class WorldSocket
             //     directly (no split needed).
             if (auction.Items.Count > 1)
             {
+                ChatPkt mergeNotice = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                    $"Merging {auction.Items.Count} item stacks for auction...");
+                GetSession().WorldClient!.SendPacketToClient(mergeNotice);
+
                 var mergeTarget = gameState.FindEmptyInventorySlot();
                 if (mergeTarget == null)
                 {
@@ -435,6 +439,9 @@ public partial class WorldSocket
                         reason = "no_empty_slot",
                         item_count = auction.Items.Count,
                     });
+                    ChatPkt chat = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                        "Auction posting cancelled — no empty bag slot for merge. Free up a slot and try again.");
+                    GetSession().WorldClient!.SendPacketToClient(chat);
                     return;
                 }
 
@@ -547,6 +554,9 @@ public partial class WorldSocket
                             total_requested = totalRequested + item.UseCount,
                             pieces = pieceOutcomes,
                         });
+                        ChatPkt chat = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                            "Auction posting cancelled — items were moved but not posted. Sort your bags into clean stacks and try again.");
+                        GetSession().WorldClient!.SendPacketToClient(chat);
                         return;
                     }
 
@@ -569,6 +579,9 @@ public partial class WorldSocket
                         total_requested = totalRequested,
                         pieces = pieceOutcomes,
                     });
+                    ChatPkt chat = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                        "Auction posting cancelled — items were moved but not posted. Sort your bags into clean stacks and try again.");
+                    GetSession().WorldClient!.SendPacketToClient(chat);
                     return;
                 }
 
