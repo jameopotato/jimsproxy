@@ -26,6 +26,12 @@ public partial class WorldSocket
     // cadence a human at the Blizzard UI could ever reach and risks tripping general
     // per-socket flood thresholds on vanilla emulators. Sells are queued (not dropped)
     // by sleeping the handler thread until the gap is satisfied.
+    //
+    // Scope: this gate is per-WorldSocket (per-character session), not per-auctioneer.
+    // A player who hops from a neutral AH to a faction AH within 500 ms will see the
+    // residual throttle apply to the first sell at the new auctioneer. That's a wash
+    // in practice because the legacy server's own per-socket flood limit also doesn't
+    // care which auctioneer the request originated from.
     private const int AuctionSellMinGapMs = 500;
     private DateTime _lastSellTime = DateTime.MinValue;
 
@@ -301,6 +307,9 @@ public partial class WorldSocket
 
         WorldPacket swapPacket = new WorldPacket(Opcode.CMSG_SWAP_ITEM);
         // Vanilla CMSG_SWAP_ITEM packet order: dstBag, dstSlot, srcBag, srcSlot.
+        // This matches the modern->legacy byte order in the existing translator at
+        // ItemHandler.cs:74-87 (HandleSwapItem), where the modern client's "B" slots
+        // (destination) are written first and "A" slots (source) second.
         swapPacket.WriteUInt8(dst.containerSlot);
         swapPacket.WriteUInt8(dst.slot);
         swapPacket.WriteUInt8(src.containerSlot);
@@ -431,6 +440,8 @@ public partial class WorldSocket
 
                 uint totalRequested = 0;
                 int piecesMoved = 0;
+                uint expectedDestStack = 0;
+                var pieceOutcomes = new System.Collections.Generic.List<object>();
                 foreach (var item in auction.Items)
                 {
                     if (item.UseCount == 0) continue;
@@ -438,6 +449,13 @@ public partial class WorldSocket
                     var srcLocation = gameState.FindItemInInventory(item.Guid.To64());
                     if (srcLocation == null)
                     {
+                        pieceOutcomes.Add(new
+                        {
+                            piece_index = piecesMoved,
+                            use_count = item.UseCount,
+                            skipped = true,
+                            skip_reason = "src_not_in_inventory",
+                        });
                         Log.Event("auction.sell.merge_skip_piece", new
                         {
                             reason = "src_not_in_inventory",
@@ -477,17 +495,60 @@ public partial class WorldSocket
                             item.Guid.ToString(), piecesMoved, "swap_full_stack_of_1");
                     }
 
+                    expectedDestStack += item.UseCount;
+
                     var destGuidNow = gameState.GetInventorySlotItem(
                         mergeTarget.Value.containerSlot, mergeTarget.Value.slot);
                     uint destStackNow = destGuidNow != WowGuid64.Empty
                         ? gameState.GetItemStackCount(destGuidNow.To128(gameState))
                         : 0;
+                    bool stackMatches = destStackNow == expectedDestStack;
+                    pieceOutcomes.Add(new
+                    {
+                        piece_index = piecesMoved,
+                        use_count = item.UseCount,
+                        dest_stack_after = destStackNow,
+                        expected_stack = expectedDestStack,
+                        ok = stackMatches,
+                    });
                     Log.Event("auction.sell.merge_piece_resolved", new
                     {
                         dest_guid = destGuidNow.ToString(),
                         dest_stack = destStackNow,
+                        expected_stack = expectedDestStack,
+                        ok = stackMatches,
                         piece_index = piecesMoved,
                     });
+
+                    // TOCTOU + correctness defense: dest slot's stack count after the
+                    // SPLIT/SWAP should equal the running sum of useCounts moved into it.
+                    // A mismatch means one of:
+                    //   * an unrelated inventory mutation (loot, trade, quest reward) hit
+                    //     the slot we picked from FindEmptyInventorySlot before our first
+                    //     piece landed (vanilla SPLIT auto-merges into same-item-type slot
+                    //     so dest_stack would exceed expected) or rejected our SPLIT
+                    //     because dest holds a different item (dest_stack equals the
+                    //     unrelated item's stack);
+                    //   * the SPLIT/SWAP was rejected for some other server-side reason;
+                    //   * the SMSG_ITEM_PUSH_RESULT settle window timed out so GameState
+                    //     is stale.
+                    // Either way we cannot safely auction this slot — auctioning would
+                    // sell the wrong stack count or wrong item entirely. Bail.
+                    if (!stackMatches)
+                    {
+                        Log.Event("auction.sell.merge_failed", new
+                        {
+                            reason = "dest_stack_unexpected",
+                            piece_index = piecesMoved,
+                            expected_stack = expectedDestStack,
+                            actual_stack = destStackNow,
+                            actual_dest_guid = destGuidNow.ToString(),
+                            pieces_moved_so_far = piecesMoved,
+                            total_requested = totalRequested + item.UseCount,
+                            pieces = pieceOutcomes,
+                        });
+                        return;
+                    }
 
                     totalRequested += item.UseCount;
                     piecesMoved++;
@@ -506,6 +567,7 @@ public partial class WorldSocket
                         reason = "target_empty_after_merge",
                         pieces_moved = piecesMoved,
                         total_requested = totalRequested,
+                        pieces = pieceOutcomes,
                     });
                     return;
                 }
