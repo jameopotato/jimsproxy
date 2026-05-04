@@ -1485,18 +1485,24 @@ public partial class WorldClient
                 }
                 float modelScale = (modelId > 0) ? GameData.GetModelData(modelId).ModelScale : 0f;
 
-                Log.Event("unit.scale.context", new
+                // Per jim's PR #117 review: per-unit-create event, hot in populated areas
+                // (raids, cities, BGs). Gated behind DebugOutput so it doesn't spam JSONL
+                // in production bundles unless a tester is actively investigating scale.
+                if (Framework.Settings.DebugOutput)
                 {
-                    guid = guid.ToString(),
-                    entry = updateData.ObjectData.EntryID,
-                    object_type = objectType.ToString(),
-                    wire_scale = wireScale,
-                    display_id = displayId,
-                    creature_model_scale = cms,
-                    model_id = modelId,
-                    model_scale = modelScale,
-                    is_create = isCreate,
-                });
+                    Log.Event("unit.scale.context", new
+                    {
+                        guid = guid.ToString(),
+                        entry = updateData.ObjectData.EntryID,
+                        object_type = objectType.ToString(),
+                        wire_scale = wireScale,
+                        display_id = displayId,
+                        creature_model_scale = cms,
+                        model_id = modelId,
+                        model_scale = modelScale,
+                        is_create = isCreate,
+                    });
+                }
             }
         }
 
@@ -2049,18 +2055,23 @@ public partial class WorldClient
 
                 if (oldMountDisplayId != newMountDisplayId)
                 {
-                    string transition = (oldMountDisplayId == 0 && newMountDisplayId != 0) ? "mounted"
-                                      : (oldMountDisplayId != 0 && newMountDisplayId == 0) ? "dismounted"
-                                      : "swapped";
-                    Log.Event("unit.mount.changed", new
+                    // Per jim's PR #117 review: fires per UNIT update with mount-id field
+                    // present, hot in populated areas. Gated behind DebugOutput.
+                    if (Framework.Settings.DebugOutput)
                     {
-                        guid = guid.ToString(),
-                        entry = updateData.ObjectData.EntryID,
-                        old_mount_display_id = oldMountDisplayId,
-                        new_mount_display_id = newMountDisplayId,
-                        transition = transition,
-                        is_create = isCreate,
-                    });
+                        string transition = (oldMountDisplayId == 0 && newMountDisplayId != 0) ? "mounted"
+                                          : (oldMountDisplayId != 0 && newMountDisplayId == 0) ? "dismounted"
+                                          : "swapped";
+                        Log.Event("unit.mount.changed", new
+                        {
+                            guid = guid.ToString(),
+                            entry = updateData.ObjectData.EntryID,
+                            old_mount_display_id = oldMountDisplayId,
+                            new_mount_display_id = newMountDisplayId,
+                            transition = transition,
+                            is_create = isCreate,
+                        });
+                    }
                 }
             }
             if (ShouldClearMountDisplayOnDeadNonPlayerUnit(guid, objectType, updateData, updates, UNIT_FIELD_MOUNTDISPLAYID))
@@ -2176,14 +2187,19 @@ public partial class WorldClient
 
                 if (oldDynFlags != newDynFlagsRaw)
                 {
-                    Log.Event("unit.dynamic_flags.changed", new
+                    // Per jim's PR #117 review: gated behind DebugOutput; fires per UNIT update
+                    // with dynamic-flags field present, hot in populated areas.
+                    if (Framework.Settings.DebugOutput)
                     {
-                        guid = guid.ToString(),
-                        entry = updateData.ObjectData.EntryID,
-                        old_flags = oldDynFlags,
-                        new_flags = newDynFlagsRaw,
-                        is_create = isCreate,
-                    });
+                        Log.Event("unit.dynamic_flags.changed", new
+                        {
+                            guid = guid.ToString(),
+                            entry = updateData.ObjectData.EntryID,
+                            old_flags = oldDynFlags,
+                            new_flags = newDynFlagsRaw,
+                            is_create = isCreate,
+                        });
+                    }
                 }
             }
             int UNIT_CHANNEL_SPELL = LegacyVersion.GetUpdateField(UnitField.UNIT_CHANNEL_SPELL);
@@ -2267,15 +2283,20 @@ public partial class WorldClient
 
                 if (oldNpcFlags != newNpcFlagsRaw)
                 {
-                    Log.Event("unit.npc_flags.changed", new
+                    // Per jim's PR #117 review: gated behind DebugOutput; fires per UNIT update
+                    // with NPC-flags field present, hot in populated areas.
+                    if (Framework.Settings.DebugOutput)
                     {
-                        guid = guid.ToString(),
-                        entry = updateData.ObjectData.EntryID,
-                        old_flags = oldNpcFlags,
-                        new_flags = newNpcFlagsRaw,
-                        translated_modern_flags = updateData.UnitData.NpcFlags[0],
-                        is_create = isCreate,
-                    });
+                        Log.Event("unit.npc_flags.changed", new
+                        {
+                            guid = guid.ToString(),
+                            entry = updateData.ObjectData.EntryID,
+                            old_flags = oldNpcFlags,
+                            new_flags = newNpcFlagsRaw,
+                            translated_modern_flags = updateData.UnitData.NpcFlags[0],
+                            is_create = isCreate,
+                        });
+                    }
                 }
             }
             int UNIT_NPC_EMOTESTATE = LegacyVersion.GetUpdateField(UnitField.UNIT_NPC_EMOTESTATE);
