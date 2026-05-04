@@ -250,6 +250,47 @@ internal static class ThreatModules
         [9898] = 39,
     };
 
+    // Warrior Battle Shout — adds threat to all mobs in combat with caster
+    // when the buff goes out (per-rank flat).
+    private static readonly Dictionary<int, double> BattleShoutAmount = new()
+    {
+        [6673]  = 1,
+        [5242]  = 12,
+        [6192]  = 22,
+        [11549] = 32,
+        [11550] = 42,
+        [11551] = 52,
+        [25289] = 60,
+    };
+
+    // Paladin Lesser Blessings — small flat threat to every mob in combat
+    // each time the buff is cast (per-rank, per-blessing-type from the lib).
+    // Greater Blessings deferred — those scale by raid class headcount,
+    // which needs raid roster mirroring we don't have yet.
+    private static readonly Dictionary<int, double> LesserBlessingAmount = new()
+    {
+        // Kings
+        [20217] = 20,
+        // Light
+        [19977] = 40, [19978] = 50, [19979] = 60,
+        // Might
+        [19740] = 4, [19834] = 12, [19835] = 22, [19836] = 32,
+        [19837] = 42, [19838] = 52, [25291] = 60,
+        // Sanctuary
+        [20911] = 30, [20912] = 40, [20913] = 50, [20914] = 60,
+        // Salvation
+        [1038]  = 26,
+        // Wisdom
+        [19742] = 14, [19850] = 24, [19852] = 34, [19853] = 44,
+        [19854] = 54, [25290] = 60,
+        // Freedom
+        [1044]  = 18,
+        // Protection
+        [1022]  = 10, [5599]  = 24, [10278] = 38,
+        // Sacrifice
+        [6940]  = 46, [20729] = 54,
+    };
+
     // -----------------------------------------------------------------------
     // Generic helpers — parametrize the common shapes so each ability boils
     // down to one entry in the registry.
@@ -359,6 +400,24 @@ internal static class ThreatModules
             });
         };
 
+    // Per-rank variant for shouts and blessings — adds the rank's flat amount
+    // to every mob the caster currently has on a threat list.
+    private static ThreatHandler PlayerAddToAllMobsByRank(string eventTag, Dictionary<int, double> amounts)
+        => (tracker, session, spellId, caster, hitTargets) =>
+        {
+            if (caster != session.GameState.CurrentPlayerGuid) return;
+            if (!amounts.TryGetValue(spellId, out double amount)) return;
+
+            tracker.AddThreatToAllMobs(caster, amount);
+
+            Log.Event("threat.spell." + eventTag, new
+            {
+                spell_id = spellId,
+                caster_low = caster.GetCounter(),
+                amount,
+            });
+        };
+
     // -----------------------------------------------------------------------
     // Registry — every spell ID we care about lands here. Adding a new ability
     // is one entry plus (optionally) a per-rank amount table above.
@@ -453,6 +512,14 @@ internal static class ThreatModules
         // Druid Demoralizing Roar — multi-target debuff threat.
         var demoRoar = PlayerMultiTargetFlat("demoralizing_roar", DemoralizingRoarAmount);
         foreach (var id in DemoralizingRoarAmount.Keys) map[id] = demoRoar;
+
+        // Warrior Battle Shout — flat add to every mob in combat with caster.
+        var battleShout = PlayerAddToAllMobsByRank("battle_shout", BattleShoutAmount);
+        foreach (var id in BattleShoutAmount.Keys) map[id] = battleShout;
+
+        // Paladin Lesser Blessings — flat add to every mob in combat.
+        var lesserBlessing = PlayerAddToAllMobsByRank("lesser_blessing", LesserBlessingAmount);
+        foreach (var id in LesserBlessingAmount.Keys) map[id] = lesserBlessing;
 
         return map;
     }
