@@ -238,21 +238,25 @@ public partial class WorldSocket
             // 1.12 client would fire these mid-cast-bar and mid-GCD, so we match that.
             if (!isOffGcd)
             {
-                // JimsProxy (Mount-Button-Stuck-Lit): drop re-clicks but resolve the modern
-                // client's tracking via the duplicate's own unique ClientGUID/ServerGUID. The
-                // earlier silent-drop approach (commit 8998c39) avoided dismissing the running
-                // cast bar but left the duplicate's action-button state pending forever. Sending
-                // SpellPrepare + CastFailed(DontReport) bound to the DUPLICATE's IDs releases the
-                // queued state without showing an error toast. The running cast's ServerCastID is
-                // distinct, so its cast bar should be unaffected.
+                // JimsProxy: if a cast-time spell is already running, keep the latest keypress
+                // queued client-side and forward it when the running cast completes. This keeps
+                // the modern action button highlighted instead of cancelling it with a local
+                // CastFailed(DontReport), while still avoiding an early CMSG_CAST_SPELL that
+                // vanilla servers would reject with SpellInProgress.
                 bool gateStarted = GetSession().GameState.HasStartedNormalCast();
                 bool gateInFlight = GetSession().GameState.HasInFlightNormalCastForSpell((uint)cast.Cast.SpellID);
-                if (gateStarted || gateInFlight)
+                if (gateStarted)
+                {
+                    HoldNormalCast(cast, castRequest);
+                    return;
+                }
+
+                if (gateInFlight)
                 {
                     Log.Event("cast.dropped.duplicate", new
                     {
                         spell_id = cast.Cast.SpellID,
-                        reason = gateInFlight ? "in_flight_same_spell_cast_spell" : "another_cast_started",
+                        reason = "in_flight_same_spell_cast_spell",
                         client_cast_id = cast.Cast.CastID.ToString(),
                         queue_depth = GetSession().GameState.PendingNormalCasts.Count,
                     });
@@ -394,6 +398,25 @@ public partial class WorldSocket
         }
         WriteSpellTargets(cast.Cast.Target, targetFlags, packet);
         return packet;
+    }
+
+    private void HoldNormalCast(CastSpell cast, ClientCastRequest castRequest)
+    {
+        WorldPacket heldPacket = BuildCastSpellPacket(cast);
+        castRequest.HeldPacketForReplay = heldPacket;
+        castRequest.HeldAtTickMs = Environment.TickCount64;
+
+        var displaced = GetSession().GameState.ForceHoldCast(castRequest);
+
+        if (displaced != null)
+        {
+            SendCastRequestFailed(displaced, false);
+        }
+
+        SpellPrepare heldPrepare = new SpellPrepare();
+        heldPrepare.ClientCastID = castRequest.ClientGUID;
+        heldPrepare.ServerCastID = castRequest.ServerGUID;
+        SendPacket(heldPrepare);
     }
 
     /// <summary>

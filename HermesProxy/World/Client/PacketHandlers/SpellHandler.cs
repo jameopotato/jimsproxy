@@ -753,11 +753,13 @@ public partial class WorldClient
 
         SpellGo spell = new SpellGo();
         spell.Cast = HandleSpellStartOrGo(packet, true);
+        bool matchedLocalNormalCast = false;
 
         // Dequeue completed cast (queue-based, FIFO order)
         if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
             GetSession().GameState.TryDequeuePendingNormalCast((uint)spell.Cast.SpellID, out var pendingCast))
         {
+            matchedLocalNormalCast = true;
             spell.Cast.CastID = pendingCast!.ServerGUID;
             spell.Cast.SpellXSpellVisualID = pendingCast.SpellXSpellVisualId;
             // SoM-renumbered item: rewrite the legacy spell id back to the modern one the client expects.
@@ -889,6 +891,19 @@ public partial class WorldClient
             spell.LogData = new SpellCastLogData();
 
         SendPacketToClient(spell);
+
+        if (matchedLocalNormalCast)
+        {
+            var gameState = GetSession().GameState;
+            if (!gameState.IsGcdHoldActive() && !gameState.HasForwardedPendingCast())
+            {
+                var heldCast = gameState.TakeHeldCastIfReady();
+                if (heldCast != null)
+                {
+                    gameState.OnGcdHeldCastFire?.Invoke(heldCast);
+                }
+            }
+        }
     }
 
     SpellCastData HandleSpellStartOrGo(WorldPacket packet, bool isSpellGo)
