@@ -342,14 +342,20 @@ public sealed class ThreatTracker
     // Auto-flushes the dirty set so a single combat-log packet results in at
     // most one SMSG_THREAT_UPDATE on the wire. Callers don't need to remember
     // to call EmitDirty.
+    // Convenience overload for melee swings (no spell id) and other call
+    // sites that don't have spell context yet. Treats it as plain damage.
     public void OnDamage(WowGuid128 attacker, WowGuid128 victim, double rawDamage)
+        => OnDamage(attacker, victim, 0, rawDamage);
+
+    public void OnDamage(WowGuid128 attacker, WowGuid128 victim, int spellId, double rawDamage)
     {
         if (rawDamage <= 0) return;
         if (!IsLocalThreater(attacker)) return;
         if (victim == default) return;
 
-        double modifier = GetPassiveModifier(attacker);
-        double scaledThreat = rawDamage * modifier;
+        double abilityMultiplier = ThreatModules.GetDamageMultiplier(spellId);
+        double passiveModifier = GetPassiveModifier(attacker);
+        double scaledThreat = rawDamage * abilityMultiplier * passiveModifier;
         AddThreat(victim, attacker, scaledThreat);
 
         if (_threatLists.TryGetValue(victim, out var list) &&
@@ -360,8 +366,10 @@ public sealed class ThreatTracker
                 attacker_low = attacker.GetCounter(),
                 attacker_is_player = attacker == _session.GameState.CurrentPlayerGuid,
                 victim_low = victim.GetCounter(),
+                spell_id = spellId,
                 damage = (long)rawDamage,
-                modifier,
+                ability_mult = abilityMultiplier,
+                passive_mod = passiveModifier,
                 threat_added = (long)scaledThreat,
                 new_total = (long)newTotal,
                 threater_count = list.Count,

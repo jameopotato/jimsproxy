@@ -60,6 +60,56 @@ internal static class ThreatModules
         return true;
     }
 
+    // Phase 6 — per-spell damage threat multiplier. Looked up on every
+    // OnDamage event with a non-zero spell id. Values mirror
+    // LibThreatClassic2's AbilityHandlers entries; spells not in the table
+    // (and melee swings, which arrive with spellId=0) get the implicit 1.0×.
+    //
+    // Set-bonus modifiers (Mage Netherwind, Warlock Plagueheart/Nemesis,
+    // Rogue Bonescythe) and talent-based school multipliers are deferred —
+    // those need item-set / talent introspection from the proxy side.
+    private static readonly Dictionary<int, double> DamageMultipliers = new()
+    {
+        // Druid Maul (R1..7) — bear-form spike attack, double-threat per the lib
+        [6807] = 1.75, [6808] = 1.75, [6809] = 1.75,
+        [8972] = 1.75, [9745] = 1.75, [9880] = 1.75, [9881] = 1.75,
+
+        // Druid Swipe (R1..5)
+        [779]  = 1.75, [780]  = 1.75, [769]  = 1.75,
+        [9754] = 1.75, [9908] = 1.75,
+
+        // Warlock Searing Pain (R1..6) — high-threat dps spell by design
+        [5676] = 2.0, [17919] = 2.0, [17920] = 2.0,
+        [17921] = 2.0, [17922] = 2.0, [17923] = 2.0,
+
+        // Priest Mind Blast (R1..9)
+        [8092] = 2.0, [8102] = 2.0, [8103] = 2.0,
+        [8104] = 2.0, [8105] = 2.0, [8106] = 2.0,
+        [10945] = 2.0, [10946] = 2.0, [10947] = 2.0,
+
+        // Priest Holy Nova damage component (R1..6) — generates no threat
+        [15237] = 0.0, [15430] = 0.0, [15431] = 0.0,
+        [27799] = 0.0, [27800] = 0.0, [27801] = 0.0,
+
+        // Priest Shadowguard reflect (R1..6) — generates no threat
+        [18137] = 0.0, [19308] = 0.0, [19309] = 0.0,
+        [19310] = 0.0, [19311] = 0.0, [19312] = 0.0,
+
+        // Shaman Earth Shock (R1..7) — designed as the shaman tank-equivalent
+        // taunt, lib applies 2x to give it real teeth on a threat meter
+        [8042] = 2.0, [8044] = 2.0, [8045] = 2.0,
+        [8046] = 2.0, [10412] = 2.0, [10413] = 2.0, [10414] = 2.0,
+
+        // Paladin Holy Shield reflect damage (R1..3)
+        [20925] = 1.2, [20927] = 1.2, [20928] = 1.2,
+    };
+
+    public static double GetDamageMultiplier(int spellId)
+    {
+        if (spellId <= 0) return 1.0;
+        return DamageMultipliers.TryGetValue(spellId, out double mult) ? mult : 1.0;
+    }
+
     // -----------------------------------------------------------------------
     // Per-spell threat tables (rank → amount). Numbers come straight from
     // LibThreatClassic2 ClassModules/Classic/*.lua.

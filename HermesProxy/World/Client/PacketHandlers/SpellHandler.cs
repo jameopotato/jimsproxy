@@ -1312,7 +1312,9 @@ public partial class WorldClient
         SendPacketToClient(spell);
 
         // Threat translation: feed spell damage (direct hit) into the tracker.
-        GetSession().ThreatTracker.OnDamage(spell.CasterGUID, spell.TargetGUID, spell.Damage);
+        // Pass the spell id so the per-ability damage multiplier (Maul x1.75,
+        // Earth Shock x2, Holy Nova x0, etc.) can apply.
+        GetSession().ThreatTracker.OnDamage(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, spell.Damage);
     }
 
     [PacketHandler(Opcode.SMSG_SPELL_EXECUTE_LOG)]
@@ -1683,7 +1685,7 @@ public partial class WorldClient
         }
         if (dotDamage > 0)
         {
-            GetSession().ThreatTracker.OnDamage(spell.CasterGUID, spell.TargetGUID, dotDamage);
+            GetSession().ThreatTracker.OnDamage(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, dotDamage);
         }
     }
 
@@ -1765,8 +1767,9 @@ public partial class WorldClient
         // Threat translation: damage-shield reflects (Thorns, Retribution Aura,
         // Lightning Shield) generate threat to the attacker who hit us. The
         // CasterGUID here is whoever owns the shield (us or our pet), the
-        // VictimGUID is the attacker who got reflected on.
-        GetSession().ThreatTracker.OnDamage(spell.CasterGUID, spell.VictimGUID, spell.Damage);
+        // VictimGUID is the attacker who got reflected on. Pass the shield
+        // spell id so Holy Shield (x1.2) and friends pick up the right mult.
+        GetSession().ThreatTracker.OnDamage(spell.CasterGUID, spell.VictimGUID, (int)spell.SpellID, spell.Damage);
     }
 
     [PacketHandler(Opcode.SMSG_ENVIRONMENTAL_DAMAGE_LOG)]
