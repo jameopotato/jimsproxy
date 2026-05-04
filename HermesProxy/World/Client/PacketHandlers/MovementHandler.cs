@@ -144,14 +144,18 @@ public partial class WorldClient
     {
         WowGuid128 guid = packet.ReadPackedGuid().To128(GetSession().GameState);
 
-        if (GetSession().GameState.IsInTaxiFlight &&
+        if (System.Threading.Volatile.Read(ref GetSession().GameState.IsInTaxiFlight) &&
             GetSession().GameState.CurrentPlayerGuid == guid)
         {
             ControlUpdate control = new ControlUpdate();
             control.Guid = guid;
             control.HasControl = true;
             SendPacketToClient(control);
-            GetSession().GameState.IsInTaxiFlight = false;
+            System.Threading.Volatile.Write(ref GetSession().GameState.IsInTaxiFlight, false);
+            // JimsProxy (taxi-flight-robustness): teleport-ack ended the flight (zone change,
+            // early-arrival sync, etc.) — cancel the pending dismount Task so it doesn't fire
+            // duplicate control/gravity packets after the player has already regained control.
+            GetSession().GameState.CancelTaxiDismount("teleport_ack_during_flight");
         }
 
         MoveTeleport teleport = new MoveTeleport();
@@ -703,43 +707,118 @@ public partial class WorldClient
 
         if (isTaxiFlight)
         {
-            if (GetSession().GameState.IsWaitingForTaxiStart)
+            var session = GetSession();
+            var gameState = session.GameState;
+
+            if (gameState.IsWaitingForTaxiStart)
             {
                 ActivateTaxiReplyPkt taxi = new();
                 taxi.Reply = ActivateTaxiReply.Ok;
                 SendPacketToClient(taxi);
-                GetSession().GameState.IsWaitingForTaxiStart = false;
+                gameState.IsWaitingForTaxiStart = false;
             }
-            GetSession().GameState.IsInTaxiFlight = true;
+            System.Threading.Volatile.Write(ref gameState.IsInTaxiFlight, true);
 
-            // Restore player control after the flight spline completes — without this,
-            // the modern client stays in the "flying" state (no gravity, no movement).
-            uint flightDuration = moveSpline.SplineTimeFull;
-            WowGuid128 playerGuid = guid;
-            System.Threading.Tasks.Task.Run(async () =>
+            // JimsProxy (taxi-flight-robustness): a fresh taxi spline supersedes any pending
+            // dismount Task — multi-segment chained flights re-enter this branch per leg and
+            // we must not let an earlier leg's timer fire mid-next-leg. CancelTaxiDismount is
+            // idempotent and a no-op when nothing is pending.
+            gameState.CancelTaxiDismount("new_taxi_spline");
+
+            // Clamp the server-reported spline duration to a sane upper bound. Longest vanilla
+            // flight is well under 10 minutes; anything larger is a malformed/buggy server packet.
+            // Without the clamp, a corrupt SplineTimeFull near uint.MaxValue would either wrap
+            // negative on the (int) cast (Task.Delay throws ArgumentOutOfRange — silently swallowed
+            // by the unawaited Task, dismount never fires) or stall the Task for weeks.
+            const uint TAXI_FLIGHT_MAX_MS = 600_000;
+            uint flightDuration = Math.Min(moveSpline.SplineTimeFull, TAXI_FLIGHT_MAX_MS);
+            int delayMs = (int)flightDuration + 250;
+
+            var attemptId = Guid.NewGuid().ToString("N").Substring(0, 8);
+            var cts = new System.Threading.CancellationTokenSource();
+            gameState.TaxiDismountCts = cts;
+            gameState.TaxiDismountFiresAtTickMs = Environment.TickCount64 + delayMs;
+            gameState.TaxiAttemptId = attemptId;
+
+            Framework.Logging.Log.Event("taxi.flight.scheduled", new
             {
-                await System.Threading.Tasks.Task.Delay((int)flightDuration + 250);
-                if (GetSession()?.GameState?.IsInTaxiFlight != true)
+                attempt_id = attemptId,
+                player_guid = guid.ToString(),
+                spline_time_full_ms = moveSpline.SplineTimeFull,
+                clamped = moveSpline.SplineTimeFull > TAXI_FLIGHT_MAX_MS,
+                delay_ms = delayMs,
+            });
+
+            // Capture session/playerGuid by value so the Task does not re-resolve GetSession()
+            // on a possibly-replaced session post-reconnect (PR #119 spawns a new WorldClient
+            // on unplanned DC). The CTS guards against firing after legitimate cancellation.
+            WowGuid128 playerGuid = guid;
+            var capturedSession = session;
+            var capturedClient = this; // for SendPacketToClient — use captured-WorldClient routing
+            var token = cts.Token;
+            _ = System.Threading.Tasks.Task.Run(async () =>
+            {
+                try
+                {
+                    await System.Threading.Tasks.Task.Delay(delayMs, token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    // CancelTaxiDismount logged the cancellation event already.
                     return;
+                }
+
+                // Defense in depth: if the in-flight bool was cleared by another path
+                // (MoveTeleportAck on line ~154, manual debug, etc.) skip the dismount.
+                if (!System.Threading.Volatile.Read(ref capturedSession.GameState.IsInTaxiFlight))
+                {
+                    Framework.Logging.Log.Event("taxi.flight.dismount_skipped", new
+                    {
+                        attempt_id = attemptId,
+                        reason = "not_in_taxi_flight",
+                    });
+                    return;
+                }
+                if (capturedSession.InstanceSocket == null)
+                {
+                    Framework.Logging.Log.Event("taxi.flight.dismount_skipped", new
+                    {
+                        attempt_id = attemptId,
+                        reason = "no_instance_socket",
+                    });
+                    return;
+                }
 
                 ControlUpdate control = new ControlUpdate();
                 control.Guid = playerGuid;
                 control.HasControl = true;
-                SendPacketToClient(control);
+                capturedClient.SendPacketToClient(control);
 
                 MoveSetFlag enableGravity = new MoveSetFlag(Opcode.SMSG_MOVE_ENABLE_GRAVITY);
                 enableGravity.MoverGUID = playerGuid;
-                SendPacketToClient(enableGravity);
+                capturedClient.SendPacketToClient(enableGravity);
 
                 MoveSetFlag unsetFly = new MoveSetFlag(Opcode.SMSG_MOVE_UNSET_CAN_FLY);
                 unsetFly.MoverGUID = playerGuid;
-                SendPacketToClient(unsetFly);
+                capturedClient.SendPacketToClient(unsetFly);
 
                 MoveSetFlag unroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
                 unroot.MoverGUID = playerGuid;
-                SendPacketToClient(unroot);
+                capturedClient.SendPacketToClient(unroot);
 
-                GetSession().GameState.IsInTaxiFlight = false;
+                System.Threading.Volatile.Write(ref capturedSession.GameState.IsInTaxiFlight, false);
+                long firedAt = Environment.TickCount64;
+                Framework.Logging.Log.Event("taxi.flight.dismount_fired", new
+                {
+                    attempt_id = attemptId,
+                    player_guid = playerGuid.ToString(),
+                    late_by_ms = firedAt - capturedSession.GameState.TaxiDismountFiresAtTickMs,
+                });
+                // Clear bookkeeping AFTER firing so the diagnostic above can include `late_by_ms`.
+                // CancelTaxiDismount would also clear it but logs a `cancelled` event we don't want here.
+                capturedSession.GameState.TaxiDismountCts = null;
+                capturedSession.GameState.TaxiDismountFiresAtTickMs = 0;
+                capturedSession.GameState.TaxiAttemptId = null;
             });
         }
     }

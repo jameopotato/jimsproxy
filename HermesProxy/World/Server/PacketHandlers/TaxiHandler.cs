@@ -1,4 +1,5 @@
 ﻿using Framework.Constants;
+using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World;
 using HermesProxy.World.Enums;
@@ -32,20 +33,41 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_ACTIVATE_TAXI)]
     void HandleActivateTaxi(ActivateTaxi taxi)
     {
+        uint fromNode = GetSession().GameState.CurrentTaxiNode;
+        bool direct = TaxiPathExist(fromNode, taxi.Node);
+
         // direct path exist
-        if (TaxiPathExist(GetSession().GameState.CurrentTaxiNode, taxi.Node))
+        if (direct)
         {
             WorldPacket packet = new WorldPacket(Opcode.CMSG_ACTIVATE_TAXI);
             packet.WriteGuid(taxi.FlightMaster.To64());
-            packet.WriteUInt32(GetSession().GameState.CurrentTaxiNode);
+            packet.WriteUInt32(fromNode);
             packet.WriteUInt32(taxi.Node);
             SendPacketToServer(packet);
+            Log.Event("taxi.activate_requested", new
+            {
+                flight_master = taxi.FlightMaster.ToString(),
+                from_node = fromNode,
+                to_node = taxi.Node,
+                routing = "direct",
+                hop_count = 2,
+            });
         }
         else // find shortest path
         {
-            HashSet<uint> path = GetTaxiPath(GetSession().GameState.CurrentTaxiNode, taxi.Node, GetSession().GameState.UsableTaxiNodes);
+            HashSet<uint> path = GetTaxiPath(fromNode, taxi.Node, GetSession().GameState.UsableTaxiNodes);
             if (path.Count <= 1) // no nodes found
+            {
+                Log.Event("taxi.activate_requested", new
+                {
+                    flight_master = taxi.FlightMaster.ToString(),
+                    from_node = fromNode,
+                    to_node = taxi.Node,
+                    routing = "no_path",
+                    hop_count = path.Count,
+                });
                 return;
+            }
 
             WorldPacket packet = new WorldPacket(Opcode.CMSG_ACTIVATE_TAXI_EXPRESS);
             packet.WriteGuid(taxi.FlightMaster.To64());
@@ -54,8 +76,34 @@ public partial class WorldSocket
             foreach (uint itr in path)
                 packet.WriteUInt32(itr);
             SendPacketToServer(packet);
+            Log.Event("taxi.activate_requested", new
+            {
+                flight_master = taxi.FlightMaster.ToString(),
+                from_node = fromNode,
+                to_node = taxi.Node,
+                routing = "express",
+                hop_count = path.Count,
+            });
         }
         GetSession().GameState.IsWaitingForTaxiStart = true;
+    }
+
+    // JimsProxy (taxi-flight-robustness): pass through the early-landing CMSG so the
+    // legacy server tears down the spline server-side, AND cancel our local dismount
+    // Task — without this, the Task fires `delay_ms` later and re-issues control/gravity
+    // packets after the player has already landed and regained control normally,
+    // potentially desyncing the modern client.
+    [PacketHandler(Opcode.CMSG_TAXI_REQUEST_EARLY_LANDING)]
+    void HandleTaxiRequestEarlyLanding(EmptyClientPacket packet)
+    {
+        Log.Event("taxi.early_landing_requested", new
+        {
+            attempt_id = GetSession().GameState.TaxiAttemptId,
+            had_pending_dismount = GetSession().GameState.TaxiDismountCts != null,
+        });
+        GetSession().GameState.CancelTaxiDismount("early_landing_requested");
+        WorldPacket fwd = new WorldPacket(Opcode.CMSG_TAXI_REQUEST_EARLY_LANDING);
+        SendPacketToServer(fwd);
     }
     bool TaxiPathExist(uint from, uint to)
     {
