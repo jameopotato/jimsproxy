@@ -93,6 +93,20 @@ public class ConfigurationParser
         return defValue;
     }
 
+    public float GetFloat(string key, float defValue)
+    {
+        KeyValueConfigurationElement s = _settingsCollection[key];
+        if (string.IsNullOrEmpty(s?.Value))
+            return defValue;
+
+        float aux;
+        if (float.TryParse(s.Value, NumberStyles.Float, CultureInfo.InvariantCulture, out aux))
+            return aux;
+
+        Console.WriteLine("Warning: \"{0}\" is not a valid float value for key \"{1}\"", s.Value, key);
+        return defValue;
+    }
+
     public TEnum GetEnum<TEnum>(string key, TEnum defValue) where TEnum : struct
     {
         KeyValueConfigurationElement s = _settingsCollection[key];

@@ -1,5 +1,6 @@
 ﻿//#define DEBUG_UPDATES
 
+using Framework;
 using Framework.GameMath;
 using Framework.Logging;
 using Framework.Util;
@@ -21,6 +22,25 @@ public partial class WorldClient
     void HandleDestroyObject(WorldPacket packet)
     {
         WowGuid128 guid = packet.ReadGuid().To128(GetSession().GameState);
+
+        // JimsProxy (mount-and-quest-diagnostics): capture cached entry/displayId BEFORE
+        // the cache eviction below so the bundle records what was being destroyed. Used
+        // to triage the Aean Swiftriver Outrunner cat-mount persistence bug — testers'
+        // summary of bundle 20260503-144300 found the cats are NOT MOUNTDISPLAYID values
+        // on the riders but separate Pet-high-GUID creature spawns (entry 4196). Without
+        // this event, we can't tell whether the legacy server ever sends a destroy for
+        // those mount GUIDs around aggro/death time.
+        int cachedEntry = GetSession().GameState.GetLegacyFieldValueInt32(guid, ObjectField.OBJECT_FIELD_ENTRY);
+        int cachedDisplayId = GetSession().GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
+        Log.Event("object.destroy", new
+        {
+            guid = guid.ToString(),
+            high_type = guid.GetHighType().ToString(),
+            guid_entry = guid.GetEntry(),
+            cached_entry = cachedEntry,
+            cached_display_id = cachedDisplayId,
+        });
+
         lock (GetSession().GameState.ObjectCacheLock)
         {
             GetSession().GameState.ObjectCacheLegacy.Remove(guid);
@@ -309,6 +329,24 @@ public partial class WorldClient
             if (guid == GetSession().GameState.CurrentPlayerGuid)
                 continue;
             PrintString($"Guid = {objCount}", index, j);
+
+            // JimsProxy (mount-and-quest-diagnostics): per-GUID structured log for far/
+            // out-of-range removals, captured BEFORE cache eviction so cached entry and
+            // displayId survive into the bundle. Pairs with object.destroy to give a
+            // complete picture of how the legacy server removes objects from the client's
+            // view — needed to triage the Outrunner cat-mount persistence bug where the
+            // mount cats are independent creature spawns (entry 4196), not MOUNTDISPLAYID.
+            int cachedEntry = GetSession().GameState.GetLegacyFieldValueInt32(guid, ObjectField.OBJECT_FIELD_ENTRY);
+            int cachedDisplayId = GetSession().GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
+            Log.Event("object.far_object", new
+            {
+                guid = guid.ToString(),
+                high_type = guid.GetHighType().ToString(),
+                guid_entry = guid.GetEntry(),
+                cached_entry = cachedEntry,
+                cached_display_id = cachedDisplayId,
+            });
+
             lock (GetSession().GameState.ObjectCacheLock)
             {
                 GetSession().GameState.ObjectCacheLegacy.Remove(guid);
@@ -1414,7 +1452,58 @@ public partial class WorldClient
         int OBJECT_FIELD_SCALE_X = LegacyVersion.GetUpdateField(ObjectField.OBJECT_FIELD_SCALE_X);
         if (OBJECT_FIELD_SCALE_X >= 0 && updateMaskArray[OBJECT_FIELD_SCALE_X])
         {
-            updateData.ObjectData.Scale = updates[OBJECT_FIELD_SCALE_X].FloatValue;
+            float wireScale = updates[OBJECT_FIELD_SCALE_X].FloatValue;
+            updateData.ObjectData.Scale = wireScale;
+
+            // JimsProxy (npc-scale-vanilla-parity): log per-unit scale context so the
+            // "X is smaller in modern than vanilla" reports (Varimathras, etc.) can be
+            // diagnosed from a JSONL bundle. Captures wire scale, DisplayID, CMS, and
+            // ModelScale so we can reconstruct the rendering math without a repro.
+            // Bounds-safe (gates field index against updateMaskArray.Length so Item /
+            // GameObject updates whose mask doesn't cover unit fields don't crash).
+            bool isUnitLike = objectType == ObjectType.Unit
+                              || objectType == ObjectType.Player
+                              || objectType == ObjectType.ActivePlayer;
+            if (isUnitLike && LegacyVersion.ExpansionVersion == 1)
+            {
+                int displayId = 0;
+                int UNIT_FIELD_DISPLAYID_idx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_DISPLAYID);
+                if (UNIT_FIELD_DISPLAYID_idx >= 0
+                    && UNIT_FIELD_DISPLAYID_idx < updateMaskArray.Length
+                    && updateMaskArray[UNIT_FIELD_DISPLAYID_idx])
+                    displayId = updates[UNIT_FIELD_DISPLAYID_idx].Int32Value;
+                else
+                    displayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
+
+                float cms = 0f;
+                uint modelId = 0;
+                if (displayId > 0)
+                {
+                    var info = GameData.GetDisplayInfo((uint)displayId);
+                    cms = info.DisplayScale;
+                    modelId = info.ModelId;
+                }
+                float modelScale = (modelId > 0) ? GameData.GetModelData(modelId).ModelScale : 0f;
+
+                // Per jim's PR #117 review: per-unit-create event, hot in populated areas
+                // (raids, cities, BGs). Gated behind DebugOutput so it doesn't spam JSONL
+                // in production bundles unless a tester is actively investigating scale.
+                if (Framework.Settings.DebugOutput)
+                {
+                    Log.Event("unit.scale.context", new
+                    {
+                        guid = guid.ToString(),
+                        entry = updateData.ObjectData.EntryID,
+                        object_type = objectType.ToString(),
+                        wire_scale = wireScale,
+                        display_id = displayId,
+                        creature_model_scale = cms,
+                        model_id = modelId,
+                        model_scale = modelScale,
+                        is_create = isCreate,
+                    });
+                }
+            }
         }
 
         // Item Fields
@@ -1904,11 +1993,46 @@ public partial class WorldClient
             {
                 updateData.UnitData.DisplayID = updates[UNIT_FIELD_DISPLAYID].Int32Value;
 
-                // in post vanilla versions, the client automatically multiplies the scale
-                // the server sends it by the default scale for this display id in the dbc
-                // this is not the case in 1.12, so we have to adjust the unit scale here
+                // JimsProxy (npc-scale-vanilla-parity): set UNIT_FIELD_DISPLAY_SCALE = 1/CMS
+                // so the modern client's `wire × CMS × DisplayScale` collapses to `wire`,
+                // matching vanilla 1.12's rendering of `wire × M` (where M is a per-model
+                // constant, NOT the same as CreatureModelScale). Verified empirically against
+                // matched-camera screenshots of Varimathras DisplayID 11658 (CMS 1.2):
+                //   * Vanilla 1.12 client:    Varimathras renders at 2.07× player height
+                //   * Modern with no comp:    Varimathras renders at 2.41× player height
+                //                             (over by ~16%, ratio 2.41/2.07 ≈ CMS itself)
+                //   * Modern with 1/CMS comp: Varimathras renders at ~2.01× (within 3% of
+                //                             vanilla — eyeball margin).
+                // The original developer's intuition was right; my "vanilla also multiplies
+                // by CMS" hypothesis was wrong. Vanilla 1.12 effectively ignores CreatureModel-
+                // Scale at render time (uses model's native size + wire scale only).
+                //
+                // The bundled CreatureDisplayInfo.csv has been refreshed from wago.tools so
+                // the lookup is now accurate (was previously stale, with ~2k spurious diffs
+                // from current modern Classic data).
+                //
+                // Pet path is independent — pets use the inverse-CMS bake-in at the SCALE_X
+                // read site (pet-scale-vanilla-parity). The 1.14 client doesn't honor
+                // UNIT_FIELD_DISPLAY_SCALE for local-player-pet units (verified by direct
+                // 1.12 vs proxy screenshots of a Felhunter and Dire Wolf), so the pet fix
+                // bakes its correction into wire SCALE_X instead.
                 if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
-                    updateData.UnitData.DisplayScale = 1.0f / GameData.GetUnitCompleteDisplayScale((uint)updateData.UnitData.DisplayID);
+                {
+                    uint dispId = (uint)updateData.UnitData.DisplayID;
+                    float complete = GameData.GetUnitCompleteDisplayScale(dispId);
+                    if (complete > 0)
+                        updateData.UnitData.DisplayScale = 1.0f / complete;
+
+                    Log.Event("unit.scale.display_scale_set", new
+                    {
+                        guid = guid.ToString(),
+                        entry = updateData.ObjectData.EntryID,
+                        display_id = dispId,
+                        modern_cms = GameData.GetDisplayInfo(dispId).DisplayScale,
+                        complete_display_scale = complete,
+                        emitted_display_scale = (float)(updateData.UnitData.DisplayScale ?? 1.0f),
+                    });
+                }
             }
             int UNIT_FIELD_NATIVEDISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_NATIVEDISPLAYID);
             if (UNIT_FIELD_NATIVEDISPLAYID >= 0 && updateMaskArray[UNIT_FIELD_NATIVEDISPLAYID])
@@ -1918,7 +2042,37 @@ public partial class WorldClient
             int UNIT_FIELD_MOUNTDISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_MOUNTDISPLAYID);
             if (UNIT_FIELD_MOUNTDISPLAYID >= 0 && updateMaskArray[UNIT_FIELD_MOUNTDISPLAYID])
             {
-                updateData.UnitData.MountDisplayID = updates[UNIT_FIELD_MOUNTDISPLAYID].Int32Value;
+                // JimsProxy (mount-and-quest-diagnostics): log mount display transitions so
+                // open bugs like the Aean Swiftriver Outrunner cat-mount persistence (cat
+                // doesn't dismount on rider aggro) can be triaged from a single JSONL
+                // bundle. Reads cached old value before overwriting; flags transitions as
+                // mounted (0→non-zero), dismounted (non-zero→0), or swapped (non-zero→
+                // different non-zero). Vanilla's cmangos `m_dismountOnAggro` is observed
+                // wire-side as a values update writing MOUNTDISPLAYID = 0 on the rider.
+                int oldMountDisplayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_MOUNTDISPLAYID);
+                int newMountDisplayId = updates[UNIT_FIELD_MOUNTDISPLAYID].Int32Value;
+                updateData.UnitData.MountDisplayID = newMountDisplayId;
+
+                if (oldMountDisplayId != newMountDisplayId)
+                {
+                    // Per jim's PR #117 review: fires per UNIT update with mount-id field
+                    // present, hot in populated areas. Gated behind DebugOutput.
+                    if (Framework.Settings.DebugOutput)
+                    {
+                        string transition = (oldMountDisplayId == 0 && newMountDisplayId != 0) ? "mounted"
+                                          : (oldMountDisplayId != 0 && newMountDisplayId == 0) ? "dismounted"
+                                          : "swapped";
+                        Log.Event("unit.mount.changed", new
+                        {
+                            guid = guid.ToString(),
+                            entry = updateData.ObjectData.EntryID,
+                            old_mount_display_id = oldMountDisplayId,
+                            new_mount_display_id = newMountDisplayId,
+                            transition = transition,
+                            is_create = isCreate,
+                        });
+                    }
+                }
             }
             if (ShouldClearMountDisplayOnDeadNonPlayerUnit(guid, objectType, updateData, updates, UNIT_FIELD_MOUNTDISPLAYID))
             {
@@ -2011,7 +2165,14 @@ public partial class WorldClient
             int UNIT_DYNAMIC_FLAGS = LegacyVersion.GetUpdateField(UnitField.UNIT_DYNAMIC_FLAGS);
             if (UNIT_DYNAMIC_FLAGS >= 0 && updateMaskArray[UNIT_DYNAMIC_FLAGS])
             {
-                UnitDynamicFlagsLegacy flags = (UnitDynamicFlagsLegacy)(updates[UNIT_DYNAMIC_FLAGS].UInt32Value);
+                // JimsProxy (mount-and-quest-diagnostics): log dynamic-flag transitions —
+                // these carry quest-relevant state (Lootable, Dead, TrackUnit, ReferAFriend,
+                // SpecialInfo). Useful for triaging "kill credit didn't fire", "loot icon
+                // missing", "quest objective marker absent" reports from JSONL bundles.
+                uint oldDynFlags = (uint)Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_DYNAMIC_FLAGS);
+                uint newDynFlagsRaw = updates[UNIT_DYNAMIC_FLAGS].UInt32Value;
+
+                UnitDynamicFlagsLegacy flags = (UnitDynamicFlagsLegacy)newDynFlagsRaw;
                 if (flags.HasFlag(UnitDynamicFlagsLegacy.Tapped) && flags.HasFlag(UnitDynamicFlagsLegacy.TappedByPlayer))
                     flags &= ~(UnitDynamicFlagsLegacy.Tapped | UnitDynamicFlagsLegacy.TappedByPlayer);
                 updateData.ObjectData.DynamicFlags = (uint)flags.CastFlags<UnitDynamicFlagsModern>();
@@ -2022,6 +2183,23 @@ public partial class WorldClient
                         updateData.UnitData.Flags2 = (uint)UnitFlags2.RegeneratePower;
                     if (flags.HasAnyFlag(UnitDynamicFlagsLegacy.AppearDead))
                         updateData.UnitData.Flags2 |= (uint)UnitFlags2.FeignDeath;
+                }
+
+                if (oldDynFlags != newDynFlagsRaw)
+                {
+                    // Per jim's PR #117 review: gated behind DebugOutput; fires per UNIT update
+                    // with dynamic-flags field present, hot in populated areas.
+                    if (Framework.Settings.DebugOutput)
+                    {
+                        Log.Event("unit.dynamic_flags.changed", new
+                        {
+                            guid = guid.ToString(),
+                            entry = updateData.ObjectData.EntryID,
+                            old_flags = oldDynFlags,
+                            new_flags = newDynFlagsRaw,
+                            is_create = isCreate,
+                        });
+                    }
                 }
             }
             int UNIT_CHANNEL_SPELL = LegacyVersion.GetUpdateField(UnitField.UNIT_CHANNEL_SPELL);
@@ -2085,14 +2263,40 @@ public partial class WorldClient
             int UNIT_NPC_FLAGS = LegacyVersion.GetUpdateField(UnitField.UNIT_NPC_FLAGS);
             if (UNIT_NPC_FLAGS >= 0 && updateMaskArray[UNIT_NPC_FLAGS])
             {
+                // JimsProxy (mount-and-quest-diagnostics): log NPC-flag transitions. These
+                // bits control gossip availability, quest-giver status (QuestGiver, Vendor,
+                // Trainer, FlightMaster, etc). When a quest report says "I can't talk to
+                // the NPC" or "no quest exclamation showing", a flag transition log line
+                // tells us whether the legacy server even sent the gossip/quest bit.
+                uint oldNpcFlags = (uint)Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_NPC_FLAGS);
+                uint newNpcFlagsRaw = updates[UNIT_NPC_FLAGS].UInt32Value;
+
                 if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
                 {
-                    NPCFlagsVanilla vanillaFlags = (NPCFlagsVanilla)updates[UNIT_NPC_FLAGS].UInt32Value;
+                    NPCFlagsVanilla vanillaFlags = (NPCFlagsVanilla)newNpcFlagsRaw;
                     updateData.UnitData.NpcFlags[0] = (uint)(vanillaFlags.CastFlags<NPCFlags>());
                 }
                 else
                 {
-                    updateData.UnitData.NpcFlags[0] = updates[UNIT_NPC_FLAGS].UInt32Value;
+                    updateData.UnitData.NpcFlags[0] = newNpcFlagsRaw;
+                }
+
+                if (oldNpcFlags != newNpcFlagsRaw)
+                {
+                    // Per jim's PR #117 review: gated behind DebugOutput; fires per UNIT update
+                    // with NPC-flags field present, hot in populated areas.
+                    if (Framework.Settings.DebugOutput)
+                    {
+                        Log.Event("unit.npc_flags.changed", new
+                        {
+                            guid = guid.ToString(),
+                            entry = updateData.ObjectData.EntryID,
+                            old_flags = oldNpcFlags,
+                            new_flags = newNpcFlagsRaw,
+                            translated_modern_flags = updateData.UnitData.NpcFlags[0],
+                            is_create = isCreate,
+                        });
+                    }
                 }
             }
             int UNIT_NPC_EMOTESTATE = LegacyVersion.GetUpdateField(UnitField.UNIT_NPC_EMOTESTATE);
@@ -3636,6 +3840,86 @@ public partial class WorldClient
             if (CORPSE_FIELD_DYNAMIC_FLAGS >= 0 && updateMaskArray[CORPSE_FIELD_DYNAMIC_FLAGS])
             {
                 updateData.CorpseData.DynamicFlags = updates[CORPSE_FIELD_DYNAMIC_FLAGS].UInt32Value;
+            }
+        }
+
+        // JimsProxy (pet-scale-vanilla-parity): the local player's pet (warlock or hunter)
+        // renders visibly smaller in modern 1.14 Classic than the vanilla 1.12 reference,
+        // even though CreatureDisplayInfo and CreatureModelData scale data is byte-
+        // identical between the two builds (extracted both sets and diffed — only 39 of
+        // ~10,500 DisplayIDs differ in CreatureModelScale, none of them pet display IDs).
+        // Root cause unverified — likely an undocumented client-side scale modifier on
+        // local-player pet units in modern Classic. A flat global multiplier doesn't work
+        // because the modern client compounds it with the per-display CreatureModelScale:
+        // a Felhunter (CMS 0.5) at 1.5× still renders too small while a Dire Wolf (CMS
+        // 1.5) at 1.5× ends up at ~2.2 effective and looks ridiculous.
+        //
+        // Inverse-CMS scaling cancels that variance: emit (wire / CreatureModelScale) × K
+        // so the modern client's wire × ModelScale × CMS multiply collapses to wire ×
+        // ModelScale × K — every pet gets a uniform K bump regardless of its CMS quirks.
+        // K = 1.5 is the empirical "felt right at 1.12" tuning value for hunter pets.
+        //
+        // Server-side combat reach and bounding radius are untouched, so range checks,
+        // melee hit detection, and ability targeting are unchanged. Only the visual scale
+        // forwarded to the client is modified; click hitbox grows with the visual.
+        //
+        // Detection: prefer CurrentPetGuid match (set when SMSG_PET_SPELLS_MESSAGE arrives,
+        // typically before the pet's first CREATE_OBJECT). Fallback to SUMMONEDBY in this
+        // update matching CurrentPlayerGuid so the first CREATE_OBJECT for a pet (which
+        // carries SUMMONEDBY) gets normalized even if CurrentPetGuid hasn't latched yet.
+        // Only fires when SCALE_X is present in this update (Scale != null) — a delta
+        // values update without SCALE_X leaves the already-normalized scale sticky on the
+        // client and avoids compounding multiplications across updates.
+        const float PetScaleK = 1.5f;
+        if (LegacyVersion.ExpansionVersion == 1
+            && updateData.ObjectData.Scale != null
+            && (objectType == ObjectType.Unit || objectType == ObjectType.Player || objectType == ObjectType.ActivePlayer))
+        {
+            var localPlayerGuid = Session.GameState.CurrentPlayerGuid;
+            var currentPetGuid = Session.GameState.CurrentPetGuid;
+            bool isLocalPet = (currentPetGuid != default && guid == currentPetGuid)
+                              || (localPlayerGuid != default
+                                  && updateData.UnitData.SummonedBy != null
+                                  && (WowGuid128)updateData.UnitData.SummonedBy == localPlayerGuid);
+
+            if (isLocalPet)
+            {
+                // DisplayID for CMS lookup. Prefer current update (most up-to-date for
+                // shapeshift/morph cases); fall back to GameState cache for delta updates.
+                int displayId = 0;
+                int UNIT_FIELD_DISPLAYID_idx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_DISPLAYID);
+                if (UNIT_FIELD_DISPLAYID_idx >= 0
+                    && UNIT_FIELD_DISPLAYID_idx < updateMaskArray.Length
+                    && updateMaskArray[UNIT_FIELD_DISPLAYID_idx])
+                    displayId = updates[UNIT_FIELD_DISPLAYID_idx].Int32Value;
+                else
+                    displayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
+
+                float rawScale = (float)updateData.ObjectData.Scale;
+                float cms = 0f;
+                if (displayId > 0)
+                    cms = GameData.GetDisplayInfo((uint)displayId).DisplayScale;
+
+                // Skip normalization if CMS data is missing/invalid — fall back to a flat
+                // K multiply so the pet still gets a size bump rather than passing through
+                // un-modified (and rendering small).
+                float emit = (cms > 0)
+                    ? (rawScale / cms) * PetScaleK
+                    : rawScale * PetScaleK;
+
+                updateData.ObjectData.Scale = emit;
+
+                Log.Event("unit.pet_scale.applied", new
+                {
+                    guid = guid.ToString(),
+                    display_id = displayId,
+                    creature_model_scale = cms,
+                    k = PetScaleK,
+                    raw_scale = rawScale,
+                    emitted_scale = emit,
+                    matched_via = (currentPetGuid != default && guid == currentPetGuid) ? "current_pet_guid" : "summoned_by",
+                    cms_fallback = cms <= 0,
+                });
             }
         }
     }

@@ -886,6 +886,33 @@ public partial class WorldClient
         if (spell.LogData == null)
             spell.LogData = new SpellCastLogData();
 
+        // JimsProxy (warrior-charge-revisit): vanilla Twinstar/Kronos broadcast a second
+        // SMSG_SPELL_GO ~1ms after the parent Charge/Intercept GO for the triggered stun
+        // sub-effect (7922 Charge Stun / 20615 Intercept Stun) with caster=local player.
+        // The modern 1.14 client kicks the sub-effect's SpellVisualKit on the caster on
+        // top of the Charge/Intercept lunge kit — two overlapping caster-side animations
+        // read as the warrior twitching ("on crack"). We want both visuals: Charge lunge
+        // on the warrior (parent spell 100/20252 GO already handled that), stun pose on
+        // the mob. Solution: rewrite CasterGUID/CasterUnit to the hit target so the
+        // modern client plays the stun kit's caster events on the mob instead of the
+        // warrior. Stun aura/icon on the mob is unaffected (SMSG_AURA_UPDATE drives that
+        // independently). CLEU will show spell 7922/20615 source=mob, but damage meters
+        // attribute Charge/Intercept damage to the parent spell, not this sub-effect.
+        if ((spell.Cast.SpellID == 7922 || spell.Cast.SpellID == 20615) &&
+            GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
+            spell.Cast.HitTargets.Count > 0)
+        {
+            WowGuid128 stunTarget = spell.Cast.HitTargets[0];
+            Log.Event("spell.go.stun_subeffect_redirected", new
+            {
+                spell_id = spell.Cast.SpellID,
+                spell_visual_id = spell.Cast.SpellXSpellVisualID,
+                redirected_to = stunTarget.ToString(),
+            });
+            spell.Cast.CasterGUID = stunTarget;
+            spell.Cast.CasterUnit = stunTarget;
+        }
+
         SendPacketToClient(spell);
     }
 
