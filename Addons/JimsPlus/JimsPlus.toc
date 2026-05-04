@@ -8,6 +8,7 @@
 
 Core.lua
 PetFix.lua
+TaxiFix.lua
 castbars/PoolManager.lua
 castbars/AnchorManager.lua
 castbars/Data.lua

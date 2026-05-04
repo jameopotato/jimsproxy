@@ -88,22 +88,32 @@ public partial class WorldSocket
         GetSession().GameState.IsWaitingForTaxiStart = true;
     }
 
-    // JimsProxy (taxi-flight-robustness): pass through the early-landing CMSG so the
-    // legacy server tears down the spline server-side, AND cancel our local dismount
-    // Task — without this, the Task fires `delay_ms` later and re-issues control/gravity
-    // packets after the player has already landed and regained control normally,
-    // potentially desyncing the modern client.
+    // JimsProxy (taxi-flight-robustness): vanilla 1.12 has no early-landing concept —
+    // the server is committed to the full SplineTimeFull and ignores any opcode trying
+    // to cut a flight short. The modern 1.14 client still surfaces the "Stop at next
+    // flight path" button regardless and sends this CMSG when clicked. Bundle
+    // 20260504-032731 (attempt_id dc1050b5) showed: server kept flying the original
+    // 56s spline to completion regardless of the early-landing CMSG.
+    //
+    // Therefore: don't forward (server can't honor it, no legacy mapping anyway), and
+    // don't cancel the dismount Task — cancelling left the player stuck in flight pose
+    // at the natural end of the spline because no one fired the control/gravity/unfly/
+    // unroot packets. The fix: log it for visibility, and let the dismount Task fire on
+    // its original schedule. Player lands cleanly at the original end destination; the
+    // button is purely cosmetic on vanilla.
+    //
+    // True early-landing emulation is a separate (substantial) follow-up — would need
+    // to compute the next taxi waypoint from the spline, force-teleport client+server
+    // there, and reconcile zone/instance/cost state. Tracked separately if needed.
     [PacketHandler(Opcode.CMSG_TAXI_REQUEST_EARLY_LANDING)]
     void HandleTaxiRequestEarlyLanding(EmptyClientPacket packet)
     {
-        Log.Event("taxi.early_landing_requested", new
+        Log.Event("taxi.early_landing_requested_ignored", new
         {
             attempt_id = GetSession().GameState.TaxiAttemptId,
             had_pending_dismount = GetSession().GameState.TaxiDismountCts != null,
+            reason = "vanilla_server_no_early_landing_support",
         });
-        GetSession().GameState.CancelTaxiDismount("early_landing_requested");
-        WorldPacket fwd = new WorldPacket(Opcode.CMSG_TAXI_REQUEST_EARLY_LANDING);
-        SendPacketToServer(fwd);
     }
     bool TaxiPathExist(uint from, uint to)
     {
