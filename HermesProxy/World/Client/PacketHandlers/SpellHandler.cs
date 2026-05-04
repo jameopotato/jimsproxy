@@ -788,6 +788,24 @@ public partial class WorldClient
                     smoothed_rtt_ms = GetSession().GameState.GetSmoothedRttMs(),
                     legacy_lookup_id = pendingCast.LegacySpellId,
                 });
+
+                var gcdCooldown = new SpellCooldownPkt();
+                gcdCooldown.Caster = spell.Cast.CasterUnit;
+                gcdCooldown.Flags = 0x01; // SPELL_COOLDOWN_FLAG_INCLUDE_GCD
+                gcdCooldown.SpellCooldowns.Add(new SpellCooldownStruct
+                {
+                    SpellID = (uint)spell.Cast.SpellID,
+                    ForcedCooldown = (uint)gcdMs,
+                    ModRate = 1.0f,
+                });
+                SendPacketToClient(gcdCooldown);
+
+                Log.Event("gcd.cooldown_synth", new
+                {
+                    spell_id = spell.Cast.SpellID,
+                    forced_cooldown_ms = gcdMs,
+                    flags = 0x01,
+                });
             }
 
             var gameStateAfter = GetSession().GameState;
