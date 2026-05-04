@@ -1371,6 +1371,32 @@ public partial class WorldClient
             }
         }
     }
+
+    private bool ShouldClearMountDisplayOnDeadNonPlayerUnit(WowGuid128 guid, ObjectType objectType, ObjectUpdate updateData, Dictionary<int, UpdateField> updates, int mountDisplayField)
+    {
+        if (updateData.UnitData.Health.GetValueOrDefault(-1) != 0)
+            return false;
+
+        if (guid.IsPlayer() ||
+            guid == GetSession().GameState.CurrentPlayerGuid ||
+            objectType == ObjectType.Player ||
+            objectType == ObjectType.ActivePlayer)
+            return false;
+
+        bool isNonPlayerUnit =
+            objectType == ObjectType.Unit ||
+            guid.GetHighType() == HighGuidType.Creature ||
+            guid.GetHighType() == HighGuidType.Pet ||
+            guid.GetHighType() == HighGuidType.Vehicle;
+        if (!isNonPlayerUnit)
+            return false;
+
+        int mountDisplayId = updateData.UnitData.MountDisplayID.GetValueOrDefault();
+        if (mountDisplayId == 0 && mountDisplayField >= 0 && updates.TryGetValue(mountDisplayField, out var cachedMountDisplay))
+            mountDisplayId = cachedMountDisplay.Int32Value;
+
+        return mountDisplayId != 0;
+    }
     
     private void StoreObjectUpdateInternal(WowGuid128 guid, ObjectType objectType, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, AuraUpdate auraUpdate, PowerUpdate? powerUpdate, bool isCreate, ObjectUpdate updateData)
     {
@@ -1893,6 +1919,12 @@ public partial class WorldClient
             if (UNIT_FIELD_MOUNTDISPLAYID >= 0 && updateMaskArray[UNIT_FIELD_MOUNTDISPLAYID])
             {
                 updateData.UnitData.MountDisplayID = updates[UNIT_FIELD_MOUNTDISPLAYID].Int32Value;
+            }
+            if (ShouldClearMountDisplayOnDeadNonPlayerUnit(guid, objectType, updateData, updates, UNIT_FIELD_MOUNTDISPLAYID))
+            {
+                updateData.UnitData.MountDisplayID = 0;
+                if (UNIT_FIELD_MOUNTDISPLAYID >= 0)
+                    updates[UNIT_FIELD_MOUNTDISPLAYID] = new UpdateField(0);
             }
             int UNIT_FIELD_MINDAMAGE = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_MINDAMAGE);
             if (UNIT_FIELD_MINDAMAGE >= 0 && updateMaskArray[UNIT_FIELD_MINDAMAGE])
