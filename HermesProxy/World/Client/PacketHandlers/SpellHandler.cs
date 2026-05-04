@@ -730,8 +730,9 @@ public partial class WorldClient
                 spell.Cast.SpellID = (int)pendingCast.SpellId;
 
             // For instant spells that skip SPELL_START, we need to send SpellPrepare
-            // before SpellGo so the client knows which cast completed
-            if (!pendingCast.HasStarted)
+            // before SpellGo so the client knows which cast completed.
+            // Off-GCD casts already sent SpellPrepare at forward time (HasSentPrepare).
+            if (!pendingCast.HasStarted && !pendingCast.HasSentPrepare)
             {
                 SpellPrepare prepare = new();
                 prepare.ClientCastID = pendingCast.ClientGUID;

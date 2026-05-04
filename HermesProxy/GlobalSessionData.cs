@@ -1478,6 +1478,8 @@ public class ClientCastRequest
     // Diagnostic only — used by spell.held_fire to compute hold duration. 0 if never held.
     public long HeldAtTickMs;
 
+    public bool HasSentPrepare;
+
     // JimsProxy: cast time (ms) reported by SMSG_SPELL_START. 0 means instant.
     // Distinguishes truly cast-time spells (Frostbolt, Polymorph) from instants that
     // *also* emit SMSG_SPELL_START on Kronos 1.12 (Arcane Explosion, Counterspell, etc.).

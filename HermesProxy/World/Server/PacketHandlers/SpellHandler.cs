@@ -385,6 +385,7 @@ public partial class WorldSocket
                 prepare.ClientCastID = castRequest.ClientGUID;
                 prepare.ServerCastID = castRequest.ServerGUID;
                 SendPacket(prepare);
+                castRequest.HasSentPrepare = true;
             }
         }
 
