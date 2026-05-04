@@ -375,6 +375,16 @@ public partial class WorldSocket
                 // Off-GCD path: still enqueue so SMSG_SPELL_GO can match back to the ClientGUID,
                 // but skip the cast-bar gate and the GCD hold.
                 GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
+
+                // Off-GCD spells bypass the hold system, so SpellPrepare must be sent now
+                // (on-GCD casts defer SpellPrepare to SPELL_START/SPELL_GO time to avoid
+                // premature GCD sweep). Without this, if the server rejects the cast (LoS,
+                // range), the client has no SpellPrepare to match against SpellFailure and
+                // the button stays in a pending/lit state permanently.
+                SpellPrepare prepare = new SpellPrepare();
+                prepare.ClientCastID = castRequest.ClientGUID;
+                prepare.ServerCastID = castRequest.ServerGUID;
+                SendPacket(prepare);
             }
         }
 
