@@ -35,6 +35,16 @@ public static class Settings
     // releases a held cast. 0 = fire exactly at expiry (cast lands ~RTT late at server).
     // Clamped to 0..50 in LoadAndVerifyFrom.
     public static int SpellCastEarlyFireOffsetMs;
+    // JimsProxy (unplanned-dc-auto-reconnect): when the legacy world server forcibly
+    // closes the proxy's TCP socket mid-session (anticheat, server crash, transient
+    // network reset), attempt one cached-session-key reconnect before giving up. If
+    // false, fall straight through to clean DC propagation (close modern InstanceSocket
+    // so the user sees "Disconnected" within a second instead of being stuck in a
+    // ghost world for tens of seconds).
+    public static bool EnableUnplannedReconnect;
+    // Hard timeout on the reconnect attempt — beyond this, abandon and propagate DC.
+    // Clamped to 1000..30000 in LoadAndVerifyFrom.
+    public static int UnplannedReconnectTimeoutMs;
 
     public static bool LoadAndVerifyFrom(ConfigurationParser config)
     {
@@ -61,6 +71,8 @@ public static class Settings
         StructuredLog = config.GetBoolean("StructuredLog", true);
         VerboseLog = config.GetBoolean("VerboseLog", false);
         SpellCastEarlyFireOffsetMs = Math.Clamp(config.GetInt("SpellCastEarlyFireOffsetMs", 0), 0, 50);
+        EnableUnplannedReconnect = config.GetBoolean("EnableUnplannedReconnect", true);
+        UnplannedReconnectTimeoutMs = Math.Clamp(config.GetInt("UnplannedReconnectTimeoutMs", 5000), 1000, 30000);
         Log.StructuredLogEnabled = StructuredLog;
         Log.VerboseLogEnabled = VerboseLog;
         // Open the JSONL file now so session.start's payload can include the full path.

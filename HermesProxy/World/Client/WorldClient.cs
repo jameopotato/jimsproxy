@@ -242,10 +242,16 @@ public partial class WorldClient
             // here, which tore down the entire BNet session including any newly-created
             // WorldClient for a different realm during a swap. Now: only null our slot
             // if it's still pointing at us (a fresh swap may have already replaced it
-            // with a new WorldClient — don't clobber that).
+            // with a new WorldClient — don't clobber that). Done via Interlocked.CompareExchange
+            // so HandleDisconnect and the ReceiveLoop catch can't both pass the check on the
+            // same TCP RST and race to spin up duplicate reconnects.
             var session = GetSession();
-            if (session != null && ReferenceEquals(session.WorldClient, this))
-                session.WorldClient = null;
+            bool wasActiveWorldClient = false;
+            if (session != null)
+            {
+                var prior = Interlocked.CompareExchange(ref session.WorldClient, null, this);
+                wasActiveWorldClient = ReferenceEquals(prior, this);
+            }
             Log.Event("session.ondisconnect.suppressed", new
             {
                 reason = "worldclient_legacy_disconnect",
@@ -253,7 +259,18 @@ public partial class WorldClient
                 last_opcode = _lastInboundOpcode.ToString(),
                 last_opcode_raw = _lastInboundOpcodeRaw,
                 ms_since_last_opcode = _lastInboundOpcodeTick == 0 ? -1 : Environment.TickCount - _lastInboundOpcodeTick,
+                was_active_world_client = wasActiveWorldClient,
             });
+            // JimsProxy (unplanned-dc-auto-reconnect): when this is a genuinely
+            // unplanned DC (we were the active client, no realm swap is replacing us),
+            // try one cached-key reconnect. If that fails, propagate cleanly to the
+            // modern client. Realm-swap path (wasActiveWorldClient == false) skips this
+            // — the new WorldClient is already in flight and will handle continuity.
+            // No exception to forward here — this path is hit on a clean read failure
+            // (zero bytes / FIN), not an exception. The reason string ("header"/"payload")
+            // is already in `session.ondisconnect.suppressed` as `disconnect_reason`.
+            if (wasActiveWorldClient)
+                session!.TryUnplannedReconnectAndPropagate(this);
         }
     }
 
@@ -308,8 +325,12 @@ public partial class WorldClient
                 Disconnect();
                 // JimsProxy realm-swap fix: see WorldClient.HandleDisconnect.
                 var session = GetSession();
-                if (session != null && ReferenceEquals(session.WorldClient, this))
-                    session.WorldClient = null;
+                bool wasActiveWorldClient = false;
+                if (session != null)
+                {
+                    var prior = Interlocked.CompareExchange(ref session.WorldClient, null, this);
+                    wasActiveWorldClient = ReferenceEquals(prior, this);
+                }
                 Log.Event("session.ondisconnect.suppressed", new
                 {
                     reason = "worldclient_receive_loop_exception",
@@ -318,7 +339,20 @@ public partial class WorldClient
                     last_opcode = _lastInboundOpcode.ToString(),
                     last_opcode_raw = _lastInboundOpcodeRaw,
                     ms_since_last_opcode = _lastInboundOpcodeTick == 0 ? -1 : Environment.TickCount - _lastInboundOpcodeTick,
+                    was_active_world_client = wasActiveWorldClient,
                 });
+                // JimsProxy (unplanned-dc-auto-reconnect): same logic as HandleDisconnect.
+                // Bundle 20260503-195159 showed Kronos PTR forcibly closing the proxy's
+                // TCP socket mid-combat (TCP RST, last_opcode SMSG_ON_MONSTER_MOVE), then
+                // 37s of frozen ghost world before the player gave up and logged out.
+                // Now: try one reconnect, fall back to clean DC. Forward the exception
+                // type/message and SocketError code so a JSONL bundle shows *why* the
+                // server cut us off (Warden mid-session vs network reset vs server crash).
+                if (wasActiveWorldClient)
+                {
+                    int? socketErrorCode = (e is SocketException se) ? (int)se.SocketErrorCode : null;
+                    session!.TryUnplannedReconnectAndPropagate(this, e.GetType().Name, e.Message, socketErrorCode);
+                }
             }
         }
     }

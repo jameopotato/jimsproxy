@@ -1843,6 +1843,248 @@ public class GlobalSessionData
         });
     }
 
+    // JimsProxy (unplanned-dc-auto-reconnect): handle a UNPLANNED legacy-side
+    // disconnect (server-initiated TCP RST or socket exception, NOT a realm swap)
+    // by attempting one cached-session-key reconnect. If reconnect succeeds within
+    // Settings.UnplannedReconnectTimeoutMs, the modern client never knows the gap
+    // happened. If it fails or times out, close the modern InstanceSocket cleanly
+    // so the user sees "Disconnected" within a second instead of being stuck in
+    // a ghost world for tens of seconds (the prior suppress-only behavior).
+    //
+    // The reconnect uses the same realmd session key the original WorldClient
+    // captured at connect time — Kronos/cmangos may or may not honor it depending
+    // on their session policy. If they reject it, the auth handshake fails and
+    // we fall through to clean DC.
+    //
+    // Heavy Log.Event coverage at every step so a JSONL bundle from a tester
+    // shows exactly where the reconnect path succeeded or failed (no repro needed
+    // to investigate). Bundle the reconnect attempt as a self-contained sequence
+    // tagged with a unique attempt_id so multiple attempts in a session can be
+    // correlated.
+    // Per-session guard: ensures only one reconnect attempt runs at a time even if
+    // HandleDisconnect and the ReceiveLoop catch fire simultaneously from the same TCP RST.
+    // 0 = idle, 1 = attempt in flight. Compare-and-swapped at entry; reset in finally.
+    private int _reconnectInProgress;
+
+    public void TryUnplannedReconnectAndPropagate(
+        World.Client.WorldClient deadClient,
+        string? originalExceptionType = null,
+        string? originalExceptionMessage = null,
+        int? originalSocketErrorCode = null)
+    {
+        var attemptId = Guid.NewGuid().ToString("N").Substring(0, 8);
+
+        // Race guard FIRST — HandleDisconnect and ReceiveLoop's catch can both fire from
+        // the same TCP RST on different threads. Only one wins the CAS; the loser exits
+        // immediately without re-emitting `detected`, propagating, or queueing a Task.
+        if (Interlocked.CompareExchange(ref _reconnectInProgress, 1, 0) != 0)
+        {
+            Framework.Logging.Log.Event("session.unplanned_reconnect.skipped_in_progress", new { attempt_id = attemptId });
+            return;
+        }
+
+        bool taskQueued = false;
+        try
+        {
+            var realm = RealmManager.GetRealm(RealmId);
+            var playerGuid = GameState?.CurrentPlayerGuid ?? default;
+
+            Framework.Logging.Log.Event("session.unplanned_dc.detected", new
+            {
+                attempt_id = attemptId,
+                realm_name = realm?.Name,
+                player_guid = playerGuid.ToString(),
+                has_authclient = AuthClient != null,
+                has_instance_socket = InstanceSocket != null,
+                reconnect_enabled = Framework.Settings.EnableUnplannedReconnect,
+                reconnect_timeout_ms = Framework.Settings.UnplannedReconnectTimeoutMs,
+                // JimsProxy: forward the underlying disconnect cause so a JSONL bundle shows
+                // *why* the legacy server cut us off, not just *that* it did. Helps spot
+                // patterns (mid-session Warden kicks, repeated RSTs after specific opcodes).
+                original_exception_type = originalExceptionType,
+                original_exception_message = originalExceptionMessage,
+                original_socket_error_code = originalSocketErrorCode,
+            });
+
+            if (!Framework.Settings.EnableUnplannedReconnect)
+            {
+                Framework.Logging.Log.Event("session.unplanned_reconnect.skipped_disabled", new { attempt_id = attemptId });
+                PropagateUnplannedDcToModern(attemptId, "reconnect_disabled");
+                return;
+            }
+
+            if (realm == null || playerGuid == default || AuthClient == null)
+            {
+                Framework.Logging.Log.Event("session.unplanned_reconnect.skipped_state", new
+                {
+                    attempt_id = attemptId,
+                    has_realm = realm != null,
+                    has_player_guid = playerGuid != default,
+                    has_authclient = AuthClient != null,
+                });
+                PropagateUnplannedDcToModern(attemptId, "missing_state");
+                return;
+            }
+
+            // Run the reconnect off the receive-loop thread so we don't block the catch.
+            // Ownership of _reconnectInProgress transfers to the Task — its finally resets it.
+            _ = System.Threading.Tasks.Task.Run(() =>
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                World.Client.WorldClient? newClient = null;
+                bool reconnectSucceeded = false;
+                try
+                {
+                    Framework.Logging.Log.Event("session.unplanned_reconnect.start", new
+                    {
+                        attempt_id = attemptId,
+                        realm_name = realm!.Name,
+                        realm_address = realm.ExternalAddress,
+                        realm_port = (int)realm.Port,
+                    });
+
+                    newClient = new World.Client.WorldClient();
+
+                    // Bound the connect+auth handshake by the configured timeout. ConnectToWorldServer
+                    // blocks until _isSuccessful is set; if the legacy server's listener is dead, the
+                    // OS-level TCP timeout (~21s on Windows) would otherwise stall us.
+                    var connectTask = System.Threading.Tasks.Task.Run(() => newClient.ConnectToWorldServer(realm, this));
+                    bool completed = connectTask.Wait(Framework.Settings.UnplannedReconnectTimeoutMs);
+                    if (!completed)
+                    {
+                        Framework.Logging.Log.Event("session.unplanned_reconnect.timeout", new
+                        {
+                            attempt_id = attemptId,
+                            elapsed_ms = sw.ElapsedMilliseconds,
+                            timeout_ms = Framework.Settings.UnplannedReconnectTimeoutMs,
+                        });
+                        PropagateUnplannedDcToModern(attemptId, "timeout");
+                        return;
+                    }
+                    bool authed = connectTask.Result;
+                    Framework.Logging.Log.Event("session.unplanned_reconnect.connect_completed", new
+                    {
+                        attempt_id = attemptId,
+                        elapsed_ms = sw.ElapsedMilliseconds,
+                        authed = authed,
+                    });
+                    if (!authed)
+                    {
+                        PropagateUnplannedDcToModern(attemptId, "auth_failed");
+                        return;
+                    }
+
+                    // CRITICAL: register the new client with the session BEFORE sending CMSG_PLAYER_LOGIN.
+                    // Modern→legacy CMSGs route via session.WorldClient (set null when the dead client
+                    // was unregistered in WorldClient.HandleDisconnect/ReceiveLoop). Without this,
+                    // any movement/cast/chat the player attempts after spawn-back is silently dropped,
+                    // AND a subsequent unplanned DC won't recover (the new client wouldn't pass the
+                    // `wasActiveWorldClient` check). Doing it before the login send also covers any
+                    // CMSGs the modern client emits between login-sent and the server's spawn burst.
+                    WorldClient = newClient;
+
+                    // Re-issue CMSG_PLAYER_LOGIN with the cached character GUID so the legacy
+                    // server places the character back in the world. The modern client's
+                    // InstanceSocket stays open across this — the legacy server's ensuing
+                    // SMSG_LOGIN_VERIFY_WORLD + spawn burst will be forwarded to the modern
+                    // client, which may visibly flash a loading screen or briefly desync.
+                    // That's acceptable vs the alternative (37s frozen world).
+                    var loginPacket = new World.WorldPacket(World.Enums.Opcode.CMSG_PLAYER_LOGIN);
+                    loginPacket.WriteGuid(playerGuid.To64());
+                    newClient.SendPacketToServer(loginPacket);
+
+                    Framework.Logging.Log.Event("session.unplanned_reconnect.player_login_sent", new
+                    {
+                        attempt_id = attemptId,
+                        elapsed_ms = sw.ElapsedMilliseconds,
+                        player_guid = playerGuid.ToString(),
+                    });
+
+                    Framework.Logging.Log.Event("session.unplanned_reconnect.success", new
+                    {
+                        attempt_id = attemptId,
+                        elapsed_ms = sw.ElapsedMilliseconds,
+                    });
+                    reconnectSucceeded = true;
+                }
+                catch (Exception ex)
+                {
+                    Framework.Logging.Log.Event("session.unplanned_reconnect.exception", new
+                    {
+                        attempt_id = attemptId,
+                        elapsed_ms = sw.ElapsedMilliseconds,
+                        exception_type = ex.GetType().Name,
+                        exception_message = ex.Message,
+                    });
+                    PropagateUnplannedDcToModern(attemptId, "exception");
+                }
+                finally
+                {
+                    // Release the in-progress flag so a future unplanned DC on this session
+                    // can attempt another reconnect.
+                    Volatile.Write(ref _reconnectInProgress, 0);
+
+                    // Close the orphaned newClient's socket on any failure path so it doesn't
+                    // linger in CLOSE_WAIT. On success the new client is the live one — leave it.
+                    if (!reconnectSucceeded && newClient != null)
+                    {
+                        try
+                        {
+                            newClient.Disconnect();
+                        }
+                        catch (Exception ex)
+                        {
+                            Framework.Logging.Log.Event("session.unplanned_reconnect.cleanup_error", new
+                            {
+                                attempt_id = attemptId,
+                                exception_type = ex.GetType().Name,
+                                exception_message = ex.Message,
+                            });
+                        }
+                    }
+                }
+            });
+            taskQueued = true;
+        }
+        finally
+        {
+            // If we returned without queueing the Task (disabled / missing state / threw),
+            // the Task's own finally never runs — release the flag here so future DCs aren't blocked.
+            if (!taskQueued)
+                Volatile.Write(ref _reconnectInProgress, 0);
+        }
+    }
+
+    // Close the modern client's InstanceSocket so the user sees "Disconnected"
+    // immediately rather than being stuck in a ghost world. Idempotent — safe to
+    // call even if InstanceSocket has already been torn down.
+    public void PropagateUnplannedDcToModern(string attemptId, string reason)
+    {
+        var socket = InstanceSocket;
+        Framework.Logging.Log.Event("session.unplanned_dc.propagated", new
+        {
+            attempt_id = attemptId,
+            reason = reason,
+            had_instance_socket = socket != null,
+        });
+        if (socket != null)
+        {
+            try
+            {
+                socket.CloseSocket();
+            }
+            catch (Exception ex)
+            {
+                Framework.Logging.Log.Event("session.unplanned_dc.close_error", new
+                {
+                    attempt_id = attemptId,
+                    exception_type = ex.GetType().Name,
+                    exception_message = ex.Message,
+                });
+            }
+        }
+    }
+
     public void OnDisconnect()
     {
         // JimsProxy: structured session.disconnect — emitted once per cleanup with snapshot
