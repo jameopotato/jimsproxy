@@ -491,35 +491,51 @@ public partial class WorldClient
         bool dequeued = false;
         bool wasStarted = false;
         bool foundActiveCastId = false;
-        // Local player/pet: PEEK (don't dequeue) — CAST_FAILED arrives ~5ms later and
-        // needs the pending cast still in the queue to dequeue, send CastFailed to the
-        // client, and fire any held GCD cast. Previously this dequeued, which consumed the
-        // entry before CAST_FAILED arrived — CAST_FAILED was silently dropped, the client
-        // never got the GCD-cancel signal, and the action bar stayed locked for 1.5s.
-        // Matches upstream Xian55/HermesProxy behavior (FirstOrDefault = peek).
+        // Local player: DEQUEUE and send CastFailed immediately. Kronos doesn't
+        // always follow SMSG_SPELL_FAILURE with SMSG_CAST_FAILED (e.g. target dies
+        // mid-cast). Previously this only peeked, relying on HandleCastFailed to
+        // dequeue — but when CAST_FAILED never arrived, the entry leaked with
+        // HasStarted=true, permanently blocking all non-off-GCD casts.
         if (GetSession().GameState.CurrentPlayerGuid == casterUnit &&
-            GetSession().GameState.PendingNormalCasts.FirstOrDefault(
-                c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId))
-            is { } pendingNormal)
+            GetSession().GameState.TryDequeuePendingNormalCast(spellId, out var pendingNormal))
         {
-            castId = pendingNormal.ServerGUID;
+            castId = pendingNormal!.ServerGUID;
             spellVisual = pendingNormal.SpellXSpellVisualId;
             if (pendingNormal.LegacySpellId != 0)
                 spellId = pendingNormal.SpellId;
             wasStarted = pendingNormal.HasStarted;
-            // Don't dequeue — let HandleCastFailed do it.
-            // Don't send SpellPrepare — HandleCastFailed handles that too.
+            dequeued = true;
+
+            if (!pendingNormal.HasStarted)
+            {
+                SpellPrepare prepare = new();
+                prepare.ClientCastID = pendingNormal.ClientGUID;
+                prepare.ServerCastID = pendingNormal.ServerGUID;
+                SendPacketToClient(prepare);
+            }
+
+            CastFailed failed = new();
+            failed.SpellID = pendingNormal.SpellId;
+            failed.SpellXSpellVisualID = pendingNormal.SpellXSpellVisualId;
+            failed.Reason = reason;
+            failed.CastID = pendingNormal.ServerGUID;
+            SendPacketToClient(failed);
         }
         else if (GetSession().GameState.CurrentPetGuid == casterUnit &&
-                 GetSession().GameState.PendingPetCasts.FirstOrDefault(
-                     c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId))
-                 is { } pendingPet)
+                 GetSession().GameState.TryDequeuePendingPetCast(spellId, out var pendingPet))
         {
-            castId = pendingPet.ServerGUID;
+            castId = pendingPet!.ServerGUID;
             spellVisual = pendingPet.SpellXSpellVisualId;
             if (pendingPet.LegacySpellId != 0)
                 spellId = pendingPet.SpellId;
             wasStarted = pendingPet.HasStarted;
+            dequeued = true;
+
+            PetCastFailed petFailed = new();
+            petFailed.SpellID = pendingPet.SpellId;
+            petFailed.Reason = reason;
+            petFailed.CastID = pendingPet.ServerGUID;
+            SendPacketToClient(petFailed);
         }
         else
         {
