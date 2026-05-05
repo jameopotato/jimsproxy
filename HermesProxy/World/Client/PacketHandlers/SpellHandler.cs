@@ -211,6 +211,7 @@ public partial class WorldClient
             SendPacketToClient(failed);
 
             var gameState = GetSession().GameState;
+            gameState.ClearHeldCastTimeCast();
             if (!gameState.IsGcdHoldActive() && !gameState.HasForwardedPendingCast())
             {
                 var heldCast = gameState.TakeHeldCastIfReady();
@@ -838,6 +839,17 @@ public partial class WorldClient
                     });
                     gameStateAfter.OnGcdHeldCastFire?.Invoke(heldCast);
                 }
+            }
+
+            var heldCastTime = gameStateAfter.TakeHeldCastTimeCast();
+            if (heldCastTime != null)
+            {
+                Log.Event("cast.held_fire_on_cast_complete", new
+                {
+                    completed_spell_id = spell.Cast.SpellID,
+                    held_spell_id = heldCastTime.SpellId,
+                });
+                gameStateAfter.OnGcdHeldCastFire?.Invoke(heldCastTime);
             }
         }
         else if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&

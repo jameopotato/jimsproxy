@@ -251,20 +251,35 @@ public partial class WorldSocket
             // 1.12 client would fire these mid-cast-bar and mid-GCD, so we match that.
             if (!isOffGcd)
             {
-                // Drop duplicate presses while a cast is started or in-flight.
-                // Send SpellPrepare + CastFailed(DontReport) to resolve the client's
-                // per-press pending button state without visible error toasts.
-                bool gateStarted = GetSession().GameState.HasStartedNormalCast();
-                bool gateInFlight = GetSession().GameState.HasInFlightNormalCastForSpell((uint)cast.Cast.SpellID);
-                if (gateStarted || gateInFlight)
+                // Guard: RTT-window duplicate — same spell forwarded but not yet started
+                if (GetSession().GameState.HasNonStartedPendingCastForSpell((uint)cast.Cast.SpellID))
                 {
                     Log.Event("cast.dropped.duplicate", new
                     {
                         spell_id = cast.Cast.SpellID,
-                        reason = gateInFlight ? "in_flight_same_spell_cast_spell" : "another_cast_started",
+                        reason = "in_flight_same_spell",
                         client_cast_id = cast.Cast.CastID.ToString(),
                         queue_depth = GetSession().GameState.PendingNormalCasts.Count,
                     });
+                    SendCastFailedWithoutPrepare(castRequest);
+                    return;
+                }
+
+                // Guard: cast-time spell in progress — hold (most-recent-wins, hidden queue)
+                if (GetSession().GameState.HasStartedNormalCast())
+                {
+                    WorldPacket heldPacket = BuildCastSpellPacket(cast);
+                    castRequest.HeldPacketForReplay = heldPacket;
+                    castRequest.HeldAtTickMs = Environment.TickCount64;
+                    var displaced = GetSession().GameState.HoldCastDuringCastTime(castRequest);
+                    Log.Event("cast.held_during_cast", new
+                    {
+                        spell_id = cast.Cast.SpellID,
+                        displaced_spell_id = displaced?.SpellId ?? 0,
+                        client_cast_id = castRequest.ClientGUID.ToString(),
+                    });
+                    if (displaced != null)
+                        SendCastFailedWithoutPrepare(displaced);
                     SendCastFailedWithoutPrepare(castRequest);
                     return;
                 }

@@ -164,6 +164,47 @@ public sealed class GameSessionData
     private uint _lastFiredSpellId;                     // spell ID forwarded by the timer; used to drop same-spell late presses
     public Action<ClientCastRequest>? OnGcdHeldCastFire; // set by WorldSocket at attach time; invoked on a ThreadPool thread at GCD expiry
 
+    // JimsProxy: cast-time spell queue. While a cast-time spell is in progress
+    // (HasStartedNormalCast), presses are held here instead of dropped. Fired
+    // on SPELL_GO when the cast completes. Most-recent-press-wins, one slot.
+    private ClientCastRequest? _heldCastTimeCast;
+
+    public ClientCastRequest? HoldCastDuringCastTime(ClientCastRequest cast)
+    {
+        lock (_gcdLock)
+        {
+            var displaced = _heldCastTimeCast;
+            _heldCastTimeCast = cast;
+            return displaced;
+        }
+    }
+
+    public ClientCastRequest? TakeHeldCastTimeCast()
+    {
+        lock (_gcdLock)
+        {
+            var cast = _heldCastTimeCast;
+            _heldCastTimeCast = null;
+            return cast;
+        }
+    }
+
+    public void ClearHeldCastTimeCast()
+    {
+        lock (_gcdLock) { _heldCastTimeCast = null; }
+    }
+
+    public bool HasNonStartedPendingCastForSpell(uint spellId)
+    {
+        foreach (var item in PendingNormalCasts)
+        {
+            if (!item.HasStarted &&
+                (item.SpellId == spellId || (item.LegacySpellId != 0 && item.LegacySpellId == spellId)))
+                return true;
+        }
+        return false;
+    }
+
     // JimsProxy: proxy→server RTT measurement for adaptive GCD fire offset.
     private readonly object _rttLock = new();
     private long _lastPingSendTickMs;
