@@ -385,6 +385,62 @@ public class ItemEnchantData
     public byte Slot;
 }
 
+// JimsProxy: modern client's "Full Scan" / GetAll request. Legacy 1.12 servers
+// have no equivalent — we synthesize the response by paginating internal
+// CMSG_AUCTION_LIST_ITEMS queries at the canonical 6s cooldown and assembling
+// the rows into one SMSG_AUCTION_REPLICATE_RESPONSE. See WorldSocket auction
+// handler for the orchestration and the auction.replicate.* JSONL events.
+class AuctionReplicateItems : ClientPacket
+{
+    public AuctionReplicateItems(WorldPacket packet) : base(packet) { }
+
+    public override void Read()
+    {
+        Auctioneer = _worldPacket.ReadPackedGuid128();
+        ChangeNumberGlobal = _worldPacket.ReadUInt32();
+        ChangeNumberCursor = _worldPacket.ReadUInt32();
+        ChangeNumberTombstone = _worldPacket.ReadUInt32();
+        Count = _worldPacket.ReadUInt32();
+        if (_worldPacket.HasBit())
+            TaintedBy = new();
+
+        if (TaintedBy != null)
+            TaintedBy.Read(_worldPacket);
+    }
+
+    public WowGuid128 Auctioneer;
+    public uint ChangeNumberGlobal;
+    public uint ChangeNumberCursor;
+    public uint ChangeNumberTombstone;
+    public uint Count;
+    public AddOnInfo TaintedBy = null!;
+}
+
+public class AuctionReplicateResponse : ServerPacket
+{
+    public AuctionReplicateResponse() : base(Opcode.SMSG_AUCTION_REPLICATE_RESPONSE) { }
+
+    public override void Write()
+    {
+        _worldPacket.WriteUInt32(Result);
+        _worldPacket.WriteUInt32(DesiredDelay);
+        _worldPacket.WriteUInt32(ChangeNumberGlobal);
+        _worldPacket.WriteUInt32(ChangeNumberCursor);
+        _worldPacket.WriteUInt32(ChangeNumberTombstone);
+        _worldPacket.WriteInt32(Items.Count);
+
+        foreach (AuctionItem item in Items)
+            item.Write(_worldPacket);
+    }
+
+    public uint Result;
+    public uint DesiredDelay = 6000;
+    public uint ChangeNumberGlobal;
+    public uint ChangeNumberCursor;
+    public uint ChangeNumberTombstone;
+    public List<AuctionItem> Items = new();
+}
+
 class AuctionSellItem : ClientPacket
 {
     public AuctionSellItem(WorldPacket packet) : base(packet) { }

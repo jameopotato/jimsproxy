@@ -5,11 +5,17 @@ using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 
 namespace HermesProxy.World.Client;
 
 public partial class WorldClient
 {
+    // JimsProxy: gap between proxy-internal CMSG_AUCTION_LIST_ITEMS during a Full
+    // Scan walk. 200ms slack above the canonical 6s vanilla cooldown so we never
+    // graze Kronos's per-session anti-flood drop (documented in Kronos AH cooldown
+    // memory: rapid AH queries silently drop and risk a session kick).
+    private const int AuctionReplicatePageGapMs = 6200;
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.MSG_AUCTION_HELLO)]
     void HandleAuctionHello(WorldPacket packet)
@@ -121,6 +127,23 @@ public partial class WorldClient
         if (auction.DesiredDelay < MinDesiredDelayMs)
             auction.DesiredDelay = MinDesiredDelayMs;
 
+        // JimsProxy: while a Full Scan / GetAll is in progress the proxy is the
+        // one driving the per-page CMSG_AUCTION_LIST_ITEMS — the modern client
+        // never sent these and must not see them. Accumulate instead, then
+        // either schedule the next page (if the page came back full) or
+        // finalize into one SMSG_AUCTION_REPLICATE_RESPONSE.
+        var gameState = GetSession().GameState;
+        bool replicating;
+        lock (gameState.AuctionReplicateLock)
+        {
+            replicating = gameState.AuctionReplicateInProgress;
+        }
+        if (replicating)
+        {
+            HandleReplicatePageResult(auction);
+            return;
+        }
+
         Log.Event("auction.list.result", new
         {
             items_returned = auction.Items.Count,
@@ -129,6 +152,149 @@ public partial class WorldClient
         });
 
         SendPacketToClient(auction);
+    }
+
+    private void HandleReplicatePageResult(AuctionListItemsResult page)
+    {
+        var gameState = GetSession().GameState;
+        int currentPage;
+        int totalSoFar;
+        WowGuid128 auctioneer;
+        bool isLastPage;
+
+        lock (gameState.AuctionReplicateLock)
+        {
+            // The session may have been aborted (logout / disconnect) while the
+            // legacy result was in flight — drop on the floor in that case.
+            if (!gameState.AuctionReplicateInProgress)
+                return;
+
+            gameState.AuctionReplicateAccumulator.AddRange(page.Items);
+            currentPage = gameState.AuctionReplicatePage;
+            totalSoFar = gameState.AuctionReplicateAccumulator.Count;
+            auctioneer = gameState.AuctionReplicateAuctioneer;
+
+            // Short page = server says "no more rows".
+            isLastPage = page.Items.Count < Server.WorldSocket.AuctionLegacyPageSize;
+
+            if (!isLastPage)
+                gameState.AuctionReplicatePage = currentPage + 1;
+        }
+
+        Log.Event("auction.replicate.page_received", new
+        {
+            page = currentPage,
+            items_in_page = page.Items.Count,
+            items_total = totalSoFar,
+            is_last = isLastPage,
+        });
+
+        if (isLastPage)
+        {
+            FinalizeReplicate();
+        }
+        else
+        {
+            // Periodic progress update — every 5 pages ≈ 30s on the 6s cooldown.
+            if ((currentPage + 1) % 5 == 0)
+            {
+                ChatPkt progress = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                    $"Full Scan: page {currentPage + 1}...");
+                SendPacketToClient(progress);
+            }
+            ScheduleNextReplicatePage(auctioneer, (uint)(currentPage + 1));
+        }
+    }
+
+    private void ScheduleNextReplicatePage(WowGuid128 auctioneer, uint nextPage)
+    {
+        Task.Delay(AuctionReplicatePageGapMs).ContinueWith(_ =>
+        {
+            try
+            {
+                var gameState = GetSession().GameState;
+                lock (gameState.AuctionReplicateLock)
+                {
+                    if (!gameState.AuctionReplicateInProgress)
+                        return;
+                }
+                var worldClient = GetSession().WorldClient;
+                if (worldClient == null || !worldClient.IsConnected())
+                {
+                    Log.Event("auction.replicate.aborted", new { reason = "world_client_disconnected" });
+                    AbortReplicate();
+                    return;
+                }
+                var socket = GetSession().InstanceSocket;
+                if (socket == null)
+                {
+                    Log.Event("auction.replicate.aborted", new { reason = "no_instance_socket" });
+                    AbortReplicate();
+                    return;
+                }
+                socket.SendReplicatePageQuery(auctioneer, nextPage);
+            }
+            catch (Exception ex)
+            {
+                Log.Event("auction.replicate.aborted", new { reason = "exception", message = ex.Message });
+                AbortReplicate();
+            }
+        });
+    }
+
+    private void FinalizeReplicate()
+    {
+        var gameState = GetSession().GameState;
+        AuctionReplicateResponse resp;
+        int finalCount;
+        int finalPage;
+        TimeSpan elapsed;
+
+        lock (gameState.AuctionReplicateLock)
+        {
+            if (!gameState.AuctionReplicateInProgress)
+                return;
+
+            resp = new AuctionReplicateResponse
+            {
+                Result = 0,
+                DesiredDelay = 6000,
+                ChangeNumberGlobal = gameState.AuctionReplicateChangeNumberGlobal,
+                ChangeNumberCursor = gameState.AuctionReplicateChangeNumberCursor,
+                ChangeNumberTombstone = gameState.AuctionReplicateChangeNumberTombstone,
+                Items = new List<AuctionItem>(gameState.AuctionReplicateAccumulator),
+            };
+            finalCount = resp.Items.Count;
+            finalPage = gameState.AuctionReplicatePage;
+            elapsed = DateTime.UtcNow - gameState.AuctionReplicateStartTime;
+            gameState.AuctionReplicateInProgress = false;
+            gameState.AuctionReplicateAccumulator.Clear();
+        }
+
+        SendPacketToClient(resp);
+
+        ChatPkt done = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+            $"Full Scan complete: {finalPage + 1} pages in {(long)elapsed.TotalSeconds}s.");
+        SendPacketToClient(done);
+
+        Log.Event("auction.replicate.complete", new
+        {
+            items = finalCount,
+            pages = finalPage + 1,
+            elapsed_seconds = (long)elapsed.TotalSeconds,
+        });
+    }
+
+    private void AbortReplicate()
+    {
+        var gameState = GetSession().GameState;
+        lock (gameState.AuctionReplicateLock)
+        {
+            if (!gameState.AuctionReplicateInProgress)
+                return;
+            gameState.AuctionReplicateInProgress = false;
+            gameState.AuctionReplicateAccumulator.Clear();
+        }
     }
 
     [PacketHandler(Opcode.SMSG_AUCTION_COMMAND_RESULT)]
