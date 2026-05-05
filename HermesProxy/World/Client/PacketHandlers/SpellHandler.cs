@@ -521,6 +521,8 @@ public partial class WorldClient
             failed.Reason = reason;
             failed.CastID = pendingNormal.ServerGUID;
             SendPacketToClient(failed);
+
+            GetSession().GameState.ClearHeldCastTimeCast();
         }
         else if (GetSession().GameState.CurrentPetGuid == casterUnit &&
                  GetSession().GameState.TryDequeuePendingPetCast(spellId, out var pendingPet))
