@@ -38,6 +38,20 @@ public partial class WorldClient
     uint _keepAlivePingSerial;
     const int KeepAliveIntervalMs = 30_000;
 
+    // JimsProxy silent-stall watchdog: if the legacy server stops delivering
+    // s2c traffic for this long while we're still sending keepalive pings,
+    // declare the WorldClient stale and trigger the unplanned-reconnect path.
+    // Bundle 20260505-131650 caught Twinstar going silent for 150s under
+    // Stormwind crowd load -- no FIN, no RST, just no data flowing -- which
+    // froze spell casts (waiting on SMSG_SPELL_GO that never came) while
+    // movement still worked client-side via extrapolation. The unplanned-
+    // reconnect path was wired but only fires on TCP RST/FIN; without a
+    // disconnect signal it never triggered, leaving the user in a ghost
+    // world until WoW itself crashed. 60s = 2 keepalive intervals + buffer;
+    // anything shorter risks false positives on transient hiccups, anything
+    // longer leaves the user staring at a frozen UI.
+    const int SilentStallThresholdMs = 60_000;
+
     // JimsProxy: last-inbound-opcode tracking for disconnect diagnostics. When
     // the legacy connection dies unexpectedly (zombie state, AFK DC), capturing
     // the most recent server-to-proxy opcode + its arrival tick narrows down
@@ -800,6 +814,72 @@ public partial class WorldClient
 
     private void SendKeepAlivePing(object? state)
     {
+        // Race guard: the timer's queued callback can still execute briefly
+        // after Disconnect() / StopKeepAliveTimer() races with it. Bail
+        // before we try to ping or trip the watchdog on a corpse.
+        if (!IsConnected() || _isSuccessful == false)
+            return;
+
+        // JimsProxy silent-stall watchdog: before sending the next keepalive
+        // ping, check whether the legacy server has gone silent on us. The
+        // existing reconnect path (HandleDisconnect / receive-loop catch)
+        // only fires on TCP RST/FIN; if Twinstar just stops sending data
+        // without closing, no disconnect ever fires and the player sits in
+        // a frozen ghost world. We piggyback on the keepalive timer rather
+        // than a dedicated watchdog timer to avoid extra timer churn -- if
+        // pings are firing, we're alive enough to check.
+        //
+        // Skip when _lastInboundOpcodeTick is still 0 (no s2c packets ever
+        // received -- mid-handshake, treat as alive).
+        if (_lastInboundOpcodeTick != 0)
+        {
+            int elapsedMs = Environment.TickCount - _lastInboundOpcodeTick;
+            if (elapsedMs > SilentStallThresholdMs)
+            {
+                Log.Event("session.worldclient.silent_stall_detected", new
+                {
+                    ms_since_last_inbound = elapsedMs,
+                    threshold_ms = SilentStallThresholdMs,
+                    last_opcode = _lastInboundOpcode.ToString(),
+                    last_opcode_raw = _lastInboundOpcodeRaw,
+                    keepalive_serial = _keepAlivePingSerial,
+                });
+
+                // Mirror the receive-loop disconnect path: take the slot if
+                // we still own it, then trigger the existing reconnect logic.
+                // CompareExchange so a racing HandleDisconnect on a real
+                // FIN arriving in the same window can't double-fire the
+                // reconnect (TryUnplannedReconnectAndPropagate also has its
+                // own CAS guard, but defense in depth is cheap).
+                var session = GetSession();
+                bool wasActiveWorldClient = false;
+                if (session != null)
+                {
+                    var prior = Interlocked.CompareExchange(ref session.WorldClient, null, this);
+                    wasActiveWorldClient = ReferenceEquals(prior, this);
+                }
+                try { Disconnect(); }
+                catch (Exception ex)
+                {
+                    Log.Event("session.worldclient.silent_stall_disconnect_error", new
+                    {
+                        exception_type = ex.GetType().Name,
+                        message = ex.Message,
+                    });
+                }
+                StopKeepAliveTimer();
+                if (wasActiveWorldClient && session != null)
+                {
+                    session.TryUnplannedReconnectAndPropagate(
+                        this,
+                        originalExceptionType: "SilentStall",
+                        originalExceptionMessage: $"No s2c packets for {elapsedMs}ms (threshold {SilentStallThresholdMs}ms)",
+                        originalSocketErrorCode: null);
+                }
+                return;
+            }
+        }
+
         uint serial = Interlocked.Increment(ref _keepAlivePingSerial);
         SendPing(serial | 0x80000000, 0);
     }
