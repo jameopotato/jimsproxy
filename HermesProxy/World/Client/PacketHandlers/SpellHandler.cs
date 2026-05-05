@@ -492,6 +492,26 @@ public partial class WorldClient
         bool dequeued = false;
         bool wasStarted = false;
         bool foundActiveCastId = false;
+
+        // JimsProxy: Twinstar's Spell::SendInterrupted hardcodes the wire reason
+        // byte to vanilla 0 (= classic AffectingCombat=1 after translation). For
+        // local-player/pet casts the real reason arrives ~1ms later in
+        // SMSG_CAST_FAILED, but the misleading "You are in combat" popup from
+        // SMSG_SPELL_FAILURE has already shown. Bundle 20260505-191020 caught
+        // this on a Mage casting Remove Lesser Curse with no curse to remove
+        // (real reason: AlreadyAtFullHealth). Override the broadcast reason to
+        // DontReport (classic 30) for local casts so the cast-bar / bow-draw
+        // dismiss still happens but no error popup fires; CastFailed (from
+        // either this path's inline send or HandleCastFailed) carries the real
+        // reason and renders the correct popup.
+        bool overrideReasonForLocalBroadcast = false;
+        bool skipBroadcastFailure = false;
+        // 1.14 needs SMSG_SPELL_FAILURE to retract the bow-draw / wand-aim visual
+        // for ranged auto-attacks (Auto Shot 75, Shoot 5019); CastFailed +
+        // CANCEL_AUTO_REPEAT alone leaves the bow stuck drawn. Other instants
+        // can drop the broadcast entirely -- there's no animation to cancel.
+        bool isRangedAutoAttack = spellId == 75 || spellId == 5019;
+
         // Local player: DEQUEUE and send CastFailed immediately. Kronos doesn't
         // always follow SMSG_SPELL_FAILURE with SMSG_CAST_FAILED (e.g. target dies
         // mid-cast). Previously this only peeked, relying on HandleCastFailed to
@@ -523,6 +543,15 @@ public partial class WorldClient
             SendPacketToClient(failed);
 
             GetSession().GameState.ClearHeldCastTimeCast();
+
+            // Instant cast that wasn't a ranged auto-attack: SPELL_START was
+            // never forwarded, so there's no cast bar to dismiss. CastFailed
+            // already cancelled GCD anticipation. Skip the misleading
+            // SpellFailure broadcast entirely.
+            if (!pendingNormal.HasStarted && !isRangedAutoAttack)
+                skipBroadcastFailure = true;
+            else
+                overrideReasonForLocalBroadcast = true;
         }
         else if (GetSession().GameState.CurrentPetGuid == casterUnit &&
                  GetSession().GameState.TryDequeuePendingPetCast(spellId, out var pendingPet))
@@ -539,6 +568,14 @@ public partial class WorldClient
             petFailed.Reason = reason;
             petFailed.CastID = pendingPet.ServerGUID;
             SendPacketToClient(petFailed);
+
+            // Pet path: PetCastFailed handles the pet UI. Suppress the broadcast
+            // SpellFailure for instants (no cast bar); for cast-time pet spells
+            // forward with DontReport so the bar dismisses without popup spam.
+            if (!pendingPet.HasStarted)
+                skipBroadcastFailure = true;
+            else
+                overrideReasonForLocalBroadcast = true;
         }
         else
         {
@@ -559,13 +596,17 @@ public partial class WorldClient
             spellVisual = GameData.GetSpellVisual(spellId);
         }
 
-        SpellFailure spell = new SpellFailure();
-        spell.CasterUnit = casterUnit;
-        spell.CastID = castId;
-        spell.SpellID = spellId;
-        spell.SpellXSpellVisualID = spellVisual;
-        spell.Reason = reason;
-        SendPacketToClient(spell);
+        byte broadcastReason = overrideReasonForLocalBroadcast ? (byte)SpellCastResultClassic.DontReport : reason;
+        if (!skipBroadcastFailure)
+        {
+            SpellFailure spell = new SpellFailure();
+            spell.CasterUnit = casterUnit;
+            spell.CastID = castId;
+            spell.SpellID = spellId;
+            spell.SpellXSpellVisualID = spellVisual;
+            spell.Reason = broadcastReason;
+            SendPacketToClient(spell);
+        }
 
         //MIRASU - Mirror the FAILED_OTHER interrupt synthesis for the broadcasted FAILURE path.
         //MIRASU   PvP scenario: you Counterspell an enemy player -> Kronos broadcasts
@@ -603,6 +644,10 @@ public partial class WorldClient
         {
             spellId,
             reason,
+            broadcast_reason = broadcastReason,
+            broadcast_skipped = skipBroadcastFailure,
+            broadcast_reason_overridden = overrideReasonForLocalBroadcast,
+            is_ranged_auto_attack = isRangedAutoAttack,
             isCaster = GetSession().GameState.CurrentPlayerGuid == casterUnit,
             isPetCaster = GetSession().GameState.CurrentPetGuid == casterUnit,
             dequeued,
