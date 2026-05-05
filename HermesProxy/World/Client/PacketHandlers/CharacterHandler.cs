@@ -370,6 +370,34 @@ public partial class WorldClient
         // the next character (or the same one re-logging in) starts clean.
         GetSession().ThreatTracker.Reset();
 
+        // JimsProxy (logout-wtf-flush follow-up): drop the session's reference
+        // to this WorldClient. The legacy server's world session for the
+        // outgoing character ends with SMSG_LOGOUT_COMPLETE; Twinstar closes
+        // its end of the world TCP shortly after. Because 861c9a5 keeps the
+        // BNet/InstanceSocket alive across logout, the next char-login arrives
+        // as CMSG_AUTH_CONTINUED_SESSION, which does NOT run the WorldClient-
+        // creation code in WorldSocket.HandleAuthSession. Without this nulling,
+        // HandlePlayerLogin's null-check would see the stale-but-not-yet-closed
+        // legacy connection, forward CMSG_PLAYER_LOGIN into a doomed socket,
+        // and either time out at "Enter World" with WOW51900309 or — worse —
+        // get the modern client into the world over the dying connection and
+        // NRE at ChatHandler.cs:227 the moment the player /says.
+        //
+        // We deliberately do NOT call Disconnect() here: this handler is
+        // running on the receive thread we'd be tearing down, which races the
+        // loop's own exit-via-disconnect path. Letting Twinstar close on its
+        // end is safer; the receive loop drains via the existing
+        // session.ondisconnect.suppressed path with was_active_world_client=false
+        // (we already nulled the slot, so its CompareExchange no-ops).
+        var droppedWorldClient = GetSession().WorldClient;
+        GetSession().WorldClient = null;
+        Log.Event("session.logout_complete.worldclient_dropped", new
+        {
+            had_world_client = droppedWorldClient != null,
+            was_connected = droppedWorldClient?.IsConnected() ?? false,
+            was_authenticated = droppedWorldClient?.IsAuthenticated() ?? false,
+        });
+
         // JimsProxy WTF-flush fix: capture the InstanceSocket reference and
         // hand it to a delayed safety-net close. Drop the session's reference
         // immediately so any subsequent send-on-this-socket path nulls out

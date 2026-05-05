@@ -186,11 +186,72 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_PLAYER_LOGIN)]
     void HandlePlayerLogin(PlayerLogin playerLogin)
     {
+        // JimsProxy (logout-wtf-flush follow-up): on every char-login after
+        // the first one in a session — including same-char relogs — the
+        // session's WorldClient slot is null (SMSG_LOGOUT_COMPLETE drops it,
+        // see World/Client/PacketHandlers/CharacterHandler.cs::HandleLogoutComplete).
+        // Re-establish a fresh legacy world session here. Mirrors a direct
+        // 1.12 client ↔ 1.12 server connection, which opens a new world TCP
+        // per character. The first login of a session falls through this
+        // block — WorldClient is already set up by WorldSocket.HandleAuthSession.
         if (GetSession().WorldClient == null || !GetSession().WorldClient!.IsConnected())
         {
-            Log.Print(LogType.Error, "WorldClient is disconnected, cannot enter world.");
-            AbortLogin(LoginFailureReason.NoWorld);
-            return;
+            Log.Event("session.relogin.worldclient_recreate_attempt", new
+            {
+                had_world_client = GetSession().WorldClient != null,
+                was_connected = GetSession().WorldClient?.IsConnected() ?? false,
+                was_authenticated = GetSession().WorldClient?.IsAuthenticated() ?? false,
+                target_guid_low = playerLogin.Guid.GetCounter(),
+            });
+
+            var reloginRealm = GetSession().RealmManager.GetRealm(GetSession().RealmId);
+            if (reloginRealm == null)
+            {
+                Log.Print(LogType.Error, $"HandlePlayerLogin: cannot recreate WorldClient — unknown realm id {GetSession().RealmId}");
+                Log.Event("session.relogin.worldclient_recreate_failed", new
+                {
+                    reason = "unknown_realm",
+                    realm_id_index = (int)GetSession().RealmId.Index,
+                });
+                AbortLogin(LoginFailureReason.NoWorld);
+                return;
+            }
+
+            // Tear down a stale-but-not-yet-disconnected leftover before
+            // overwriting the slot, so its receive-loop exit path doesn't
+            // race the new client onto session.WorldClient. Disconnect()
+            // is idempotent on already-closed sockets.
+            var staleWorldClient = GetSession().WorldClient;
+            if (staleWorldClient != null)
+            {
+                try { staleWorldClient.Disconnect(); }
+                catch (Exception ex)
+                {
+                    Log.Event("session.relogin.stale_worldclient_disconnect_error", new
+                    {
+                        exception_type = ex.GetType().Name,
+                        message = ex.Message,
+                    });
+                }
+            }
+
+            var reconnectStopwatch = System.Diagnostics.Stopwatch.StartNew();
+            GetSession().WorldClient = new World.Client.WorldClient();
+            bool reloginConnected = GetSession().WorldClient!.ConnectToWorldServer(reloginRealm, GetSession());
+            Log.Event("session.relogin.worldclient_recreated", new
+            {
+                realm_name = reloginRealm.Name,
+                connected = reloginConnected,
+                authenticated = GetSession().WorldClient?.IsAuthenticated() ?? false,
+                elapsed_ms = reconnectStopwatch.ElapsedMilliseconds,
+            });
+            if (!reloginConnected)
+            {
+                Log.Print(LogType.Error, "HandlePlayerLogin: failed to recreate WorldClient on re-login.");
+                GetSession().WorldClient = null;
+                AbortLogin(LoginFailureReason.NoWorld);
+                return;
+            }
         }
 
         if (!GetSession().GameState.CachedPlayers.TryGetValue(playerLogin.Guid, out var selectedChar))
