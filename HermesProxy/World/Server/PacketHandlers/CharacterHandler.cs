@@ -186,21 +186,29 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_PLAYER_LOGIN)]
     void HandlePlayerLogin(PlayerLogin playerLogin)
     {
-        // JimsProxy (logout-wtf-flush follow-up): on every char-login after
-        // the first one in a session — including same-char relogs — the
-        // session's WorldClient slot is null (SMSG_LOGOUT_COMPLETE drops it,
-        // see World/Client/PacketHandlers/CharacterHandler.cs::HandleLogoutComplete).
-        // Re-establish a fresh legacy world session here. Mirrors a direct
-        // 1.12 client ↔ 1.12 server connection, which opens a new world TCP
-        // per character. The first login of a session falls through this
-        // block — WorldClient is already set up by WorldSocket.HandleAuthSession.
-        if (GetSession().WorldClient == null || !GetSession().WorldClient!.IsConnected())
+        // JimsProxy (logout-wtf-flush follow-up): recreate WorldClient if
+        //   (a) it's null/disconnected (defensive), OR
+        //   (b) the prior character's logout marked the session for a fresh
+        //       world TCP (WorldClientNeedsRecreateOnNextLogin).
+        // Twinstar accepts a second CMSG_PLAYER_LOGIN on the existing world
+        // TCP -- the LOGIN_VERIFY_WORLD comes back fine -- but then drops
+        // the connection a few seconds into the new character's session,
+        // leaving session.WorldClient null mid-game and NRE'ing the next
+        // /say at ChatHandler.cs:227. Mirror direct 1.12 client ↔ 1.12
+        // server (one world TCP per character). The first login of a
+        // session takes neither branch: WorldClient is alive from
+        // WorldSocket.HandleAuthSession and the recreate flag isn't set.
+        bool needsRecreate = GetSession().WorldClient == null
+            || !GetSession().WorldClient!.IsConnected()
+            || GetSession().WorldClientNeedsRecreateOnNextLogin;
+        if (needsRecreate)
         {
             Log.Event("session.relogin.worldclient_recreate_attempt", new
             {
                 had_world_client = GetSession().WorldClient != null,
                 was_connected = GetSession().WorldClient?.IsConnected() ?? false,
                 was_authenticated = GetSession().WorldClient?.IsAuthenticated() ?? false,
+                marked_by_logout = GetSession().WorldClientNeedsRecreateOnNextLogin,
                 target_guid_low = playerLogin.Guid.GetCounter(),
             });
 
@@ -217,7 +225,7 @@ public partial class WorldSocket
                 return;
             }
 
-            // Tear down a stale-but-not-yet-disconnected leftover before
+            // Tear down the existing client (alive or stale) before
             // overwriting the slot, so its receive-loop exit path doesn't
             // race the new client onto session.WorldClient. Disconnect()
             // is idempotent on already-closed sockets.
@@ -252,6 +260,7 @@ public partial class WorldSocket
                 AbortLogin(LoginFailureReason.NoWorld);
                 return;
             }
+            GetSession().WorldClientNeedsRecreateOnNextLogin = false;
         }
 
         if (!GetSession().GameState.CachedPlayers.TryGetValue(playerLogin.Guid, out var selectedChar))

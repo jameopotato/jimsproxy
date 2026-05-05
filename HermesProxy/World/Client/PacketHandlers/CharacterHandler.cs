@@ -370,32 +370,31 @@ public partial class WorldClient
         // the next character (or the same one re-logging in) starts clean.
         GetSession().ThreatTracker.Reset();
 
-        // JimsProxy (logout-wtf-flush follow-up): drop the session's reference
-        // to this WorldClient. The legacy server's world session for the
-        // outgoing character ends with SMSG_LOGOUT_COMPLETE; Twinstar closes
-        // its end of the world TCP shortly after. Because 861c9a5 keeps the
-        // BNet/InstanceSocket alive across logout, the next char-login arrives
-        // as CMSG_AUTH_CONTINUED_SESSION, which does NOT run the WorldClient-
-        // creation code in WorldSocket.HandleAuthSession. Without this nulling,
-        // HandlePlayerLogin's null-check would see the stale-but-not-yet-closed
-        // legacy connection, forward CMSG_PLAYER_LOGIN into a doomed socket,
-        // and either time out at "Enter World" with WOW51900309 or — worse —
-        // get the modern client into the world over the dying connection and
-        // NRE at ChatHandler.cs:227 the moment the player /says.
+        // JimsProxy (logout-wtf-flush follow-up): mark the session so the next
+        // CMSG_PLAYER_LOGIN tears down and recreates WorldClient. Twinstar
+        // accepts a second CMSG_PLAYER_LOGIN on the existing world TCP (the
+        // LOGIN_VERIFY_WORLD comes back fine) but then drops the connection
+        // a few seconds into the new character's session, leaving
+        // session.WorldClient null mid-game. The first observed symptom was
+        // an NRE at ChatHandler.cs:227 the moment the player /said; the
+        // second was WOW51900309 at "Enter World" if the legacy socket died
+        // before HandlePlayerLogin could forward CMSG_PLAYER_LOGIN.
         //
-        // We deliberately do NOT call Disconnect() here: this handler is
-        // running on the receive thread we'd be tearing down, which races the
-        // loop's own exit-via-disconnect path. Letting Twinstar close on its
-        // end is safer; the receive loop drains via the existing
-        // session.ondisconnect.suppressed path with was_active_world_client=false
-        // (we already nulled the slot, so its CompareExchange no-ops).
-        var droppedWorldClient = GetSession().WorldClient;
-        GetSession().WorldClient = null;
-        Log.Event("session.logout_complete.worldclient_dropped", new
+        // We do NOT null WorldClient here: the modern client transitions to
+        // char-select during the InstanceSocket hold below, and char-select
+        // forwards CMSG_ENUM_CHARACTERS / CMSG_QUERY_PLAYER_NAME / etc.
+        // through the same WorldClient. Nulling here means those queries
+        // get silently dropped, the modern client never receives
+        // SMSG_ENUM_CHARACTERS_RESULT, and after ~12s of waiting it sends
+        // CMSG_LOG_DISCONNECT and quits to the login screen. Bundle
+        // 20260505-130649 reproduced exactly that regression. The flag is
+        // cleared in WorldSocket.HandlePlayerLogin after the recreate.
+        GetSession().WorldClientNeedsRecreateOnNextLogin = true;
+        Log.Event("session.logout_complete.worldclient_recreate_marked", new
         {
-            had_world_client = droppedWorldClient != null,
-            was_connected = droppedWorldClient?.IsConnected() ?? false,
-            was_authenticated = droppedWorldClient?.IsAuthenticated() ?? false,
+            had_world_client = GetSession().WorldClient != null,
+            was_connected = GetSession().WorldClient?.IsConnected() ?? false,
+            was_authenticated = GetSession().WorldClient?.IsAuthenticated() ?? false,
         });
 
         // JimsProxy WTF-flush fix: capture the InstanceSocket reference and

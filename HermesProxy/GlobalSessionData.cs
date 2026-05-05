@@ -1588,6 +1588,16 @@ public class GlobalSessionData
     public WorldSocket InstanceSocket = null!;
     public AuthClient AuthClient = null!;
     public WorldClient? WorldClient;
+    // JimsProxy: set true on SMSG_LOGOUT_COMPLETE so the next CMSG_PLAYER_LOGIN
+    // tears down and recreates WorldClient. Twinstar accepts a second
+    // CMSG_PLAYER_LOGIN on the same world TCP (the LOGIN_VERIFY_WORLD comes
+    // back fine) but then closes the connection a few seconds into the new
+    // character's session — leaving session.WorldClient null mid-game. We
+    // can't drop the WorldClient at LOGOUT_COMPLETE itself because char-select
+    // (CMSG_ENUM_CHARACTERS / CMSG_QUERY_PLAYER_NAME / etc.) is forwarded over
+    // the same WorldClient and needs it alive until the user picks a char.
+    // Cleared after the recreate succeeds.
+    public bool WorldClientNeedsRecreateOnNextLogin;
     public SniffFile ModernSniff = null!;
 
     public Dictionary<string, WowGuid128> GuildsByName = [];
