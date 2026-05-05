@@ -1593,10 +1593,16 @@ public class GlobalSessionData
     public Dictionary<string, WowGuid128> GuildsByName = [];
     public Dictionary<uint, List<string>> GuildRanks = [];
 
+    // JimsProxy threat translation: per-session threat calculator. Vanilla 1.12
+    // doesn't broadcast threat; this engine observes combat events and synthesizes
+    // SMSG_THREAT_UPDATE so the modern client's native threat APIs populate.
+    public ThreatTracker ThreatTracker = null!;
+
     public GlobalSessionData()
     {
         GameState = GameSessionData.CreateNewGameSessionData(this);
         AuthClient = new AuthClient(this);
+        ThreatTracker = new ThreatTracker(this);
     }
 
     public void StoreGuildRankNames(uint guildId, List<string> ranks)
@@ -2182,6 +2188,9 @@ public class GlobalSessionData
         }
 
         GameState = GameSessionData.CreateNewGameSessionData(this);
+        // Threat lists are tied to the previous character's mob/unit GUIDs;
+        // wipe so the new login starts clean.
+        ThreatTracker.Reset();
     }
 
     public void SendHermesTextMessage(string message, bool isError = false)

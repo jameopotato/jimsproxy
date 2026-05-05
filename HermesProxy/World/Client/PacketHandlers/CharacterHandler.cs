@@ -351,6 +351,9 @@ public partial class WorldClient
         GetSession().SnapshotQuestItemProgressForRestore();
         GetSession().FlushQuestItemProgressToDisk();
         GetSession().GameState = GameSessionData.CreateNewGameSessionData(GetSession());
+        // Threat lists were keyed off the outgoing character's GUIDs; wipe so
+        // the next character (or the same one re-logging in) starts clean.
+        GetSession().ThreatTracker.Reset();
         GetSession().InstanceSocket.CloseSocket();
         GetSession().InstanceSocket = null!;
     }

@@ -943,6 +943,13 @@ public partial class WorldClient
         }
 
         SendPacketToClient(spell);
+
+        // JimsProxy threat translation: route Hunter / Pet / class abilities
+        // through the threat tracker so SMSG_THREAT_UPDATE reflects the cast.
+        // Done after SendPacketToClient so the SpellGo arrives first and any
+        // resulting THREAT_UPDATE follows it on the wire (matches the
+        // server-driven ordering the modern client expects).
+        GetSession().ThreatTracker.OnSpellCast(spell.Cast.CasterUnit, spell.Cast.SpellID, spell.Cast.HitTargets);
     }
 
     SpellCastData HandleSpellStartOrGo(WorldPacket packet, bool isSpellGo)
@@ -1331,6 +1338,11 @@ public partial class WorldClient
         }
 
         SendPacketToClient(spell);
+
+        // Threat translation: feed spell damage (direct hit) into the tracker.
+        // Pass the spell id so the per-ability damage multiplier (Maul x1.75,
+        // Earth Shock x2, Holy Nova x0, etc.) can apply.
+        GetSession().ThreatTracker.OnDamage(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, spell.Damage);
     }
 
     [PacketHandler(Opcode.SMSG_SPELL_EXECUTE_LOG)]
@@ -1530,6 +1542,15 @@ public partial class WorldClient
         });
 
         SendPacketToClient(spell);
+
+        // Threat translation: heal threat = 0.5 x effective heal, distributed
+        // across every mob in combat with the heal target. Overheal generates
+        // no threat — feed only the effective amount.
+        long effectiveHeal = (long)spell.HealAmount - (long)spell.OverHeal;
+        if (effectiveHeal > 0)
+        {
+            GetSession().ThreatTracker.OnHeal(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, effectiveHeal);
+        }
     }
 
     // Computes overhealing for a heal event by looking up the target's current HP
@@ -1686,6 +1707,35 @@ public partial class WorldClient
             }
         }
         SendPacketToClient(spell);
+
+        // Threat translation: feed periodic damage (DoT ticks) into the tracker.
+        // Sum the damage portion of all PeriodicDamage / PeriodicDamagePercent
+        // effect entries; heal ticks generate heal threat instead.
+        double dotDamage = 0;
+        double hotHeal = 0;
+        foreach (var effect in spell.Effects)
+        {
+            if (effect.Effect == (uint)AuraType.PeriodicDamage ||
+                effect.Effect == (uint)AuraType.PeriodicDamagePercent)
+            {
+                dotDamage += effect.Amount;
+            }
+            else if (effect.Effect == (uint)AuraType.PeriodicHeal)
+            {
+                hotHeal += effect.Amount;
+            }
+        }
+        if (dotDamage > 0)
+        {
+            GetSession().ThreatTracker.OnDamage(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, dotDamage);
+        }
+        if (hotHeal > 0)
+        {
+            // HoT ticks don't carry overheal info on the wire, so we feed
+            // the raw amount. Slight overcount when the target is at max hp;
+            // acceptable at this stage.
+            GetSession().ThreatTracker.OnHeal(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, hotHeal);
+        }
     }
 
     [PacketHandler(Opcode.SMSG_SPELL_ENERGIZE_LOG)]
@@ -1762,6 +1812,13 @@ public partial class WorldClient
 
         spell.SchoolMask = school;
         SendPacketToClient(spell);
+
+        // Threat translation: damage-shield reflects (Thorns, Retribution Aura,
+        // Lightning Shield) generate threat to the attacker who hit us. The
+        // CasterGUID here is whoever owns the shield (us or our pet), the
+        // VictimGUID is the attacker who got reflected on. Pass the shield
+        // spell id so Holy Shield (x1.2) and friends pick up the right mult.
+        GetSession().ThreatTracker.OnDamage(spell.CasterGUID, spell.VictimGUID, (int)spell.SpellID, spell.Damage);
     }
 
     [PacketHandler(Opcode.SMSG_ENVIRONMENTAL_DAMAGE_LOG)]

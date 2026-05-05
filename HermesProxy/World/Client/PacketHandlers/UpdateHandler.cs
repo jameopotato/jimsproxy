@@ -51,6 +51,13 @@ public partial class WorldClient
         UpdateObject updateObject = new UpdateObject(GetSession().GameState);
         updateObject.DestroyedGuids.Add(guid);
         SendPacketToClient(updateObject);
+
+        // Threat translation: when a unit despawns / dies / leaves the player's
+        // visibility, drop any threat list keyed off it (it was a mob we tracked)
+        // and any entries it held on other mobs (it was a player/pet who left
+        // the fight). The first call emits SMSG_THREAT_CLEAR; the loop emits
+        // per-mob updates so the modern client's threat APIs go quiet.
+        GetSession().ThreatTracker.OnUnitDestroyed(guid);
     }
 
     [PacketHandler(Opcode.SMSG_COMPRESSED_UPDATE_OBJECT)]

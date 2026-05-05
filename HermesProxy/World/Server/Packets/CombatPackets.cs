@@ -339,3 +339,97 @@ class PartyKillLog : ServerPacket, ISpanWritable
     public WowGuid128 Player;
     public WowGuid128 Victim;
 }
+
+// JimsProxy: synthesized threat opcodes. The 1.12 vanilla legacy server does not
+// broadcast threat data over the wire — threat tables are server-side internal
+// state. The proxy calculates threat client-side (port of LibThreatClassic2) and
+// emits these modern SMSG packets so the 1.14 client's native threat APIs
+// (UnitThreatSituation, UnitDetailedThreatSituation, UNIT_THREAT_LIST_UPDATE
+// event) populate, which in turn drives addons like Details TinyThreat and
+// Threat Plates without any addon-side modification.
+//
+// Wire format follows TrinityCore Classic 1.14 convention:
+//   PackedGuid128 unitGUID
+//   uint32 count
+//   foreach threater:
+//     PackedGuid128 threaterGUID
+//     int64 threat  <-- 8 BYTES, not 4. Modern protocol uses int64 even though
+//                       practical threat values fit in 32 bits; reading 4 here
+//                       causes the client to gobble the next entry's GUID-mask
+//                       bytes into the high dword and produce billions-scale
+//                       garbage values. Verified against TrinityCore master
+//                       and Frostshake/TrinityCoreClassic 1.14.0.40618.
+//
+// Note that the modern protocol packs threat values × 100 (Classic Era addons
+// divide by 100 on read), so emitters must scale up before writing.
+public class ThreatInfo
+{
+    public WowGuid128 ThreaterGUID;
+    public long Threat; // raw threat × 100, on-wire int64
+}
+
+public class ThreatUpdatePkt : ServerPacket
+{
+    public ThreatUpdatePkt() : base(Opcode.SMSG_THREAT_UPDATE) { }
+
+    public override void Write()
+    {
+        _worldPacket.WritePackedGuid128(UnitGUID);
+        _worldPacket.WriteUInt32((uint)ThreatList.Count);
+        foreach (var info in ThreatList)
+        {
+            _worldPacket.WritePackedGuid128(info.ThreaterGUID);
+            _worldPacket.WriteInt64(info.Threat);
+        }
+    }
+
+    public WowGuid128 UnitGUID;                    // the threatened entity (mob)
+    public List<ThreatInfo> ThreatList = new();    // threaters (players/pets) and their threat × 100
+}
+
+public class HighestThreatUpdatePkt : ServerPacket
+{
+    public HighestThreatUpdatePkt() : base(Opcode.SMSG_HIGHEST_THREAT_UPDATE) { }
+
+    public override void Write()
+    {
+        _worldPacket.WritePackedGuid128(UnitGUID);
+        _worldPacket.WritePackedGuid128(HighestThreatGUID);
+        _worldPacket.WriteUInt32((uint)ThreatList.Count);
+        foreach (var info in ThreatList)
+        {
+            _worldPacket.WritePackedGuid128(info.ThreaterGUID);
+            _worldPacket.WriteInt64(info.Threat);
+        }
+    }
+
+    public WowGuid128 UnitGUID;                    // the threatened entity (mob)
+    public WowGuid128 HighestThreatGUID;            // the new top threater
+    public List<ThreatInfo> ThreatList = new();
+}
+
+public class ThreatRemovePkt : ServerPacket
+{
+    public ThreatRemovePkt() : base(Opcode.SMSG_THREAT_REMOVE) { }
+
+    public override void Write()
+    {
+        _worldPacket.WritePackedGuid128(UnitGUID);
+        _worldPacket.WritePackedGuid128(AboutGUID);
+    }
+
+    public WowGuid128 UnitGUID;     // the threatened entity (mob)
+    public WowGuid128 AboutGUID;    // the threater being removed from the mob's threat list
+}
+
+public class ThreatClearPkt : ServerPacket
+{
+    public ThreatClearPkt() : base(Opcode.SMSG_THREAT_CLEAR) { }
+
+    public override void Write()
+    {
+        _worldPacket.WritePackedGuid128(UnitGUID);
+    }
+
+    public WowGuid128 UnitGUID;     // the entity whose threat list is being cleared
+}
