@@ -1179,7 +1179,9 @@ public sealed class GameSessionData
     {
         lock (_gcdLock)
         {
-            return _gcdTimerHasFired && _lastFiredSpellId == spellId;
+            return _gcdTimerHasFired &&
+                   _lastFiredSpellId == spellId &&
+                   _gcdExpireTimestampMs > Environment.TickCount64;
         }
     }
 
