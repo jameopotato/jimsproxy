@@ -1,3 +1,9 @@
+#May-6-2026
+Please update proxy to latest 5.1.0-hotfix.1 or beta 5.1.1-beta.5 for the realm swap hotfix. 
+Alternatively, without updating, you can delete the last_character.txt file from the Hermes/AccountData/[your account name]/ folder which client and proxy are closed.
+
+
+
 # JimsProxy
 
 A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesProxy) (archived November 2024) with rich diagnostic logging and fixes targeting Twinstar/Kronos servers.
