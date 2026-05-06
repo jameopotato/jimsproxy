@@ -71,7 +71,7 @@ public static class Settings
         StructuredLog = config.GetBoolean("StructuredLog", true);
         VerboseLog = config.GetBoolean("VerboseLog", false);
         SpellCastEarlyFireOffsetMs = Math.Clamp(config.GetInt("SpellCastEarlyFireOffsetMs", 0), 0, 50);
-        EnableUnplannedReconnect = config.GetBoolean("EnableUnplannedReconnect", true);
+        EnableUnplannedReconnect = config.GetBoolean("EnableUnplannedReconnect", false);
         UnplannedReconnectTimeoutMs = Math.Clamp(config.GetInt("UnplannedReconnectTimeoutMs", 5000), 1000, 30000);
         Log.StructuredLogEnabled = StructuredLog;
         Log.VerboseLogEnabled = VerboseLog;

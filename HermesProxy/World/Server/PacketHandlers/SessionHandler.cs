@@ -12,7 +12,6 @@ using Framework.Web;
 using Google.Protobuf;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Server.Packets;
-using AuthResult = HermesProxy.Auth.AuthResult;
 
 namespace HermesProxy.World.Server;
 
@@ -24,51 +23,17 @@ public partial class WorldSocket
         ChangeRealmTicketResponse response = new();
         response.Token = request.Token;
 
-        // JimsProxy: realm-swap diagnostics. CHANGE_REALM_TICKET is the modern client's
-        // signal that it intends to (re)select a realm — fires both on initial pick from
-        // the realm list and on any subsequent swap (e.g. PTR↔Live). The Reconnect()
-        // below only runs if AuthClient is currently disconnected; if it's still alive
-        // the ticket reuses the existing SRP-derived session key. The session key prefix
-        // before/after lets us see whether a fresh SRP key was actually derived, since
-        // the new realm will reject reuse of the prior realm's key.
-        bool authWasConnected = GetSession().AuthClient != null && GetSession().AuthClient.IsConnected();
-        string keyBefore = SafeAuthKeyPrefix(GetSession().AuthClient);
-        bool reconnectAttempted = false;
-        string? reconnectResult = null;
-
-        if (GetSession().AuthClient != null && !GetSession().AuthClient.IsConnected())
-        {
-            reconnectAttempted = true;
-            var rc = GetSession().AuthClient.Reconnect();
-            reconnectResult = rc.ToString();
-            if (rc != AuthResult.SUCCESS)
-            {
-                Log.Event("realm.swap.change_ticket", new
-                {
-                    phase = "reconnect_failed",
-                    auth_was_connected = authWasConnected,
-                    reconnect_attempted = reconnectAttempted,
-                    reconnect_result = reconnectResult,
-                    auth_key_prefix_before = keyBefore,
-                });
-                Log.Print(LogType.Error, "Failed to reconnect to auth server.");
-                response.Allow = false;
-                SendPacket(response);
-                return;
-            }
-        }
-        // GetSession().AuthClient.SendRealmListUpdateRequest();
-
-        string keyAfter = SafeAuthKeyPrefix(GetSession().AuthClient);
+        // JimsProxy: removed AuthClient.Reconnect() that previously fired here when
+        // the realmd socket was closed. Kronos closes the realmd TCP after sending the
+        // realmlist, so Reconnect() fired on EVERY realm select — doing a full SRP6
+        // LOGON_CHALLENGE that doubled the auth count per login and tripped Kronos's
+        // rate limiter after a few login cycles. The session key from the initial
+        // ConnectToAuthServer persists in the realmd DB until the next login, so the
+        // world server's CMSG_AUTH_SESSION validation still works without re-authing.
         Log.Event("realm.swap.change_ticket", new
         {
             phase = "ok",
-            auth_was_connected = authWasConnected,
-            reconnect_attempted = reconnectAttempted,
-            reconnect_result = reconnectResult,
-            auth_key_prefix_before = keyBefore,
-            auth_key_prefix_after = keyAfter,
-            auth_key_changed = keyBefore != keyAfter,
+            auth_connected = GetSession().AuthClient != null && GetSession().AuthClient.IsConnected(),
         });
 
         _bnetRpc.SetClientSecret(request.Secret);
@@ -77,25 +42,6 @@ public partial class WorldSocket
         response.Ticket = new ByteBuffer(new byte[1]);
 
         SendPacket(response);
-    }
-
-    // JimsProxy: 4-byte hex prefix of the SRP-derived session key. Safe against null
-    // AuthClient and empty key arrays. Used by realm.swap.* events so we can correlate
-    // whether the key actually rotated between phases without leaking the full secret.
-    private static string SafeAuthKeyPrefix(HermesProxy.Auth.AuthClient? authClient)
-    {
-        if (authClient == null) return "<null>";
-        try
-        {
-            var key = authClient.GetSessionKey();
-            if (key == null || key.Length == 0) return "<empty>";
-            int n = Math.Min(4, key.Length);
-            return Convert.ToHexString(key, 0, n);
-        }
-        catch
-        {
-            return "<error>";
-        }
     }
 
     [PacketHandler(Opcode.CMSG_BATTLENET_REQUEST)]

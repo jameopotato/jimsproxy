@@ -321,6 +321,7 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
                 Log.Print(LogType.Server, $"Client disconnected with reason {reason}.");
                 if (_connectType == ConnectionType.Realm)
                 {
+                    GetSession().SetLogoutIntentional();
                     if (GetSession().AuthClient != null)
                         GetSession().AuthClient.Disconnect();
                     if (GetSession().WorldClient != null)
@@ -691,6 +692,7 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
                 previous_was_authenticated = previousWorldClient.IsAuthenticated(),
                 new_realm_index = (uint)_realmId.Index,
             });
+            previousWorldClient.Disconnect();
         }
 
         GetSession().WorldClient = new Client.WorldClient();

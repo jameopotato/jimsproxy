@@ -1925,6 +1925,29 @@ public class GlobalSessionData
     // 0 = idle, 1 = attempt in flight. Compare-and-swapped at entry; reset in finally.
     private int _reconnectInProgress;
 
+    // Intentional-logout/disconnect flag. Set when the player initiates logout
+    // (CMSG_LOGOUT_REQUEST forwarded) or the modern client sends CMSG_LOG_DISCONNECT.
+    // Cleared on SMSG_LOGOUT_CANCEL_ACK and CMSG_PLAYER_LOGIN (fresh session).
+    // Cross-thread: RealmSocket thread writes (CMSG_LOG_DISCONNECT),
+    // WorldClient ReceiveLoop thread reads (HandleDisconnect).
+    // Accessed via Volatile.Write/Read for memory ordering.
+    private int _logoutOrDisconnectIntentional;
+
+    public void SetLogoutIntentional()
+    {
+        Volatile.Write(ref _logoutOrDisconnectIntentional, 1);
+    }
+
+    public void ClearLogoutIntentional()
+    {
+        Volatile.Write(ref _logoutOrDisconnectIntentional, 0);
+    }
+
+    public bool IsLogoutIntentional()
+    {
+        return Volatile.Read(ref _logoutOrDisconnectIntentional) != 0;
+    }
+
     public void TryUnplannedReconnectAndPropagate(
         World.Client.WorldClient deadClient,
         string? originalExceptionType = null,

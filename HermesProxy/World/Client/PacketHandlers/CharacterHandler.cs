@@ -465,6 +465,7 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_LOGOUT_CANCEL_ACK)]
     void HandleLogoutCancelAck(WorldPacket packet)
     {
+        GetSession().ClearLogoutIntentional();
         LogoutCancelAck logout = new LogoutCancelAck();
         SendPacketToClient(logout);
     }

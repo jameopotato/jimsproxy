@@ -275,16 +275,23 @@ public partial class WorldClient
                 ms_since_last_opcode = _lastInboundOpcodeTick == 0 ? -1 : Environment.TickCount - _lastInboundOpcodeTick,
                 was_active_world_client = wasActiveWorldClient,
             });
-            // JimsProxy (unplanned-dc-auto-reconnect): when this is a genuinely
-            // unplanned DC (we were the active client, no realm swap is replacing us),
-            // try one cached-key reconnect. If that fails, propagate cleanly to the
-            // modern client. Realm-swap path (wasActiveWorldClient == false) skips this
-            // — the new WorldClient is already in flight and will handle continuity.
-            // No exception to forward here — this path is hit on a clean read failure
-            // (zero bytes / FIN), not an exception. The reason string ("header"/"payload")
-            // is already in `session.ondisconnect.suppressed` as `disconnect_reason`.
             if (wasActiveWorldClient)
-                session!.TryUnplannedReconnectAndPropagate(this);
+            {
+                if (session!.IsLogoutIntentional())
+                {
+                    Log.Event("session.unplanned_reconnect.skipped_intentional_logout", new
+                    {
+                        disconnect_reason = reason,
+                    });
+                    session.PropagateUnplannedDcToModern(
+                        Guid.NewGuid().ToString("N")[..8],
+                        "intentional_logout");
+                }
+                else
+                {
+                    session.TryUnplannedReconnectAndPropagate(this);
+                }
+            }
         }
     }
 
@@ -355,17 +362,24 @@ public partial class WorldClient
                     ms_since_last_opcode = _lastInboundOpcodeTick == 0 ? -1 : Environment.TickCount - _lastInboundOpcodeTick,
                     was_active_world_client = wasActiveWorldClient,
                 });
-                // JimsProxy (unplanned-dc-auto-reconnect): same logic as HandleDisconnect.
-                // Bundle 20260503-195159 showed Kronos PTR forcibly closing the proxy's
-                // TCP socket mid-combat (TCP RST, last_opcode SMSG_ON_MONSTER_MOVE), then
-                // 37s of frozen ghost world before the player gave up and logged out.
-                // Now: try one reconnect, fall back to clean DC. Forward the exception
-                // type/message and SocketError code so a JSONL bundle shows *why* the
-                // server cut us off (Warden mid-session vs network reset vs server crash).
                 if (wasActiveWorldClient)
                 {
-                    int? socketErrorCode = (e is SocketException se) ? (int)se.SocketErrorCode : null;
-                    session!.TryUnplannedReconnectAndPropagate(this, e.GetType().Name, e.Message, socketErrorCode);
+                    if (session!.IsLogoutIntentional())
+                    {
+                        Log.Event("session.unplanned_reconnect.skipped_intentional_logout", new
+                        {
+                            exception_type = e.GetType().Name,
+                            exception_message = e.Message,
+                        });
+                        session.PropagateUnplannedDcToModern(
+                            Guid.NewGuid().ToString("N")[..8],
+                            "intentional_logout");
+                    }
+                    else
+                    {
+                        int? socketErrorCode = (e is SocketException se) ? (int)se.SocketErrorCode : null;
+                        session.TryUnplannedReconnectAndPropagate(this, e.GetType().Name, e.Message, socketErrorCode);
+                    }
                 }
             }
         }
