@@ -404,6 +404,21 @@ public partial class WorldClient
             }
         }
 
+        // Pet auto-cast failure (mirrors HandleSpellFailure fix). Defensive: if the
+        // server ever broadcasts pet auto-cast failure via FAILED_OTHER, dismiss visual.
+        if (casterIsPet && !sentCancelVisual)
+        {
+            resolvedSpellVisualId = GameData.GetSpellVisualIdFromXSpellVisual(spellVisual);
+            if (resolvedSpellVisualId != 0)
+            {
+                CancelSpellVisual cancelVisual = new CancelSpellVisual();
+                cancelVisual.Source = casterUnit;
+                cancelVisual.SpellVisualID = (int)resolvedSpellVisualId;
+                SendPacketToClient(cancelVisual);
+                sentCancelVisual = true;
+            }
+        }
+
         Log.Event("spell.failed_other.routed", new
         {
             spellId,
@@ -629,6 +644,23 @@ public partial class WorldClient
             SendPacketToClient(interruptLog);
             sentInterruptLog = true;
 
+            resolvedSpellVisualId = GameData.GetSpellVisualIdFromXSpellVisual(spellVisual);
+            if (resolvedSpellVisualId != 0)
+            {
+                CancelSpellVisual cancelVisual = new CancelSpellVisual();
+                cancelVisual.Source = casterUnit;
+                cancelVisual.SpellVisualID = (int)resolvedSpellVisualId;
+                SendPacketToClient(cancelVisual);
+                sentCancelVisual = true;
+            }
+        }
+
+        // Pet auto-cast failure: when a pet's AI-initiated spell fails (target dies,
+        // LoS, range), the cast fell through to the else branch (no PendingPetCasts
+        // entry for auto-casts). SpellFailure packet dismisses the cast bar, but the
+        // visual kit (animation + looping sound) needs explicit CancelSpellVisual.
+        if (casterIsPet && !dequeued && !sentCancelVisual)
+        {
             resolvedSpellVisualId = GameData.GetSpellVisualIdFromXSpellVisual(spellVisual);
             if (resolvedSpellVisualId != 0)
             {
