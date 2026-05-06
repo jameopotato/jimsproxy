@@ -129,7 +129,10 @@ public partial class BnetServices
 
         var realm = GetSession().RealmManager.GetRealms().FirstOrDefault(r => r.Name == lastPlayedChar.realmName && !r.Flags.HasFlag(RealmFlags.Offline));
         if (realm == null)
-            return BattlenetRpcErrorCode.UtilServerFailedToSerializeResponse;
+        {
+            GetSession().AccountMetaDataMgr.InvalidateLastSelectedCharacter();
+            return BattlenetRpcErrorCode.Ok;
+        }
 
         byte[] compressedRealmEntry = GetSession().RealmManager.GetCompressdRealmEntryJSON(realm, GetSession().Build);
         if (compressedRealmEntry.Length == 0)
