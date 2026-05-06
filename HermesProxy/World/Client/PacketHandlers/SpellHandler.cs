@@ -211,6 +211,7 @@ public partial class WorldClient
             SendPacketToClient(failed);
 
             var gameState = GetSession().GameState;
+            gameState.ClearHeldCastTimeCast();
             if (!gameState.IsGcdHoldActive() && !gameState.HasForwardedPendingCast())
             {
                 var heldCast = gameState.TakeHeldCastIfReady();
@@ -481,32 +482,41 @@ public partial class WorldClient
         // ranged-attack visual on 1.14 — observed in the 2026-04-28 hunter
         // bundle where every Auto Shot SPELL_START was paired with a suppressed
         // SPELL_FAILURE reason=1 and the bow stuck drawn.
-        bool isRangedAutoAttack = spellId == 75 || spellId == 5019;
-        if ((casterIsLocalPlayer || casterIsLocalPet) && !isRangedAutoAttack)
-        {
-            Log.Event("spell.failure.suppressed_for_caster", new
-            {
-                spellId,
-                raw_reason_byte = reason,
-                is_pet = casterIsLocalPet,
-            });
-            return;
-        }
-        if (isRangedAutoAttack && (casterIsLocalPlayer || casterIsLocalPet))
-        {
-            Log.Event("spell.failure.ranged_auto_forwarded", new
-            {
-                spellId,
-                raw_reason_byte = reason,
-                is_pet = casterIsLocalPet,
-            });
-        }
+        // SPELL_FAILURE is now forwarded for all casters including local player (matches
+        // upstream Xian55/HermesProxy). The client needs it to cancel the animation that
+        // SPELL_START started. PR #72 originally suppressed this for local player, but the
+        // GCD-lock bug was caused by the dequeue (now changed to peek), not the forwarding.
 
         WowGuid128 castId;
         uint spellVisual;
         bool dequeued = false;
         bool wasStarted = false;
         bool foundActiveCastId = false;
+
+        // JimsProxy: Twinstar's Spell::SendInterrupted hardcodes the wire reason
+        // byte to vanilla 0 (= classic AffectingCombat=1 after translation). For
+        // local-player/pet casts the real reason arrives ~1ms later in
+        // SMSG_CAST_FAILED, but the misleading "You are in combat" popup from
+        // SMSG_SPELL_FAILURE has already shown. Bundle 20260505-191020 caught
+        // this on a Mage casting Remove Lesser Curse with no curse to remove
+        // (real reason: AlreadyAtFullHealth). Override the broadcast reason to
+        // DontReport (classic 30) for local casts so the cast-bar / bow-draw
+        // dismiss still happens but no error popup fires; CastFailed (from
+        // either this path's inline send or HandleCastFailed) carries the real
+        // reason and renders the correct popup.
+        bool overrideReasonForLocalBroadcast = false;
+        bool skipBroadcastFailure = false;
+        // 1.14 needs SMSG_SPELL_FAILURE to retract the bow-draw / wand-aim visual
+        // for ranged auto-attacks (Auto Shot 75, Shoot 5019); CastFailed +
+        // CANCEL_AUTO_REPEAT alone leaves the bow stuck drawn. Other instants
+        // can drop the broadcast entirely -- there's no animation to cancel.
+        bool isRangedAutoAttack = spellId == 75 || spellId == 5019;
+
+        // Local player: DEQUEUE and send CastFailed immediately. Kronos doesn't
+        // always follow SMSG_SPELL_FAILURE with SMSG_CAST_FAILED (e.g. target dies
+        // mid-cast). Previously this only peeked, relying on HandleCastFailed to
+        // dequeue — but when CAST_FAILED never arrived, the entry leaked with
+        // HasStarted=true, permanently blocking all non-off-GCD casts.
         if (GetSession().GameState.CurrentPlayerGuid == casterUnit &&
             GetSession().GameState.TryDequeuePendingNormalCast(spellId, out var pendingNormal))
         {
@@ -514,12 +524,9 @@ public partial class WorldClient
             spellVisual = pendingNormal.SpellXSpellVisualId;
             if (pendingNormal.LegacySpellId != 0)
                 spellId = pendingNormal.SpellId;
-            dequeued = true;
             wasStarted = pendingNormal.HasStarted;
+            dequeued = true;
 
-            // Pre-cast failure (rare via SPELL_FAILURE -- usually goes through
-            // CAST_FAILED, but cover it for parity): client needs SpellPrepare
-            // to match the upcoming failure to its pending cast slot.
             if (!pendingNormal.HasStarted)
             {
                 SpellPrepare prepare = new();
@@ -527,6 +534,24 @@ public partial class WorldClient
                 prepare.ServerCastID = pendingNormal.ServerGUID;
                 SendPacketToClient(prepare);
             }
+
+            CastFailed failed = new();
+            failed.SpellID = pendingNormal.SpellId;
+            failed.SpellXSpellVisualID = pendingNormal.SpellXSpellVisualId;
+            failed.Reason = reason;
+            failed.CastID = pendingNormal.ServerGUID;
+            SendPacketToClient(failed);
+
+            GetSession().GameState.ClearHeldCastTimeCast();
+
+            // Instant cast that wasn't a ranged auto-attack: SPELL_START was
+            // never forwarded, so there's no cast bar to dismiss. CastFailed
+            // already cancelled GCD anticipation. Skip the misleading
+            // SpellFailure broadcast entirely.
+            if (!pendingNormal.HasStarted && !isRangedAutoAttack)
+                skipBroadcastFailure = true;
+            else
+                overrideReasonForLocalBroadcast = true;
         }
         else if (GetSession().GameState.CurrentPetGuid == casterUnit &&
                  GetSession().GameState.TryDequeuePendingPetCast(spellId, out var pendingPet))
@@ -535,16 +560,22 @@ public partial class WorldClient
             spellVisual = pendingPet.SpellXSpellVisualId;
             if (pendingPet.LegacySpellId != 0)
                 spellId = pendingPet.SpellId;
-            dequeued = true;
             wasStarted = pendingPet.HasStarted;
+            dequeued = true;
 
+            PetCastFailed petFailed = new();
+            petFailed.SpellID = pendingPet.SpellId;
+            petFailed.Reason = reason;
+            petFailed.CastID = pendingPet.ServerGUID;
+            SendPacketToClient(petFailed);
+
+            // Pet path: PetCastFailed handles the pet UI. Suppress the broadcast
+            // SpellFailure for instants (no cast bar); for cast-time pet spells
+            // forward with DontReport so the bar dismisses without popup spam.
             if (!pendingPet.HasStarted)
-            {
-                SpellPrepare prepare = new();
-                prepare.ClientCastID = pendingPet.ClientGUID;
-                prepare.ServerCastID = pendingPet.ServerGUID;
-                SendPacketToClient(prepare);
-            }
+                skipBroadcastFailure = true;
+            else
+                overrideReasonForLocalBroadcast = true;
         }
         else
         {
@@ -565,13 +596,17 @@ public partial class WorldClient
             spellVisual = GameData.GetSpellVisual(spellId);
         }
 
-        SpellFailure spell = new SpellFailure();
-        spell.CasterUnit = casterUnit;
-        spell.CastID = castId;
-        spell.SpellID = spellId;
-        spell.SpellXSpellVisualID = spellVisual;
-        spell.Reason = reason;
-        SendPacketToClient(spell);
+        byte broadcastReason = overrideReasonForLocalBroadcast ? (byte)SpellCastResultClassic.DontReport : reason;
+        if (!skipBroadcastFailure)
+        {
+            SpellFailure spell = new SpellFailure();
+            spell.CasterUnit = casterUnit;
+            spell.CastID = castId;
+            spell.SpellID = spellId;
+            spell.SpellXSpellVisualID = spellVisual;
+            spell.Reason = broadcastReason;
+            SendPacketToClient(spell);
+        }
 
         //MIRASU - Mirror the FAILED_OTHER interrupt synthesis for the broadcasted FAILURE path.
         //MIRASU   PvP scenario: you Counterspell an enemy player -> Kronos broadcasts
@@ -609,6 +644,10 @@ public partial class WorldClient
         {
             spellId,
             reason,
+            broadcast_reason = broadcastReason,
+            broadcast_skipped = skipBroadcastFailure,
+            broadcast_reason_overridden = overrideReasonForLocalBroadcast,
+            is_ranged_auto_attack = isRangedAutoAttack,
             isCaster = GetSession().GameState.CurrentPlayerGuid == casterUnit,
             isPetCaster = GetSession().GameState.CurrentPetGuid == casterUnit,
             dequeued,
@@ -695,21 +734,11 @@ public partial class WorldClient
         bool isRangedAutoAttack = spell.Cast.SpellID == 75      // Auto Shot
                                   || spell.Cast.SpellID == 5019; // Shoot (Wand)
         bool isChanneled = GameData.IsChanneledSpell((uint)spell.Cast.SpellID);
-        bool suppressInstantStart = (casterIsLocalPlayer || casterIsLocalPet)
-                                    && spell.Cast.CastTime == 0
-                                    && !isRangedAutoAttack
-                                    && !isChanneled;
-        if (suppressInstantStart)
-        {
-            Log.Event("spell.start.instant_suppressed", new
-            {
-                spell_id = spell.Cast.SpellID,
-                cast_time_ms = spell.Cast.CastTime,
-                caster_is_player = casterIsLocalPlayer,
-                caster_is_pet = casterIsLocalPet,
-            });
-            return;
-        }
+        // PR #72 originally suppressed SPELL_START for local player instants to prevent
+        // GCD-lock-on-failure. Root cause was HandleSpellFailure dequeuing the pending cast
+        // before CAST_FAILED could reach the client. Fixed by changing SPELL_FAILURE to peek
+        // instead of dequeue. SPELL_START is now forwarded for all spells (matches upstream
+        // Xian55/HermesProxy) — instant animations play immediately instead of ~RTT/2 late.
         if (isRangedAutoAttack && (casterIsLocalPlayer || casterIsLocalPet) && spell.Cast.CastTime == 0)
         {
             Log.Event("spell.start.ranged_auto_forwarded", new
@@ -765,8 +794,9 @@ public partial class WorldClient
                 spell.Cast.SpellID = (int)pendingCast.SpellId;
 
             // For instant spells that skip SPELL_START, we need to send SpellPrepare
-            // before SpellGo so the client knows which cast completed
-            if (!pendingCast.HasStarted)
+            // before SpellGo so the client knows which cast completed.
+            // Off-GCD casts already sent SpellPrepare at forward time (HasSentPrepare).
+            if (!pendingCast.HasStarted && !pendingCast.HasSentPrepare)
             {
                 SpellPrepare prepare = new();
                 prepare.ClientCastID = pendingCast.ClientGUID;
@@ -823,6 +853,50 @@ public partial class WorldClient
                     smoothed_rtt_ms = GetSession().GameState.GetSmoothedRttMs(),
                     legacy_lookup_id = pendingCast.LegacySpellId,
                 });
+
+                var gcdCooldown = new SpellCooldownPkt();
+                gcdCooldown.Caster = spell.Cast.CasterUnit;
+                gcdCooldown.Flags = 0x01; // SPELL_COOLDOWN_FLAG_INCLUDE_GCD
+                gcdCooldown.SpellCooldowns.Add(new SpellCooldownStruct
+                {
+                    SpellID = (uint)spell.Cast.SpellID,
+                    ForcedCooldown = (uint)gcdMs,
+                    ModRate = 1.0f,
+                });
+                SendPacketToClient(gcdCooldown);
+
+                Log.Event("gcd.cooldown_synth", new
+                {
+                    spell_id = spell.Cast.SpellID,
+                    forced_cooldown_ms = gcdMs,
+                    flags = 0x01,
+                });
+            }
+
+            var gameStateAfter = GetSession().GameState;
+            if (!gameStateAfter.HasForwardedPendingCast())
+            {
+                var heldCast = gameStateAfter.TakeHeldCastIfReady();
+                if (heldCast != null)
+                {
+                    Log.Event("spell.held_fire_on_success", new
+                    {
+                        success_spell_id = spell.Cast.SpellID,
+                        held_spell_id = heldCast.SpellId,
+                    });
+                    gameStateAfter.OnGcdHeldCastFire?.Invoke(heldCast);
+                }
+            }
+
+            var heldCastTime = gameStateAfter.TakeHeldCastTimeCast();
+            if (heldCastTime != null)
+            {
+                Log.Event("cast.held_fire_on_cast_complete", new
+                {
+                    completed_spell_id = spell.Cast.SpellID,
+                    held_spell_id = heldCastTime.SpellId,
+                });
+                gameStateAfter.OnGcdHeldCastFire?.Invoke(heldCastTime);
             }
         }
         else if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
@@ -888,7 +962,41 @@ public partial class WorldClient
         if (spell.LogData == null)
             spell.LogData = new SpellCastLogData();
 
+        // JimsProxy (warrior-charge-revisit): vanilla Twinstar/Kronos broadcast a second
+        // SMSG_SPELL_GO ~1ms after the parent Charge/Intercept GO for the triggered stun
+        // sub-effect (7922 Charge Stun / 20615 Intercept Stun) with caster=local player.
+        // The modern 1.14 client kicks the sub-effect's SpellVisualKit on the caster on
+        // top of the Charge/Intercept lunge kit — two overlapping caster-side animations
+        // read as the warrior twitching ("on crack"). We want both visuals: Charge lunge
+        // on the warrior (parent spell 100/20252 GO already handled that), stun pose on
+        // the mob. Solution: rewrite CasterGUID/CasterUnit to the hit target so the
+        // modern client plays the stun kit's caster events on the mob instead of the
+        // warrior. Stun aura/icon on the mob is unaffected (SMSG_AURA_UPDATE drives that
+        // independently). CLEU will show spell 7922/20615 source=mob, but damage meters
+        // attribute Charge/Intercept damage to the parent spell, not this sub-effect.
+        if ((spell.Cast.SpellID == 7922 || spell.Cast.SpellID == 20615) &&
+            GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
+            spell.Cast.HitTargets.Count > 0)
+        {
+            WowGuid128 stunTarget = spell.Cast.HitTargets[0];
+            Log.Event("spell.go.stun_subeffect_redirected", new
+            {
+                spell_id = spell.Cast.SpellID,
+                spell_visual_id = spell.Cast.SpellXSpellVisualID,
+                redirected_to = stunTarget.ToString(),
+            });
+            spell.Cast.CasterGUID = stunTarget;
+            spell.Cast.CasterUnit = stunTarget;
+        }
+
         SendPacketToClient(spell);
+
+        // JimsProxy threat translation: route Hunter / Pet / class abilities
+        // through the threat tracker so SMSG_THREAT_UPDATE reflects the cast.
+        // Done after SendPacketToClient so the SpellGo arrives first and any
+        // resulting THREAT_UPDATE follows it on the wire (matches the
+        // server-driven ordering the modern client expects).
+        GetSession().ThreatTracker.OnSpellCast(spell.Cast.CasterUnit, spell.Cast.SpellID, spell.Cast.HitTargets);
     }
 
     SpellCastData HandleSpellStartOrGo(WorldPacket packet, bool isSpellGo)
@@ -986,6 +1094,13 @@ public partial class WorldClient
 
         if (!isSpellGo || LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
             dbdata.CastTime = packet.ReadUInt32();
+
+        // Vanilla 1.12 SPELL_GO doesn't carry CastTime. Without a timestamp the
+        // 1.14 client chains GCD starts (new = old + 1500ms) instead of anchoring
+        // to server time, causing ~RTT drift per cast. Stamp with proxy time so the
+        // client's TIME_SYNC offset can convert it to local time.
+        if (isSpellGo && dbdata.CastTime == 0)
+            dbdata.CastTime = Time.GetMSTime();
 
         if (isSpellGo)
         {
@@ -1270,6 +1385,11 @@ public partial class WorldClient
         }
 
         SendPacketToClient(spell);
+
+        // Threat translation: feed spell damage (direct hit) into the tracker.
+        // Pass the spell id so the per-ability damage multiplier (Maul x1.75,
+        // Earth Shock x2, Holy Nova x0, etc.) can apply.
+        GetSession().ThreatTracker.OnDamage(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, spell.Damage);
     }
 
     [PacketHandler(Opcode.SMSG_SPELL_EXECUTE_LOG)]
@@ -1469,6 +1589,15 @@ public partial class WorldClient
         });
 
         SendPacketToClient(spell);
+
+        // Threat translation: heal threat = 0.5 x effective heal, distributed
+        // across every mob in combat with the heal target. Overheal generates
+        // no threat — feed only the effective amount.
+        long effectiveHeal = (long)spell.HealAmount - (long)spell.OverHeal;
+        if (effectiveHeal > 0)
+        {
+            GetSession().ThreatTracker.OnHeal(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, effectiveHeal);
+        }
     }
 
     // Computes overhealing for a heal event by looking up the target's current HP
@@ -1625,6 +1754,35 @@ public partial class WorldClient
             }
         }
         SendPacketToClient(spell);
+
+        // Threat translation: feed periodic damage (DoT ticks) into the tracker.
+        // Sum the damage portion of all PeriodicDamage / PeriodicDamagePercent
+        // effect entries; heal ticks generate heal threat instead.
+        double dotDamage = 0;
+        double hotHeal = 0;
+        foreach (var effect in spell.Effects)
+        {
+            if (effect.Effect == (uint)AuraType.PeriodicDamage ||
+                effect.Effect == (uint)AuraType.PeriodicDamagePercent)
+            {
+                dotDamage += effect.Amount;
+            }
+            else if (effect.Effect == (uint)AuraType.PeriodicHeal)
+            {
+                hotHeal += effect.Amount;
+            }
+        }
+        if (dotDamage > 0)
+        {
+            GetSession().ThreatTracker.OnDamage(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, dotDamage);
+        }
+        if (hotHeal > 0)
+        {
+            // HoT ticks don't carry overheal info on the wire, so we feed
+            // the raw amount. Slight overcount when the target is at max hp;
+            // acceptable at this stage.
+            GetSession().ThreatTracker.OnHeal(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, hotHeal);
+        }
     }
 
     [PacketHandler(Opcode.SMSG_SPELL_ENERGIZE_LOG)]
@@ -1701,6 +1859,13 @@ public partial class WorldClient
 
         spell.SchoolMask = school;
         SendPacketToClient(spell);
+
+        // Threat translation: damage-shield reflects (Thorns, Retribution Aura,
+        // Lightning Shield) generate threat to the attacker who hit us. The
+        // CasterGUID here is whoever owns the shield (us or our pet), the
+        // VictimGUID is the attacker who got reflected on. Pass the shield
+        // spell id so Holy Shield (x1.2) and friends pick up the right mult.
+        GetSession().ThreatTracker.OnDamage(spell.CasterGUID, spell.VictimGUID, (int)spell.SpellID, spell.Damage);
     }
 
     [PacketHandler(Opcode.SMSG_ENVIRONMENTAL_DAMAGE_LOG)]

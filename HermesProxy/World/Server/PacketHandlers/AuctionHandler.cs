@@ -21,6 +21,28 @@ public partial class WorldSocket
     private const double AuctionSearchCooldownSeconds = 6.0;
     private DateTime _lastSearchTime = DateTime.MinValue;
 
+    // Minimum gap between forwarded CMSG_AUCTION_SELL_ITEM packets. Aux and similar
+    // batch-posting addons can fire sells ~190 ms apart, which is well under the
+    // cadence a human at the Blizzard UI could ever reach and risks tripping general
+    // per-socket flood thresholds on vanilla emulators. Sells are queued (not dropped)
+    // by sleeping the handler thread until the gap is satisfied.
+    //
+    // Scope: this gate is per-WorldSocket (per-character session), not per-auctioneer.
+    // A player who hops from a neutral AH to a faction AH within 500 ms will see the
+    // residual throttle apply to the first sell at the new auctioneer. That's a wash
+    // in practice because the legacy server's own per-socket flood limit also doesn't
+    // care which auctioneer the request originated from.
+    private const int AuctionSellMinGapMs = 500;
+    private DateTime _lastSellTime = DateTime.MinValue;
+
+    // Maximum time to wait after a CMSG_SPLIT_ITEM / CMSG_SWAP_ITEM for the resulting
+    // SMSG_ITEM_PUSH_RESULT / object update to arrive and update GameState before we
+    // read the destination slot back. We poll adaptively (see WaitForInventoryChange)
+    // and return the moment a change is observed; this 750 ms ceiling is the safety
+    // net for a slow / stalled server. Typical update arrival is 50-200 ms.
+    private const int AuctionSplitSettleMs = 750;
+    private const int AuctionSplitPollMs = 25;
+
     [PacketHandler(Opcode.CMSG_AUCTION_HELLO_REQUEST)]
     void HandleAuctionHelloRequest(InteractWithNPC interact)
     {
@@ -55,8 +77,30 @@ public partial class WorldSocket
     void HandleAuctionListItems(AuctionListItems auction)
     {
         var now = DateTime.UtcNow;
-        if ((now - _lastSearchTime).TotalSeconds < AuctionSearchCooldownSeconds)
+        var elapsedMs = (now - _lastSearchTime).TotalMilliseconds;
+        var cooldownMs = AuctionSearchCooldownSeconds * 1000.0;
+        if (elapsedMs < cooldownMs)
+        {
+            // JimsProxy (aux-auction-cooldown-investigation): silent-drop diagnostic only.
+            // No behavior change vs. prior code -- still returns without forwarding to the
+            // legacy server. Hypothesis: this drop leaves the modern client's
+            // CanSendAuctionQuery() permanently false (no SMSG_AUCTION_LIST_ITEMS_RESULT
+            // ever arrives), which hangs Aux's pre-post search loop at scan.lua:117. If
+            // this event fires when Aux hangs, theory confirmed and the fix is to queue
+            // the CMSG until cooldown expires instead of dropping.
+            Framework.Logging.Log.Event("auction.list.dropped_cooldown", new
+            {
+                elapsed_ms = (long)elapsedMs,
+                cooldown_ms = (long)cooldownMs,
+                remaining_ms = (long)(cooldownMs - elapsedMs),
+                name = auction.Name,
+                offset = auction.Offset,
+                exact_match = auction.ExactMatch,
+                only_usable = auction.OnlyUsable,
+                quality = auction.Quality,
+            });
             return;
+        }
         _lastSearchTime = now;
 
         // Kronos has its own per-session search cooldown (canonical vanilla 6s) and
@@ -169,12 +213,150 @@ public partial class WorldSocket
         SendPacketToServer(packet);
     }
 
+    private void SendMergePieceSplit(
+        GameSessionData gameState,
+        (byte containerSlot, byte slot) src,
+        (byte containerSlot, byte slot) dst,
+        uint count,
+        string sourceGuid,
+        int pieceIndex,
+        string mode)
+    {
+        var preGuid = gameState.GetInventorySlotItem(dst.containerSlot, dst.slot);
+        uint preStack = preGuid != WowGuid64.Empty
+            ? gameState.GetItemStackCount(preGuid.To128(gameState))
+            : 0;
+
+        WorldPacket splitPacket = new WorldPacket(Opcode.CMSG_SPLIT_ITEM);
+        splitPacket.WriteUInt8(src.containerSlot);
+        splitPacket.WriteUInt8(src.slot);
+        splitPacket.WriteUInt8(dst.containerSlot);
+        splitPacket.WriteUInt8(dst.slot);
+        if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_2_0_10192))
+            splitPacket.WriteInt32((int)count);
+        else
+            splitPacket.WriteUInt8((byte)count);
+        SendPacketToServer(splitPacket);
+
+        Framework.Logging.Log.Event("auction.sell.merge_piece_sent", new
+        {
+            source_container = src.containerSlot,
+            source_slot = src.slot,
+            dest_container = dst.containerSlot,
+            dest_slot = dst.slot,
+            count,
+            source_guid = sourceGuid,
+            piece_index = pieceIndex,
+            mode,
+        });
+
+        int waitedMs = WaitForInventoryChange(gameState, dst, preGuid, preStack, AuctionSplitSettleMs);
+        Framework.Logging.Log.Event("auction.sell.merge_piece_settled", new
+        {
+            piece_index = pieceIndex,
+            mode,
+            waited_ms = waitedMs,
+            timed_out = waitedMs >= AuctionSplitSettleMs - AuctionSplitPollMs,
+        });
+    }
+
+    // Poll GameState until the destination slot reflects a change from the captured
+    // pre-operation (guid, stack) tuple, or the timeout elapses. Returns the elapsed
+    // time so the diagnostic can show how long the inventory update actually took.
+    // Server inventory updates arrive on the WorldClient thread; this WorldSocket
+    // thread sleeps in short intervals so it doesn't block update processing.
+    private int WaitForInventoryChange(
+        GameSessionData gameState,
+        (byte containerSlot, byte slot) target,
+        WowGuid64 beforeGuid,
+        uint beforeStack,
+        int maxMs)
+    {
+        var start = DateTime.UtcNow;
+        var deadline = start.AddMilliseconds(maxMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            Thread.Sleep(AuctionSplitPollMs);
+            var nowGuid = gameState.GetInventorySlotItem(target.containerSlot, target.slot);
+            uint nowStack = nowGuid != WowGuid64.Empty
+                ? gameState.GetItemStackCount(nowGuid.To128(gameState))
+                : 0;
+            if (nowGuid != beforeGuid || nowStack != beforeStack)
+                return (int)(DateTime.UtcNow - start).TotalMilliseconds;
+        }
+        return (int)(DateTime.UtcNow - start).TotalMilliseconds;
+    }
+
+    // CMSG_SWAP_ITEM with src holding a same-item-type stack and dst already
+    // populated with the same item triggers vanilla Player::SwapItem's auto-stack
+    // path — the server merges src into dst rather than swapping slot positions.
+    // This is how we land the final unit of a "full-stack-into-target" merge that
+    // CMSG_SPLIT_ITEM can't handle (split rejects count >= stack).
+    private void SendMergePieceSwap(
+        GameSessionData gameState,
+        (byte containerSlot, byte slot) src,
+        (byte containerSlot, byte slot) dst,
+        string sourceGuid,
+        int pieceIndex,
+        string mode)
+    {
+        var preGuid = gameState.GetInventorySlotItem(dst.containerSlot, dst.slot);
+        uint preStack = preGuid != WowGuid64.Empty
+            ? gameState.GetItemStackCount(preGuid.To128(gameState))
+            : 0;
+
+        WorldPacket swapPacket = new WorldPacket(Opcode.CMSG_SWAP_ITEM);
+        // Vanilla CMSG_SWAP_ITEM packet order: dstBag, dstSlot, srcBag, srcSlot.
+        // This matches the modern->legacy byte order in the existing translator at
+        // ItemHandler.cs:74-87 (HandleSwapItem), where the modern client's "B" slots
+        // (destination) are written first and "A" slots (source) second.
+        swapPacket.WriteUInt8(dst.containerSlot);
+        swapPacket.WriteUInt8(dst.slot);
+        swapPacket.WriteUInt8(src.containerSlot);
+        swapPacket.WriteUInt8(src.slot);
+        SendPacketToServer(swapPacket);
+
+        Framework.Logging.Log.Event("auction.sell.merge_piece_sent", new
+        {
+            source_container = src.containerSlot,
+            source_slot = src.slot,
+            dest_container = dst.containerSlot,
+            dest_slot = dst.slot,
+            count = (uint)0,
+            source_guid = sourceGuid,
+            piece_index = pieceIndex,
+            mode,
+        });
+
+        int waitedMs = WaitForInventoryChange(gameState, dst, preGuid, preStack, AuctionSplitSettleMs);
+        Framework.Logging.Log.Event("auction.sell.merge_piece_settled", new
+        {
+            piece_index = pieceIndex,
+            mode,
+            waited_ms = waitedMs,
+            timed_out = waitedMs >= AuctionSplitSettleMs - AuctionSplitPollMs,
+        });
+    }
+
     [PacketHandler(Opcode.CMSG_AUCTION_SELL_ITEM)]
         void HandleAuctionSellItem(AuctionSellItem auction)
         {
-        
-        
-        
+        var sellNow = DateTime.UtcNow;
+        var sellElapsedMs = (sellNow - _lastSellTime).TotalMilliseconds;
+        if (sellElapsedMs < AuctionSellMinGapMs)
+        {
+            int waitMs = (int)(AuctionSellMinGapMs - sellElapsedMs);
+            Framework.Logging.Log.Event("auction.sell.throttled", new
+            {
+                elapsed_ms = (long)sellElapsedMs,
+                wait_ms = waitMs,
+                min_gap_ms = AuctionSellMinGapMs,
+                item_count = auction.Items.Count,
+            });
+            Thread.Sleep(waitMs);
+        }
+        _lastSellTime = DateTime.UtcNow;
+
         uint expireTime = auction.ExpireTime;
 
             // auction durations were increased in tbc
@@ -230,10 +412,199 @@ public partial class WorldSocket
         {
             var gameState = GetSession().GameState;
 
-            // Pre-3.2.2a servers have no quantity field — they auction the entire item.
-            // If the player wants a partial stack, split UseCount to a temp slot and
-            // auction that instead. The original item keeps the remainder, which is
-            // what the modern client expects (original stack shrinks by UseCount).
+            // Pre-3.2.2a CMSG_AUCTION_SELL_ITEM has no per-item count field — the
+            // server auctions the entire stack at the GUID. Modern (3.2.2a+) clients
+            // send a list of (item, useCount) tuples and expect the server to combine
+            // them into one stack for one auction. To honor that semantics on a vanilla
+            // server, we have to do the combining client-side BEFORE sending the legacy
+            // sell packet:
+            //   * Multi-item CMSGs: split every item's useCount into ONE shared target
+            //     slot (vanilla CMSG_SPLIT_ITEM auto-merges when the destination has the
+            //     same item type), then auction the merged GUID once.
+            //   * Single-item CMSG with useCount < stack: split useCount into a temp
+            //     slot and auction the temp.
+            //   * Single-item CMSG with useCount == stack: auction the source GUID
+            //     directly (no split needed).
+            if (auction.Items.Count > 1)
+            {
+                ChatPkt mergeNotice = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                    $"Merging {auction.Items.Count} item stacks for auction...");
+                GetSession().WorldClient!.SendPacketToClient(mergeNotice);
+
+                var mergeTarget = gameState.FindEmptyInventorySlot();
+                if (mergeTarget == null)
+                {
+                    Log.Event("auction.sell.merge_failed", new
+                    {
+                        reason = "no_empty_slot",
+                        item_count = auction.Items.Count,
+                    });
+                    ChatPkt chat = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                        "Auction posting cancelled — no empty bag slot for merge. Free up a slot and try again.");
+                    GetSession().WorldClient!.SendPacketToClient(chat);
+                    return;
+                }
+
+                uint totalRequested = 0;
+                int piecesMoved = 0;
+                uint expectedDestStack = 0;
+                var pieceOutcomes = new System.Collections.Generic.List<object>();
+                foreach (var item in auction.Items)
+                {
+                    if (item.UseCount == 0) continue;
+
+                    var srcLocation = gameState.FindItemInInventory(item.Guid.To64());
+                    if (srcLocation == null)
+                    {
+                        pieceOutcomes.Add(new
+                        {
+                            piece_index = piecesMoved,
+                            use_count = item.UseCount,
+                            skipped = true,
+                            skip_reason = "src_not_in_inventory",
+                        });
+                        Log.Event("auction.sell.merge_skip_piece", new
+                        {
+                            reason = "src_not_in_inventory",
+                            source_guid = item.Guid.ToString(),
+                            use_count = item.UseCount,
+                        });
+                        continue;
+                    }
+
+                    uint srcStackCount = gameState.GetItemStackCount(item.Guid);
+
+                    // Vanilla CMSG_SPLIT_ITEM is validated server-side as
+                    // pSrcItem->GetCount() > count, i.e. it's rejected with
+                    // EQUIP_ERR_TRIED_TO_SPLIT_MORE_THAN_COUNT when count >= stack.
+                    // For full-stack-or-larger pieces:
+                    //   * srcStack >= 2: SPLIT (srcStack-1) into target, then CMSG_SWAP_ITEM
+                    //     the leftover 1-stack with target. Vanilla Player::SwapItem detects
+                    //     same-item-type with stack space and auto-merges the final unit
+                    //     in instead of swapping slot positions.
+                    //   * srcStack == 1: skip SPLIT entirely; the SWAP alone moves/merges
+                    //     the 1-stack into target.
+                    if (item.UseCount < srcStackCount)
+                    {
+                        SendMergePieceSplit(gameState, srcLocation.Value, mergeTarget.Value,
+                            item.UseCount, item.Guid.ToString(), piecesMoved, "single");
+                    }
+                    else if (srcStackCount >= 2)
+                    {
+                        SendMergePieceSplit(gameState, srcLocation.Value, mergeTarget.Value,
+                            srcStackCount - 1, item.Guid.ToString(), piecesMoved, "n_minus_1");
+                        SendMergePieceSwap(gameState, srcLocation.Value, mergeTarget.Value,
+                            item.Guid.ToString(), piecesMoved, "swap_leftover");
+                    }
+                    else
+                    {
+                        SendMergePieceSwap(gameState, srcLocation.Value, mergeTarget.Value,
+                            item.Guid.ToString(), piecesMoved, "swap_full_stack_of_1");
+                    }
+
+                    expectedDestStack += item.UseCount;
+
+                    var destGuidNow = gameState.GetInventorySlotItem(
+                        mergeTarget.Value.containerSlot, mergeTarget.Value.slot);
+                    uint destStackNow = destGuidNow != WowGuid64.Empty
+                        ? gameState.GetItemStackCount(destGuidNow.To128(gameState))
+                        : 0;
+                    bool stackMatches = destStackNow == expectedDestStack;
+                    pieceOutcomes.Add(new
+                    {
+                        piece_index = piecesMoved,
+                        use_count = item.UseCount,
+                        dest_stack_after = destStackNow,
+                        expected_stack = expectedDestStack,
+                        ok = stackMatches,
+                    });
+                    Log.Event("auction.sell.merge_piece_resolved", new
+                    {
+                        dest_guid = destGuidNow.ToString(),
+                        dest_stack = destStackNow,
+                        expected_stack = expectedDestStack,
+                        ok = stackMatches,
+                        piece_index = piecesMoved,
+                    });
+
+                    // TOCTOU + correctness defense: dest slot's stack count after the
+                    // SPLIT/SWAP should equal the running sum of useCounts moved into it.
+                    // A mismatch means one of:
+                    //   * an unrelated inventory mutation (loot, trade, quest reward) hit
+                    //     the slot we picked from FindEmptyInventorySlot before our first
+                    //     piece landed (vanilla SPLIT auto-merges into same-item-type slot
+                    //     so dest_stack would exceed expected) or rejected our SPLIT
+                    //     because dest holds a different item (dest_stack equals the
+                    //     unrelated item's stack);
+                    //   * the SPLIT/SWAP was rejected for some other server-side reason;
+                    //   * the SMSG_ITEM_PUSH_RESULT settle window timed out so GameState
+                    //     is stale.
+                    // Either way we cannot safely auction this slot — auctioning would
+                    // sell the wrong stack count or wrong item entirely. Bail.
+                    if (!stackMatches)
+                    {
+                        Log.Event("auction.sell.merge_failed", new
+                        {
+                            reason = "dest_stack_unexpected",
+                            piece_index = piecesMoved,
+                            expected_stack = expectedDestStack,
+                            actual_stack = destStackNow,
+                            actual_dest_guid = destGuidNow.ToString(),
+                            pieces_moved_so_far = piecesMoved,
+                            total_requested = totalRequested + item.UseCount,
+                            pieces = pieceOutcomes,
+                        });
+                        ChatPkt chat = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                            "Auction posting cancelled — items were moved but not posted. Sort your bags into clean stacks and try again.");
+                        GetSession().WorldClient!.SendPacketToClient(chat);
+                        return;
+                    }
+
+                    totalRequested += item.UseCount;
+                    piecesMoved++;
+                }
+
+                var mergedGuid = gameState.GetInventorySlotItem(
+                    mergeTarget.Value.containerSlot, mergeTarget.Value.slot);
+                uint mergedStack = mergedGuid != WowGuid64.Empty
+                    ? gameState.GetItemStackCount(mergedGuid.To128(gameState))
+                    : 0;
+
+                if (mergedGuid == WowGuid64.Empty)
+                {
+                    Log.Event("auction.sell.merge_failed", new
+                    {
+                        reason = "target_empty_after_merge",
+                        pieces_moved = piecesMoved,
+                        total_requested = totalRequested,
+                        pieces = pieceOutcomes,
+                    });
+                    ChatPkt chat = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                        "Auction posting cancelled — items were moved but not posted. Sort your bags into clean stacks and try again.");
+                    GetSession().WorldClient!.SendPacketToClient(chat);
+                    return;
+                }
+
+                WorldPacket legacyPacket = new WorldPacket(Opcode.CMSG_AUCTION_SELL_ITEM);
+                legacyPacket.WriteGuid(auction.Auctioneer.To64());
+                legacyPacket.WriteGuid(mergedGuid);
+                legacyPacket.WriteUInt32((uint)auction.MinBid);
+                legacyPacket.WriteUInt32((uint)auction.BuyoutPrice);
+                legacyPacket.WriteUInt32(expireTime);
+                SendPacketToServer(legacyPacket);
+
+                Log.Event("auction.sell.posted_merged", new
+                {
+                    auction_item_guid = mergedGuid.ToString(),
+                    merged_stack_count = mergedStack,
+                    total_requested = totalRequested,
+                    item_count = auction.Items.Count,
+                    pieces_moved = piecesMoved,
+                });
+                return;
+            }
+
+            // Single-item path below. Compute needsSplit / splitSlot for the lone item.
             bool needsSplit = auction.Items.Any(i => i.UseCount > 0 &&
                 i.UseCount < gameState.GetItemStackCount(i.Guid));
 
@@ -251,10 +622,13 @@ public partial class WorldSocket
             foreach (var item in auction.Items)
             {
                 WowGuid64 auctionItemGuid = item.Guid.To64();
+                WowGuid64 sourceItemGuid = item.Guid.To64();
+                uint preSplitStackCount = gameState.GetItemStackCount(item.Guid);
+                bool didSplit = false;
 
                 if (item.UseCount > 0 && splitSlot != null)
                 {
-                    uint currentStackCount = gameState.GetItemStackCount(item.Guid);
+                    uint currentStackCount = preSplitStackCount;
 
                     if (item.UseCount < currentStackCount)
                     {
@@ -262,12 +636,25 @@ public partial class WorldSocket
 
                         if (itemLocation == null)
                         {
-                            Log.Print(LogType.Error,
-                                "AuctionSellItem: Cannot split stack — item not found in inventory");
+                            Log.Event("auction.sell.split_failed", new
+                            {
+                                reason = "item_not_in_inventory",
+                                item_guid = item.Guid.ToString(),
+                                use_count = item.UseCount,
+                                stack_count = currentStackCount,
+                            });
                             continue;
                         }
 
-                        // Split the desired quantity to the temp slot
+                        // Snapshot dest slot pre-state so we can poll for the inventory
+                        // update (SMSG_ITEM_PUSH_RESULT / object update) instead of
+                        // waiting a fixed AuctionSplitSettleMs every time.
+                        var preGuid = gameState.GetInventorySlotItem(
+                            splitSlot.Value.containerSlot, splitSlot.Value.slot);
+                        uint preStack = preGuid != WowGuid64.Empty
+                            ? gameState.GetItemStackCount(preGuid.To128(gameState))
+                            : 0;
+
                         WorldPacket splitPacket = new WorldPacket(Opcode.CMSG_SPLIT_ITEM);
                         splitPacket.WriteUInt8(itemLocation.Value.containerSlot);
                         splitPacket.WriteUInt8(itemLocation.Value.slot);
@@ -279,51 +666,83 @@ public partial class WorldSocket
                             splitPacket.WriteUInt8((byte)item.UseCount);
                         SendPacketToServer(splitPacket);
 
-                        Thread.Sleep(500);
+                        Log.Event("auction.sell.split_sent", new
+                        {
+                            source_container = itemLocation.Value.containerSlot,
+                            source_slot = itemLocation.Value.slot,
+                            dest_container = splitSlot.Value.containerSlot,
+                            dest_slot = splitSlot.Value.slot,
+                            count = item.UseCount,
+                            source_stack_count = currentStackCount,
+                            source_guid = item.Guid.ToString(),
+                        });
+
+                        int waitedMs = WaitForInventoryChange(gameState, splitSlot.Value,
+                            preGuid, preStack, AuctionSplitSettleMs);
+                        Log.Event("auction.sell.split_settled", new
+                        {
+                            waited_ms = waitedMs,
+                            timed_out = waitedMs >= AuctionSplitSettleMs - AuctionSplitPollMs,
+                            source_guid = item.Guid.ToString(),
+                        });
 
                         // Read the new item's GUID from the destination slot
                         auctionItemGuid = gameState.GetInventorySlotItem(
                             splitSlot.Value.containerSlot, splitSlot.Value.slot);
 
+                        uint postSplitDestStack = auctionItemGuid != WowGuid64.Empty
+                            ? gameState.GetItemStackCount(auctionItemGuid.To128(gameState))
+                            : 0;
+                        uint postSplitSourceStack = gameState.GetItemStackCount(item.Guid);
+
+                        Log.Event("auction.sell.split_resolved", new
+                        {
+                            dest_container = splitSlot.Value.containerSlot,
+                            dest_slot = splitSlot.Value.slot,
+                            dest_guid_after = auctionItemGuid.ToString(),
+                            dest_stack_after = postSplitDestStack,
+                            source_stack_after = postSplitSourceStack,
+                            source_guid = item.Guid.ToString(),
+                            same_as_source = auctionItemGuid == sourceItemGuid,
+                            empty_dest = auctionItemGuid == WowGuid64.Empty,
+                        });
+
                         if (auctionItemGuid == WowGuid64.Empty)
                         {
-                            Log.Print(LogType.Error,
-                                "AuctionSellItem: Split item not found in destination slot");
+                            Log.Event("auction.sell.split_failed", new
+                            {
+                                reason = "dest_slot_still_empty_after_500ms",
+                                source_guid = item.Guid.ToString(),
+                                use_count = item.UseCount,
+                            });
                             continue;
                         }
+
+                        didSplit = true;
                     }
                 }
 
-                // --- BULK SELL LOOP ---
-                // Loop through every single item the 1.14 client wants to sell in this batch
-                foreach (var itemToSell in auction.Items)
+                // Send the legacy CMSG using the post-split GUID so the server auctions
+                // the partial stack we just moved to the temp slot — not the original
+                // (now-shrunk) source stack. Pre-3.2.2a CMSG_AUCTION_SELL_ITEM has no
+                // count field, so the server always auctions the whole stack at the GUID.
+                WorldPacket legacyPacket = new WorldPacket(Opcode.CMSG_AUCTION_SELL_ITEM);
+                legacyPacket.WriteGuid(auction.Auctioneer.To64());
+                legacyPacket.WriteGuid(auctionItemGuid);
+                legacyPacket.WriteUInt32((uint)auction.MinBid);
+                legacyPacket.WriteUInt32((uint)auction.BuyoutPrice);
+                legacyPacket.WriteUInt32(expireTime);
+                SendPacketToServer(legacyPacket);
+
+                Log.Event("auction.sell.posted", new
                 {
-                    WorldPacket legacyPacket = new WorldPacket(Opcode.CMSG_AUCTION_SELL_ITEM);
-
-                    // 1. Auctioneer GUID (8 bytes)
-                    legacyPacket.WriteGuid(auction.Auctioneer.To64());
-
-                    // 2. This specific Item's GUID (8 bytes)
-                    legacyPacket.WriteGuid(itemToSell.Guid.To64());
-
-                    // 3. Bid Price (4 bytes) - Downcast modern 64-bit to Vanilla 32-bit
-                    legacyPacket.WriteUInt32((uint)auction.MinBid);
-
-                    // 4. Buyout Price (4 bytes) - Downcast modern 64-bit to Vanilla 32-bit
-                    legacyPacket.WriteUInt32((uint)auction.BuyoutPrice);
-
-                    // 5. Translated Duration (4 bytes)
-                    legacyPacket.WriteUInt32(expireTime);
-
-                    // Send this single item to TrinityCore (28 bytes)
-                    SendPacketToServer(legacyPacket);
-
-                    // --- ANTI-SPAM DELAY ---
-                    // Pause the proxy thread for 50 milliseconds to let the server process
-                    System.Threading.Thread.Sleep(50);
-                }
-
-                return;
+                    auction_item_guid = auctionItemGuid.ToString(),
+                    source_item_guid = sourceItemGuid.ToString(),
+                    use_count = item.UseCount,
+                    pre_split_stack_count = preSplitStackCount,
+                    did_split = didSplit,
+                    auctioning_source_directly = auctionItemGuid == sourceItemGuid,
+                });
             }
         }
         else

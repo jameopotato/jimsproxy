@@ -333,6 +333,21 @@ public partial class WorldClient
         SendPacketToClient(logout);
     }
 
+    // JimsProxy: how long to leave the InstanceSocket open after sending
+    // SMSG_LOGOUT_COMPLETE before the proxy force-closes it as a safety net.
+    // The 1.14 client flushes WTF (keybinds / macros / account / cache) as
+    // part of its char-select transition; if we slam the TCP socket within
+    // microseconds of LOGOUT_COMPLETE the client takes an error-disconnect
+    // code path that skips the flush, wiping settings. Symptom is most
+    // common on instant-logout flows (Exit Game, in-town logout) where
+    // there's no 20s countdown to widen the window. A direct 1.12 client
+    // ↔ 1.12 server connection never sees this because the legacy server
+    // doesn't proactively kill the client socket on logout-complete; we
+    // mirror that and let WoW close its end first. The safety-net timer
+    // bounds how long a buggy / never-closing client can leak the socket.
+    private const int LogoutCompleteSocketHoldMs = 3_000;
+    private const int LogoutCompletePollIntervalMs = 100;
+
     [PacketHandler(Opcode.SMSG_LOGOUT_COMPLETE)]
     void HandleLogoutComplete(WorldPacket packet)
     {
@@ -351,8 +366,100 @@ public partial class WorldClient
         GetSession().SnapshotQuestItemProgressForRestore();
         GetSession().FlushQuestItemProgressToDisk();
         GetSession().GameState = GameSessionData.CreateNewGameSessionData(GetSession());
-        GetSession().InstanceSocket.CloseSocket();
+        // Threat lists were keyed off the outgoing character's GUIDs; wipe so
+        // the next character (or the same one re-logging in) starts clean.
+        GetSession().ThreatTracker.Reset();
+
+        // JimsProxy (logout-wtf-flush follow-up): mark the session so the next
+        // CMSG_PLAYER_LOGIN tears down and recreates WorldClient. Twinstar
+        // accepts a second CMSG_PLAYER_LOGIN on the existing world TCP (the
+        // LOGIN_VERIFY_WORLD comes back fine) but then drops the connection
+        // a few seconds into the new character's session, leaving
+        // session.WorldClient null mid-game. The first observed symptom was
+        // an NRE at ChatHandler.cs:227 the moment the player /said; the
+        // second was WOW51900309 at "Enter World" if the legacy socket died
+        // before HandlePlayerLogin could forward CMSG_PLAYER_LOGIN.
+        //
+        // We do NOT null WorldClient here: the modern client transitions to
+        // char-select during the InstanceSocket hold below, and char-select
+        // forwards CMSG_ENUM_CHARACTERS / CMSG_QUERY_PLAYER_NAME / etc.
+        // through the same WorldClient. Nulling here means those queries
+        // get silently dropped, the modern client never receives
+        // SMSG_ENUM_CHARACTERS_RESULT, and after ~12s of waiting it sends
+        // CMSG_LOG_DISCONNECT and quits to the login screen. Bundle
+        // 20260505-130649 reproduced exactly that regression. The flag is
+        // cleared in WorldSocket.HandlePlayerLogin after the recreate.
+        GetSession().WorldClientNeedsRecreateOnNextLogin = true;
+        Log.Event("session.logout_complete.worldclient_recreate_marked", new
+        {
+            had_world_client = GetSession().WorldClient != null,
+            was_connected = GetSession().WorldClient?.IsConnected() ?? false,
+            was_authenticated = GetSession().WorldClient?.IsAuthenticated() ?? false,
+        });
+
+        // JimsProxy WTF-flush fix: capture the InstanceSocket reference and
+        // hand it to a delayed safety-net close. Drop the session's reference
+        // immediately so any subsequent send-on-this-socket path nulls out
+        // cleanly via the existing send-on-closed handling. Do NOT call
+        // CloseSocket() synchronously -- the modern client's WTF flush is
+        // gated on a clean socket lifetime through the char-select transition.
+        var lingeringSocket = GetSession().InstanceSocket;
         GetSession().InstanceSocket = null!;
+        var holdStart = DateTime.UtcNow;
+        Log.Event("session.logout_complete.socket_hold_started", new
+        {
+            hold_ms = LogoutCompleteSocketHoldMs,
+            poll_interval_ms = LogoutCompletePollIntervalMs,
+        });
+        // Poll the socket so the JSONL captures *when* the client closed
+        // its end (the WTF flush gate). On fast paths (Exit Game / in-town
+        // instant logout) we expect this to land well under 3s; on the
+        // 20s-countdown path the client may already have closed by the
+        // time LOGOUT_COMPLETE arrives. If 3s elapses without the client
+        // closing, the safety net fires and the same elapsed_ms tells us
+        // the buffer was actually load-bearing this session.
+        System.Threading.Tasks.Task.Run(async () =>
+        {
+            try
+            {
+                while ((DateTime.UtcNow - holdStart).TotalMilliseconds < LogoutCompleteSocketHoldMs)
+                {
+                    if (lingeringSocket == null || !lingeringSocket.IsOpen())
+                    {
+                        var elapsed = (long)(DateTime.UtcNow - holdStart).TotalMilliseconds;
+                        Log.Event("session.logout_complete.client_closed_first", new
+                        {
+                            elapsed_ms = elapsed,
+                        });
+                        return;
+                    }
+                    await System.Threading.Tasks.Task.Delay(LogoutCompletePollIntervalMs);
+                }
+                // 3s elapsed and the client still hasn't closed -- safety net.
+                if (lingeringSocket != null && lingeringSocket.IsOpen())
+                {
+                    lingeringSocket.CloseSocket();
+                    Log.Event("session.logout_complete.safety_net_closed", new
+                    {
+                        elapsed_ms = LogoutCompleteSocketHoldMs,
+                    });
+                }
+                else
+                {
+                    // Tight race: client closed between the last poll and the
+                    // window expiring. Treat as client-closed-first.
+                    Log.Event("session.logout_complete.client_closed_first", new
+                    {
+                        elapsed_ms = LogoutCompleteSocketHoldMs,
+                        late_race = true,
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Event("session.logout_complete.safety_net_error", new { message = ex.Message });
+            }
+        });
     }
 
     [PacketHandler(Opcode.SMSG_LOGOUT_CANCEL_ACK)]

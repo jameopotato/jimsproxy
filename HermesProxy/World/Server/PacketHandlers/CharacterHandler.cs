@@ -186,11 +186,81 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_PLAYER_LOGIN)]
     void HandlePlayerLogin(PlayerLogin playerLogin)
     {
-        if (GetSession().WorldClient == null || !GetSession().WorldClient!.IsConnected())
+        // JimsProxy (logout-wtf-flush follow-up): recreate WorldClient if
+        //   (a) it's null/disconnected (defensive), OR
+        //   (b) the prior character's logout marked the session for a fresh
+        //       world TCP (WorldClientNeedsRecreateOnNextLogin).
+        // Twinstar accepts a second CMSG_PLAYER_LOGIN on the existing world
+        // TCP -- the LOGIN_VERIFY_WORLD comes back fine -- but then drops
+        // the connection a few seconds into the new character's session,
+        // leaving session.WorldClient null mid-game and NRE'ing the next
+        // /say at ChatHandler.cs:227. Mirror direct 1.12 client ↔ 1.12
+        // server (one world TCP per character). The first login of a
+        // session takes neither branch: WorldClient is alive from
+        // WorldSocket.HandleAuthSession and the recreate flag isn't set.
+        bool needsRecreate = GetSession().WorldClient == null
+            || !GetSession().WorldClient!.IsConnected()
+            || GetSession().WorldClientNeedsRecreateOnNextLogin;
+        if (needsRecreate)
         {
-            Log.Print(LogType.Error, "WorldClient is disconnected, cannot enter world.");
-            AbortLogin(LoginFailureReason.NoWorld);
-            return;
+            Log.Event("session.relogin.worldclient_recreate_attempt", new
+            {
+                had_world_client = GetSession().WorldClient != null,
+                was_connected = GetSession().WorldClient?.IsConnected() ?? false,
+                was_authenticated = GetSession().WorldClient?.IsAuthenticated() ?? false,
+                marked_by_logout = GetSession().WorldClientNeedsRecreateOnNextLogin,
+                target_guid_low = playerLogin.Guid.GetCounter(),
+            });
+
+            var reloginRealm = GetSession().RealmManager.GetRealm(GetSession().RealmId);
+            if (reloginRealm == null)
+            {
+                Log.Print(LogType.Error, $"HandlePlayerLogin: cannot recreate WorldClient — unknown realm id {GetSession().RealmId}");
+                Log.Event("session.relogin.worldclient_recreate_failed", new
+                {
+                    reason = "unknown_realm",
+                    realm_id_index = (int)GetSession().RealmId.Index,
+                });
+                AbortLogin(LoginFailureReason.NoWorld);
+                return;
+            }
+
+            // Tear down the existing client (alive or stale) before
+            // overwriting the slot, so its receive-loop exit path doesn't
+            // race the new client onto session.WorldClient. Disconnect()
+            // is idempotent on already-closed sockets.
+            var staleWorldClient = GetSession().WorldClient;
+            if (staleWorldClient != null)
+            {
+                try { staleWorldClient.Disconnect(); }
+                catch (Exception ex)
+                {
+                    Log.Event("session.relogin.stale_worldclient_disconnect_error", new
+                    {
+                        exception_type = ex.GetType().Name,
+                        message = ex.Message,
+                    });
+                }
+            }
+
+            var reconnectStopwatch = System.Diagnostics.Stopwatch.StartNew();
+            GetSession().WorldClient = new World.Client.WorldClient();
+            bool reloginConnected = GetSession().WorldClient!.ConnectToWorldServer(reloginRealm, GetSession());
+            Log.Event("session.relogin.worldclient_recreated", new
+            {
+                realm_name = reloginRealm.Name,
+                connected = reloginConnected,
+                authenticated = GetSession().WorldClient?.IsAuthenticated() ?? false,
+                elapsed_ms = reconnectStopwatch.ElapsedMilliseconds,
+            });
+            if (!reloginConnected)
+            {
+                Log.Print(LogType.Error, "HandlePlayerLogin: failed to recreate WorldClient on re-login.");
+                GetSession().WorldClient = null;
+                AbortLogin(LoginFailureReason.NoWorld);
+                return;
+            }
+            GetSession().WorldClientNeedsRecreateOnNextLogin = false;
         }
 
         if (!GetSession().GameState.CachedPlayers.TryGetValue(playerLogin.Guid, out var selectedChar))

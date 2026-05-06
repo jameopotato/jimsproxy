@@ -160,7 +160,50 @@ public sealed class GameSessionData
     private ClientCastRequest? _heldGcdCast;            // most recently-pressed cast while GCD active (overwritten on new press)
     private Timer? _gcdExpiryTimer;
     private uint _gcdGeneration;                        // incremented each BeginGcd; callback compares against its captured generation to detect stale fires
+    private bool _gcdTimerHasFired;                     // true after OnGcdTimerElapsed runs; prevents orphaned holds
+    private uint _lastFiredSpellId;                     // spell ID forwarded by the timer; used to drop same-spell late presses
     public Action<ClientCastRequest>? OnGcdHeldCastFire; // set by WorldSocket at attach time; invoked on a ThreadPool thread at GCD expiry
+
+    // JimsProxy: cast-time spell queue. While a cast-time spell is in progress
+    // (HasStartedNormalCast), presses are held here instead of dropped. Fired
+    // on SPELL_GO when the cast completes. Most-recent-press-wins, one slot.
+    private ClientCastRequest? _heldCastTimeCast;
+
+    public ClientCastRequest? HoldCastDuringCastTime(ClientCastRequest cast)
+    {
+        lock (_gcdLock)
+        {
+            var displaced = _heldCastTimeCast;
+            _heldCastTimeCast = cast;
+            return displaced;
+        }
+    }
+
+    public ClientCastRequest? TakeHeldCastTimeCast()
+    {
+        lock (_gcdLock)
+        {
+            var cast = _heldCastTimeCast;
+            _heldCastTimeCast = null;
+            return cast;
+        }
+    }
+
+    public void ClearHeldCastTimeCast()
+    {
+        lock (_gcdLock) { _heldCastTimeCast = null; }
+    }
+
+    public bool HasNonStartedPendingCastForSpell(uint spellId)
+    {
+        foreach (var item in PendingNormalCasts)
+        {
+            if (!item.HasStarted &&
+                (item.SpellId == spellId || (item.LegacySpellId != 0 && item.LegacySpellId == spellId)))
+                return true;
+        }
+        return false;
+    }
 
     // JimsProxy: proxy→server RTT measurement for adaptive GCD fire offset.
     private readonly object _rttLock = new();
@@ -907,7 +950,11 @@ public sealed class GameSessionData
             if (serial != _lastPingSerial || _lastPingSendTickMs == 0) return;
             long rttMs = Environment.TickCount64 - _lastPingSendTickMs;
             _lastPingSendTickMs = 0;
-            if (rttMs > 5000) return;
+            if (rttMs > 300)
+            {
+                Log.Event("rtt.sample.rejected", new { serial, raw_ms = rttMs, reason = "outlier_above_300ms" });
+                return;
+            }
             const double alpha = 0.2;
             _smoothedRttMs = _rttSampleCount == 0 ? rttMs : (_smoothedRttMs * (1 - alpha) + rttMs * alpha);
             _rttSampleCount++;
@@ -921,7 +968,19 @@ public sealed class GameSessionData
         {
             if (_rttSampleCount < 3)
                 return Framework.Settings.SpellCastEarlyFireOffsetMs;
-            return (int)Math.Clamp(Math.Round(_smoothedRttMs * 0.5), 0, 100);
+            return (int)Math.Clamp(Math.Round(_smoothedRttMs - 10), 0, 100);
+        }
+    }
+
+    public void ResetRttSmoothing()
+    {
+        lock (_rttLock)
+        {
+            _smoothedRttMs = 0;
+            _rttSampleCount = 0;
+            _lastPingSendTickMs = 0;
+            _lastPingSerial = 0;
+            Log.Event("rtt.smoothing.reset", new { });
         }
     }
 
@@ -1103,9 +1162,24 @@ public sealed class GameSessionData
         {
             if (_gcdExpireTimestampMs <= Environment.TickCount64)
                 return false;
+            if (_gcdTimerHasFired)
+                return false; // Timer already fired — no one to release this cast. Forward immediately.
             displaced = _heldGcdCast;
             _heldGcdCast = cast;
             return true;
+        }
+    }
+
+    /// <summary>
+    /// Returns true if the GCD timer already fired and the spell it forwarded matches
+    /// the given spell ID. Used to silently drop same-spell late presses that would
+    /// just get NOT_READY from the server.
+    /// </summary>
+    public bool ShouldDropLateSameSpell(uint spellId)
+    {
+        lock (_gcdLock)
+        {
+            return _gcdTimerHasFired && _lastFiredSpellId == spellId;
         }
     }
 
@@ -1120,6 +1194,7 @@ public sealed class GameSessionData
         {
             _gcdExpiryTimer?.Dispose();
             _gcdExpireTimestampMs = expireAtTickMs;
+            _gcdTimerHasFired = false;
             unchecked { _gcdGeneration++; }
             uint myGeneration = _gcdGeneration;
             long delayMs = Math.Max(0, fireAtTickMs - Environment.TickCount64);
@@ -1147,6 +1222,7 @@ public sealed class GameSessionData
             _gcdExpiryTimer?.Dispose();
             _gcdExpiryTimer = null;
             _gcdExpireTimestampMs = 0;
+            _gcdTimerHasFired = false;
             _heldGcdCast = null;
             // Bump generation so any already-queued callback from the cancelled timer sees a
             // stale generation and bails. Prevents post-cancel firing on session teardown.
@@ -1185,10 +1261,11 @@ public sealed class GameSessionData
 
             toFire = _heldGcdCast;
             _heldGcdCast = null;
-            // Keep _gcdExpireTimestampMs alive — presses between fireAt and expireAt are still
-            // caught by IsGcdHoldActive() and stored in the now-empty _heldGcdCast slot. The
-            // next BeginGcd (from SPELL_GO) picks them up. Clearing it here created an unguarded
-            // RTT window where spam-presses bypassed all guards and doubled casts to the server.
+            _gcdTimerHasFired = true;
+            _lastFiredSpellId = toFire?.SpellId ?? 0;
+            // Keep _gcdExpireTimestampMs alive — but presses after timer fires should NOT be
+            // held (no timer to release them). TryHoldCastDuringGcd checks _gcdTimerHasFired
+            // and returns false so the caller forwards immediately instead of orphaning.
             // Don't null _gcdExpiryTimer here: a concurrent BeginGcd could have already replaced it.
         }
         if (toFire != null)
@@ -1442,6 +1519,8 @@ public class ClientCastRequest
     // Diagnostic only — used by spell.held_fire to compute hold duration. 0 if never held.
     public long HeldAtTickMs;
 
+    public bool HasSentPrepare;
+
     // JimsProxy: cast time (ms) reported by SMSG_SPELL_START. 0 means instant.
     // Distinguishes truly cast-time spells (Frostbolt, Polymorph) from instants that
     // *also* emit SMSG_SPELL_START on Kronos 1.12 (Arcane Explosion, Counterspell, etc.).
@@ -1509,15 +1588,31 @@ public class GlobalSessionData
     public WorldSocket InstanceSocket = null!;
     public AuthClient AuthClient = null!;
     public WorldClient? WorldClient;
+    // JimsProxy: set true on SMSG_LOGOUT_COMPLETE so the next CMSG_PLAYER_LOGIN
+    // tears down and recreates WorldClient. Twinstar accepts a second
+    // CMSG_PLAYER_LOGIN on the same world TCP (the LOGIN_VERIFY_WORLD comes
+    // back fine) but then closes the connection a few seconds into the new
+    // character's session — leaving session.WorldClient null mid-game. We
+    // can't drop the WorldClient at LOGOUT_COMPLETE itself because char-select
+    // (CMSG_ENUM_CHARACTERS / CMSG_QUERY_PLAYER_NAME / etc.) is forwarded over
+    // the same WorldClient and needs it alive until the user picks a char.
+    // Cleared after the recreate succeeds.
+    public volatile bool WorldClientNeedsRecreateOnNextLogin;
     public SniffFile ModernSniff = null!;
 
     public Dictionary<string, WowGuid128> GuildsByName = [];
     public Dictionary<uint, List<string>> GuildRanks = [];
 
+    // JimsProxy threat translation: per-session threat calculator. Vanilla 1.12
+    // doesn't broadcast threat; this engine observes combat events and synthesizes
+    // SMSG_THREAT_UPDATE so the modern client's native threat APIs populate.
+    public ThreatTracker ThreatTracker = null!;
+
     public GlobalSessionData()
     {
         GameState = GameSessionData.CreateNewGameSessionData(this);
         AuthClient = new AuthClient(this);
+        ThreatTracker = new ThreatTracker(this);
     }
 
     public void StoreGuildRankNames(uint guildId, List<string> ranks)
@@ -2126,6 +2221,9 @@ public class GlobalSessionData
         }
 
         GameState = GameSessionData.CreateNewGameSessionData(this);
+        // Threat lists are tied to the previous character's mob/unit GUIDs;
+        // wipe so the new login starts clean.
+        ThreatTracker.Reset();
     }
 
     public void SendHermesTextMessage(string message, bool isError = false)
