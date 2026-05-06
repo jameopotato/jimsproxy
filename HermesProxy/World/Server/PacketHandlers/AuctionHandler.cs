@@ -76,6 +76,35 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_AUCTION_LIST_ITEMS)]
     void HandleAuctionListItems(AuctionListItems auction)
     {
+        // JimsProxy: while a Full Scan is in progress, the proxy is internally
+        // paginating CMSG_AUCTION_LIST_ITEMS at the 6s cooldown. A user search
+        // click during that window would race for the same Kronos query slot
+        // and trip its anti-flood drop, kicking us. Reject with a chat-system
+        // line so the player knows scan is running.
+        var replicateState = GetSession().GameState;
+        bool replicateActive;
+        int replicatePage;
+        int replicateAccum;
+        lock (replicateState.AuctionReplicateLock)
+        {
+            replicateActive = replicateState.AuctionReplicateInProgress;
+            replicatePage = replicateState.AuctionReplicatePage;
+            replicateAccum = replicateState.AuctionReplicateAccumulator.Count;
+        }
+        if (replicateActive)
+        {
+            Log.Event("auction.list.rejected_replicate_in_progress", new
+            {
+                replicate_page = replicatePage,
+                replicate_items_so_far = replicateAccum,
+                name = auction.Name,
+            });
+            ChatPkt notice = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                $"Full Scan in progress (page {replicatePage}, {replicateAccum} items). Please wait for it to finish before searching.");
+            GetSession().WorldClient!.SendPacketToClient(notice);
+            return;
+        }
+
         var now = DateTime.UtcNow;
         var elapsedMs = (now - _lastSearchTime).TotalMilliseconds;
         var cooldownMs = AuctionSearchCooldownSeconds * 1000.0;
@@ -769,6 +798,111 @@ public partial class WorldSocket
         packet.WriteGuid(auction.Auctioneer.To64());
         packet.WriteUInt32(auction.AuctionID);
         SendPacketToServer(packet);
+    }
+
+    // JimsProxy: legacy 1.12 vanilla page size for SMSG_AUCTION_LIST_ITEMS_RESULT.
+    // Mirrors Auctionator.Constants.MaxResultsPerPage; a returned page shorter than
+    // this is the last page and ends the replicate walk.
+    internal const int AuctionLegacyPageSize = 50;
+
+    [PacketHandler(Opcode.CMSG_AUCTION_REPLICATE_ITEMS)]
+    void HandleAuctionReplicateItems(AuctionReplicateItems req)
+    {
+        // CMSG_AUCTION_REPLICATE_ITEMS is the modern Full Scan opcode. Default
+        // Browse-UI Search uses CMSG_AUCTION_LIST_ITEMS (different opcode,
+        // different handler), so any REPLICATE_ITEMS arriving here came from an
+        // addon (Auctionator / Auctioneer / etc.) explicitly calling
+        // C_AuctionHouse.ReplicateItems(). Always walk the full AH.
+        var gameState = GetSession().GameState;
+        bool alreadyRunning = false;
+        lock (gameState.AuctionReplicateLock)
+        {
+            if (gameState.AuctionReplicateInProgress)
+            {
+                alreadyRunning = true;
+            }
+            else
+            {
+                gameState.AuctionReplicateInProgress = true;
+                gameState.AuctionReplicatePage = 0;
+                gameState.AuctionReplicateAuctioneer = req.Auctioneer;
+                gameState.AuctionReplicateChangeNumberGlobal = req.ChangeNumberGlobal;
+                gameState.AuctionReplicateChangeNumberCursor = req.ChangeNumberCursor;
+                gameState.AuctionReplicateChangeNumberTombstone = req.ChangeNumberTombstone;
+                gameState.AuctionReplicateAccumulator.Clear();
+                gameState.AuctionReplicateStartTime = DateTime.UtcNow;
+            }
+        }
+
+        if (alreadyRunning)
+        {
+            Log.Event("auction.replicate.rejected_already_running", new
+            {
+                auctioneer = req.Auctioneer.ToString(),
+            });
+            // Send an empty (Result=0, 0 items) response so the modern client's
+            // Full Scan frame doesn't hang waiting on AUCTION_ITEM_LIST_UPDATE.
+            SendEmptyAuctionReplicateResponse(req);
+            return;
+        }
+
+        Log.Event("auction.replicate.started", new
+        {
+            auctioneer = req.Auctioneer.ToString(),
+            change_global = req.ChangeNumberGlobal,
+            change_cursor = req.ChangeNumberCursor,
+            change_tombstone = req.ChangeNumberTombstone,
+            wire_tainted = req.TaintedBy != null,
+            wire_tainted_by = req.TaintedBy?.Name ?? "",
+        });
+
+        // Stamp our cooldown so the very next user CMSG (if any slips through
+        // before the first SMSG result re-asserts the in-progress flag in the
+        // common path) won't double up.
+        _lastSearchTime = DateTime.UtcNow;
+        SendReplicatePageQuery(req.Auctioneer, page: 0);
+    }
+
+    internal void SendReplicatePageQuery(WowGuid128 auctioneer, uint page)
+    {
+        // The legacy server's CMSG_AUCTION_LIST_ITEMS offset field is an *item*
+        // offset (rows-to-skip), not a page index. Confirmed against a 109-item
+        // PTR AH: sending raw page index produced 50 near-identical rows per
+        // "page" because the server window slid by 1 item instead of 50 (every
+        // SMSG was 3210 bytes: 50 items × ~64 bytes, just shifted). Multiply by
+        // the legacy 50-row page size so each query advances a full window.
+        uint itemOffset = page * (uint)AuctionLegacyPageSize;
+        WorldPacket packet = new WorldPacket(Opcode.CMSG_AUCTION_LIST_ITEMS);
+        packet.WriteGuid(auctioneer.To64());
+        packet.WriteUInt32(itemOffset);
+        packet.WriteCString("");
+        packet.WriteUInt8(0);  // minLevel
+        packet.WriteUInt8(0);  // maxLevel
+        packet.WriteInt32(-1); // inventorySlot — any
+        packet.WriteInt32(-1); // mainCategory
+        packet.WriteInt32(-1); // subCategory
+        packet.WriteInt32(-1); // quality — any
+        packet.WriteBool(false); // onlyUsable
+        if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
+        {
+            packet.WriteBool(false); // exactMatch
+            packet.WriteUInt8(0);    // sortCount
+        }
+        SendPacketToServer(packet);
+        Log.Event("auction.replicate.page_query_sent", new { page, item_offset = itemOffset });
+    }
+
+    private void SendEmptyAuctionReplicateResponse(AuctionReplicateItems req)
+    {
+        AuctionReplicateResponse resp = new AuctionReplicateResponse
+        {
+            Result = 0,
+            DesiredDelay = 6000,
+            ChangeNumberGlobal = req.ChangeNumberGlobal,
+            ChangeNumberCursor = req.ChangeNumberCursor,
+            ChangeNumberTombstone = req.ChangeNumberTombstone,
+        };
+        GetSession().WorldClient!.SendPacketToClient(resp);
     }
 
     [PacketHandler(Opcode.CMSG_AUCTION_PLACE_BID)]

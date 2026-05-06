@@ -146,6 +146,23 @@ public sealed class GameSessionData
     public uint CurrentGuildNumAccounts;
     public WowGuid128 CurrentInteractedWithNPC;
     public WowGuid128 CurrentInteractedWithGO;
+    // JimsProxy: Auctionator-style Full Scan synthesis state. CMSG_AUCTION_REPLICATE_ITEMS
+    // has no legacy 1.12 equivalent; the proxy walks pages internally via
+    // CMSG_AUCTION_LIST_ITEMS at the canonical 6s cooldown and assembles rows
+    // into one SMSG_AUCTION_REPLICATE_RESPONSE. Default Browse-UI Search uses
+    // CMSG_AUCTION_LIST_ITEMS (different opcode), so every REPLICATE_ITEMS is
+    // by definition a full-AH scan request — no side-channel needed to
+    // differentiate. Lock guards every read/write: accumulator is appended
+    // from the WorldClient SMSG thread and read from the WorldSocket CMSG thread.
+    public bool AuctionReplicateInProgress;
+    public int AuctionReplicatePage;
+    public WowGuid128 AuctionReplicateAuctioneer = WowGuid128.Empty;
+    public uint AuctionReplicateChangeNumberGlobal;
+    public uint AuctionReplicateChangeNumberCursor;
+    public uint AuctionReplicateChangeNumberTombstone;
+    public List<World.Server.Packets.AuctionItem> AuctionReplicateAccumulator = new();
+    public readonly Lock AuctionReplicateLock = new();
+    public DateTime AuctionReplicateStartTime;
     public uint LastWhoRequestId;
     public WowGuid128 CurrentPetGuid;
     public WowGuid64 CurrentAttackTarget;        // active CMSG_ATTACK_SWING victim, cleared on ATTACK_STOP/CANCEL_COMBAT
