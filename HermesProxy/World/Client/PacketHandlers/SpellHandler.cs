@@ -1062,26 +1062,6 @@ public partial class WorldClient
             }
         }
 
-        // JimsProxy: emit structured spell.cast event so we can diagnose spell-ID
-        // and visual-kit lookup issues without parsing .pkt files. Particularly
-        // useful for comparing what different 1.12 servers (Kronos vs Ashen-wow)
-        // send for the same spell -- on Kronos PW:Shield doesn't render the
-        // bubble visual; on Ashen-wow it does. If spell_visual_id=0 here, the
-        // CSV lookup failed (either wrong spellId from server or missing row).
-        // Emitted for both SMSG_SPELL_START and SMSG_SPELL_GO (shared codepath).
-        Log.Event("spell.cast", new
-        {
-            direction = "s2c",
-            phase = isSpellGo ? "go" : "start",
-            spell_id = dbdata.SpellID,
-            spell_visual_id = dbdata.SpellXSpellVisualID,
-            visual_lookup_missing = dbdata.SpellXSpellVisualID == 0,
-            caster_guid = dbdata.CasterGUID.ToString(),
-            caster_is_player = dbdata.CasterGUID == GetSession().GameState.CurrentPlayerGuid,
-            casterCounter = dbdata.CasterUnit.GetCounter(), //MIRASU - lets us correlate with spell.failed_other.routed
-            castIdCounter = dbdata.CastID.GetCounter(),     //MIRASU - this is the CastID the modern client tracks
-        });
-
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180) && LegacyVersion.RemovedInVersion(ClientVersionBuild.V3_0_2_9056) && !isSpellGo)
             packet.ReadUInt8(); // cast count
 
@@ -1101,6 +1081,31 @@ public partial class WorldClient
         // client's TIME_SYNC offset can convert it to local time.
         if (isSpellGo && dbdata.CastTime == 0)
             dbdata.CastTime = Time.GetMSTime();
+
+        // JimsProxy: emit structured spell.cast event so we can diagnose spell-ID
+        // and visual-kit lookup issues without parsing .pkt files. Particularly
+        // useful for comparing what different 1.12 servers (Kronos vs Ashen-wow)
+        // send for the same spell -- on Kronos PW:Shield doesn't render the
+        // bubble visual; on Ashen-wow it does. If spell_visual_id=0 here, the
+        // CSV lookup failed (either wrong spellId from server or missing row).
+        // Emitted for both SMSG_SPELL_START and SMSG_SPELL_GO (shared codepath).
+        // Logged after CastFlags + CastTime are parsed so the bundle can grep
+        // pet-only instant-cast SPELL_STARTs (warlock-pet spawn glow triage).
+        Log.Event("spell.cast", new
+        {
+            direction = "s2c",
+            phase = isSpellGo ? "go" : "start",
+            spell_id = dbdata.SpellID,
+            spell_visual_id = dbdata.SpellXSpellVisualID,
+            visual_lookup_missing = dbdata.SpellXSpellVisualID == 0,
+            caster_guid = dbdata.CasterGUID.ToString(),
+            caster_is_player = dbdata.CasterGUID == GetSession().GameState.CurrentPlayerGuid,
+            caster_is_pet = dbdata.CasterUnit == GetSession().GameState.CurrentPetGuid,
+            cast_time = dbdata.CastTime,
+            cast_flags = dbdata.CastFlags,
+            casterCounter = dbdata.CasterUnit.GetCounter(), //MIRASU - lets us correlate with spell.failed_other.routed
+            castIdCounter = dbdata.CastID.GetCounter(),     //MIRASU - this is the CastID the modern client tracks
+        });
 
         if (isSpellGo)
         {

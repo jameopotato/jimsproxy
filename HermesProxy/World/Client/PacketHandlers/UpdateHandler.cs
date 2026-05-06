@@ -10,6 +10,7 @@ using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
 using System;
 using System.Collections;
+using System.Collections.Frozen;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -17,6 +18,21 @@ namespace HermesProxy.World.Client;
 
 public partial class WorldClient
 {
+    // JimsProxy (warlock-pet-scale): inverse-CMS pet-scale fix from PR #117 over-bumped
+    // every warlock pet by ~2x at K=1.5 (tester screenshots 2026-05-06: Imp/Felhunter/
+    // Voidwalker/Succubus all uniformly oversized vs 1.12). Halving K for the warlock
+    // family lands them at 1.12 size without disturbing hunter-pet behavior. Detection
+    // is by DisplayID — vanilla warlock pet roster is fixed and small.
+    private static readonly FrozenSet<int> WarlockPetDisplayIds = new[]
+    {
+        4449,   // Imp
+        850,    // Felhunter
+        1132,   // Voidwalker
+        4162,   // Succubus
+        1813,   // Felsteed
+        18223,  // Dreadsteed
+    }.ToFrozenSet();
+
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_DESTROY_OBJECT)]
     void HandleDestroyObject(WorldPacket packet)
@@ -3877,7 +3893,12 @@ public partial class WorldClient
         // Only fires when SCALE_X is present in this update (Scale != null) — a delta
         // values update without SCALE_X leaves the already-normalized scale sticky on the
         // client and avoids compounding multiplications across updates.
-        const float PetScaleK = 1.5f;
+        // K_hunter validated against Dire Wolf side-by-side vs 1.12 (commit 17a08c7).
+        // K_warlock = K_hunter / 2 — tester screenshots 2026-05-06 showed every warlock
+        // pet (Imp/Felhunter/Voidwalker/Succubus) rendering ~2x oversized at K=1.5
+        // uniformly across CMS values; halving the constant lands them at 1.12 size.
+        const float K_hunter  = 1.5f;
+        const float K_warlock = 0.75f;
         if (LegacyVersion.ExpansionVersion == 1
             && updateData.ObjectData.Scale != null
             && (objectType == ObjectType.Unit || objectType == ObjectType.Player || objectType == ObjectType.ActivePlayer))
@@ -3907,12 +3928,15 @@ public partial class WorldClient
                 if (displayId > 0)
                     cms = GameData.GetDisplayInfo((uint)displayId).DisplayScale;
 
+                bool isWarlockPet = WarlockPetDisplayIds.Contains(displayId);
+                float k = isWarlockPet ? K_warlock : K_hunter;
+
                 // Skip normalization if CMS data is missing/invalid — fall back to a flat
                 // K multiply so the pet still gets a size bump rather than passing through
                 // un-modified (and rendering small).
                 float emit = (cms > 0)
-                    ? (rawScale / cms) * PetScaleK
-                    : rawScale * PetScaleK;
+                    ? (rawScale / cms) * k
+                    : rawScale * k;
 
                 updateData.ObjectData.Scale = emit;
 
@@ -3921,7 +3945,8 @@ public partial class WorldClient
                     guid = guid.ToString(),
                     display_id = displayId,
                     creature_model_scale = cms,
-                    k = PetScaleK,
+                    k = k,
+                    family = isWarlockPet ? "warlock" : "hunter",
                     raw_scale = rawScale,
                     emitted_scale = emit,
                     matched_via = (currentPetGuid != default && guid == currentPetGuid) ? "current_pet_guid" : "summoned_by",
