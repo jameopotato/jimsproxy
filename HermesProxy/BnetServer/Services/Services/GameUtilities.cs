@@ -151,7 +151,7 @@ public partial class BnetServices
         if (GetSession().GameAccountInfo == null)
             return BattlenetRpcErrorCode.UserServerBadWowAccount;
 
-        if (!GetSession().AuthClient.IsConnected())
+        if (!GetSession().AuthClient.IsConnected() && !GetSession().RealmManager.GetRealms().Any())
             return BattlenetRpcErrorCode.UtilServerMissingRealmList;
 
         string subRegionId = "";
