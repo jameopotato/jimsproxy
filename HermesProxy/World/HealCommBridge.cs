@@ -290,13 +290,19 @@ public sealed class HealCommBridge
 
     private string? TranslateHotOutbound(string[] parts)
     {
-        // H:{totalTicks}:{spellID}:{amount}::{tickIntervalMs}:{guidsCSV}
+        // LHC4 wire: H:{totalTicks}:{spellID}:{amount}::{tickIntervalSec}:{guidsCSV}
+        // tickInterval is SECONDS, not milliseconds (verified in
+        // LibHealComm-4.0.lua:1922 — `duration = totalTicks * tickInterval`
+        // and `endTime = GetTime() + duration` where GetTime() returns seconds).
+        // Earlier code divided by 1000 thinking ms, producing duration=0 for
+        // every HoT (5 * 3 / 1000 = 0) → emitted "Renew/{name}/0/" which
+        // 1.12 HC-1.0 receivers ignore.
         if (parts.Length < 7) return null;
         if (!int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int totalTicks))
             return null;
         if (!uint.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out uint spellId))
             return null;
-        if (!int.TryParse(parts[5], NumberStyles.Integer, CultureInfo.InvariantCulture, out int tickIntervalMs))
+        if (!int.TryParse(parts[5], NumberStyles.Integer, CultureInfo.InvariantCulture, out int tickIntervalSec))
             return null;
 
         if (!HotKeywordById.TryGetValue(spellId, out string? keyword))
@@ -306,8 +312,7 @@ public sealed class HealCommBridge
         if (targetNames.Count == 0)
             return null;
 
-        // HC-1.0 carries duration in seconds (integer for vanilla HoTs).
-        int durationSec = (totalTicks * tickIntervalMs) / 1000;
+        int durationSec = totalTicks * tickIntervalSec;
         // Single HoT message per target — HC-1.0 has no batched form.
         var sb = new StringBuilder();
         foreach (var name in targetNames)
