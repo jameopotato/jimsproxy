@@ -546,62 +546,51 @@ public partial class WorldClient
         // can drop the broadcast entirely -- there's no animation to cancel.
         bool isRangedAutoAttack = spellId == 75 || spellId == 5019;
 
-        // Local player: DEQUEUE and send CastFailed immediately. Kronos doesn't
-        // always follow SMSG_SPELL_FAILURE with SMSG_CAST_FAILED (e.g. target dies
-        // mid-cast). Previously this only peeked, relying on HandleCastFailed to
-        // dequeue — but when CAST_FAILED never arrived, the entry leaked with
-        // HasStarted=true, permanently blocking all non-off-GCD casts.
+        // JimsProxy: PEEK (don't dequeue) so the trailing SMSG_CAST_FAILED — which
+        // carries the real failure reason on vmangos/Twinstar after Spell::SendInterrupted
+        // hardcodes the SpellFailure wire reason to 0 (= AffectingCombat after translation)
+        // — can be matched by HandleCastFailed via TryDequeuePendingNormalCast and
+        // delivered to the client. Sending an inline CastFailed here would (a) consume
+        // the queue entry HandleCastFailed needs, leaving its dequeue empty, and (b)
+        // ship the misleading hardcoded reason to the client, which the 1.14 popup +
+        // button-state renderer reads regardless of whether the broadcast SpellFailure
+        // was suppressed. Trade-off: on Kronos, where the trailing SMSG_CAST_FAILED can
+        // be dropped (e.g. target dies mid-cast on cast-time spells), the cast can leak
+        // in the queue. For the SendInterrupted hardcoded-zero path that triggers this
+        // suppression — overwhelmingly instants on vmangos/Twinstar — the trailing
+        // CAST_FAILED reliably arrives. ClearHeldCastTimeCast still fires to release
+        // any cast-time-held press attached to a now-failed cast bar.
         if (GetSession().GameState.CurrentPlayerGuid == casterUnit &&
-            GetSession().GameState.TryDequeuePendingNormalCast(spellId, out var pendingNormal))
+            GetSession().GameState.PendingNormalCasts.FirstOrDefault(c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId)) is { } pendingNormal)
         {
-            castId = pendingNormal!.ServerGUID;
+            castId = pendingNormal.ServerGUID;
             spellVisual = pendingNormal.SpellXSpellVisualId;
             if (pendingNormal.LegacySpellId != 0)
                 spellId = pendingNormal.SpellId;
             wasStarted = pendingNormal.HasStarted;
-            dequeued = true;
-
-            if (!pendingNormal.HasStarted)
-            {
-                SpellPrepare prepare = new();
-                prepare.ClientCastID = pendingNormal.ClientGUID;
-                prepare.ServerCastID = pendingNormal.ServerGUID;
-                SendPacketToClient(prepare);
-            }
-
-            CastFailed failed = new();
-            failed.SpellID = pendingNormal.SpellId;
-            failed.SpellXSpellVisualID = pendingNormal.SpellXSpellVisualId;
-            failed.Reason = reason;
-            failed.CastID = pendingNormal.ServerGUID;
-            SendPacketToClient(failed);
+            dequeued = false; // peeked — HandleCastFailed dequeues on the trailing SMSG_CAST_FAILED
 
             GetSession().GameState.ClearHeldCastTimeCast();
 
             // Instant cast that wasn't a ranged auto-attack: SPELL_START was
-            // never forwarded, so there's no cast bar to dismiss. CastFailed
-            // already cancelled GCD anticipation. Skip the misleading
-            // SpellFailure broadcast entirely.
+            // never forwarded, so there's no cast bar to dismiss. Skip the misleading
+            // broadcast SpellFailure entirely. The trailing SMSG_CAST_FAILED via
+            // HandleCastFailed sends SpellPrepare + CastFailed with the real reason,
+            // which clears button-lit state and shows the correct popup.
             if (!pendingNormal.HasStarted && !isRangedAutoAttack)
                 skipBroadcastFailure = true;
             else
                 overrideReasonForLocalBroadcast = true;
         }
         else if (GetSession().GameState.CurrentPetGuid == casterUnit &&
-                 GetSession().GameState.TryDequeuePendingPetCast(spellId, out var pendingPet))
+                 GetSession().GameState.PendingPetCasts.FirstOrDefault(c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId)) is { } pendingPet)
         {
-            castId = pendingPet!.ServerGUID;
+            castId = pendingPet.ServerGUID;
             spellVisual = pendingPet.SpellXSpellVisualId;
             if (pendingPet.LegacySpellId != 0)
                 spellId = pendingPet.SpellId;
             wasStarted = pendingPet.HasStarted;
-            dequeued = true;
-
-            PetCastFailed petFailed = new();
-            petFailed.SpellID = pendingPet.SpellId;
-            petFailed.Reason = reason;
-            petFailed.CastID = pendingPet.ServerGUID;
-            SendPacketToClient(petFailed);
+            dequeued = false; // peeked — HandlePetCastFailed dequeues on the trailing SMSG_PET_CAST_FAILED
 
             // Pet path: PetCastFailed handles the pet UI. Suppress the broadcast
             // SpellFailure for instants (no cast bar); for cast-time pet spells
