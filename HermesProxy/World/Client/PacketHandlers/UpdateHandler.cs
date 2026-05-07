@@ -2523,6 +2523,16 @@ public partial class WorldClient
                             else
                             {
                                 GetSession().GameState.GetAuraDuration(guid, i, out durationLeft, out durationFull);
+                                // JimsProxy (Cheap-Shot-aura-duration 2026-05-07): mirror the
+                                // SpellHandler refresh path's CSV fallback. On a cold cache (fresh
+                                // enemy debuff via OBJECT_UPDATE before any SMSG_AURA_UPDATE fires)
+                                // GetAuraDuration returns 0 for both values, leaving the modern
+                                // client with no duration → UnitAura returns 0/0 → stun-watch
+                                // addons (TidyPlates, CCC, ElvUI) show no countdown. Spell 1833
+                                // (Cheap Shot, flat 4 s) is the primary case; any other spell with
+                                // an AuraDurations CSV row also benefits.
+                                if (durationFull <= 0)
+                                    durationFull = GameData.GetAuraSpellDuration((uint)aura.AuraData.SpellID);
                             }
 
                             if (durationLeft > 0 && durationFull > 0)
