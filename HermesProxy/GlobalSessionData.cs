@@ -1666,11 +1666,17 @@ public class GlobalSessionData
     // SMSG_THREAT_UPDATE so the modern client's native threat APIs populate.
     public ThreatTracker ThreatTracker = null!;
 
+    // JimsProxy HealComm bridge: cross-version heal-prediction and resurrection
+    // addon-comm translation between LibHealComm-4.0 (modern) and HealComm-1.0
+    // (vanilla 1.12), so mixed-population raids see each other's predictions.
+    public HealCommBridge HealCommBridge = null!;
+
     public GlobalSessionData()
     {
         GameState = GameSessionData.CreateNewGameSessionData(this);
         AuthClient = new AuthClient(this);
         ThreatTracker = new ThreatTracker(this);
+        HealCommBridge = new HealCommBridge(this);
     }
 
     public void StoreGuildRankNames(uint guildId, List<string> ranks)

@@ -233,7 +233,15 @@ public partial class WorldSocket
     void HandleAddonMessage(ChatAddonMessage packet)
     {
         uint language = (uint)Language.Addon;
-        string text = packet.Params.Prefix + '\t' + packet.Params.Text;
+        string prefix = packet.Params.Prefix;
+        string body = packet.Params.Text;
+
+        // JimsProxy HealComm bridge: rewrite outbound LibHealComm-4.0 addon
+        // messages into HealComm-1.0 wire format so 1.12-native Luna users
+        // in the same raid see our heal predictions on their unit frames.
+        GetSession().HealCommBridge.TryTranslateOutboundAddon(ref prefix, ref body);
+
+        string text = prefix + '\t' + body;
 
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
         {
@@ -251,7 +259,13 @@ public partial class WorldSocket
     void HandleAddonMessageTargeted(ChatAddonMessageTargeted packet)
     {
         uint language = (uint)Language.Addon;
-        string text = packet.Params.Prefix + '\t' + packet.Params.Text;
+        string prefix = packet.Params.Prefix;
+        string body = packet.Params.Text;
+
+        // JimsProxy HealComm bridge: see HandleAddonMessage above.
+        GetSession().HealCommBridge.TryTranslateOutboundAddon(ref prefix, ref body);
+
+        string text = prefix + '\t' + body;
         string channelName = packet.ChannelGuid.IsEmpty() ? "" :
             GetSession().GameState.GetChannelName((int)packet.ChannelGuid.GetCounter());
 
