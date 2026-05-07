@@ -725,12 +725,16 @@ public sealed class HealCommBridge
     }
 
     // Called from HandleSpellStart when the legacy server's REAL SMSG_SPELL_START
-    // arrives for a remote caster. If we have an active synth for this caster +
-    // spell, dismiss the synth first so the modern client doesn't render two
-    // overlapping cast bars (the synthesized one + the real one).
+    // arrives for a remote caster. If we have an active synth for this caster,
+    // dismiss it so the modern client doesn't render two overlapping cast bars
+    // (synth + real). Don't gate on spellId equality — synth uses a class-
+    // guessed rank-1 spell ID (e.g. 635 Holy Light Rank 1) while the real cast
+    // carries the actual rank (e.g. 19943 Rank 9), so a strict match always
+    // fails. Vanilla emits at most one heal cast at a time per caster anyway,
+    // so dismissing on any tracked-caster real-cast arrival is safe.
     public void OnRealSpellStartFromOther(WowGuid128 casterGuid, uint spellId)
     {
-        if (_synthCastsByCaster.TryGetValue(casterGuid, out var synth) && synth.SpellId == spellId)
+        if (_synthCastsByCaster.ContainsKey(casterGuid))
             DismissSynth(casterGuid, "real_spell_start_arrived");
     }
 
@@ -805,15 +809,23 @@ public sealed class HealCommBridge
     }
 
     // Hook called from spell-failure / cast-failed paths when the failing
-    // caster is the local player. Emits HC-1.0 stop only if we previously
-    // tracked a resurrection start for this player (avoids spamming stop
-    // for non-rez failures).
+    // caster is the local player. Emits HC-1.0 stop only if the failing
+    // spell matches our tracked rez. Earlier code did unconditional
+    // TryRemove which silently consumed the rez tracker on any non-rez
+    // spell fail (extremely common — denied Holy Light, OOM Heal, etc.) —
+    // so the real rez interrupt never emitted a stop, leaving 1.12 Luna's
+    // incoming-rez indicator stuck.
     public void OnLocalPlayerSpellStop(uint spellId)
     {
         var localGuid = _session.GameState.CurrentPlayerGuid;
         if (localGuid.IsEmpty()) return;
-        if (!_pendingByCaster.TryRemove(localGuid, out var pending)) return;
+        if (!_pendingByCaster.TryGetValue(localGuid, out var pending)) return;
+        if (pending.SpellId != spellId) return;
         if (!IsResurrectionSpell(pending.SpellId)) return;
+
+        // Atomic: remove only if the entry is still the same one we peeked.
+        if (!_pendingByCaster.TryRemove(new KeyValuePair<WowGuid128, PendingCast>(localGuid, pending)))
+            return;
 
         string payload = BuildResurrectionStopPayload(pending.SpellId);
         EmitToServer(HcPrefix, payload);
@@ -853,19 +865,21 @@ public sealed class HealCommBridge
         });
     }
 
-    // Detect raid vs party from cached group state. CurrentGroups[0] is
-    // the home group; raid sub-groups (indices 1+) signal raid context.
+    // Detect raid vs party from cached group state. CurrentGroups is a
+    // length-2 array: [0] is the home group, [1] is the battleground group.
+    // Raid context is encoded in the home group's PartyFlags (Raid | FakeRaid),
+    // NOT by which array slot is populated. Earlier code checked slot 1 which
+    // only fires inside BGs and never for an actual 5-40 player raid — net
+    // effect was the bridge sent emit on Party channel during raids (server
+    // rejects "no party") and broke heal-prediction inside the headline use
+    // case.
     private bool IsInRaid()
     {
         var groups = _session.GameState.CurrentGroups;
-        if (groups == null) return false;
-        for (int i = 1; i < groups.Length; i++)
-        {
-            var g = groups[i];
-            if (g != null && g.PlayerList?.Count > 0)
-                return true;
-        }
-        return false;
+        if (groups == null || groups.Length == 0) return false;
+        var home = groups[0];
+        if (home == null) return false;
+        return (home.PartyFlags & GroupFlags.MaskBgRaid) != 0;
     }
 
     // ---- Helpers -----------------------------------------------------------
