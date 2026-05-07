@@ -778,7 +778,20 @@ public partial class WorldClient
             }
             _isSuccessful = true;
             StartKeepAliveTimer();
-            SendRttProbes();
+            // JimsProxy m_OverSpeedPings antiflood fix:
+            // Replaced 3-pings-at-login burst with a single immediate ping. vmangos-
+            // family servers (Twinstar, Kronos) flag any ping arriving <27s after the
+            // prior one as an "over-speed ping" via m_OverSpeedPings counter. The
+            // original 3 probes 1s apart added 2 over-speed strikes per session,
+            // accumulating toward the kick threshold across hours. Stacked with the
+            // doubled-forward bug (also fixed in this PR — see WorldSocket.cs
+            // CMSG_PING handler) this is what was triggering "Socket Closed By
+            // GameWorldServer (header)" 1-2 hours into a session. One immediate
+            // probe still seeds RTT 30s ahead of the first keepalive (preserves
+            // issue #43 adaptive-fire-offset convergence) without tripping the
+            // counter — this single probe is the first ping on the connection so
+            // there's no prior to be over-speed against.
+            SendKeepAlivePing(null);
         }
         else if (result == AuthResult.AUTH_WAIT_QUEUE)
         {
