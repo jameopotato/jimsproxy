@@ -227,11 +227,50 @@ public partial class WorldClient
         if (!ChatPkt.CheckAddonPrefix(GetSession().GameState.AddonPrefixes, ref language, ref text, ref addonPrefix))
             return;
 
+        // JimsProxy (chat-link-suffix 2026-05-07): expand vanilla 4-field item links back into
+        // modern Classic 1.14 12-field format on the way to the modern client. The legacy server
+        // requires the vanilla format for its anti-spam validation (name match against signed
+        // randomProperty in ItemRandomSuffix.dbc), but the modern client parses the chat-link
+        // positionally as modern format — without expansion the suffix ID lands in a gem slot
+        // and the tooltip renders the base item without "of the X" stats.
+        text = ExpandVanillaItemLinkToModern(text);
         text = MaybeScrambleForeignLanguage(text, language);
 
         ChatMessageTypeModern chatTypeModern = chatType.CastEnum<ChatMessageTypeModern>();
         ChatPkt chat = new ChatPkt(GetSession(), chatTypeModern, text, language, sender, senderName, receiver, "", channelName, chatFlags, addonPrefix);
         SendPacketToClient(chat);
+    }
+
+    /// <summary>
+    /// JimsProxy: rewrites vanilla 4-field item hyperlinks into modern Classic 1.14 12-field
+    /// format. Vanilla format <c>|Hitem:itemID:enchantID:randomProperty:creator|h</c> becomes
+    /// <c>|Hitem:itemID:enchantID:0:0:0:0:suffixID:0:linkLevel:0:0:0|h</c> with suffix at modern
+    /// position 5 (always positive — modern client uses sign-agnostic positive lookup at this
+    /// position). randomProperty &lt; 0 means ItemRandomSuffix.dbc; the absolute value is the
+    /// DBC ID. Items with no suffix (randomProperty == 0) still get expanded so the modern
+    /// client always sees a consistent format.
+    /// </summary>
+    private static string ExpandVanillaItemLinkToModern(string text)
+    {
+        if (string.IsNullOrEmpty(text) || !text.Contains("|Hitem:"))
+            return text;
+        return System.Text.RegularExpressions.Regex.Replace(text,
+            @"\|Hitem:(\d+):(-?\d+):(-?\d+):(-?\d+)\|h",
+            match =>
+            {
+                string itemId = match.Groups[1].Value;
+                int enchant = int.TryParse(match.Groups[2].Value, out var e) ? e : 0;
+                int randomProp = int.TryParse(match.Groups[3].Value, out var r) ? r : 0;
+                int suffixModern = randomProp < 0 ? -randomProp : randomProp;
+                Framework.Logging.Log.Event("chat.item_link.expanded", new
+                {
+                    item_id = itemId,
+                    enchant_id = enchant,
+                    random_property_signed = randomProp,
+                    suffix_modern_positive = suffixModern,
+                });
+                return $"|Hitem:{itemId}:{enchant}:0:0:0:0:{suffixModern}:0:60:0:0:0|h";
+            });
     }
 
     [PacketHandler(Opcode.SMSG_CHAT, ClientVersionBuild.V2_0_1_6180)]
@@ -409,7 +448,55 @@ public partial class WorldClient
             return; // was handled by us
         }
         Log.Print(LogType.Debug, "RAW CHAT INTERCEPTED: " + msg);
-        msg = System.Text.RegularExpressions.Regex.Replace(msg, @"(\|Hitem:\d+)[^|]*(\|h)", "$1:0:0:0$2");
+        // JimsProxy (chat-link-suffix 2026-05-07): preserve enchant + random-suffix when
+        // collapsing modern item-link inner fields to vanilla format. The original fix
+        // (f667118) replaced everything between :itemID and |h with :0:0:0, dropping the
+        // suffixID at position 5 — so "Sword of the Eagle" arrived at the legacy server as a
+        // plain "Sword" link, and the broadcast SMSG_CHAT either silently dropped the suffix
+        // or got rejected entirely.
+        //
+        // Modern WoW Classic 1.14 itemString fields after itemID:
+        //   [0] enchantID, [1-4] gem1-4, [5] suffixID, [6] uniqueID, [7] linkLevel, ...
+        // Vanilla 1.12 itemString fields after itemID:
+        //   [0] enchantID, [1] randomProperty (signed; matches modern suffixID), [2] creator
+        msg = System.Text.RegularExpressions.Regex.Replace(msg, @"\|Hitem:(\d+)([^|]*)\|h(\[[^\]]*\])?", match =>
+        {
+            string itemId = match.Groups[1].Value;
+            string raw = match.Groups[2].Value;
+            string nameTag = match.Groups[3].Value;
+            // The captured group starts with ':' (the separator after itemID). Substring(1)
+            // skips that leading separator so Split(':') preserves empty positions correctly
+            // — earlier TrimStart(':') was eating leading-empty fields and shifting indices.
+            string[] inner = raw.Length > 0 && raw[0] == ':'
+                ? raw.Substring(1).Split(':')
+                : raw.Split(':');
+            // JimsProxy (chat-link-suffix 2026-05-07): WoW Classic Era 1.14 itemString fields
+            // after itemID, verified empirically against bundle jimsproxy-20260507-183921:
+            //   [0] enchantID     [1-4] gem1-4              [5] suffixID
+            //   [6] uniqueID      [7] linkLevel             [8..] specID/upgrade/etc.
+            // (matches the Wowpedia public docs after the leading-colon Substring(1) fix.)
+            int enchant = inner.Length > 0 && int.TryParse(inner[0], out var e) ? e : 0;
+            int suffix  = inner.Length > 5 && int.TryParse(inner[5], out var s) ? s : 0;
+            // JimsProxy (chat-link-suffix 2026-05-07): vanilla wire chat-link convention is
+            // signed — negative randomProperty → ItemRandomSuffix.dbc lookup (variable-stat
+            // "of the Bear"), positive → ItemRandomProperties.dbc (fixed bonuses).
+            // Modern Classic 1.14 stores both as positive at position 5; assume ItemRandomSuffix
+            // (the dominant case for "of the X" suffix items) and negate. If a value is already
+            // negative we leave it alone — modern client may pre-sign it.
+            if (suffix > 0)
+                suffix = -suffix;
+            Framework.Logging.Log.Event("chat.item_link.translated", new
+            {
+                item_id = itemId,
+                inner_raw = raw,
+                inner_fields = inner,
+                inner_field_count = inner.Length,
+                enchant_id = enchant,
+                suffix_id = suffix,
+                display_name = nameTag,
+            });
+            return $"|Hitem:{itemId}:{enchant}:{suffix}:0|h{nameTag}";
+        });
         WorldPacket packet = new WorldPacket(Opcode.CMSG_MESSAGECHAT);
         packet.WriteUInt32((uint)type);
         packet.WriteUInt32(lang);
