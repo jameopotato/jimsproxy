@@ -1109,6 +1109,40 @@ public sealed class GameSessionData
     }
 
     /// <summary>
+    /// JimsProxy reconnect-state-cleanup: drop all in-flight cast bookkeeping
+    /// after an unplanned disconnect+reconnect. The legacy server forgets
+    /// everything we had in flight when it cuts the socket; if we don't drop
+    /// our local mirror, the next press of any spell that was pending at DC
+    /// time gets silently rejected by HasNonStartedPendingCastForSpell —
+    /// user-visible symptom is "spell stuck, spamming key does nothing, no
+    /// error message" (e.g. rogue's R-key Sinister Strike not firing). Same
+    /// story for OtherCasterActiveCastIds (mob/other-player CastIDs minted
+    /// pre-DC won't match anything the new server-side state knows about).
+    /// Returns the count of entries cleared so the reconnect log can show
+    /// whether the gap was actually significant.
+    /// </summary>
+    public (int normalCasts, int petCasts, int otherCasterIds) ResetInFlightCastState()
+    {
+        int normalCount;
+        lock (PendingCastsLock)
+        {
+            normalCount = PendingNormalCasts.Count;
+            while (PendingNormalCasts.TryDequeue(out _)) { }
+        }
+        int petCount = PendingPetCasts.Count;
+        while (PendingPetCasts.TryDequeue(out _)) { }
+        int otherCount = OtherCasterActiveCastIds.Count;
+        OtherCasterActiveCastIds.Clear();
+        // Single-slot trackers for melee + auto-repeat (Auto Shot, Shoot Wand)
+        // — same lifecycle as PendingNormalCasts; if a tracker was set when
+        // the DC fired, it never gets cleared by the SPELL_GO/CAST_FAILED
+        // path that normally nulls it.
+        CurrentClientNextMeleeCast = null;
+        CurrentClientAutoRepeatCast = null;
+        return (normalCount, petCount, otherCount);
+    }
+
+    /// <summary>
     /// Check if there's a pet cast that has already started (is in progress).
     /// Used to reject new casts without forwarding to server.
     /// </summary>
@@ -2113,6 +2147,23 @@ public class GlobalSessionData
                         PropagateUnplannedDcToModern(attemptId, "auth_failed");
                         return;
                     }
+
+                    // JimsProxy reconnect-state-cleanup: drop in-flight cast bookkeeping that
+                    // the legacy server forgot when it cut the socket. Without this, the next
+                    // press of any spell that was pending at DC time gets silently rejected
+                    // (HasNonStartedPendingCastForSpell), and the user sees "stuck spell, no
+                    // error". Done BEFORE registering the new WorldClient so that any CMSG
+                    // arriving in the tiny race window between WorldClient assignment and
+                    // PLAYER_LOGIN-completion sees a clean slate. See ResetInFlightCastState
+                    // doc for the full rationale.
+                    var clearedCounts = GameState!.ResetInFlightCastState();
+                    Framework.Logging.Log.Event("session.unplanned_reconnect.state_cleared", new
+                    {
+                        attempt_id = attemptId,
+                        normal_casts_cleared = clearedCounts.normalCasts,
+                        pet_casts_cleared = clearedCounts.petCasts,
+                        other_caster_ids_cleared = clearedCounts.otherCasterIds,
+                    });
 
                     // CRITICAL: register the new client with the session BEFORE sending CMSG_PLAYER_LOGIN.
                     // Modern→legacy CMSGs route via session.WorldClient (set null when the dead client

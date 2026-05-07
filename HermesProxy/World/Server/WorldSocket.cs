@@ -431,12 +431,57 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         }
     }
 
+    // JimsProxy: counters for c2s packets dropped while WorldClient is disconnected.
+    // The modern client keeps spamming movement (60+ Hz) during the dead window
+    // between TCP close and the reconnect's WorldClient reassignment. Each drop
+    // used to log a separate Log.Print line — under a 7-second DC window with a
+    // moving player that's hundreds of lines of noise drowning the actual
+    // disconnect cause in JSONL bundles. We now suppress per-packet logs after
+    // the first few and emit a single structured summary, then reset on next
+    // successful c2s send.
+    private int _disconnectedDropCount;
+    private long _disconnectedFirstDropMs;
+    private const int DropLogVerboseLimit = 3;
+
     private void SendPacketToServer(WorldPacket packet, Opcode delayUntilOpcode = Opcode.MSG_NULL_ACTION)
     {
         if (GetSession().WorldClient != null)
+        {
+            // Reset the drop-window counter on first successful send after a DC,
+            // emit a final summary so the JSONL shows the size of the gap.
+            if (_disconnectedDropCount > 0)
+            {
+                int finalCount = _disconnectedDropCount;
+                long firstMs = _disconnectedFirstDropMs;
+                _disconnectedDropCount = 0;
+                _disconnectedFirstDropMs = 0;
+                Log.Event("c2s.dropped_during_disconnect.summary", new
+                {
+                    total_dropped = finalCount,
+                    window_ms = firstMs == 0 ? 0 : Environment.TickCount64 - firstMs,
+                });
+            }
             GetSession().WorldClient!.SendPacketToServer(packet, delayUntilOpcode);
-        else
-            Log.Print(LogType.Error, $"Attempt to send opcode {packet.GetUniversalOpcode(false)} ({packet.GetOpcode()}) while WorldClient is disconnected!");
+            return;
+        }
+
+        // WorldClient is null: drop the packet. Log verbose for the first few
+        // (still useful diagnostics for one-off issues) then go quiet, but keep
+        // structured-event accounting so a DC investigation can see the rate.
+        int dropIdx = Interlocked.Increment(ref _disconnectedDropCount);
+        if (dropIdx == 1)
+            _disconnectedFirstDropMs = Environment.TickCount64;
+        var opcode = packet.GetUniversalOpcode(false);
+        Log.Event("c2s.dropped_during_disconnect", new
+        {
+            opcode = opcode.ToString(),
+            opcode_raw = packet.GetOpcode(),
+            drop_index = dropIdx,
+        });
+        if (dropIdx <= DropLogVerboseLimit)
+            Log.Print(LogType.Error, $"Attempt to send opcode {opcode} ({packet.GetOpcode()}) while WorldClient is disconnected!");
+        else if (dropIdx == DropLogVerboseLimit + 1)
+            Log.Print(LogType.Error, $"... further per-packet drop logs suppressed (see c2s.dropped_during_disconnect events for full count)");
     }
 
     public PacketHandler? GetHandler(Opcode opcode)
