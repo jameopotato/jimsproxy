@@ -341,6 +341,16 @@ public sealed class GameSessionData
     // is merged against state the client no longer has, and the previous
     // buff bar lingers stale until reload.
     public HashSet<WowGuid128> NeedsFullAuraRefresh = [];
+    // JimsProxy (synth-spell-start-for-autoshot): timestamp of the most recent
+    // natural SMSG_SPELL_START forwarded for the local player's ranged auto
+    // attack (Auto Shot 75 / Shoot 5019). The 1.12 server only emits SPELL_START
+    // at toggle/retarget — every subsequent auto-repeat tick arrives as a bare
+    // SPELL_GO. Modern Classic 1.14 servers emit SPELL_START per tick, so any
+    // CAST_START-driven swing-timer addon (e.g. Kaedin's swing timer) only
+    // fires once per series via the proxy. HandleSpellGo synthesizes a
+    // SPELL_START before the GO when no natural one was forwarded recently
+    // (window: AutoShotSynthSpellStartGapMs).
+    public Dictionary<uint, long> LastNaturalAutoShotSpellStartMs = [];
     public TradeSession? CurrentTrade = null;
     public HashSet<uint> RequestedItemHotfixes = [];
     public HashSet<uint> RequestedItemSparseHotfixes = [];

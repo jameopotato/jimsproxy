@@ -744,6 +744,7 @@ public partial class WorldClient
             // bubble up through ReceiveLoop and DC the user. See HandleSpellGo
             // for the in-the-wild repro and rationale.
             LogSpellStartGoParseFailure(packet, e, isSpellGo: false);
+            DrainOrphanedStartedNormalCastsOnParseFailure(isSpellGo: false);
             return;
         }
 
@@ -826,6 +827,11 @@ public partial class WorldClient
                 caster_is_player = casterIsLocalPlayer,
                 caster_is_pet = casterIsLocalPet,
             });
+            // Track the natural SPELL_START so HandleSpellGo can decide
+            // whether to synthesize one for subsequent auto-repeat ticks
+            // that arrive without a preceding START.
+            if (casterIsLocalPlayer)
+                GetSession().GameState.LastNaturalAutoShotSpellStartMs[(uint)spell.Cast.SpellID] = Time.GetMSTime();
         }
         if (isChanneled && (casterIsLocalPlayer || casterIsLocalPet) && spell.Cast.CastTime == 0)
         {
@@ -873,7 +879,38 @@ public partial class WorldClient
             // DCs the entire WorldClient session. Log full packet
             // contents so the next hit gives us bytes to fix the parser.
             LogSpellStartGoParseFailure(packet, e, isSpellGo: true);
+            DrainOrphanedStartedNormalCastsOnParseFailure(isSpellGo: true);
             return;
+        }
+
+        // JimsProxy (synth-spell-start-for-autoshot): the 1.12 server only
+        // emits SMSG_SPELL_START at toggle/retarget for ranged auto attacks
+        // (Auto Shot 75, Shoot 5019). Every auto-repeat tick is a bare
+        // SPELL_GO. Modern Classic 1.14 servers emit SPELL_START per tick,
+        // so addons that listen for COMBAT_LOG_EVENT SPELL_CAST_START
+        // (Kaedin's swing timer, Quartz, etc.) only fire once per series
+        // through the proxy. Synthesize a SPELL_START before the GO when
+        // no natural one was forwarded within AutoShotSynthSpellStartGapMs.
+        bool isRangedAutoAttack = spell.Cast.SpellID == 75 || spell.Cast.SpellID == 5019;
+        if (isRangedAutoAttack &&
+            spell.Cast.CasterUnit == GetSession().GameState.CurrentPlayerGuid)
+        {
+            long now = Time.GetMSTime();
+            long lastNaturalMs = GetSession().GameState.LastNaturalAutoShotSpellStartMs
+                .GetValueOrDefault((uint)spell.Cast.SpellID, 0);
+            long gapMs = now - lastNaturalMs;
+            const long AutoShotSynthSpellStartGapMs = 1000;
+            if (gapMs > AutoShotSynthSpellStartGapMs)
+            {
+                SpellStart synthStart = new SpellStart();
+                synthStart.Cast = spell.Cast;
+                SendPacketToClient(synthStart);
+                Log.Event("spell.start.synth_for_autoshot", new
+                {
+                    spell_id = spell.Cast.SpellID,
+                    gap_ms = gapMs,
+                });
+            }
         }
 
         // Dequeue completed cast (queue-based, FIFO order)
@@ -1114,6 +1151,52 @@ public partial class WorldClient
             error = e.Message,
             stack = e.StackTrace,
         });
+    }
+
+    // JimsProxy (synth-spell-start-for-autoshot follow-up): when a SPELL_START
+    // or SPELL_GO packet fails to parse, the matching pending-cast queue entry
+    // is orphaned — no normal completion path dequeues it. For HasStarted=true
+    // entries this is bad: HasStartedNormalCast() permanently returns true and
+    // blocks subsequent cast-time spells. Emit a synthetic CastFailed(DontReport)
+    // for each orphaned entry so the modern client's cast bar dismisses
+    // silently and the queue self-heals. We can't tell from a failed parse
+    // whether the packet was for the local player or a foreign caster; on
+    // average there's at most one HasStarted=true entry (the GCD gate ensures
+    // serial cast-time spells), so worst-case spurious cleanup is bounded to
+    // one cast — a small price to avoid the permanent lock.
+    private void DrainOrphanedStartedNormalCastsOnParseFailure(bool isSpellGo)
+    {
+        var queue = GetSession().GameState.PendingNormalCasts;
+        var keep = new List<ClientCastRequest>();
+        int orphaned = 0;
+        while (queue.TryDequeue(out var cast))
+        {
+            if (cast.HasStarted)
+            {
+                CastFailed failed = new();
+                failed.SpellID = cast.SpellId;
+                failed.SpellXSpellVisualID = cast.SpellXSpellVisualId;
+                failed.Reason = (uint)SpellCastResultClassic.DontReport;
+                failed.CastID = cast.ServerGUID;
+                SendPacketToClient(failed);
+                orphaned++;
+            }
+            else
+            {
+                keep.Add(cast);
+            }
+        }
+        foreach (var c in keep)
+            queue.Enqueue(c);
+
+        if (orphaned > 0)
+        {
+            Log.Event("spell.parse_failed.queue_drained", new
+            {
+                phase = isSpellGo ? "go" : "start",
+                orphaned_count = orphaned,
+            });
+        }
     }
 
     SpellCastData HandleSpellStartOrGo(WorldPacket packet, bool isSpellGo)
