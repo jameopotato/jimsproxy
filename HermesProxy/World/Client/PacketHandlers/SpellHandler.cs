@@ -12,6 +12,14 @@ namespace HermesProxy.World.Client;
 
 public partial class WorldClient
 {
+    // JimsProxy (PR #161 follow-up): how long after HandleSpellFailure peeks a
+    // pending cast we wait for the trailing SMSG_CAST_FAILED before assuming
+    // the legacy server isn't sending one. 2.5s is comfortably longer than
+    // any observed CAST_FAILED arrival on vmangos/Twinstar (~1ms after FAILURE)
+    // and shorter than feels-laggy to the user when the pathological Kronos
+    // case kicks in (target-dies-mid-cast, no trailing CAST_FAILED).
+    private const long WatchdogWindowMs = 2500;
+
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_SEND_KNOWN_SPELLS)]
     void HandleSendKnownSpells(WorldPacket packet)
@@ -137,6 +145,11 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_CAST_FAILED)]
     void HandleCastFailed(WorldPacket packet)
     {
+        // JimsProxy (PR #161 follow-up): clean up any prior peek that didn't
+        // get its own trailing CAST_FAILED — happens occasionally on Kronos
+        // for cast-time + target-dies. Self-healing on every cast event.
+        GetSession().RunWatchdogEviction();
+
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
             packet.ReadUInt8(); // cast count
 
@@ -468,6 +481,11 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_SPELL_FAILURE)]
     void HandleSpellFailure(WorldPacket packet)
     {
+        // JimsProxy (PR #161 follow-up): clean up any prior peek that didn't
+        // get a trailing CAST_FAILED within the watchdog window. Runs before
+        // we set up a new watchdog so leaks can't accumulate across failures.
+        GetSession().RunWatchdogEviction();
+
         WowGuid128 casterUnit;
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
             casterUnit = packet.ReadPackedGuid().To128(GetSession().GameState);
@@ -569,6 +587,13 @@ public partial class WorldClient
                 spellId = pendingNormal.SpellId;
             wasStarted = pendingNormal.HasStarted;
             dequeued = false; // peeked — HandleCastFailed dequeues on the trailing SMSG_CAST_FAILED
+            // JimsProxy (PR #161 follow-up): arm the watchdog. If the trailing
+            // SMSG_CAST_FAILED arrives within 2.5s, HandleCastFailed dequeues
+            // normally (deadline becomes irrelevant). If not (Kronos-style
+            // target-dies-mid-cast drop), the next event runs RunWatchdogEviction
+            // and force-dequeues with synthetic SpellPrepare + CastFailed(DontReport)
+            // so HasStartedNormalCast doesn't permanently block subsequent casts.
+            pendingNormal.WatchdogDeadlineMs = Environment.TickCount64 + WatchdogWindowMs;
 
             GetSession().GameState.ClearHeldCastTimeCast();
 
@@ -591,6 +616,7 @@ public partial class WorldClient
                 spellId = pendingPet.SpellId;
             wasStarted = pendingPet.HasStarted;
             dequeued = false; // peeked — HandlePetCastFailed dequeues on the trailing SMSG_PET_CAST_FAILED
+            pendingPet.WatchdogDeadlineMs = Environment.TickCount64 + WatchdogWindowMs;
 
             // Pet path: PetCastFailed handles the pet UI. Suppress the broadcast
             // SpellFailure for instants (no cast bar); for cast-time pet spells
