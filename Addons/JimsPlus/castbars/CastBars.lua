@@ -494,6 +494,8 @@ function addon:PLAYER_LOGIN()
     self:UnregisterEvent("PLAYER_LOGIN")
     self.PLAYER_LOGIN = nil
 
+    C_ChatInfo.SendAddonMessage("JP", "1", "WHISPER", UnitName("player"))
+
     ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", function(_, _, msg)
         local p = msg:sub(1, 3)
         if p == "JP_" then

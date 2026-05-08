@@ -2298,16 +2298,22 @@ public partial class WorldClient
                         if (spellId != 0)
                         {
                             channelSpells[guid] = spellId;
-                            var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
-                                $"JP_CH:S:{guidStr}:{spellId}");
-                            SendPacketToClient(chatPkt);
+                            if (GetSession().GameState.JimsPlusSideband)
+                            {
+                                var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                                    $"JP_CH:S:{guidStr}:{spellId}");
+                                SendPacketToClient(chatPkt);
+                            }
                         }
                         else
                         {
                             channelSpells.TryRemove(guid, out _);
-                            var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
-                                $"JP_CH:X:{guidStr}");
-                            SendPacketToClient(chatPkt);
+                            if (GetSession().GameState.JimsPlusSideband)
+                            {
+                                var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                                    $"JP_CH:X:{guidStr}");
+                                SendPacketToClient(chatPkt);
+                            }
                         }
                     }
                 }

@@ -232,6 +232,12 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CHAT_ADDON_MESSAGE)]
     void HandleAddonMessage(ChatAddonMessage packet)
     {
+        if (packet.Params.Prefix == "JP")
+        {
+            GetSession().GameState.JimsPlusSideband = packet.Params.Text == "1";
+            return;
+        }
+
         uint language = (uint)Language.Addon;
         string body = AddonInteropTranslator.TranslateOutbound(packet.Params.Prefix, packet.Params.Text);
         if (string.IsNullOrEmpty(body)) return;
@@ -252,6 +258,12 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CHAT_ADDON_MESSAGE_TARGETED)]
     void HandleAddonMessageTargeted(ChatAddonMessageTargeted packet)
     {
+        if (packet.Params.Prefix == "JP")
+        {
+            GetSession().GameState.JimsPlusSideband = packet.Params.Text == "1";
+            return;
+        }
+
         uint language = (uint)Language.Addon;
         string body = AddonInteropTranslator.TranslateOutbound(packet.Params.Prefix, packet.Params.Text);
         if (string.IsNullOrEmpty(body)) return;

@@ -4,6 +4,8 @@ namespace.BUILD = 18
 
 print("|cFF00FF00[JimsPlus]|r Core loaded (build " .. namespace.BUILD .. ")")
 
+C_ChatInfo.RegisterAddonMessagePrefix("JP")
+
 namespace.modules = {}
 
 function namespace:RegisterModule(name, initFunc)

@@ -52,6 +52,7 @@ public sealed class GameSessionData
 {
     public bool HasWsgHordeFlagCarrier;
     public bool HasWsgAllyFlagCarrier;
+    public bool JimsPlusSideband;
     public bool ChannelDisplayList;
     public bool ShowPlayedTime;
     public bool IsInFarSight;
