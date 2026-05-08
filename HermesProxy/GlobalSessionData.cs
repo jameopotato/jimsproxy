@@ -925,6 +925,33 @@ public sealed class GameSessionData
     /// Pure data operation — no socket dependency, easy to unit-test.
     /// </summary>
     /// <summary>
+    /// JimsProxy (PR #161 follow-up — movement preemption): walks
+    /// PendingNormalCasts and marks every HasStarted=true cast-time spell
+    /// (StartedCastTimeMs>0) as MovementCancelled. Trailing SMSG_SPELL_FAILURE
+    /// / SMSG_CAST_FAILED for these casts are suppressed (modern client
+    /// already cancelled its own cast bar via client-side movement prediction).
+    /// Also arms the watchdog so even if the legacy server never sends the
+    /// trailing failure, the leak heals at the next cast event. Returns the
+    /// number of casts marked, for diagnostics. Instants and not-yet-started
+    /// casts are ignored (movement doesn't cancel them in vanilla).
+    /// </summary>
+    public int MarkStartedCastsMovementCancelled(long watchdogDeadlineMs)
+    {
+        int marked = 0;
+        foreach (var cast in PendingNormalCasts)
+        {
+            if (cast.HasStarted && cast.StartedCastTimeMs > 0)
+            {
+                cast.MovementCancelled = true;
+                if (cast.WatchdogDeadlineMs == 0)
+                    cast.WatchdogDeadlineMs = watchdogDeadlineMs;
+                marked++;
+            }
+        }
+        return marked;
+    }
+
+    /// <summary>
     /// JimsProxy (PR #161 follow-up — destroy-hook fast path): walks pending
     /// queues and dequeues any cast whose TargetGuid matches the destroyed
     /// unit. Returns evicted entries for the caller to emit synthetic
@@ -1734,6 +1761,16 @@ public class ClientCastRequest
     // watchdog. Empty/default GUID = self-cast or no unit target (e.g. AoE
     // ground-target spells), which the destroy hook ignores.
     public WowGuid128 TargetGuid;
+
+    // JimsProxy (PR #161 follow-up — movement preemption): set true when the
+    // proxy detects a CMSG_MOVE_START_* opcode while this cast-time spell is
+    // in progress (HasStarted=true && StartedCastTimeMs>0). Vanilla cancels
+    // any cast-time spell on movement, and the modern 1.14 client predicts
+    // this client-side — so when this flag is set the trailing
+    // SMSG_SPELL_FAILURE suppresses its broadcast (no misleading "in combat"
+    // popup) and the trailing SMSG_CAST_FAILED forwards as DontReport so the
+    // client gets its CMSG_CANCEL_CAST ack without a popup.
+    public bool MovementCancelled;
 }
 public class ArenaTeamData
 {

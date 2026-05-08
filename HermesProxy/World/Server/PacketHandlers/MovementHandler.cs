@@ -45,6 +45,39 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MOVE_DOUBLE_JUMP)]
     void HandlePlayerMove(ClientPlayerMovement movement)
     {
+        // JimsProxy (PR #161 follow-up — movement preemption): mark any in-flight
+        // cast-time spell as movement-cancelled the moment the user starts moving.
+        // Vanilla cancels cast-time spells on movement; the modern 1.14 client
+        // predicts this client-side and dismisses its own cast bar before the
+        // server's SMSG_SPELL_FAILURE round-trips. Without the marker, the
+        // trailing failure surfaces as a misleading "You are in combat" popup
+        // (vmangos hardcodes the wire reason in SendInterrupted) or a redundant
+        // CastFailed that re-flashes the action button. Also arms the watchdog
+        // so the entry doesn't leak if the legacy server response never arrives.
+        switch (movement.GetUniversalOpcode())
+        {
+            case Opcode.CMSG_MOVE_START_FORWARD:
+            case Opcode.CMSG_MOVE_START_BACKWARD:
+            case Opcode.CMSG_MOVE_START_STRAFE_LEFT:
+            case Opcode.CMSG_MOVE_START_STRAFE_RIGHT:
+            case Opcode.CMSG_MOVE_START_SWIM:
+            case Opcode.CMSG_MOVE_START_ASCEND:
+            case Opcode.CMSG_MOVE_START_DESCEND:
+            case Opcode.CMSG_MOVE_JUMP:
+            case Opcode.CMSG_MOVE_DOUBLE_JUMP:
+                int marked = GetSession().GameState.MarkStartedCastsMovementCancelled(
+                    Environment.TickCount64 + 2500);
+                if (marked > 0)
+                {
+                    Framework.Logging.Log.Event("cast.movement_cancel_preempted", new
+                    {
+                        casts_marked = marked,
+                        trigger_opcode = movement.GetUniversalOpcode().ToString(),
+                    });
+                }
+                break;
+        }
+
         string opcodeName = movement.GetUniversalOpcode().ToString();
         opcodeName = opcodeName.Replace("CMSG", "MSG");
         uint opcode = Opcodes.GetOpcodeValueForVersion(opcodeName, Framework.Settings.ServerBuild);

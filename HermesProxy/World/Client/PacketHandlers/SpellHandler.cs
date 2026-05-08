@@ -206,7 +206,28 @@ public partial class WorldClient
         // Look up pending normal cast by SpellId (queue-based, FIFO order)
         else if (GetSession().GameState.TryDequeuePendingNormalCast(spellId, out var pendingCast))
         {
-            if (!pendingCast!.HasStarted)
+            // JimsProxy (PR #161 follow-up — movement preemption): if this
+            // cast was marked when the user started moving, the modern client
+            // sent CMSG_CANCEL_CAST and is waiting for SMSG_CAST_FAILED to
+            // confirm. Suppressing CastFailed entirely makes the bar linger
+            // for the legacy round-trip (~150-200ms — observed as a "small
+            // delay" by testers). Emit CastFailed with DontReport so the
+            // client gets its ack instantly with no popup or error sound.
+            // Skip the SpellPrepare (no point prepping a cast we're failing).
+            bool movementSuppressed = pendingCast!.MovementCancelled;
+            uint effectiveReason = movementSuppressed
+                ? (uint)SpellCastResultClassic.DontReport
+                : LegacyVersion.ConvertSpellCastResult(reason);
+            if (movementSuppressed)
+            {
+                Log.Event("cast.movement_cancel_suppressed", new
+                {
+                    queue = "normal",
+                    spell_id = pendingCast.SpellId,
+                    client_cast_id = pendingCast.ClientGUID.ToString(),
+                });
+            }
+            else if (!pendingCast.HasStarted)
             {
                 SpellPrepare prepare2 = new SpellPrepare();
                 prepare2.ClientCastID = pendingCast.ClientGUID;
@@ -217,7 +238,7 @@ public partial class WorldClient
             CastFailed failed = new();
             failed.SpellID = pendingCast.SpellId;
             failed.SpellXSpellVisualID = pendingCast.SpellXSpellVisualId;
-            failed.Reason = LegacyVersion.ConvertSpellCastResult(reason);
+            failed.Reason = effectiveReason;
             failed.CastID = pendingCast.ServerGUID;
             failed.FailedArg1 = arg1;
             failed.FailedArg2 = arg2;
@@ -597,12 +618,20 @@ public partial class WorldClient
 
             GetSession().GameState.ClearHeldCastTimeCast();
 
+            // JimsProxy (PR #161 follow-up — movement preemption): if the user
+            // started moving while this cast-time spell was in progress, the
+            // modern client already cancelled its own cast bar via client-side
+            // prediction. Suppress the broadcast SpellFailure entirely —
+            // emitting it would surface a misleading "You are in combat" popup
+            // (Spell::SendInterrupted hardcodes the wire reason to 0).
+            if (pendingNormal.MovementCancelled)
+                skipBroadcastFailure = true;
             // Instant cast that wasn't a ranged auto-attack: SPELL_START was
             // never forwarded, so there's no cast bar to dismiss. Skip the misleading
             // broadcast SpellFailure entirely. The trailing SMSG_CAST_FAILED via
             // HandleCastFailed sends SpellPrepare + CastFailed with the real reason,
             // which clears button-lit state and shows the correct popup.
-            if (!pendingNormal.HasStarted && !isRangedAutoAttack)
+            else if (!pendingNormal.HasStarted && !isRangedAutoAttack)
                 skipBroadcastFailure = true;
             else
                 overrideReasonForLocalBroadcast = true;

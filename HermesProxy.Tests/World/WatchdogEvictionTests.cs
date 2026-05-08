@@ -240,4 +240,95 @@ public class WatchdogEvictionTests
 
         Assert.False(session.HasStartedNormalCast());
     }
+
+    // ---- Movement preemption tests ----
+
+    private static ClientCastRequest MakeCastTimeCast(uint spellId, uint castTimeMs, bool hasStarted)
+    {
+        return new ClientCastRequest
+        {
+            SpellId = spellId,
+            Timestamp = Environment.TickCount,
+            HasStarted = hasStarted,
+            StartedCastTimeMs = castTimeMs,
+        };
+    }
+
+    [Fact]
+    public void MarkStartedCastsMovementCancelled_StartedCastTime_Marked()
+    {
+        var session = NewSession();
+        long now = Environment.TickCount64;
+        // 2.5s Frostbolt currently casting
+        session.PendingNormalCasts.Enqueue(MakeCastTimeCast(116, castTimeMs: 2500, hasStarted: true));
+
+        int marked = session.MarkStartedCastsMovementCancelled(now + 2500);
+
+        Assert.Equal(1, marked);
+        var entry = session.PendingNormalCasts.ToArray()[0];
+        Assert.True(entry.MovementCancelled);
+        Assert.Equal(now + 2500, entry.WatchdogDeadlineMs);
+    }
+
+    [Fact]
+    public void MarkStartedCastsMovementCancelled_Instant_NotMarked()
+    {
+        // Instants don't get cancelled by movement in vanilla.
+        var session = NewSession();
+        session.PendingNormalCasts.Enqueue(MakeCastTimeCast(1953, castTimeMs: 0, hasStarted: true));
+
+        int marked = session.MarkStartedCastsMovementCancelled(Environment.TickCount64 + 2500);
+
+        Assert.Equal(0, marked);
+        Assert.False(session.PendingNormalCasts.ToArray()[0].MovementCancelled);
+    }
+
+    [Fact]
+    public void MarkStartedCastsMovementCancelled_NotStarted_NotMarked()
+    {
+        // Cast hasn't started yet (in-flight to server, awaiting SMSG_SPELL_START).
+        // Movement at this stage doesn't apply because nothing's actually casting.
+        var session = NewSession();
+        session.PendingNormalCasts.Enqueue(MakeCastTimeCast(116, castTimeMs: 2500, hasStarted: false));
+
+        int marked = session.MarkStartedCastsMovementCancelled(Environment.TickCount64 + 2500);
+
+        Assert.Equal(0, marked);
+        Assert.False(session.PendingNormalCasts.ToArray()[0].MovementCancelled);
+    }
+
+    [Fact]
+    public void MarkStartedCastsMovementCancelled_PreservesExistingWatchdog()
+    {
+        // If a watchdog deadline was already set (e.g., from a prior peek),
+        // movement marking shouldn't shorten it. We only fill in the gap.
+        var session = NewSession();
+        long now = Environment.TickCount64;
+        var cast = MakeCastTimeCast(116, castTimeMs: 2500, hasStarted: true);
+        cast.WatchdogDeadlineMs = now + 1000; // earlier deadline already armed
+        session.PendingNormalCasts.Enqueue(cast);
+
+        session.MarkStartedCastsMovementCancelled(now + 5000);
+
+        var entry = session.PendingNormalCasts.ToArray()[0];
+        Assert.True(entry.MovementCancelled);
+        Assert.Equal(now + 1000, entry.WatchdogDeadlineMs);
+    }
+
+    [Fact]
+    public void MarkStartedCastsMovementCancelled_MultipleEntries_OnlyStartedCastTimeMarked()
+    {
+        var session = NewSession();
+        session.PendingNormalCasts.Enqueue(MakeCastTimeCast(116, castTimeMs: 2500, hasStarted: true));   // marked
+        session.PendingNormalCasts.Enqueue(MakeCastTimeCast(1953, castTimeMs: 0, hasStarted: true));    // instant — skip
+        session.PendingNormalCasts.Enqueue(MakeCastTimeCast(133, castTimeMs: 2500, hasStarted: false)); // not started — skip
+
+        int marked = session.MarkStartedCastsMovementCancelled(Environment.TickCount64 + 2500);
+
+        Assert.Equal(1, marked);
+        var arr = session.PendingNormalCasts.ToArray();
+        Assert.True(arr[0].MovementCancelled);
+        Assert.False(arr[1].MovementCancelled);
+        Assert.False(arr[2].MovementCancelled);
+    }
 }
