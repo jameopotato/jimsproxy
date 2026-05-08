@@ -614,7 +614,44 @@ public partial class WorldClient
         EmoteMessage emote = new EmoteMessage();
         emote.EmoteID = packet.ReadUInt32();
         emote.Guid = packet.ReadGuid().To128(GetSession().GameState);
+        // JimsProxy (emote-state-diag 2026-05-07): capture emote broadcasts so we can pair them
+        // with subsequent emote.state.update events when triaging stuck-dance bugs.
+        Framework.Logging.Log.Event("emote.broadcast", new
+        {
+            emote_id = emote.EmoteID,
+            target_low = emote.Guid.GetCounter(),
+            is_player_target = emote.Guid == GetSession().GameState.CurrentPlayerGuid,
+        });
+        // JimsProxy (dance-stuck-on-movement 2026-05-07): track the player's last looping
+        // emote. EMOTE_ONESHOT_DANCE (10) is the known case — Classic 1.14 client loops it
+        // until another SMSG_EMOTE arrives, and Kronos/Twinstar don't broadcast one on move.
+        // Any new SMSG_EMOTE for the player overrides/clears the tracker (matches the actual
+        // client-side behavior — a new emote replaces the active loop).
+        if (emote.Guid == GetSession().GameState.CurrentPlayerGuid)
+        {
+            if (IsClientLoopingEmote(emote.EmoteID))
+            {
+                GetSession().GameState.LastLoopingEmoteId = emote.EmoteID;
+                GetSession().GameState.LastLoopingEmoteTickMs = Environment.TickCount64;
+            }
+            else
+            {
+                // Non-looping emote breaks any active loop on the client side; mirror that.
+                GetSession().GameState.LastLoopingEmoteId = 0;
+            }
+        }
         SendPacketToClient(emote);
+    }
+
+    /// <summary>
+    /// JimsProxy: returns true if the given EMOTE_ONESHOT_* ID is one that the modern
+    /// Classic 1.14 client treats as a looping animation client-side (continues until a
+    /// new SMSG_EMOTE arrives). Currently just EMOTE_ONESHOT_DANCE (10). Add others here
+    /// if reports surface for /sleep, /kneel, etc.
+    /// </summary>
+    private static bool IsClientLoopingEmote(uint emoteId)
+    {
+        return emoteId == 10; // EMOTE_ONESHOT_DANCE
     }
 
     [PacketHandler(Opcode.SMSG_TEXT_EMOTE)]

@@ -69,6 +69,14 @@ public sealed class GameSessionData
     // SendPacketToClient or fired control-grant packets at a session that had moved on.
     public CancellationTokenSource? TaxiDismountCts;
     public long TaxiDismountFiresAtTickMs;
+    // JimsProxy (dance-stuck-on-movement 2026-05-07): the modern Classic 1.14 client treats
+    // certain ONESHOT emote IDs (notably EMOTE_ONESHOT_DANCE = 10) as looping animations
+    // client-side and only stops them on a new SMSG_EMOTE arriving. Vanilla 1.12 servers
+    // (Kronos / Twinstar) don't broadcast a stop emote when the player moves, so the dance
+    // loops indefinitely. Track the last looping emote so HandlePlayerMove can synthesize
+    // a stop SMSG_EMOTE on the first movement-start packet.
+    public uint LastLoopingEmoteId; // 0 means no active loop
+    public long LastLoopingEmoteTickMs;
     public string? TaxiAttemptId;
     public bool IsWaitingForNewWorld;
     public bool IsWaitingForWorldPortAck;
