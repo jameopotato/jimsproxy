@@ -141,6 +141,13 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CAST_SPELL)]
     void HandleCastSpell(CastSpell cast)
     {
+        // JimsProxy (PR #161 follow-up): self-heal any leaked peek-without-CAST_FAILED
+        // before HasStartedNormalCast / HasNonStartedPendingCastForSpell run their
+        // gate checks below. Without this, a Kronos-style "no trailing CAST_FAILED"
+        // leak would block every subsequent cast until the user happened to retrigger
+        // the same spell that's leaked, which is unintuitive and looks like a freeze.
+        GetSession().RunWatchdogEviction();
+
         if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
             GetSession().GameState.LastDispellSpellId = (uint)cast.Cast.SpellID;
 

@@ -926,6 +926,43 @@ public sealed class GameSessionData
     }
 
     /// <summary>
+    /// JimsProxy (PR #161 follow-up): walks PendingNormalCasts and PendingPetCasts,
+    /// dequeues any entry whose WatchdogDeadlineMs has expired, and returns the
+    /// evicted entries via the out parameters. Caller (GlobalSessionData
+    /// .RunWatchdogEviction) emits the synthetic packets via InstanceSocket.
+    /// Pure data operation — no socket dependency, easy to unit-test.
+    /// </summary>
+    public void DrainExpiredWatchdogCasts(long nowMs,
+        out List<ClientCastRequest> normalEvicted,
+        out List<ClientCastRequest> petEvicted)
+    {
+        normalEvicted = new List<ClientCastRequest>();
+        petEvicted = new List<ClientCastRequest>();
+
+        var keepNormal = new List<ClientCastRequest>();
+        while (PendingNormalCasts.TryDequeue(out var cast))
+        {
+            if (cast.WatchdogDeadlineMs > 0 && cast.WatchdogDeadlineMs < nowMs)
+                normalEvicted.Add(cast);
+            else
+                keepNormal.Add(cast);
+        }
+        foreach (var c in keepNormal)
+            PendingNormalCasts.Enqueue(c);
+
+        var keepPet = new List<ClientCastRequest>();
+        while (PendingPetCasts.TryDequeue(out var cast))
+        {
+            if (cast.WatchdogDeadlineMs > 0 && cast.WatchdogDeadlineMs < nowMs)
+                petEvicted.Add(cast);
+            else
+                keepPet.Add(cast);
+        }
+        foreach (var c in keepPet)
+            PendingPetCasts.Enqueue(c);
+    }
+
+    /// <summary>
     /// JimsProxy (Mount-Button-Stuck-Lit): returns true if any pending normal cast — started OR
     /// merely in flight to the legacy server — matches the given SpellId (or its LegacySpellId
     /// for SoM-renumbered USE_ITEMs).
@@ -1646,6 +1683,16 @@ public class ClientCastRequest
     // The GCD hold gate in HandleSpellGo uses this instead of HasStarted so Kronos-flavored
     // instants still trigger BeginGcd. See JimsProxy issue #43 follow-up.
     public uint StartedCastTimeMs;
+
+    // JimsProxy (PR #161 follow-up): when HandleSpellFailure peeks this entry
+    // (instead of dequeuing) so the trailing SMSG_CAST_FAILED can deliver the
+    // real reason, set this to TickCount64 + 2500ms. If HandleCastFailed
+    // doesn't dequeue within the window (Kronos can drop the trailing CAST_FAILED
+    // on cast-time + target-dies), EvictExpiredWatchdogCasts force-dequeues
+    // and emits a synthetic SpellPrepare + CastFailed(DontReport) to clear
+    // button-lit state instead of leaking a HasStarted=true entry that
+    // permanently blocks HasStartedNormalCast(). 0 = no watchdog active.
+    public long WatchdogDeadlineMs;
 }
 public class ArenaTeamData
 {
@@ -1732,6 +1779,68 @@ public class GlobalSessionData
         GameState = GameSessionData.CreateNewGameSessionData(this);
         AuthClient = new AuthClient(this);
         ThreatTracker = new ThreatTracker(this);
+    }
+
+    /// <summary>
+    /// JimsProxy (PR #161 follow-up): drain any expired watchdog peeks from the
+    /// pending-cast queues and emit synthetic SpellPrepare + CastFailed(DontReport)
+    /// (or PetCastFailed) for each so the modern client's button-lit / cast-bar
+    /// state clears. Called from the top of every spell-event handler so a leak
+    /// from "no trailing CAST_FAILED arrived" is at most one cast event old.
+    /// Reason=DontReport because the trailing CAST_FAILED that would have carried
+    /// the real reason never arrived — we don't know which to show.
+    /// </summary>
+    public void RunWatchdogEviction()
+    {
+        if (InstanceSocket == null)
+            return;
+
+        long nowMs = Environment.TickCount64;
+        GameState.DrainExpiredWatchdogCasts(nowMs,
+            out var normalEvicted,
+            out var petEvicted);
+
+        foreach (var cast in normalEvicted)
+        {
+            Log.Event("cast.watchdog_evicted", new
+            {
+                queue = "normal",
+                spell_id = cast.SpellId,
+                client_cast_id = cast.ClientGUID.ToString(),
+                had_started = cast.HasStarted,
+                ms_overdue = nowMs - cast.WatchdogDeadlineMs,
+            });
+            if (!cast.HasStarted)
+            {
+                SpellPrepare prepare = new();
+                prepare.ClientCastID = cast.ClientGUID;
+                prepare.ServerCastID = cast.ServerGUID;
+                InstanceSocket.SendPacket(prepare);
+            }
+            CastFailed failed = new();
+            failed.SpellID = cast.SpellId;
+            failed.SpellXSpellVisualID = cast.SpellXSpellVisualId;
+            failed.Reason = (byte)SpellCastResultClassic.DontReport;
+            failed.CastID = cast.ServerGUID;
+            InstanceSocket.SendPacket(failed);
+        }
+
+        foreach (var cast in petEvicted)
+        {
+            Log.Event("cast.watchdog_evicted", new
+            {
+                queue = "pet",
+                spell_id = cast.SpellId,
+                client_cast_id = cast.ClientGUID.ToString(),
+                had_started = cast.HasStarted,
+                ms_overdue = nowMs - cast.WatchdogDeadlineMs,
+            });
+            PetCastFailed failed = new();
+            failed.SpellID = cast.SpellId;
+            failed.Reason = (uint)SpellCastResultClassic.DontReport;
+            failed.CastID = cast.ServerGUID;
+            InstanceSocket.SendPacket(failed);
+        }
     }
 
     public void StoreGuildRankNames(uint guildId, List<string> ranks)
