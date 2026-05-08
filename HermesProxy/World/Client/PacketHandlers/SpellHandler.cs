@@ -378,6 +378,14 @@ public partial class WorldClient
         bool sentInterruptLog = false;
         bool sentCancelVisual = false;
         uint resolvedSpellVisualId = 0;
+        // JimsProxy (mob-channel-cleanup-diag 2026-05-07): capture the actual GUIDs and
+        // BackfireSpellID we stamp on the synthesized packets so a bug bundle can prove
+        // whether either is being filled with the wrong value (e.g. player GUID instead
+        // of mob GUID, or BackfireSpellID=0). Default 0 = packet was not synthesized.
+        ulong interruptLogCasterLow = 0;
+        ulong interruptLogVictimLow = 0;
+        int interruptLogBackfireSpellId = 0;
+        ulong cancelVisualSourceLow = 0;
         if (reason == 61 /* Interrupted */ && !casterIsPlayer && !casterIsPet)
         {
             SpellInterruptLog interruptLog = new SpellInterruptLog();
@@ -392,6 +400,9 @@ public partial class WorldClient
             interruptLog.BackfireSpellID = (int)spellId;
             SendPacketToClient(interruptLog);
             sentInterruptLog = true;
+            interruptLogCasterLow = interruptLog.Caster.GetCounter();
+            interruptLogVictimLow = interruptLog.Victim.GetCounter();
+            interruptLogBackfireSpellId = interruptLog.BackfireSpellID;
 
             resolvedSpellVisualId = GameData.GetSpellVisualIdFromXSpellVisual(spellVisual);
             if (resolvedSpellVisualId != 0)
@@ -401,6 +412,7 @@ public partial class WorldClient
                 cancelVisual.SpellVisualID = (int)resolvedSpellVisualId;
                 SendPacketToClient(cancelVisual);
                 sentCancelVisual = true;
+                cancelVisualSourceLow = cancelVisual.Source.GetCounter();
             }
         }
 
@@ -416,6 +428,7 @@ public partial class WorldClient
                 cancelVisual.SpellVisualID = (int)resolvedSpellVisualId;
                 SendPacketToClient(cancelVisual);
                 sentCancelVisual = true;
+                cancelVisualSourceLow = cancelVisual.Source.GetCounter();
             }
         }
 
@@ -431,6 +444,12 @@ public partial class WorldClient
             sentInterruptLog,
             sentCancelVisual,
             resolvedSpellVisualId,
+            // Diagnostic: actual content of synthesized cleanup packets
+            interruptLogCasterLow,
+            interruptLogVictimLow,
+            interruptLogBackfireSpellId,
+            cancelVisualSourceLow,
+            playerGuidLow = GetSession().GameState.CurrentPlayerGuid.GetCounter(),
         });
     }
 
@@ -634,6 +653,11 @@ public partial class WorldClient
         bool sentInterruptLog = false;
         bool sentCancelVisual = false;
         uint resolvedSpellVisualId = 0;
+        // JimsProxy (mob-channel-cleanup-diag 2026-05-07): see HandleSpellFailedOther for rationale.
+        ulong interruptLogCasterLow = 0;
+        ulong interruptLogVictimLow = 0;
+        int interruptLogBackfireSpellId = 0;
+        ulong cancelVisualSourceLow = 0;
         if (reason == 61 /* Interrupted */ && foundActiveCastId && !casterIsPlayer && !casterIsPet)
         {
             SpellInterruptLog interruptLog = new SpellInterruptLog();
@@ -643,6 +667,9 @@ public partial class WorldClient
             interruptLog.BackfireSpellID = (int)spellId;
             SendPacketToClient(interruptLog);
             sentInterruptLog = true;
+            interruptLogCasterLow = interruptLog.Caster.GetCounter();
+            interruptLogVictimLow = interruptLog.Victim.GetCounter();
+            interruptLogBackfireSpellId = interruptLog.BackfireSpellID;
 
             resolvedSpellVisualId = GameData.GetSpellVisualIdFromXSpellVisual(spellVisual);
             if (resolvedSpellVisualId != 0)
@@ -652,6 +679,7 @@ public partial class WorldClient
                 cancelVisual.SpellVisualID = (int)resolvedSpellVisualId;
                 SendPacketToClient(cancelVisual);
                 sentCancelVisual = true;
+                cancelVisualSourceLow = cancelVisual.Source.GetCounter();
             }
         }
 
@@ -669,6 +697,7 @@ public partial class WorldClient
                 cancelVisual.SpellVisualID = (int)resolvedSpellVisualId;
                 SendPacketToClient(cancelVisual);
                 sentCancelVisual = true;
+                cancelVisualSourceLow = cancelVisual.Source.GetCounter();
             }
         }
 
@@ -688,6 +717,13 @@ public partial class WorldClient
             sentInterruptLog,
             sentCancelVisual,
             resolvedSpellVisualId,
+            // Diagnostic: actual content of synthesized cleanup packets
+            interruptLogCasterLow,
+            interruptLogVictimLow,
+            interruptLogBackfireSpellId,
+            cancelVisualSourceLow,
+            casterUnitLow = casterUnit.GetCounter(),
+            playerGuidLow = GetSession().GameState.CurrentPlayerGuid.GetCounter(),
         });
     }
 
