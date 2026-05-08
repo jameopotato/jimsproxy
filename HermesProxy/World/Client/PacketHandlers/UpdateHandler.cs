@@ -64,6 +64,15 @@ public partial class WorldClient
         }
         GetSession().GameState.LastAuraCasterOnTarget.Remove(guid);
 
+        // JimsProxy (PR #161 follow-up — destroy-hook fast path): if any pending
+        // cast was aimed at this GUID, evict it now and emit synthetic
+        // CastFailed(BadTargets). Faster than waiting up to 2.5s for the
+        // watchdog and carries the correct popup reason since we know exactly
+        // why the cast can't proceed (target was just destroyed). Covers the
+        // Kronos "target dies mid-cast, no trailing CAST_FAILED" scenario at
+        // the source of the problem instead of the watchdog catch-all.
+        GetSession().EvictPendingCastsForDestroyedTarget(guid);
+
         UpdateObject updateObject = new UpdateObject(GetSession().GameState);
         updateObject.DestroyedGuids.Add(guid);
         SendPacketToClient(updateObject);

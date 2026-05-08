@@ -1,5 +1,9 @@
 using System;
 using HermesProxy;
+using HermesProxy.Enums;
+using HermesProxy.World;
+using HermesProxy.World.Enums;
+using HermesProxy.World.Objects;
 using Xunit;
 
 namespace HermesProxy.Tests.World;
@@ -135,5 +139,105 @@ public class WatchdogEvictionTests
 
         Assert.Empty(normal);
         Assert.Single(session.PendingNormalCasts);
+    }
+
+    // ---- Destroy-hook fast path tests ----
+
+    private static WowGuid128 Creature(ulong counter) =>
+        WowGuid128.Create(HighGuidType703.Creature, 0, 12345, counter);
+
+    private static ClientCastRequest MakeCastWithTarget(uint spellId, WowGuid128 targetGuid, bool hasStarted = false)
+    {
+        return new ClientCastRequest
+        {
+            SpellId = spellId,
+            Timestamp = Environment.TickCount,
+            TargetGuid = targetGuid,
+            HasStarted = hasStarted,
+        };
+    }
+
+    [Fact]
+    public void DrainPendingCastsForDestroyedTarget_NoMatch_KeepsAll()
+    {
+        var session = NewSession();
+        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(100, Creature(1)));
+        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(200, Creature(2)));
+
+        session.DrainPendingCastsForDestroyedTarget(Creature(99),
+            out var normal, out var pet);
+
+        Assert.Empty(normal);
+        Assert.Empty(pet);
+        Assert.Equal(2, session.PendingNormalCasts.Count);
+    }
+
+    [Fact]
+    public void DrainPendingCastsForDestroyedTarget_Match_EvictsOnly()
+    {
+        var session = NewSession();
+        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(100, Creature(1), hasStarted: true));
+        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(200, Creature(2)));
+        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(300, Creature(1))); // also targets evicted unit
+
+        session.DrainPendingCastsForDestroyedTarget(Creature(1),
+            out var normal, out var pet);
+
+        Assert.Equal(2, normal.Count);
+        Assert.Contains(normal, c => c.SpellId == 100);
+        Assert.Contains(normal, c => c.SpellId == 300);
+        Assert.Single(session.PendingNormalCasts);
+        Assert.Empty(pet);
+    }
+
+    [Fact]
+    public void DrainPendingCastsForDestroyedTarget_EmptyTargetGuids_Ignored()
+    {
+        // AoE / self-cast spells have empty TargetGuid. Destroy hook should
+        // not match them by accident even if the destroyed GUID is also empty.
+        var session = NewSession();
+        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(100, default));
+        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(200, Creature(5)));
+
+        session.DrainPendingCastsForDestroyedTarget(default,
+            out var normal, out var _);
+
+        Assert.Empty(normal);
+        Assert.Equal(2, session.PendingNormalCasts.Count);
+    }
+
+    [Fact]
+    public void DrainPendingCastsForDestroyedTarget_PetQueue_DrainedSeparately()
+    {
+        var session = NewSession();
+        var dyingMob = Creature(1);
+        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(100, dyingMob));
+        session.PendingPetCasts.Enqueue(MakeCastWithTarget(200, dyingMob));
+
+        session.DrainPendingCastsForDestroyedTarget(dyingMob,
+            out var normal, out var pet);
+
+        Assert.Single(normal);
+        Assert.Single(pet);
+        Assert.Equal(100u, normal[0].SpellId);
+        Assert.Equal(200u, pet[0].SpellId);
+    }
+
+    [Fact]
+    public void DrainPendingCastsForDestroyedTarget_HasStartedNormalCast_FalseAfterEviction()
+    {
+        // The end-to-end symptom: cast-time spell on a target, target dies, server
+        // sends only SMSG_SPELL_FAILURE (no trailing CAST_FAILED on Kronos). Without
+        // the destroy hook the entry leaks. With the hook, SMSG_DESTROY_OBJECT for
+        // the target evicts it immediately and HasStartedNormalCast returns false.
+        var session = NewSession();
+        var dyingMob = Creature(1);
+        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(100, dyingMob, hasStarted: true));
+
+        Assert.True(session.HasStartedNormalCast());
+
+        session.DrainPendingCastsForDestroyedTarget(dyingMob, out var _, out var _);
+
+        Assert.False(session.HasStartedNormalCast());
     }
 }
