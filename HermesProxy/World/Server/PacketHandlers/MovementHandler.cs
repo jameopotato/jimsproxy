@@ -45,6 +45,25 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MOVE_DOUBLE_JUMP)]
     void HandlePlayerMove(ClientPlayerMovement movement)
     {
+        // JimsProxy (dance-stuck-on-movement 2026-05-07): if the player has an active
+        // client-looping emote (e.g. /dance) and just initiated movement, synthesize a stop
+        // SMSG_EMOTE to break the loop. Kronos/Twinstar never broadcast one for movement, so
+        // without this the dance loops forever until another emote is used.
+        if (GetSession().GameState.LastLoopingEmoteId != 0 && IsMovementStartOpcode(movement.GetUniversalOpcode()))
+        {
+            EmoteMessage stopEmote = new EmoteMessage();
+            stopEmote.EmoteID = 0; // EMOTE_ONESHOT_NONE — clears the looping animation
+            stopEmote.Guid = GetSession().GameState.CurrentPlayerGuid;
+            SendPacket(stopEmote);
+            Framework.Logging.Log.Event("emote.loop.broken_by_move", new
+            {
+                last_emote_id = GetSession().GameState.LastLoopingEmoteId,
+                age_ms = Environment.TickCount64 - GetSession().GameState.LastLoopingEmoteTickMs,
+                trigger_opcode = movement.GetUniversalOpcode().ToString(),
+            });
+            GetSession().GameState.LastLoopingEmoteId = 0;
+        }
+
         string opcodeName = movement.GetUniversalOpcode().ToString();
         opcodeName = opcodeName.Replace("CMSG", "MSG");
         uint opcode = Opcodes.GetOpcodeValueForVersion(opcodeName, Framework.Settings.ServerBuild);
@@ -56,6 +75,30 @@ public partial class WorldSocket
             packet.WritePackedGuid(movement.Guid.To64());
         movement.MoveInfo.WriteMovementInfoLegacy(packet);
         SendPacketToServer(packet);
+    }
+
+    /// <summary>
+    /// JimsProxy: true for movement-start CMSG opcodes that should break a client-side
+    /// looping emote. Excludes heartbeats (just position updates), stops, and turn/facing
+    /// changes (turning in place shouldn't break /dance).
+    /// </summary>
+    private static bool IsMovementStartOpcode(Opcode opcode)
+    {
+        switch (opcode)
+        {
+            case Opcode.CMSG_MOVE_START_FORWARD:
+            case Opcode.CMSG_MOVE_START_BACKWARD:
+            case Opcode.CMSG_MOVE_START_STRAFE_LEFT:
+            case Opcode.CMSG_MOVE_START_STRAFE_RIGHT:
+            case Opcode.CMSG_MOVE_START_SWIM:
+            case Opcode.CMSG_MOVE_START_ASCEND:
+            case Opcode.CMSG_MOVE_START_DESCEND:
+            case Opcode.CMSG_MOVE_JUMP:
+            case Opcode.CMSG_MOVE_DOUBLE_JUMP:
+                return true;
+            default:
+                return false;
+        }
     }
 
     [PacketHandler(Opcode.CMSG_MOVE_TELEPORT_ACK)]

@@ -2326,6 +2326,17 @@ public partial class WorldClient
             if (UNIT_NPC_EMOTESTATE >= 0 && updateMaskArray[UNIT_NPC_EMOTESTATE])
             {
                 updateData.UnitData.EmoteState = updates[UNIT_NPC_EMOTESTATE].Int32Value;
+                // JimsProxy (emote-state-diag 2026-05-07): user reports /dance staying active
+                // through movement on Kronos. Capture every EMOTESTATE update so we can see
+                // whether the server sends EMOTESTATE=0 on move (proxy is dropping it) or never
+                // sends it at all (server-side bug, fix via proxy synthesis on movement).
+                Framework.Logging.Log.Event("emote.state.update", new
+                {
+                    target_low = guid.GetCounter(),
+                    is_player_target = guid == GetSession().GameState.CurrentPlayerGuid,
+                    new_emote_state = updateData.UnitData.EmoteState,
+                    is_create = isCreate,
+                });
             }
             int UNIT_TRAINING_POINTS = LegacyVersion.GetUpdateField(UnitField.UNIT_TRAINING_POINTS);
             if (UNIT_TRAINING_POINTS >= 0 && updateMaskArray[UNIT_TRAINING_POINTS])
