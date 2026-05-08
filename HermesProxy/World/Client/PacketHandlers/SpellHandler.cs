@@ -734,7 +734,18 @@ public partial class WorldClient
             return;
 
         SpellStart spell = new SpellStart();
-        spell.Cast = HandleSpellStartOrGo(packet, false);
+        try
+        {
+            spell.Cast = HandleSpellStartOrGo(packet, false);
+        }
+        catch (Exception e)
+        {
+            // Log + skip the cast instead of letting the parse exception
+            // bubble up through ReceiveLoop and DC the user. See HandleSpellGo
+            // for the in-the-wild repro and rationale.
+            LogSpellStartGoParseFailure(packet, e, isSpellGo: false);
+            return;
+        }
 
         bool casterIsLocalPlayer = GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit;
         bool casterIsLocalPet    = GetSession().GameState.CurrentPetGuid    == spell.Cast.CasterUnit;
@@ -849,7 +860,21 @@ public partial class WorldClient
             return;
 
         SpellGo spell = new SpellGo();
-        spell.Cast = HandleSpellStartOrGo(packet, true);
+        try
+        {
+            spell.Cast = HandleSpellStartOrGo(packet, true);
+        }
+        catch (Exception e)
+        {
+            // Some legacy servers emit a SMSG_SPELL_GO that the parser
+            // misreads — most often around channeled-spell ticks (Drain
+            // Soul on Kronos PTR was the original repro). Without this
+            // guard the exception bubbles up through ReceiveLoop and
+            // DCs the entire WorldClient session. Log full packet
+            // contents so the next hit gives us bytes to fix the parser.
+            LogSpellStartGoParseFailure(packet, e, isSpellGo: true);
+            return;
+        }
 
         // Dequeue completed cast (queue-based, FIFO order)
         if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
@@ -1065,6 +1090,30 @@ public partial class WorldClient
         // resulting THREAT_UPDATE follows it on the wire (matches the
         // server-driven ordering the modern client expects).
         GetSession().ThreatTracker.OnSpellCast(spell.Cast.CasterUnit, spell.Cast.SpellID, spell.Cast.HitTargets);
+    }
+
+    private static void LogSpellStartGoParseFailure(WorldPacket packet, Exception e, bool isSpellGo)
+    {
+        // Capture full packet bytes (capped) as a hex string so the next time
+        // this fires we have exact bytes to trace the parse divergence.
+        const int maxBytes = 512;
+        byte[] data = packet.GetData();
+        int dumpLen = data.Length < maxBytes ? data.Length : maxBytes;
+        var sb = new System.Text.StringBuilder(dumpLen * 2);
+        for (int i = 0; i < dumpLen; i++)
+            sb.Append(data[i].ToString("x2"));
+
+        Log.PrintNet(LogType.Error, LogNetDir.S2P,
+            $"SMSG_SPELL_{(isSpellGo ? "GO" : "START")} parse failed (suppressed DC): {e.Message}");
+        Log.Event("spell.parse_failed", new
+        {
+            phase = isSpellGo ? "go" : "start",
+            packet_size = data.Length,
+            dumped_bytes = dumpLen,
+            packet_hex = sb.ToString(),
+            error = e.Message,
+            stack = e.StackTrace,
+        });
     }
 
     SpellCastData HandleSpellStartOrGo(WorldPacket packet, bool isSpellGo)
