@@ -218,6 +218,7 @@ public partial class WorldSocket
             castRequest.SpellId = cast.Cast.SpellID;
             castRequest.SpellXSpellVisualId = cast.Cast.SpellXSpellVisualID;
             castRequest.ClientGUID = cast.Cast.CastID;
+            castRequest.TargetGuid = cast.Cast.Target.Unit;
 
             // Get the appropriate tracking variable based on spell type
             ref ClientCastRequest? currentCast = ref (isAutoRepeat
@@ -251,6 +252,7 @@ public partial class WorldSocket
             castRequest.SpellId = cast.Cast.SpellID;
             castRequest.SpellXSpellVisualId = cast.Cast.SpellXSpellVisualID;
             castRequest.ClientGUID = cast.Cast.CastID;
+            castRequest.TargetGuid = cast.Cast.Target.Unit;
             castRequest.ServerGUID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, cast.Cast.SpellID, 10000 + cast.Cast.CastID.GetCounter());
 
             // JimsProxy (issue #43): off-GCD spells (Sprint, Evasion, Trinket, racials, etc)
@@ -483,6 +485,7 @@ public partial class WorldSocket
         castRequest.SpellId = cast.Cast.SpellID;
         castRequest.SpellXSpellVisualId = cast.Cast.SpellXSpellVisualID;
         castRequest.ClientGUID = cast.Cast.CastID;
+        castRequest.TargetGuid = cast.Cast.Target.Unit;
         castRequest.ServerGUID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, cast.Cast.SpellID, 10000 + cast.Cast.CastID.GetCounter());
 
         // Check if there's already a pet cast in progress - reject without forwarding to server
@@ -516,6 +519,7 @@ public partial class WorldSocket
         castRequest.SpellId = use.Cast.SpellID;
         castRequest.SpellXSpellVisualId = use.Cast.SpellXSpellVisualID;
         castRequest.ClientGUID = use.Cast.CastID;
+        castRequest.TargetGuid = use.Cast.Target.Unit;
         castRequest.ServerGUID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, use.Cast.SpellID, 10000 + use.Cast.CastID.GetCounter());
         castRequest.ItemGUID = use.CastItem;
 

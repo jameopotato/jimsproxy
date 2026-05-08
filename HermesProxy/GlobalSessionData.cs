@@ -924,6 +924,46 @@ public sealed class GameSessionData
     /// .RunWatchdogEviction) emits the synthetic packets via InstanceSocket.
     /// Pure data operation — no socket dependency, easy to unit-test.
     /// </summary>
+    /// <summary>
+    /// JimsProxy (PR #161 follow-up — destroy-hook fast path): walks pending
+    /// queues and dequeues any cast whose TargetGuid matches the destroyed
+    /// unit. Returns evicted entries for the caller to emit synthetic
+    /// CastFailed packets with a more accurate reason (BadTargets) than the
+    /// watchdog's DontReport, since we know exactly why the cast can't
+    /// proceed: the target was destroyed.
+    /// </summary>
+    public void DrainPendingCastsForDestroyedTarget(WowGuid128 destroyedGuid,
+        out List<ClientCastRequest> normalEvicted,
+        out List<ClientCastRequest> petEvicted)
+    {
+        normalEvicted = new List<ClientCastRequest>();
+        petEvicted = new List<ClientCastRequest>();
+        if (destroyedGuid.IsEmpty())
+            return;
+
+        var keepNormal = new List<ClientCastRequest>();
+        while (PendingNormalCasts.TryDequeue(out var cast))
+        {
+            if (!cast.TargetGuid.IsEmpty() && cast.TargetGuid == destroyedGuid)
+                normalEvicted.Add(cast);
+            else
+                keepNormal.Add(cast);
+        }
+        foreach (var c in keepNormal)
+            PendingNormalCasts.Enqueue(c);
+
+        var keepPet = new List<ClientCastRequest>();
+        while (PendingPetCasts.TryDequeue(out var cast))
+        {
+            if (!cast.TargetGuid.IsEmpty() && cast.TargetGuid == destroyedGuid)
+                petEvicted.Add(cast);
+            else
+                keepPet.Add(cast);
+        }
+        foreach (var c in keepPet)
+            PendingPetCasts.Enqueue(c);
+    }
+
     public void DrainExpiredWatchdogCasts(long nowMs,
         out List<ClientCastRequest> normalEvicted,
         out List<ClientCastRequest> petEvicted)
@@ -1685,6 +1725,15 @@ public class ClientCastRequest
     // button-lit state instead of leaking a HasStarted=true entry that
     // permanently blocks HasStartedNormalCast(). 0 = no watchdog active.
     public long WatchdogDeadlineMs;
+
+    // JimsProxy (PR #161 follow-up — destroy-hook fast path): captured from
+    // CastSpell.Cast.Target.Unit at enqueue time. When HandleDestroyObject
+    // sees this GUID, the proxy can immediately evict any pending casts that
+    // were aimed at it (target died / despawned) and emit a synthetic
+    // CastFailed(BadTargets) — much faster than waiting up to 2.5s for the
+    // watchdog. Empty/default GUID = self-cast or no unit target (e.g. AoE
+    // ground-target spells), which the destroy hook ignores.
+    public WowGuid128 TargetGuid;
 }
 public class ArenaTeamData
 {
@@ -1771,6 +1820,66 @@ public class GlobalSessionData
         GameState = GameSessionData.CreateNewGameSessionData(this);
         AuthClient = new AuthClient(this);
         ThreatTracker = new ThreatTracker(this);
+    }
+
+    /// <summary>
+    /// JimsProxy (PR #161 follow-up — destroy-hook fast path): when
+    /// SMSG_DESTROY_OBJECT arrives for a unit, evict any pending casts aimed
+    /// at it. Reason=BadTargets because we know exactly why the cast can't
+    /// proceed (target was destroyed) and the modern client renders the
+    /// correct popup ("Invalid target"). Faster than the 2.5s watchdog —
+    /// fires within ~RTT of the destroy packet.
+    /// </summary>
+    public void EvictPendingCastsForDestroyedTarget(WowGuid128 destroyedGuid)
+    {
+        if (InstanceSocket == null) return;
+        if (destroyedGuid.IsEmpty()) return;
+
+        GameState.DrainPendingCastsForDestroyedTarget(destroyedGuid,
+            out var normalEvicted,
+            out var petEvicted);
+
+        foreach (var cast in normalEvicted)
+        {
+            Log.Event("cast.destroy_evicted", new
+            {
+                queue = "normal",
+                spell_id = cast.SpellId,
+                client_cast_id = cast.ClientGUID.ToString(),
+                target_low = cast.TargetGuid.GetCounter(),
+                had_started = cast.HasStarted,
+            });
+            if (!cast.HasStarted)
+            {
+                SpellPrepare prepare = new();
+                prepare.ClientCastID = cast.ClientGUID;
+                prepare.ServerCastID = cast.ServerGUID;
+                InstanceSocket.SendPacket(prepare);
+            }
+            CastFailed failed = new();
+            failed.SpellID = cast.SpellId;
+            failed.SpellXSpellVisualID = cast.SpellXSpellVisualId;
+            failed.Reason = (byte)SpellCastResultClassic.BadTargets;
+            failed.CastID = cast.ServerGUID;
+            InstanceSocket.SendPacket(failed);
+        }
+
+        foreach (var cast in petEvicted)
+        {
+            Log.Event("cast.destroy_evicted", new
+            {
+                queue = "pet",
+                spell_id = cast.SpellId,
+                client_cast_id = cast.ClientGUID.ToString(),
+                target_low = cast.TargetGuid.GetCounter(),
+                had_started = cast.HasStarted,
+            });
+            PetCastFailed failed = new();
+            failed.SpellID = cast.SpellId;
+            failed.Reason = (uint)SpellCastResultClassic.BadTargets;
+            failed.CastID = cast.ServerGUID;
+            InstanceSocket.SendPacket(failed);
+        }
     }
 
     /// <summary>
