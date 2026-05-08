@@ -349,10 +349,23 @@ public sealed class GameSessionData
 
     }
 
-    public static GameSessionData CreateNewGameSessionData(GlobalSessionData globalSession)
+    public static GameSessionData CreateNewGameSessionData(GlobalSessionData globalSession, GameSessionData? previous = null)
     {
         var self = new GameSessionData();
         self.CurrentPlayerStorage = new CurrentPlayerStorage(globalSession);
+
+        // Realm-scoped caches survive a /camp on a native 1.12 client (NameCache, ignore
+        // list, guild membership of other players are all per-realm files, not per-character).
+        // Wiping them on logout caused SMSG_INSPECT_RESULT to silently bail at the
+        // CachedPlayers lookup whenever the modern client's own persistent name cache
+        // satisfied the unit-frame name without issuing a fresh CMSG_QUERY_PLAYER_NAME —
+        // the proxy then had no entry to fill the inspect Name/Class/Race/Sex fields.
+        if (previous != null)
+        {
+            self.CachedPlayers = previous.CachedPlayers;
+            self.PlayerGuildIds = previous.PlayerGuildIds;
+            self.IgnoredPlayers = previous.IgnoredPlayers;
+        }
         return self;
     }
 
@@ -2341,7 +2354,7 @@ public class GlobalSessionData
             InstanceSocket = null!;
         }
 
-        GameState = GameSessionData.CreateNewGameSessionData(this);
+        GameState = GameSessionData.CreateNewGameSessionData(this, GameState);
         // Threat lists are tied to the previous character's mob/unit GUIDs;
         // wipe so the new login starts clean.
         ThreatTracker.Reset();

@@ -365,7 +365,7 @@ public partial class WorldClient
         //MIRASU   off the outgoing GameState.
         GetSession().SnapshotQuestItemProgressForRestore();
         GetSession().FlushQuestItemProgressToDisk();
-        GetSession().GameState = GameSessionData.CreateNewGameSessionData(GetSession());
+        GetSession().GameState = GameSessionData.CreateNewGameSessionData(GetSession(), GetSession().GameState);
         // Threat lists were keyed off the outgoing character's GUIDs; wipe so
         // the next character (or the same one re-logging in) starts clean.
         GetSession().ThreatTracker.Reset();
