@@ -111,7 +111,14 @@ public partial class WorldClient
                     PrintString($"Guid = {guid.ToString()}", i);
 
                     ObjectUpdate updateData = new ObjectUpdate(guid, UpdateTypeModern.Values, GetSession());
-                    AuraUpdate auraUpdate = new AuraUpdate(guid, false);
+                    // JimsProxy (aura-refresh-after-far-objects): if this unit
+                    // was just FarObjects-evicted, the modern client dropped
+                    // the unit's aura state on OutOfRangeGuids — a delta
+                    // AuraUpdate has nothing to merge against and the buff
+                    // bar lingers stale. Promote this AuraUpdate to a full
+                    // refresh so the modern client reseeds from scratch.
+                    bool needsFullAuraRefresh = GetSession().GameState.NeedsFullAuraRefresh.Remove(guid);
+                    AuraUpdate auraUpdate = new AuraUpdate(guid, needsFullAuraRefresh);
                     PowerUpdate powerUpdate = new PowerUpdate(guid);
                     ReadValuesUpdateBlock(packet, guid, updateData, auraUpdate, powerUpdate, i);
 
@@ -161,6 +168,10 @@ public partial class WorldClient
 
                     ObjectUpdate updateData = new ObjectUpdate(guid, UpdateTypeModern.CreateObject1, GetSession());
                     AuraUpdate auraUpdate = new AuraUpdate(guid, true);
+                    // CREATE already uses UpdateAll=true; just clear the
+                    // FarObjects bookkeeping so a later Values update for
+                    // this guid doesn't double-promote.
+                    GetSession().GameState.NeedsFullAuraRefresh.Remove(guid);
                     ReadCreateObjectBlock(packet, guid, updateData, auraUpdate, i);
 
                     if (updateData.Guid == GetSession().GameState.CurrentPlayerGuid)
@@ -196,6 +207,7 @@ public partial class WorldClient
 
                     ObjectUpdate updateData = new ObjectUpdate(guid, UpdateTypeModern.CreateObject2, GetSession());
                     AuraUpdate auraUpdate = new AuraUpdate(guid, true);
+                    GetSession().GameState.NeedsFullAuraRefresh.Remove(guid);
                     ReadCreateObjectBlock(packet, guid, updateData, auraUpdate, i);
 
                     if (guid.IsItem() && updateData.ObjectData.EntryID != null &&
@@ -376,6 +388,31 @@ public partial class WorldClient
                 GetSession().GameState.ObjectCacheModern.Remove(guid);
             }
             GetSession().GameState.LastAuraCasterOnTarget.Remove(guid);
+            // JimsProxy (aura-refresh-after-far-objects): aura state only
+            // applies to units (players, creatures, pets, vehicles). Skip
+            // gameobjects, items, dynamic objects, corpses, etc. — sending
+            // an AuraUpdate for those is at best ignored and at worst
+            // malformed traffic the client logs as an error.
+            bool guidIsUnit = guid.IsPlayer() || guid.IsCreature();
+            if (guidIsUnit)
+            {
+                // JimsProxy (aura-refresh-after-far-objects): mark this guid so
+                // the next Values OBJECT_UPDATE for it arrives as
+                // AuraUpdate(UpdateAll=true). The modern client just dropped the
+                // unit's aura state on OutOfRangeGuids; without the promotion,
+                // a later delta merges against nothing and the buff bar lingers
+                // stale until the user reloads the UI.
+                GetSession().GameState.NeedsFullAuraRefresh.Add(guid);
+                // Proactively wipe the modern client's buff/debuff bar for this
+                // unit. The target frame keeps showing the last-known auras
+                // after the unit leaves render — sending an empty AuraUpdate
+                // with UpdateAll=true wipes them immediately so PvPers don't
+                // see stale debuff icons (e.g. Detect Magic) hanging on a
+                // target that ran out of range. Re-entry via CreateObject1/2
+                // carries the full aura state from the legacy server, so the
+                // bar repopulates correctly when the unit returns.
+                SendPacketToClient(new AuraUpdate(guid, true));
+            }
 
             // If the pet is too far away, sends a SMSG_UPDATE_OBJECT protocol
             if (GetSession().GameState.CurrentPetGuid == guid)
