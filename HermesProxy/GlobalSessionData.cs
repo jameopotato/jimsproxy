@@ -466,8 +466,14 @@ public sealed class GameSessionData
         if (updates == null)
             return 0;
 
-        uint itemId = updates[OBJECT_FIELD_ENTRY].UInt32Value;
-        return itemId;
+        // JimsProxy (mc-player-pet-bar 2026-05-07): players don't have OBJECT_FIELD_ENTRY in
+        // their cached field set, so a raw indexer access throws KeyNotFoundException ('3')
+        // when called for an MC'd player target. Several callers (notably the SMSG_PET_SPELLS
+        // handler in PetHandler.cs) catch broadly and silently drop their entire output —
+        // empty pet bar in BG MC. Treat missing field as "no entry" and return 0.
+        if (!updates.TryGetValue(OBJECT_FIELD_ENTRY, out var entryField))
+            return 0;
+        return entryField.UInt32Value;
     }
     public void SetFlatSpellMod(byte spellMod, byte spellMask, int amount)
     {
