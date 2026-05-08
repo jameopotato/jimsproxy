@@ -233,7 +233,9 @@ public partial class WorldSocket
     void HandleAddonMessage(ChatAddonMessage packet)
     {
         uint language = (uint)Language.Addon;
-        string text = packet.Params.Prefix + '\t' + packet.Params.Text;
+        string body = AddonInteropTranslator.TranslateOutbound(packet.Params.Prefix, packet.Params.Text);
+        if (string.IsNullOrEmpty(body)) return;
+        string text = packet.Params.Prefix + '\t' + body;
 
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
         {
@@ -251,7 +253,9 @@ public partial class WorldSocket
     void HandleAddonMessageTargeted(ChatAddonMessageTargeted packet)
     {
         uint language = (uint)Language.Addon;
-        string text = packet.Params.Prefix + '\t' + packet.Params.Text;
+        string body = AddonInteropTranslator.TranslateOutbound(packet.Params.Prefix, packet.Params.Text);
+        if (string.IsNullOrEmpty(body)) return;
+        string text = packet.Params.Prefix + '\t' + body;
         string channelName = packet.ChannelGuid.IsEmpty() ? "" :
             GetSession().GameState.GetChannelName((int)packet.ChannelGuid.GetCounter());
 
