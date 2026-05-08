@@ -766,6 +766,21 @@ public sealed class GameSessionData
         if (UnitAuraCaster.TryGetValue(guid, out var dict))
             dict.Remove(slot);
     }
+    // JimsProxy (target-buffs-stuck-after-render-roundtrip): drop all
+    // per-target aura state when a unit is destroyed (left render
+    // distance, despawned, or died). Without this, the modern client
+    // surfaces stale buffs the next time the target re-enters render.
+    // Returns the number of (slot,duration) entries evicted from
+    // UnitAuraDurationLeft so the caller can record diagnostics.
+    public int EvictUnitAuraState(WowGuid128 guid)
+    {
+        int evicted = UnitAuraDurationLeft.TryGetValue(guid, out var leftDict) ? leftDict.Count : 0;
+        UnitAuraDurationUpdateTime.Remove(guid);
+        UnitAuraDurationLeft.Remove(guid);
+        UnitAuraDurationFull.Remove(guid);
+        UnitAuraCaster.Remove(guid);
+        return evicted;
+    }
     public WowGuid128 GetAuraCaster(WowGuid128 target, byte slot)
     {
         if (UnitAuraCaster.TryGetValue(target, out var dict) &&

@@ -48,6 +48,14 @@ public partial class WorldClient
         // those mount GUIDs around aggro/death time.
         int cachedEntry = GetSession().GameState.GetLegacyFieldValueInt32(guid, ObjectField.OBJECT_FIELD_ENTRY);
         int cachedDisplayId = GetSession().GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
+
+        // JimsProxy (target-buffs-stuck-after-render-roundtrip): drop the
+        // four per-target aura tables for this guid. Without this, the
+        // modern client surfaces stale buffs when the unit re-enters
+        // render distance — fresh OBJECT_UPDATE deltas don't reliably
+        // overwrite the old slot data before the addon's first read.
+        int aurasEvicted = GetSession().GameState.EvictUnitAuraState(guid);
+
         Log.Event("object.destroy", new
         {
             guid = guid.ToString(),
@@ -55,6 +63,7 @@ public partial class WorldClient
             guid_entry = guid.GetEntry(),
             cached_entry = cachedEntry,
             cached_display_id = cachedDisplayId,
+            auras_evicted = aurasEvicted,
         });
 
         lock (GetSession().GameState.ObjectCacheLock)
