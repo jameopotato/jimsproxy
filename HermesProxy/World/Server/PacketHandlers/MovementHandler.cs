@@ -45,11 +45,36 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MOVE_DOUBLE_JUMP)]
     void HandlePlayerMove(ClientPlayerMovement movement)
     {
+        bool isMoveStart = IsMovementStartOpcode(movement.GetUniversalOpcode());
+
+        // JimsProxy (PR #161 follow-up — movement preemption): mark any in-flight
+        // cast-time spell as movement-cancelled the moment the user starts moving.
+        // Vanilla cancels cast-time spells on movement; the modern 1.14 client
+        // predicts this client-side and dismisses its own cast bar before the
+        // server's SMSG_SPELL_FAILURE round-trips. Without the marker, the
+        // trailing failure surfaces as a misleading "You are in combat" popup
+        // (vmangos hardcodes the wire reason in SendInterrupted) or a redundant
+        // CastFailed that re-flashes the action button. Also arms the watchdog
+        // so the entry doesn't leak if the legacy server response never arrives.
+        if (isMoveStart)
+        {
+            int marked = GetSession().GameState.MarkStartedCastsMovementCancelled(
+                Environment.TickCount64 + 2500);
+            if (marked > 0)
+            {
+                Framework.Logging.Log.Event("cast.movement_cancel_preempted", new
+                {
+                    casts_marked = marked,
+                    trigger_opcode = movement.GetUniversalOpcode().ToString(),
+                });
+            }
+        }
+
         // JimsProxy (dance-stuck-on-movement 2026-05-07): if the player has an active
         // client-looping emote (e.g. /dance) and just initiated movement, synthesize a stop
         // SMSG_EMOTE to break the loop. Kronos/Twinstar never broadcast one for movement, so
         // without this the dance loops forever until another emote is used.
-        if (GetSession().GameState.LastLoopingEmoteId != 0 && IsMovementStartOpcode(movement.GetUniversalOpcode()))
+        if (GetSession().GameState.LastLoopingEmoteId != 0 && isMoveStart)
         {
             EmoteMessage stopEmote = new EmoteMessage();
             stopEmote.EmoteID = 0; // EMOTE_ONESHOT_NONE — clears the looping animation

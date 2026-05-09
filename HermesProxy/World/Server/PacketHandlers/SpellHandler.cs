@@ -174,6 +174,13 @@ public partial class WorldSocket
             return;
         }
 
+        // JimsProxy (PR #161 follow-up): self-heal any leaked peek-without-CAST_FAILED
+        // before HasStartedNormalCast / HasNonStartedPendingCastForSpell run their
+        // gate checks below. Without this, a Kronos-style "no trailing CAST_FAILED"
+        // leak would block every subsequent cast until the user happened to retrigger
+        // the same spell that's leaked, which is unintuitive and looks like a freeze.
+        GetSession().RunWatchdogEviction();
+
         if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
             GetSession().GameState.LastDispellSpellId = (uint)cast.Cast.SpellID;
 
@@ -244,6 +251,7 @@ public partial class WorldSocket
             castRequest.SpellId = cast.Cast.SpellID;
             castRequest.SpellXSpellVisualId = cast.Cast.SpellXSpellVisualID;
             castRequest.ClientGUID = cast.Cast.CastID;
+            castRequest.TargetGuid = cast.Cast.Target.Unit;
 
             // Get the appropriate tracking variable based on spell type
             ref ClientCastRequest? currentCast = ref (isAutoRepeat
@@ -277,6 +285,7 @@ public partial class WorldSocket
             castRequest.SpellId = cast.Cast.SpellID;
             castRequest.SpellXSpellVisualId = cast.Cast.SpellXSpellVisualID;
             castRequest.ClientGUID = cast.Cast.CastID;
+            castRequest.TargetGuid = cast.Cast.Target.Unit;
             castRequest.ServerGUID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, cast.Cast.SpellID, 10000 + cast.Cast.CastID.GetCounter());
 
             // JimsProxy (issue #43): off-GCD spells (Sprint, Evasion, Trinket, racials, etc)
@@ -298,7 +307,16 @@ public partial class WorldSocket
                     return;
                 }
 
-                // Guard: cast-time spell in progress — hold (most-recent-wins, hidden queue)
+                // Guard: cast-time spell in progress — hold (most-recent-wins, hidden queue).
+                // JimsProxy (GCD-sweep-during-cast-time-spam 2026-05-07): keep the held press
+                // hidden from the modern client. Previously this path sent SendCastFailedWithoutPrepare
+                // for the new cast immediately, which made the action button drop its GCD
+                // anticipation; the held cast firing on cast complete then started a fresh
+                // SpellPrepare → brief idle gap visible as "no GCD sweep". Mirror the GCD-hold
+                // branch's silent-hold behavior (line ~336 comment): only ack-fail the
+                // displaced previously-held cast; don't ack-fail the new one. The eventual
+                // SpellPrepare at SPELL_START time keeps the button lit smoothly across the
+                // hold.
                 if (GetSession().GameState.HasStartedNormalCast())
                 {
                     WorldPacket heldPacket = BuildCastSpellPacket(cast);
@@ -310,10 +328,13 @@ public partial class WorldSocket
                         spell_id = cast.Cast.SpellID,
                         displaced_spell_id = displaced?.SpellId ?? 0,
                         client_cast_id = castRequest.ClientGUID.ToString(),
+                        silent_hold = true,
                     });
                     if (displaced != null)
                         SendCastFailedWithoutPrepare(displaced);
-                    SendCastFailedWithoutPrepare(castRequest);
+                    // Don't ack-fail castRequest — keep the modern client's action-button GCD
+                    // anticipation lit until SpellPrepare arrives at SPELL_START time for the
+                    // refired cast. Matches the smooth feel of native 1.14.
                     return;
                 }
 
@@ -509,6 +530,7 @@ public partial class WorldSocket
         castRequest.SpellId = cast.Cast.SpellID;
         castRequest.SpellXSpellVisualId = cast.Cast.SpellXSpellVisualID;
         castRequest.ClientGUID = cast.Cast.CastID;
+        castRequest.TargetGuid = cast.Cast.Target.Unit;
         castRequest.ServerGUID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, cast.Cast.SpellID, 10000 + cast.Cast.CastID.GetCounter());
 
         // Check if there's already a pet cast in progress - reject without forwarding to server
@@ -542,6 +564,7 @@ public partial class WorldSocket
         castRequest.SpellId = use.Cast.SpellID;
         castRequest.SpellXSpellVisualId = use.Cast.SpellXSpellVisualID;
         castRequest.ClientGUID = use.Cast.CastID;
+        castRequest.TargetGuid = use.Cast.Target.Unit;
         castRequest.ServerGUID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, use.Cast.SpellID, 10000 + use.Cast.CastID.GetCounter());
         castRequest.ItemGUID = use.CastItem;
 
@@ -605,6 +628,22 @@ public partial class WorldSocket
                     : 0L,
             });
             SendCastFailedWithoutPrepare(dropped);
+        }
+
+        // JimsProxy (silent-hold GCD sweep 2026-05-07): also clear any cast-time held slot.
+        // A press held silently during a cast bar is now unacked; ESC must release it.
+        var heldCastTimeDrop = GetSession().GameState.ClearHeldCastTimeCast();
+        if (heldCastTimeDrop != null)
+        {
+            Log.Event("spell.cast_time_held_cancel", new
+            {
+                dropped_spell_id = heldCastTimeDrop.SpellId,
+                cancelled_spell_id = cast.SpellID,
+                held_for_ms = heldCastTimeDrop.HeldAtTickMs > 0
+                    ? Environment.TickCount64 - heldCastTimeDrop.HeldAtTickMs
+                    : 0L,
+            });
+            SendCastFailedWithoutPrepare(heldCastTimeDrop);
         }
 
         WorldPacket packet = new WorldPacket(Opcode.CMSG_CANCEL_CAST);

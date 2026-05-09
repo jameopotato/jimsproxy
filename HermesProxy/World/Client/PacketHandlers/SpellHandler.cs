@@ -12,6 +12,14 @@ namespace HermesProxy.World.Client;
 
 public partial class WorldClient
 {
+    // JimsProxy (PR #161 follow-up): how long after HandleSpellFailure peeks a
+    // pending cast we wait for the trailing SMSG_CAST_FAILED before assuming
+    // the legacy server isn't sending one. 2.5s is comfortably longer than
+    // any observed CAST_FAILED arrival on vmangos/Twinstar (~1ms after FAILURE)
+    // and shorter than feels-laggy to the user when the pathological Kronos
+    // case kicks in (target-dies-mid-cast, no trailing CAST_FAILED).
+    private const long WatchdogWindowMs = 2500;
+
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_SEND_KNOWN_SPELLS)]
     void HandleSendKnownSpells(WorldPacket packet)
@@ -157,6 +165,11 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_CAST_FAILED)]
     void HandleCastFailed(WorldPacket packet)
     {
+        // JimsProxy (PR #161 follow-up): clean up any prior peek that didn't
+        // get its own trailing CAST_FAILED — happens occasionally on Kronos
+        // for cast-time + target-dies. Self-healing on every cast event.
+        GetSession().RunWatchdogEviction();
+
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
             packet.ReadUInt8(); // cast count
 
@@ -213,7 +226,28 @@ public partial class WorldClient
         // Look up pending normal cast by SpellId (queue-based, FIFO order)
         else if (GetSession().GameState.TryDequeuePendingNormalCast(spellId, out var pendingCast))
         {
-            if (!pendingCast!.HasStarted)
+            // JimsProxy (PR #161 follow-up — movement preemption): if this
+            // cast was marked when the user started moving, the modern client
+            // sent CMSG_CANCEL_CAST and is waiting for SMSG_CAST_FAILED to
+            // confirm. Suppressing CastFailed entirely makes the bar linger
+            // for the legacy round-trip (~150-200ms — observed as a "small
+            // delay" by testers). Emit CastFailed with DontReport so the
+            // client gets its ack instantly with no popup or error sound.
+            // Skip the SpellPrepare (no point prepping a cast we're failing).
+            bool movementSuppressed = pendingCast!.MovementCancelled;
+            uint effectiveReason = movementSuppressed
+                ? (uint)SpellCastResultClassic.DontReport
+                : LegacyVersion.ConvertSpellCastResult(reason);
+            if (movementSuppressed)
+            {
+                Log.Event("cast.movement_cancel_suppressed", new
+                {
+                    queue = "normal",
+                    spell_id = pendingCast.SpellId,
+                    client_cast_id = pendingCast.ClientGUID.ToString(),
+                });
+            }
+            else if (!pendingCast.HasStarted)
             {
                 SpellPrepare prepare2 = new SpellPrepare();
                 prepare2.ClientCastID = pendingCast.ClientGUID;
@@ -224,14 +258,16 @@ public partial class WorldClient
             CastFailed failed = new();
             failed.SpellID = pendingCast.SpellId;
             failed.SpellXSpellVisualID = pendingCast.SpellXSpellVisualId;
-            failed.Reason = LegacyVersion.ConvertSpellCastResult(reason);
+            failed.Reason = effectiveReason;
             failed.CastID = pendingCast.ServerGUID;
             failed.FailedArg1 = arg1;
             failed.FailedArg2 = arg2;
             SendPacketToClient(failed);
 
             var gameState = GetSession().GameState;
-            gameState.ClearHeldCastTimeCast();
+            var heldCastTimeDrop = gameState.ClearHeldCastTimeCast();
+            if (heldCastTimeDrop != null)
+                GetSession().InstanceSocket.SendCastRequestFailed(heldCastTimeDrop, false);
             if (!gameState.IsGcdHoldActive() && !gameState.HasForwardedPendingCast())
             {
                 var heldCast = gameState.TakeHeldCastIfReady();
@@ -260,7 +296,12 @@ public partial class WorldClient
         if (!GetSession().GameState.TryDequeuePendingPetCast(spellId, out var pendingCast))
             return;
 
-        if (!pendingCast!.HasStarted)
+        // JimsProxy (PR #161 follow-up — movement preemption parity): mirror
+        // the player-side suppression. If the pet's pending cast was marked
+        // MovementCancelled, force the reason to DontReport so no popup or
+        // error sound fires while still acking the cancel to the client.
+        bool movementSuppressed = pendingCast!.MovementCancelled;
+        if (!pendingCast.HasStarted && !movementSuppressed)
         {
             SpellPrepare prepare2 = new SpellPrepare();
             prepare2.ClientCastID = pendingCast.ClientGUID;
@@ -271,7 +312,9 @@ public partial class WorldClient
         PetCastFailed spell = new PetCastFailed();
         spell.SpellID = spellId;
         uint reason = packet.ReadUInt8();
-        spell.Reason = LegacyVersion.ConvertSpellCastResult(reason);
+        spell.Reason = movementSuppressed
+            ? (uint)SpellCastResultClassic.DontReport
+            : LegacyVersion.ConvertSpellCastResult(reason);
         spell.CastID = pendingCast.ServerGUID;
         SendPacketToClient(spell);
     }
@@ -288,7 +331,10 @@ public partial class WorldClient
         if (!GetSession().GameState.TryDequeuePendingPetCast(spellId, out var pendingCast))
             return;
 
-        if (!pendingCast!.HasStarted)
+        // JimsProxy (PR #161 follow-up — movement preemption parity): mirror
+        // the player-side suppression. See HandlePetCastFailed for rationale.
+        bool movementSuppressed = pendingCast!.MovementCancelled;
+        if (!pendingCast.HasStarted && !movementSuppressed)
         {
             SpellPrepare prepare2 = new SpellPrepare();
             prepare2.ClientCastID = pendingCast.ClientGUID;
@@ -299,7 +345,9 @@ public partial class WorldClient
         PetCastFailed failed = new PetCastFailed();
         failed.SpellID = spellId;
         uint reason = packet.ReadUInt8();
-        failed.Reason = LegacyVersion.ConvertSpellCastResult(reason);
+        failed.Reason = movementSuppressed
+            ? (uint)SpellCastResultClassic.DontReport
+            : LegacyVersion.ConvertSpellCastResult(reason);
         failed.CastID = pendingCast.ServerGUID;
 
         if (packet.CanRead())
@@ -488,6 +536,11 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_SPELL_FAILURE)]
     void HandleSpellFailure(WorldPacket packet)
     {
+        // JimsProxy (PR #161 follow-up): clean up any prior peek that didn't
+        // get a trailing CAST_FAILED within the watchdog window. Runs before
+        // we set up a new watchdog so leaks can't accumulate across failures.
+        GetSession().RunWatchdogEviction();
+
         WowGuid128 casterUnit;
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
             casterUnit = packet.ReadPackedGuid().To128(GetSession().GameState);
@@ -566,62 +619,69 @@ public partial class WorldClient
         // can drop the broadcast entirely -- there's no animation to cancel.
         bool isRangedAutoAttack = spellId == 75 || spellId == 5019;
 
-        // Local player: DEQUEUE and send CastFailed immediately. Kronos doesn't
-        // always follow SMSG_SPELL_FAILURE with SMSG_CAST_FAILED (e.g. target dies
-        // mid-cast). Previously this only peeked, relying on HandleCastFailed to
-        // dequeue — but when CAST_FAILED never arrived, the entry leaked with
-        // HasStarted=true, permanently blocking all non-off-GCD casts.
+        // JimsProxy: PEEK (don't dequeue) so the trailing SMSG_CAST_FAILED — which
+        // carries the real failure reason on vmangos/Twinstar after Spell::SendInterrupted
+        // hardcodes the SpellFailure wire reason to 0 (= AffectingCombat after translation)
+        // — can be matched by HandleCastFailed via TryDequeuePendingNormalCast and
+        // delivered to the client. Sending an inline CastFailed here would (a) consume
+        // the queue entry HandleCastFailed needs, leaving its dequeue empty, and (b)
+        // ship the misleading hardcoded reason to the client, which the 1.14 popup +
+        // button-state renderer reads regardless of whether the broadcast SpellFailure
+        // was suppressed. Trade-off: on Kronos, where the trailing SMSG_CAST_FAILED can
+        // be dropped (e.g. target dies mid-cast on cast-time spells), the cast can leak
+        // in the queue. For the SendInterrupted hardcoded-zero path that triggers this
+        // suppression — overwhelmingly instants on vmangos/Twinstar — the trailing
+        // CAST_FAILED reliably arrives. ClearHeldCastTimeCast still fires to release
+        // any cast-time-held press attached to a now-failed cast bar.
         if (GetSession().GameState.CurrentPlayerGuid == casterUnit &&
-            GetSession().GameState.TryDequeuePendingNormalCast(spellId, out var pendingNormal))
+            GetSession().GameState.PendingNormalCasts.FirstOrDefault(c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId)) is { } pendingNormal)
         {
-            castId = pendingNormal!.ServerGUID;
+            castId = pendingNormal.ServerGUID;
             spellVisual = pendingNormal.SpellXSpellVisualId;
             if (pendingNormal.LegacySpellId != 0)
                 spellId = pendingNormal.SpellId;
             wasStarted = pendingNormal.HasStarted;
-            dequeued = true;
+            dequeued = false; // peeked — HandleCastFailed dequeues on the trailing SMSG_CAST_FAILED
+            // JimsProxy (PR #161 follow-up): arm the watchdog. If the trailing
+            // SMSG_CAST_FAILED arrives within 2.5s, HandleCastFailed dequeues
+            // normally (deadline becomes irrelevant). If not (Kronos-style
+            // target-dies-mid-cast drop), the next event runs RunWatchdogEviction
+            // and force-dequeues with synthetic SpellPrepare + CastFailed(DontReport)
+            // so HasStartedNormalCast doesn't permanently block subsequent casts.
+            pendingNormal.WatchdogDeadlineMs = Environment.TickCount64 + WatchdogWindowMs;
 
-            if (!pendingNormal.HasStarted)
-            {
-                SpellPrepare prepare = new();
-                prepare.ClientCastID = pendingNormal.ClientGUID;
-                prepare.ServerCastID = pendingNormal.ServerGUID;
-                SendPacketToClient(prepare);
-            }
+            var heldCastTimeDrop = GetSession().GameState.ClearHeldCastTimeCast();
+            if (heldCastTimeDrop != null)
+                GetSession().InstanceSocket.SendCastRequestFailed(heldCastTimeDrop, false);
 
-            CastFailed failed = new();
-            failed.SpellID = pendingNormal.SpellId;
-            failed.SpellXSpellVisualID = pendingNormal.SpellXSpellVisualId;
-            failed.Reason = reason;
-            failed.CastID = pendingNormal.ServerGUID;
-            SendPacketToClient(failed);
-
-            GetSession().GameState.ClearHeldCastTimeCast();
-
+            // JimsProxy (PR #161 follow-up — movement preemption): if the user
+            // started moving while this cast-time spell was in progress, the
+            // modern client already cancelled its own cast bar via client-side
+            // prediction. Suppress the broadcast SpellFailure entirely —
+            // emitting it would surface a misleading "You are in combat" popup
+            // (Spell::SendInterrupted hardcodes the wire reason to 0).
+            if (pendingNormal.MovementCancelled)
+                skipBroadcastFailure = true;
             // Instant cast that wasn't a ranged auto-attack: SPELL_START was
-            // never forwarded, so there's no cast bar to dismiss. CastFailed
-            // already cancelled GCD anticipation. Skip the misleading
-            // SpellFailure broadcast entirely.
-            if (!pendingNormal.HasStarted && !isRangedAutoAttack)
+            // never forwarded, so there's no cast bar to dismiss. Skip the misleading
+            // broadcast SpellFailure entirely. The trailing SMSG_CAST_FAILED via
+            // HandleCastFailed sends SpellPrepare + CastFailed with the real reason,
+            // which clears button-lit state and shows the correct popup.
+            else if (!pendingNormal.HasStarted && !isRangedAutoAttack)
                 skipBroadcastFailure = true;
             else
                 overrideReasonForLocalBroadcast = true;
         }
         else if (GetSession().GameState.CurrentPetGuid == casterUnit &&
-                 GetSession().GameState.TryDequeuePendingPetCast(spellId, out var pendingPet))
+                 GetSession().GameState.PendingPetCasts.FirstOrDefault(c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId)) is { } pendingPet)
         {
-            castId = pendingPet!.ServerGUID;
+            castId = pendingPet.ServerGUID;
             spellVisual = pendingPet.SpellXSpellVisualId;
             if (pendingPet.LegacySpellId != 0)
                 spellId = pendingPet.SpellId;
             wasStarted = pendingPet.HasStarted;
-            dequeued = true;
-
-            PetCastFailed petFailed = new();
-            petFailed.SpellID = pendingPet.SpellId;
-            petFailed.Reason = reason;
-            petFailed.CastID = pendingPet.ServerGUID;
-            SendPacketToClient(petFailed);
+            dequeued = false; // peeked — HandlePetCastFailed dequeues on the trailing SMSG_PET_CAST_FAILED
+            pendingPet.WatchdogDeadlineMs = Environment.TickCount64 + WatchdogWindowMs;
 
             // Pet path: PetCastFailed handles the pet UI. Suppress the broadcast
             // SpellFailure for instants (no cast bar); for cast-time pet spells
