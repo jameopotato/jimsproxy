@@ -96,6 +96,13 @@ public partial class WorldClient
         }
         spells.SpellID.Add(spellId);
         spells.Superceded.Add(supercededId);
+        // JimsProxy (cast-block-unknown-spells): keep CurrentPlayerKnownSpells in sync
+        // so the outbound CMSG_CAST_SPELL guard sees the actual server-side known set.
+        // Without this, a rank-up replaces the action-bar binding but the proxy still
+        // thinks the old rank is known and never tracks the new one.
+        var knownSpellsSuperseded = GetSession().GameState.CurrentPlayerKnownSpells;
+        knownSpellsSuperseded.Remove(supercededId);
+        knownSpellsSuperseded.Add(spellId);
         SendPacketToClient(spells);
     }
 
@@ -105,6 +112,9 @@ public partial class WorldClient
         LearnedSpells spells = new LearnedSpells();
         uint spellId = packet.ReadUInt32();
         spells.Spells.Add(spellId);
+        // JimsProxy (cast-block-unknown-spells): track newly-learned spells so the
+        // outbound CMSG_CAST_SPELL guard doesn't false-positive on trainer/talent grants.
+        GetSession().GameState.CurrentPlayerKnownSpells.Add(spellId);
         SendPacketToClient(spells);
     }
 
@@ -113,10 +123,14 @@ public partial class WorldClient
     {
         SendUnlearnSpells spells = new SendUnlearnSpells();
         uint spellCount = packet.ReadUInt32();
+        var knownSpellsSendUnlearn = GetSession().GameState.CurrentPlayerKnownSpells;
         for (uint i = 0; i < spellCount; i++)
         {
             uint spellId = packet.ReadUInt32();
             spells.Spells.Add(spellId);
+            // JimsProxy (cast-block-unknown-spells): drop unlearned spells from the
+            // proxy-side known set so the CMSG_CAST_SPELL guard matches the real server state.
+            knownSpellsSendUnlearn.Remove(spellId);
         }
         SendPacketToClient(spells);
     }
@@ -131,6 +145,12 @@ public partial class WorldClient
         else
             spellId = packet.ReadUInt16();
         spells.Spells.Add(spellId);
+        // JimsProxy (cast-block-unknown-spells): GMs deleveling players (PTR) and talent
+        // respecs (live) both unlearn spells via this opcode. Without removing from the
+        // proxy-side known set, the outbound CMSG_CAST_SPELL guard would still allow casts
+        // for unlearned spells — same autoban path Nellag confirmed (server treats CMSG_CAST_SPELL
+        // for an unknown spell as cheating and bans).
+        GetSession().GameState.CurrentPlayerKnownSpells.Remove(spellId);
         SendPacketToClient(spells);
     }
 
