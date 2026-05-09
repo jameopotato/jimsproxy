@@ -45,6 +45,13 @@ public static class Settings
     // Hard timeout on the reconnect attempt — beyond this, abandon and propagate DC.
     // Clamped to 1000..30000 in LoadAndVerifyFrom.
     public static int UnplannedReconnectTimeoutMs;
+    // JimsProxy (cross-version addon interop): translate PallyPower ASSIGN class
+    // index between 1.12 (0-indexed) and 1.14 (1-indexed) at the chat-addon
+    // wire boundary so paladins on either client version can party with each
+    // other and assign blessings without installing a forked addon. Strictly
+    // prefix-gated to "PLPWR" — no other addon traffic is touched. Disable if
+    // a future PallyPower protocol bump invalidates the assumption.
+    public static bool EnablePallyPowerInterop;
 
     public static bool LoadAndVerifyFrom(ConfigurationParser config)
     {
@@ -73,6 +80,7 @@ public static class Settings
         SpellCastEarlyFireOffsetMs = Math.Clamp(config.GetInt("SpellCastEarlyFireOffsetMs", 0), 0, 50);
         EnableUnplannedReconnect = config.GetBoolean("EnableUnplannedReconnect", false);
         UnplannedReconnectTimeoutMs = Math.Clamp(config.GetInt("UnplannedReconnectTimeoutMs", 5000), 1000, 30000);
+        EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);
         Log.StructuredLogEnabled = StructuredLog;
         Log.VerboseLogEnabled = VerboseLog;
         // Open the JSONL file now so session.start's payload can include the full path.

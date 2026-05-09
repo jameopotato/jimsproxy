@@ -2,6 +2,7 @@
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
+using HermesProxy.World.Server;
 using HermesProxy.World.Server.Packets;
 using System;
 using System.Globalization;
@@ -227,13 +228,29 @@ public partial class WorldClient
         if (!ChatPkt.CheckAddonPrefix(GetSession().GameState.AddonPrefixes, ref language, ref text, ref addonPrefix))
             return;
 
-        // JimsProxy (chat-link-suffix 2026-05-07): expand vanilla 4-field item links back into
-        // modern Classic 1.14 12-field format on the way to the modern client. The legacy server
-        // requires the vanilla format for its anti-spam validation (name match against signed
-        // randomProperty in ItemRandomSuffix.dbc), but the modern client parses the chat-link
-        // positionally as modern format — without expansion the suffix ID lands in a gem slot
-        // and the tooltip renders the base item without "of the X" stats.
-        text = ExpandVanillaItemLinkToModern(text);
+        if (!string.IsNullOrEmpty(addonPrefix))
+        {
+            // JimsProxy (cross-version addon interop): translate addon-comm
+            // bodies (PallyPower etc.) between vanilla and modern wire formats.
+            // Must run before MaybeScrambleForeignLanguage and BEFORE chat-link
+            // expansion below — addon bodies are binary-encoded, not chat text.
+            text = AddonInteropTranslator.TranslateInbound(addonPrefix, text);
+            if (string.IsNullOrEmpty(text))
+                return;
+        }
+        else
+        {
+            // JimsProxy (chat-link-suffix 2026-05-07): expand vanilla 4-field item links back into
+            // modern Classic 1.14 12-field format on the way to the modern client. The legacy server
+            // requires the vanilla format for its anti-spam validation (name match against signed
+            // randomProperty in ItemRandomSuffix.dbc), but the modern client parses the chat-link
+            // positionally as modern format — without expansion the suffix ID lands in a gem slot
+            // and the tooltip renders the base item without "of the X" stats.
+            // Skip for addon messages — those carry binary payloads that look nothing like
+            // item links and must not be passed through the link parser.
+            text = ExpandVanillaItemLinkToModern(text);
+        }
+
         text = MaybeScrambleForeignLanguage(text, language);
 
         ChatMessageTypeModern chatTypeModern = chatType.CastEnum<ChatMessageTypeModern>();
@@ -400,6 +417,13 @@ public partial class WorldClient
         string addonPrefix = "";
         if (!ChatPkt.CheckAddonPrefix(GetSession().GameState.AddonPrefixes, ref language, ref text, ref addonPrefix))
             return;
+
+        if (!string.IsNullOrEmpty(addonPrefix))
+        {
+            text = AddonInteropTranslator.TranslateInbound(addonPrefix, text);
+            if (string.IsNullOrEmpty(text))
+                return;
+        }
 
         text = MaybeScrambleForeignLanguage(text, language);
 
