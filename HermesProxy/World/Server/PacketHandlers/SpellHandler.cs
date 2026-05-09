@@ -141,6 +141,39 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CAST_SPELL)]
     void HandleCastSpell(CastSpell cast)
     {
+        // JimsProxy (cast-block-unknown-spells): vanilla 1.12 server autobans clients that
+        // emit CMSG_CAST_SPELL for spells they don't know. Native 1.12 clients block this
+        // locally and never send the packet; modern Classic 1.14 clients send it through to
+        // the server (UI gray-out is cosmetic). Without this guard, `.level` deleveling
+        // (PTR, via players with GM commands) and talent respecs (live) both unlearn spells
+        // server-side while the modern client's action bar binding lingers — pressing the
+        // button → autoban. Three live PTR bans observed on Ice Block / Cone of Cold R5 /
+        // Fireball R12 after delevels, all matching this pattern. The guard is parity-
+        // restoring (matches native 1.12 client behavior), not a new behavior.
+        //
+        // Safety net: only enforce if CurrentPlayerKnownSpells is populated (SMSG_SEND_KNOWN_SPELLS
+        // already arrived). An empty set means the initial-spells packet hasn't landed yet, and
+        // a fast-clicker at login could otherwise be blocked from legitimate casts.
+        var knownSpellsForCastGuard = GetSession().GameState.CurrentPlayerKnownSpells;
+        uint guardSpellId = (uint)cast.Cast.SpellID;
+        if (knownSpellsForCastGuard.Count > 0 && !knownSpellsForCastGuard.Contains(guardSpellId))
+        {
+            Log.Event("spell.cast.blocked_unknown_spell", new
+            {
+                spell_id = guardSpellId,
+                spell_visual_id = cast.Cast.SpellXSpellVisualID,
+                known_spell_count = knownSpellsForCastGuard.Count,
+                client_cast_id = cast.Cast.CastID.ToString(),
+            });
+            CastFailed failed = new();
+            failed.SpellID = guardSpellId;
+            failed.SpellXSpellVisualID = cast.Cast.SpellXSpellVisualID;
+            failed.Reason = (uint)SpellCastResultClassic.NotKnown;
+            failed.CastID = cast.Cast.CastID;
+            SendPacket(failed);
+            return;
+        }
+
         if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
             GetSession().GameState.LastDispellSpellId = (uint)cast.Cast.SpellID;
 
