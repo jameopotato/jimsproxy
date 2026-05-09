@@ -764,9 +764,11 @@ public partial class WorldClient
             foreach (var failed in failedCasts)
                 GetSession().InstanceSocket.SendCastRequestFailed(failed, false);
         }
-        else if (casterIsLocalPet &&
-                 GetSession().GameState.TryMarkPendingPetCastStarted((uint)spell.Cast.SpellID, out var pendingPetCast))
+        bool petCastWasPlayerPressed = false;
+        if (casterIsLocalPet &&
+            GetSession().GameState.TryMarkPendingPetCastStarted((uint)spell.Cast.SpellID, out var pendingPetCast))
         {
+            petCastWasPlayerPressed = true;
             spell.Cast.CastID = pendingPetCast!.ServerGUID;
             spell.Cast.SpellXSpellVisualID = pendingPetCast.SpellXSpellVisualId;
             if (pendingPetCast.LegacySpellId != 0)
@@ -824,6 +826,30 @@ public partial class WorldClient
                 caster_is_player = casterIsLocalPlayer,
                 caster_is_pet = casterIsLocalPet,
             });
+        }
+
+        // JimsProxy (pet-instant-buff-double-sound): suppress SMSG_SPELL_START for pet
+        // server-driven AUTO-CASTS that are instant. For these, SPELL_START + SPELL_GO
+        // arrive in the same millisecond — the modern Classic 1.14 client's SpellVisualKit
+        // fires sound on each, producing a noticeably stuck/repeated sound (tester first
+        // reported succubus Lesser Invisibility 7870; says all 4 warlock pets exhibit it
+        // on their auto-cast spawn abilities). SPELL_GO arrives normally and plays the
+        // single correct sound; the pet aura still applies via aura.slot.set independent
+        // of whether SPELL_START reached the client.
+        //
+        // Heuristic: pet caster + CastTime == 0 + no matching pending CMSG_PET_CAST_SPELL.
+        // The pending check distinguishes auto-casts from player-pressed pet-bar abilities
+        // (Sacrifice, Spell Lock, manually-triggered Lesser Invisibility, etc.) where the
+        // START visual matters for snappy feel — those still forward as before.
+        if (casterIsLocalPet && spell.Cast.CastTime == 0 && !petCastWasPlayerPressed)
+        {
+            Log.Event("spell.start.suppressed_pet_auto_double_sound", new
+            {
+                spell_id = spell.Cast.SpellID,
+                spell_visual_id = spell.Cast.SpellXSpellVisualID,
+                caster_low = spell.Cast.CasterUnit.GetCounter(),
+            });
+            return;
         }
 
         SendPacketToClient(spell);
