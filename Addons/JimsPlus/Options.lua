@@ -82,20 +82,28 @@ for _, info in ipairs(castbarUnits) do
 end
 
 ---------------------------------------------------------------------------
--- Sync checkboxes from saved state when shown
+-- Sync checkboxes from saved state
 ---------------------------------------------------------------------------
-panel:SetScript("OnShow", function()
-    local db = namespace.db or {}
-    cbPetFix:SetChecked(db.petFix ~= false)
-    cbTaxiFix:SetChecked(db.taxiFix ~= false)
+local function RefreshCheckboxes()
+    local db = namespace.db or JimsPlusDB or {}
+    cbPetFix:SetChecked(db.petFix == true)
+    cbTaxiFix:SetChecked(db.taxiFix == true)
 
     local cdb = JimsPlusCastbars and JimsPlusCastbars.db
     if cdb then
         for _, info in ipairs(castbarUnits) do
             local unitDB = cdb[info.key]
-            castbarCBs[info.key]:SetChecked(unitDB and unitDB.enabled)
+            castbarCBs[info.key]:SetChecked(unitDB and unitDB.enabled and true or false)
         end
     end
+end
+panel:SetScript("OnShow", RefreshCheckboxes)
+
+local initFrame = CreateFrame("Frame")
+initFrame:RegisterEvent("PLAYER_LOGIN")
+initFrame:SetScript("OnEvent", function()
+    RefreshCheckboxes()
+    initFrame:UnregisterAllEvents()
 end)
 
 ---------------------------------------------------------------------------
