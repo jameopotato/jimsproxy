@@ -333,6 +333,14 @@ public sealed class GameSessionData
     public Dictionary<byte, Dictionary<byte, int>> FlatSpellMods = [];
     public Dictionary<byte, Dictionary<byte, int>> PctSpellMods = [];
     public Dictionary<WowGuid128, Dictionary<uint, WowGuid128>> LastAuraCasterOnTarget = [];
+    // JimsProxy (aura-refresh-after-far-objects): GUIDs the legacy server
+    // just told us to remove via FarObjects. The modern client drops the
+    // unit's aura state on OutOfRangeGuids, so the next Values update for
+    // any of these units must arrive as AuraUpdate(UpdateAll=true) to
+    // reseed the buff/debuff bar from scratch — otherwise the next delta
+    // is merged against state the client no longer has, and the previous
+    // buff bar lingers stale until reload.
+    public HashSet<WowGuid128> NeedsFullAuraRefresh = [];
     public TradeSession? CurrentTrade = null;
     public HashSet<uint> RequestedItemHotfixes = [];
     public HashSet<uint> RequestedItemSparseHotfixes = [];
