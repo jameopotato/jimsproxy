@@ -781,6 +781,33 @@ public partial class WorldClient
             }
         }
 
+        // JimsProxy (cast-failure-stuck-visual 2026-05-10): For local-player cast
+        // failures where SPELL_START was forwarded, the modern 1.14 client does not
+        // reliably cancel the caster-side visual kit (casting pose, looping channel
+        // sound, bow-draw / wand-aim) from SMSG_SPELL_FAILURE alone. Two repros in
+        // bundle 20260509-111449:
+        //   1. Holy Light: server emits SPELL_START + SPELL_FAILURE in the same
+        //      packet batch (vmangos/Twinstar post-START LoS/range rejection).
+        //      The just-anchored visual kit stays running through the failure.
+        //   2. Holy Light during movement: SpellFailure broadcast suppressed
+        //      (client-side cast-bar prediction already unwound the bar) but the
+        //      casting pose is not part of that prediction.
+        // User reports the same stuck-visual on Auto Shot (75) every session.
+        // Mirrors the pet block above — purely additive, idempotent on the client.
+        if (casterIsLocalPlayer && wasStarted && !sentCancelVisual)
+        {
+            resolvedSpellVisualId = GameData.GetSpellVisualIdFromXSpellVisual(spellVisual);
+            if (resolvedSpellVisualId != 0)
+            {
+                CancelSpellVisual cancelVisual = new CancelSpellVisual();
+                cancelVisual.Source = casterUnit;
+                cancelVisual.SpellVisualID = (int)resolvedSpellVisualId;
+                SendPacketToClient(cancelVisual);
+                sentCancelVisual = true;
+                cancelVisualSourceLow = cancelVisual.Source.GetCounter();
+            }
+        }
+
         Log.Event("spell.failure.routed", new
         {
             spellId,
