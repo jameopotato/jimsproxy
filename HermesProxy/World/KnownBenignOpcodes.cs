@@ -106,6 +106,20 @@ public static class KnownBenignOpcodes
         // 2x SMSG_LEARNED_SPELL translated successfully alongside the 2
         // TRAINER_BUY_SUCCEEDED warnings in the same session).
         Opcode.SMSG_TRAINER_BUY_SUCCEEDED,
+
+        // Added 2026-05-10 from Linux build-from-source community report:
+        // MSG_MOVE_TIME_SKIPPED (vanilla 0x319) is the legacy server's
+        // peer-sync broadcast — when *another* player nearby time-skips,
+        // the server tells us so our local prediction can compensate. The
+        // modern 1.14 client doesn't have an equivalent inbound opcode and
+        // handles peer drift via its own movement extrapolation, so a
+        // silent drop is correct. The c2s direction (CMSG_MOVE_TIME_SKIPPED,
+        // own player time-skipped → forward to server) still has its
+        // dedicated handler at Server/PacketHandlers/MovementHandler.cs.
+        // Pre-fix this fired a noisy "No handler for opcode" warning on
+        // every nearby player's time-skip event, which on Linux Debug
+        // builds also flooded the terminal alongside the actual fault.
+        Opcode.MSG_MOVE_TIME_SKIPPED,
     };
 
     /// <summary>True if the opcode is known to originate from a modern-client
