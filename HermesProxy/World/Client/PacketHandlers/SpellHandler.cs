@@ -287,14 +287,36 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_PET_CAST_FAILED, ClientVersionBuild.Zero, ClientVersionBuild.V2_0_1_6180)]
     void HandlePetCastFailed(WorldPacket packet)
     {
+        // Vanilla SMSG_PET_CAST_FAILED wire format varies between server flavors:
+        //   cMaNGOS / vmangos canonical:  uint32 SpellID, uint8 Result.
+        //   Kronos 5 (TrinityCore-1.12):  uint32 SpellID only (4 body bytes).
+        // The original implementation always read SpellID + uint8 status, gated on
+        // status==2, then read another uint8 reason. On Kronos 5 that meant:
+        //   (a) the very first ReadUInt8 ran past end-of-buffer when SpellID
+        //       consumed the entire 4-byte body → IndexOutOfRangeException in
+        //       the world-client receive loop → connection died → a follow-on
+        //       CMSG_CHAT_ADDON_MESSAGE NRE'd HandleAddonMessage → process crash;
+        //   (b) on cMaNGOS-style 5-byte bodies, reason!=2 silently dropped the
+        //       failure (action button stayed lit), and reason==2 crashed on the
+        //       second ReadUInt8.
+        // Repro that surfaced the crash: warlock /cast Consume Shadows on a pet
+        // that's full-HP via macro (Kronos 5, captured in
+        // jimsproxy-20260510-115151.jsonl, packet body size 4).
         uint spellId = packet.ReadUInt32();
-        var status = packet.ReadUInt8();
-        if (status != 2)
-            return;
+        bool hasReason = packet.CanRead();
+        uint legacyReason = hasReason ? packet.ReadUInt8() : 0u;
 
         // Look up pending pet cast by SpellId (queue-based, FIFO order)
         if (!GetSession().GameState.TryDequeuePendingPetCast(spellId, out var pendingCast))
+        {
+            Log.Event("pet.cast_failed.no_pending", new
+            {
+                spell_id = spellId,
+                has_reason = hasReason,
+                legacy_reason = legacyReason,
+            });
             return;
+        }
 
         // JimsProxy (PR #161 follow-up — movement preemption parity): mirror
         // the player-side suppression. If the pet's pending cast was marked
@@ -311,12 +333,25 @@ public partial class WorldClient
 
         PetCastFailed spell = new PetCastFailed();
         spell.SpellID = spellId;
-        uint reason = packet.ReadUInt8();
-        spell.Reason = movementSuppressed
+        // If movement-suppressed OR the wire didn't carry a reason byte
+        // (Kronos-style 4-byte body), send DontReport so the action button
+        // releases without a misleading popup.
+        spell.Reason = (movementSuppressed || !hasReason)
             ? (uint)SpellCastResultClassic.DontReport
-            : LegacyVersion.ConvertSpellCastResult(reason);
+            : LegacyVersion.ConvertSpellCastResult(legacyReason);
         spell.CastID = pendingCast.ServerGUID;
         SendPacketToClient(spell);
+
+        Log.Event("pet.cast_failed.routed", new
+        {
+            spell_id = spellId,
+            has_reason = hasReason,
+            legacy_reason = legacyReason,
+            translated_reason = spell.Reason,
+            movement_suppressed = movementSuppressed,
+            had_started = pendingCast.HasStarted,
+            cast_id = pendingCast.ServerGUID.ToString(),
+        });
     }
 
     [PacketHandler(Opcode.SMSG_PET_CAST_FAILED, ClientVersionBuild.V2_0_1_6180)]
