@@ -129,9 +129,18 @@ public partial class WorldClient
         // --- Mirasu RP Walk Bug Fix ---
         // The 1.14 client forgets to un-toggle Walk mode after CC wears off.
         // When control is returned, we explicitly force a run speed update to reset the UI toggle.
+        //
+        // Use the modern universal opcode SMSG_MOVE_SET_RUN_SPEED here — MoveSetSpeed
+        // extends ServerPacket whose constructor calls ModernVersion.GetCurrentOpcode().
+        // The legacy-only SMSG_FORCE_RUN_SPEED_CHANGE has no entry in the modern (1.14)
+        // opcode table so the lookup returns 0, tripping Trace.Assert(opcode != 0) in
+        // Packet.cs:73 (visible Linux Debug crash) and serializing 0x0000 as the wire
+        // opcode on Release builds (silent — modern client drops the malformed packet,
+        // so the fix has historically been a no-op). The neighboring handler at line
+        // ~298 already does the same SMSG_FORCE_*_CHANGE → SMSG_MOVE_SET_* translation.
         if (control.HasControl && control.Guid == GetSession().GameState.CurrentPlayerGuid)
         {
-            MoveSetSpeed runFix = new MoveSetSpeed(Opcode.SMSG_FORCE_RUN_SPEED_CHANGE);
+            MoveSetSpeed runFix = new MoveSetSpeed(Opcode.SMSG_MOVE_SET_RUN_SPEED);
             runFix.MoverGUID = control.Guid;
             runFix.MoveCounter = 0;
             runFix.Speed = 7.0f; // Default WoW running speed
