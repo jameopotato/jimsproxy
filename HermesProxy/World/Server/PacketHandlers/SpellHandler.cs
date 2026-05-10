@@ -655,6 +655,10 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CANCEL_CHANNELLING)]
     void HandleCancelChannelling(CancelChannelling cast)
     {
+        Log.Event("spell.cancel_channelling", new
+        {
+            spell_id = cast.SpellID,
+        });
         WorldPacket packet = new WorldPacket(Opcode.CMSG_CANCEL_CHANNELLING);
         packet.WriteInt32(cast.SpellID);
         SendPacketToServer(packet);
@@ -668,6 +672,10 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CANCEL_AURA)]
     void HandleCancelAura(CancelAura aura)
     {
+        Log.Event("spell.cancel_aura", new
+        {
+            spell_id = aura.SpellID,
+        });
         WorldPacket packet = new WorldPacket(Opcode.CMSG_CANCEL_AURA);
         packet.WriteUInt32(aura.SpellID);
         SendPacketToServer(packet);
@@ -713,6 +721,11 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_RESURRECT_RESPONSE)]
     void HandleResurrectResponse(ResurrectResponse revive)
     {
+        Log.Event("spell.resurrect_response", new
+        {
+            caster_guid = revive.CasterGUID.ToString(),
+            accepted = revive.Response != 0,
+        });
         WorldPacket packet = new WorldPacket(Opcode.CMSG_RESURRECT_RESPONSE);
         packet.WriteGuid(revive.CasterGUID.To64());
         packet.WriteUInt8((byte)(revive.Response != 0 ? 0 : 1));
@@ -721,6 +734,7 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_SELF_RES)]
     void HandleSelfRes(SelfRes revive)
     {
+        Log.Event("spell.self_res", new { });
         WorldPacket packet = new WorldPacket(Opcode.CMSG_SELF_RES);
         SendPacketToServer(packet);
     }
