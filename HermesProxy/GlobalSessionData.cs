@@ -62,6 +62,15 @@ public sealed class GameSessionData
     // the dismount logic (e.g. seeing true after handler set it false).
     public bool IsInTaxiFlight;
     public bool IsWaitingForTaxiStart;
+    // JimsProxy (rp-walk-control-transition): tracks whether the most recent
+    // SMSG_CONTROL_UPDATE for the player carried HasControl=true. Used by the
+    // RP-walk speed-reset fix to gate firing on a real false→true transition
+    // (CC release) and skip the no-op true→true case (login, /reload). Without
+    // this gate the login flow's HasControl=true blanket-fires the speed reset
+    // and clobbers any active speed buff (mount, sprint, aspect of the cheetah)
+    // by hardcoding 7.0f. Default true: a player who has never been CC'd is
+    // always in control, so the natural login state is "has control already."
+    public bool LastObservedHasControl = true;
     // JimsProxy (taxi-flight-robustness): when set, signals a pending taxi-dismount Task
     // scheduled to fire at TaxiDismountFiresAtTickMs. The CTS is cancelled+disposed on
     // (a) clean session disconnect, (b) early landing CMSG, (c) a fresh taxi spline

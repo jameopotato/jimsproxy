@@ -128,10 +128,37 @@ public partial class WorldClient
 
         // --- Mirasu RP Walk Bug Fix ---
         // The 1.14 client forgets to un-toggle Walk mode after CC wears off.
-        // When control is returned, we explicitly force a run speed update to reset the UI toggle.
-        if (control.HasControl && control.Guid == GetSession().GameState.CurrentPlayerGuid)
+        // When control is RESTORED (false → true transition) we explicitly force
+        // a run speed update to reset the UI toggle.
+        //
+        // Two correctness gates:
+        //
+        // 1. Use the modern universal opcode SMSG_MOVE_SET_RUN_SPEED. MoveSetSpeed
+        //    extends ServerPacket whose constructor calls
+        //    ModernVersion.GetCurrentOpcode(). The legacy-only
+        //    SMSG_FORCE_RUN_SPEED_CHANGE has no entry in the modern (1.14) opcode
+        //    table so the lookup returns 0 and trips Trace.Assert(opcode != 0)
+        //    in Packet.cs:73 (visible Linux Debug crash) and serializes 0x0000
+        //    onto the wire on Release (silent — modern client drops the malformed
+        //    packet, so the fix has historically been a no-op). The neighboring
+        //    handler at MovementHandler.cs:~298 already does the
+        //    SMSG_FORCE_*_CHANGE → SMSG_MOVE_SET_* translation when forwarding
+        //    incoming legacy speed-change packets.
+        //
+        // 2. Only fire on a *transition* from no-control → has-control. The
+        //    server emits SMSG_CONTROL_UPDATE(HasControl=true) on login and on
+        //    /reload too, not just when CC ends. Without this gate the login
+        //    handler hardcodes 7.0f and clobbers any active speed buff (mount,
+        //    sprint, aspect of the cheetah, druid travel form) — observable as
+        //    "log in mounted, walk at unmounted speed until I remount."
+        bool isLocalPlayer = control.Guid == GetSession().GameState.CurrentPlayerGuid;
+        bool justRegainedControl = control.HasControl && !GetSession().GameState.LastObservedHasControl;
+        if (isLocalPlayer)
+            GetSession().GameState.LastObservedHasControl = control.HasControl;
+
+        if (isLocalPlayer && justRegainedControl)
         {
-            MoveSetSpeed runFix = new MoveSetSpeed(Opcode.SMSG_FORCE_RUN_SPEED_CHANGE);
+            MoveSetSpeed runFix = new MoveSetSpeed(Opcode.SMSG_MOVE_SET_RUN_SPEED);
             runFix.MoverGUID = control.Guid;
             runFix.MoveCounter = 0;
             runFix.Speed = 7.0f; // Default WoW running speed
