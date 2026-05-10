@@ -46,11 +46,13 @@ public sealed class ThreatTracker
 
     private readonly GlobalSessionData _session;
 
-    // Passive threat multiplier cache. Recomputed on every threat operation
-    // (cheap) but the threat.passive_modifier event only emits on change,
-    // so testers can spot stance / form transitions without spamming logs.
-    private double _cachedPassiveModifier = 1.0;
-    private uint _cachedStanceFormAuraId = 0;
+    // Passive threat multiplier cache, keyed by threater GUID. Recomputed
+    // on every threat operation (cheap) but the threat.passive_modifier
+    // event only emits on change, so testers can spot stance / form
+    // transitions without spamming logs. Phase 6.0 widened from a single
+    // pair (local player only) to a per-threater dict so groupmates'
+    // stance / form changes are also tracked.
+    private readonly Dictionary<WowGuid128, (uint stanceForm, double modifier)> _passiveCache = new();
 
     public ThreatTracker(GlobalSessionData session)
     {
@@ -350,7 +352,7 @@ public sealed class ThreatTracker
     public void OnDamage(WowGuid128 attacker, WowGuid128 victim, int spellId, double rawDamage)
     {
         if (rawDamage <= 0) return;
-        if (!IsLocalThreater(attacker)) return;
+        if (!IsRelevantThreater(attacker)) return;
         if (victim == default) return;
 
         double abilityMultiplier = ThreatModules.GetDamageMultiplier(spellId);
@@ -392,7 +394,7 @@ public sealed class ThreatTracker
     public void OnHeal(WowGuid128 healer, WowGuid128 healTarget, int spellId, double effectiveHeal)
     {
         if (effectiveHeal <= 0) return;
-        if (!IsLocalThreater(healer)) return;
+        if (!IsRelevantThreater(healer)) return;
         if (healTarget == default) return;
 
         // Collect mobs whose threater list contains the heal target.
@@ -450,17 +452,27 @@ public sealed class ThreatTracker
         EmitDirty();
     }
 
-    // True if the given GUID is the local player or a unit they currently own
-    // (pet, totem, guardian). Pet ownership is read from UNIT_FIELD_SUMMONEDBY
+    // True if the given GUID is the local player, a unit they own (pet,
+    // totem, guardian), any party / raid member, or a pet owned by any
+    // party / raid member. Pet ownership is read from UNIT_FIELD_SUMMONEDBY
     // on the unit's cached fields, which the legacy server populates and the
     // proxy mirrors. We re-check on every event rather than caching because
     // pets get swapped (Hunter Call Pet, Warlock summon swap) and the cost
     // of one dictionary lookup per damage event is negligible.
-    private bool IsLocalThreater(WowGuid128 guid)
+    //
+    // JimsProxy Phase 6.0 (group-aware threat): widened from local-player +
+    // local-pet to the full party / raid so addons (Details TinyThreat,
+    // TidyPlates_ThreatPlates) see threat for everyone in your group, not
+    // just yourself. Vanilla 1.12 servers broadcast combat-log packets
+    // (SMSG_ATTACKER_STATE_UPDATE, SMSG_SPELL_NON_MELEE_DAMAGE_LOG) to
+    // every client in range, so each proxy can compute group-wide threat
+    // unilaterally — no peer cooperation needed for in-range groupmates.
+    private bool IsRelevantThreater(WowGuid128 guid)
     {
         if (guid == default) return false;
         var playerGuid = _session.GameState.CurrentPlayerGuid;
         if (guid == playerGuid) return true;
+        if (IsAnyPartyMember(guid)) return true;
 
         var fields = _session.GameState.GetCachedObjectFieldsLegacy(guid);
         if (fields == null) return false;
@@ -472,7 +484,26 @@ public sealed class ThreatTracker
         if (summonedBy64 == WowGuid64.Empty) return false;
 
         WowGuid128 summonedBy128 = summonedBy64.To128(_session.GameState);
-        return summonedBy128 == playerGuid;
+        return summonedBy128 == playerGuid || IsAnyPartyMember(summonedBy128);
+    }
+
+    // Iterates both home + battleground party slots so we recognise
+    // everyone in the user's current group regardless of context.
+    private bool IsAnyPartyMember(WowGuid128 guid)
+    {
+        if (guid == default) return false;
+        var groups = _session.GameState.CurrentGroups;
+        for (int i = 0; i < groups.Length; i++)
+        {
+            var group = groups[i];
+            if (group == null) continue;
+            foreach (var member in group.PlayerList)
+            {
+                if (member.GUID == guid)
+                    return true;
+            }
+        }
+        return false;
     }
 
     // -----------------------------------------------------------------------
@@ -523,40 +554,61 @@ public sealed class ThreatTracker
     };
 
     // Returns the passive multiplier to apply to threater's flat-add threat.
-    // Pet (and other local threaters that aren't the player) always return 1.0
-    // since vanilla pets carry no stance / form / class modifier.
+    // Phase 6.1 generalised to any group threater: class via party-list
+    // lookup (or local-player class for self), stance / form via the
+    // threater's own UNIT_FIELD_AURA cache. Pets / charms / unknown class
+    // fall through to 1.0 since vanilla pets carry no stance / form /
+    // class modifier.
     //
     // Side effect: emits threat.passive_modifier on every value change so
     // testers can correlate stance switches with threat shifts in the JSONL.
     private double GetPassiveModifier(WowGuid128 threater)
     {
-        if (threater != _session.GameState.CurrentPlayerGuid)
-            return 1.0;
+        var threaterClass = GetThreaterClass(threater);
+        uint formAura = ScanStanceFormAura(threater);
+        double modifier = ComputePassiveModifier(threaterClass, formAura);
 
-        uint formAura = ScanPlayerStanceFormAura();
-        var playerClass = (Class)_session.GameState.CurrentPlayerClass;
-        double modifier = ComputePassiveModifier(playerClass, formAura);
-
-        if (formAura != _cachedStanceFormAuraId || modifier != _cachedPassiveModifier)
+        _passiveCache.TryGetValue(threater, out var cached);
+        if (cached.stanceForm != formAura || cached.modifier != modifier)
         {
             Log.Event("threat.passive_modifier", new
             {
-                player_class = (byte)playerClass,
+                threater_low = threater.GetCounter(),
+                is_local_player = threater == _session.GameState.CurrentPlayerGuid,
+                player_class = (byte)threaterClass,
                 stance_form_spell = formAura,
                 modifier,
-                previous_modifier = _cachedPassiveModifier,
-                previous_stance_form_spell = _cachedStanceFormAuraId,
+                previous_modifier = cached.modifier,
+                previous_stance_form_spell = cached.stanceForm,
             });
-            _cachedStanceFormAuraId = formAura;
-            _cachedPassiveModifier = modifier;
+            _passiveCache[threater] = (formAura, modifier);
         }
 
         return modifier;
     }
 
-    private uint ScanPlayerStanceFormAura()
+    private Class GetThreaterClass(WowGuid128 guid)
     {
-        var fields = _session.GameState.GetCachedObjectFieldsLegacy(_session.GameState.CurrentPlayerGuid);
+        if (guid == _session.GameState.CurrentPlayerGuid)
+            return (Class)_session.GameState.CurrentPlayerClass;
+
+        var groups = _session.GameState.CurrentGroups;
+        for (int i = 0; i < groups.Length; i++)
+        {
+            var group = groups[i];
+            if (group == null) continue;
+            foreach (var member in group.PlayerList)
+            {
+                if (member.GUID == guid)
+                    return member.ClassId;
+            }
+        }
+        return Class.None;
+    }
+
+    private uint ScanStanceFormAura(WowGuid128 guid)
+    {
+        var fields = _session.GameState.GetCachedObjectFieldsLegacy(guid);
         if (fields == null) return 0;
 
         int unitFieldAura = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
