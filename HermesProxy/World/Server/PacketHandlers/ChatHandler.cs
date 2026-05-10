@@ -239,9 +239,19 @@ public partial class WorldSocket
         }
 
         uint language = (uint)Language.Addon;
-        string body = AddonInteropTranslator.TranslateOutbound(packet.Params.Prefix, packet.Params.Text);
+        string prefix = packet.Params.Prefix;
+        string body = packet.Params.Text;
+
+        // JimsProxy HealComm bridge: rewrite outbound LibHealComm-4.0 addon
+        // messages into HealComm-1.0 wire format so 1.12-native Luna users
+        // in the same raid see our heal predictions on their unit frames.
+        GetSession().HealCommBridge.TryTranslateOutboundAddon(ref prefix, ref body);
+
+        // JimsProxy PallyPower: rewrite outbound PLPWR class/skill fields from
+        // modern numbering to legacy. Pass-through for non-PallyPower prefixes.
+        body = AddonInteropTranslator.TranslateOutbound(prefix, body);
         if (string.IsNullOrEmpty(body)) return;
-        string text = packet.Params.Prefix + '\t' + body;
+        string text = prefix + '\t' + body;
 
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
         {
@@ -265,9 +275,16 @@ public partial class WorldSocket
         }
 
         uint language = (uint)Language.Addon;
-        string body = AddonInteropTranslator.TranslateOutbound(packet.Params.Prefix, packet.Params.Text);
+        string prefix = packet.Params.Prefix;
+        string body = packet.Params.Text;
+
+        // JimsProxy HealComm bridge: see HandleAddonMessage above.
+        GetSession().HealCommBridge.TryTranslateOutboundAddon(ref prefix, ref body);
+
+        // JimsProxy PallyPower: see HandleAddonMessage above.
+        body = AddonInteropTranslator.TranslateOutbound(prefix, body);
         if (string.IsNullOrEmpty(body)) return;
-        string text = packet.Params.Prefix + '\t' + body;
+        string text = prefix + '\t' + body;
         string channelName = packet.ChannelGuid.IsEmpty() ? "" :
             GetSession().GameState.GetChannelName((int)packet.ChannelGuid.GetCounter());
 
