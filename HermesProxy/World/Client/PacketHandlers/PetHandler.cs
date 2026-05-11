@@ -158,7 +158,7 @@ public partial class WorldClient
         }
         catch (Exception ex)
         {
-            Log.Print(LogType.Error, $"PetSpellsMessage parse failed (non-fatal, packet dropped): packetSize={dbgPacketSize} {ex.GetType().Name}: {ex.Message}");
+            Log.Print(LogType.Error, $"PetSpellsMessage parse failed (non-fatal): packetSize={dbgPacketSize} {ex.GetType().Name}: {ex.Message}");
             Log.Event("pet.spells_message.parse_failed", new
             {
                 exception_type = ex.GetType().Name,
@@ -166,6 +166,48 @@ public partial class WorldClient
                 packet_size = dbgPacketSize,
                 packet_hex = HexDump(dbgRawBytes),
             });
+
+            // Pre-fix behavior was to silently drop the malformed packet, leaving
+            // the modern client with no pet bars for a pet that's alive in the
+            // world. Symptom: player summons a fresh Voidwalker, the legacy
+            // server emits an SMSG_PET_SPELLS_MESSAGE in a shape we can't fully
+            // parse (e.g. 144-byte variant on Twinstar; quest tame on Kronos via
+            // spell 19684), parser throws partway through, packet dropped, no
+            // pet bars ever appear, pet uncommandable until dismiss+resummon
+            // hits a parseable shape. Observed once in jimsproxy-20260511-114307
+            // (Voidwalker via spell 697 → 144-byte SMSG_PET_SPELLS_MESSAGE →
+            // ArgumentOutOfRangeException → silent drop → 203 sec of no pet
+            // control until manual dismiss).
+            //
+            // The GUID was successfully read at the very top of the try (line
+            // ~42) and saved to GameState.CurrentPetGuid before any of the
+            // downstream reads could throw. Use that to emit a minimal PetSpells
+            // fallback: pet bars exist on the modern client, action buttons
+            // empty, react/command state defaulted so the dropdown menus still
+            // work (dismiss / stay / follow / attack-mode toggle remain
+            // operable). Better than the silent drop — player has SOME control
+            // path back to a working state instead of being stuck.
+            var fallbackGuid = GetSession().GameState.CurrentPetGuid;
+            if (!fallbackGuid.IsEmpty())
+            {
+                var fallback = new PetSpells
+                {
+                    PetGUID = fallbackGuid,
+                    CreatureFamily = 1, // Wolf — generic beast, safe for paper-doll tooltip
+                    ReactState = ReactStates.Defensive,
+                    CommandState = CommandStates.Follow,
+                    Flag = 0,
+                };
+                // ActionButtons stays as default uint[10] of zeros — empty bar
+                // but the pet bar frame is visible.
+                Log.Event("pet.spells.fallback_sent", new
+                {
+                    pet_guid = fallbackGuid.ToString(),
+                    reason = "parse_failed",
+                    parsed_packet_size = dbgPacketSize,
+                });
+                SendPacketToClient(fallback);
+            }
         }
     }
 
