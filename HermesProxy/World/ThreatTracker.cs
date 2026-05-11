@@ -44,6 +44,16 @@ public sealed class ThreatTracker
     // SMSG_HIGHEST_THREAT_UPDATE when the top actually changes.
     private readonly Dictionary<WowGuid128, WowGuid128> _lastHighest = new();
 
+    // Vanilla melee aggro hysteresis: a challenger must exceed the current
+    // tank's threat by 10% before aggro flips. Without this, two threaters
+    // doing similar damage rapidly swap the "highest" position on every
+    // damage event and the modern client paints Luna red on every party
+    // member simultaneously. 1.10 = melee threshold; ranged is 1.30 but
+    // we can't tell from a damage event whether the challenger is in melee
+    // range so we use the more permissive value (matches the local-player
+    // case which is by far the dominant one).
+    private const double AggroFlipMargin = 1.10;
+
     private readonly GlobalSessionData _session;
 
     // Passive threat multiplier cache, keyed by threater GUID. Recomputed
@@ -245,17 +255,65 @@ public sealed class ThreatTracker
             if (!_threatLists.TryGetValue(mob, out var list) || list.Count == 0)
                 continue;
 
-            // Find the top threater. Ties broken arbitrarily — vanilla itself
-            // has tie-breaking quirks but they don't matter for display.
-            WowGuid128 newHighest = default;
-            double highestValue = -1;
+            // Find the raw top threater (max value, no hysteresis).
+            WowGuid128 rawTop = default;
+            double rawTopValue = -1;
             foreach (var (threater, value) in list)
             {
-                if (value > highestValue)
+                if (value > rawTopValue)
                 {
-                    highestValue = value;
-                    newHighest = threater;
+                    rawTopValue = value;
+                    rawTop = threater;
                 }
+            }
+
+            // Apply vanilla aggro hysteresis. Vanilla 1.12 requires a melee
+            // challenger to exceed the current tank's threat by 10% (130% for
+            // ranged) before aggro flips. Numerically passing the top by 1
+            // threat point is NOT enough — the server holds aggro on the
+            // current tank until the threshold is crossed.
+            //
+            // Why this matters for addons: the modern client computes
+            // UnitThreatSituation status against HighestThreatGUID. If we
+            // re-flip the top on every close-tie swing (two players doing
+            // similar damage, tank + DPS within 10%, etc.), each threater
+            // briefly becomes "the highest" and the modern client reports
+            // status 2-3 for both, painting Luna red on every party member
+            // simultaneously. Holding the current top until the 110%
+            // threshold is crossed restores vanilla's "one tank, one aggro"
+            // feel — DPS sit at status 0/1 (hidden / yellow) while the actual
+            // tank sits at status 3 (red).
+            _lastHighest.TryGetValue(mob, out var prevHighest);
+            WowGuid128 newHighest;
+            double highestValue;
+            bool aggroFlipHeld = false;
+            if (prevHighest == default || !list.TryGetValue(prevHighest, out var prevValue))
+            {
+                // No prior top, or prior top has dropped off the list (left
+                // party / died / despawned). No hysteresis to apply — pick
+                // the raw top.
+                newHighest = rawTop;
+                highestValue = rawTopValue;
+            }
+            else if (rawTop == prevHighest)
+            {
+                // Current top still on top — no flip to consider.
+                newHighest = prevHighest;
+                highestValue = prevValue;
+            }
+            else if (rawTopValue >= prevValue * AggroFlipMargin)
+            {
+                // Challenger crossed the 110% threshold — flip.
+                newHighest = rawTop;
+                highestValue = rawTopValue;
+            }
+            else
+            {
+                // Challenger numerically ahead but inside the hysteresis
+                // band — vanilla server would still target prev. Hold.
+                newHighest = prevHighest;
+                highestValue = prevValue;
+                aggroFlipHeld = true;
             }
 
             var update = new ThreatUpdatePkt { UnitGUID = mob };
@@ -269,8 +327,20 @@ public sealed class ThreatTracker
             }
             SendToClient(update);
 
-            _lastHighest.TryGetValue(mob, out var prevHighest);
             bool highestChanged = prevHighest != newHighest;
+
+            if (aggroFlipHeld)
+            {
+                Log.Event("threat.aggro_flip_held", new
+                {
+                    mob_low = mob.GetCounter(),
+                    held_threater_low = prevHighest.GetCounter(),
+                    held_value = (long)highestValue,
+                    challenger_low = rawTop.GetCounter(),
+                    challenger_value = (long)rawTopValue,
+                    margin_required = AggroFlipMargin,
+                });
+            }
 
             Log.Event("threat.emit_update", new
             {
@@ -338,6 +408,32 @@ public sealed class ThreatTracker
         _threatLists.Clear();
         _lastHighest.Clear();
         _dirty.Clear();
+    }
+
+    // Called from SMSG_CANCEL_COMBAT — the legacy server told the local player
+    // they've left combat. The 1.12 server does NOT broadcast leave-combat
+    // for other party members and doesn't emit a "drop the threat list" packet
+    // for mobs that evade / run away / lose interest. Without an explicit
+    // clear, the modern client retains the stale threat list and Luna /
+    // ThreatPlates keep their red indicators lit on every nameplate the
+    // player fought during the session.
+    //
+    // Aggressive but matches vanilla feel: if WE'RE not in combat, nothing
+    // should display threat anywhere. If a groupmate is still fighting, their
+    // own subsequent damage events will re-populate the relevant mob's list.
+    public void OnLocalPlayerLeftCombat()
+    {
+        if (_threatLists.Count == 0) return;
+
+        var mobsCleared = _threatLists.Count;
+        var mobsToClear = new List<WowGuid128>(_threatLists.Keys);
+        foreach (var mob in mobsToClear)
+            ClearMob(mob);
+
+        Log.Event("threat.local_player_left_combat", new
+        {
+            mobs_cleared = mobsCleared,
+        });
     }
 
     // Called from the SMSG_DESTROY_OBJECT handler. Two cases to clean up:
