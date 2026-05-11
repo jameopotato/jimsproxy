@@ -3869,6 +3869,65 @@ public static partial class GameData
     // (e.g. on player relog). Once relocated, the record is authoritative.
     internal static readonly HashSet<int> PreservedItemEffectIds = new();
 
+    // Known healthstone ItemEffect records that the modern client's local DB2 has at
+    // LegacySlotIndex=1, but the vanilla 1.12 server places the use-spell at slot 0.
+    // Without an override the modern client never finds the spell at slot 1 and
+    // strips the "Use:" tooltip line / blocks action-bar binding. Pairs are
+    // (record_id, parent_item_id) per CSV/ItemEffect2.csv lines 820/822-823/833/1133
+    // plus 5513 (Twinstar repurposed to Mana Jade, same slot bug).
+    //
+    // The reactive path in GenerateItemEffectUpdateIfNeeded fixes this when an item
+    // is freshly queried via CMSG_ITEM_QUERY_SINGLE, but the client only queries
+    // items it doesn't have cached locally. Returning players (or anyone who got
+    // their first healthstone before this fix shipped) have a stale cached
+    // ItemTemplate; no query fires; the reactive path never runs. PushKnownItemEffectFixes
+    // forces the corrected records to ship via SMSG_HOTFIX_MESSAGE at login regardless
+    // of cache state.
+    private static readonly (uint RecordId, int ParentItemId)[] KnownHealthstoneItemEffects = new[]
+    {
+        (97905u, 5509),
+        (97906u, 5510),
+        (97937u, 5511),
+        (97875u, 5512),
+        (97663u, 5513),
+        (99320u, 9421),
+    };
+
+    public static List<Server.Packets.HotFixMessage> PushKnownItemEffectFixes()
+    {
+        var messages = new List<Server.Packets.HotFixMessage>();
+        foreach (var (recordId, parentItemId) in KnownHealthstoneItemEffects)
+        {
+            if (!ItemEffectStore.TryGetValue(recordId, out var effect))
+                continue;
+            if (effect.ParentItemID != parentItemId)
+                continue;
+            // Only relocate if still at the modern-DB2 default slot. If the reactive
+            // path already moved it (because the client queried earlier this session)
+            // or if Twinstar's data places it elsewhere, leave the relocated value
+            // alone — the reactive path is authoritative when it has full server data.
+            if (effect.LegacySlotIndex == 0)
+                continue;
+
+            effect.LegacySlotIndex = 0;
+            PreservedItemEffectIds.Add(effect.Id);
+            UpdateHotfix(effect);
+
+            Log.Event("hotfix.itemeffect.preserved_at_login", new
+            {
+                record_id = recordId,
+                item_entry = parentItemId,
+                spell_id = effect.SpellID,
+                new_legacy_slot = 0,
+            });
+
+            var msg = GenerateHotFixMessage(effect);
+            if (msg != null)
+                messages.Add(msg);
+        }
+        return messages;
+    }
+
     public static Server.Packets.HotFixMessage? GenerateItemEffectUpdateIfNeeded(ItemTemplate item, byte slot)
     {
         ItemEffect? effect = GetItemEffectByItemId(item.Entry, slot);
