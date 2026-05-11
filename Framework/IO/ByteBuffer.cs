@@ -679,6 +679,11 @@ public class ByteBuffer : IDisposable
         return (uint)_length;
     }
 
+    // JimsProxy: bytes still unread on a read-mode buffer. Used by parse paths that
+    // need to validate a declared count (e.g. SMSG_SPELL_GO hitCount) against the
+    // actual remaining buffer before entering a fixed-stride read loop.
+    public int BytesRemaining => _length - _position;
+
     [Obsolete("Use GetData() instead. This creates a MemoryStream copy for compatibility.")]
     public Stream GetCurrentStream()
     {

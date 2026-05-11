@@ -1531,6 +1531,20 @@ public partial class WorldClient
         if (isSpellGo)
         {
             var hitCount = packet.ReadUInt8();
+            // JimsProxy: bounds-check the declared hitCount against actual remaining
+            // packet bytes BEFORE entering the fixed-stride read loop. If hitCount * 8
+            // (one full GUID per target) exceeds what's left, throw a descriptive
+            // exception that the outer try/catch in HandleSpellGo logs along with the
+            // packet hex bytes. Without this guard, ReadGuid() bottoms out in
+            // BinaryPrimitives.ReadUInt64LittleEndian and throws a generic
+            // ArgumentOutOfRangeException with no spell context — diagnostically
+            // useless and (on builds that lack the outer try/catch) caused player DCs.
+            // Most likely trigger: an earlier optional field was read with the wrong
+            // LegacyVersion gate, shifting byte alignment so hitCount lands on a bogus
+            // value like 0xFF, producing a 2040-byte target list demand.
+            if (hitCount * 8 > packet.BytesRemaining)
+                throw new InvalidOperationException(
+                    $"SMSG_SPELL_GO parse overrun: spell={dbdata.SpellID} hitCount={hitCount} needs {hitCount * 8} bytes but only {packet.BytesRemaining} remain");
             for (var i = 0; i < hitCount; i++)
             {
                 WowGuid128 hitTarget = packet.ReadGuid().To128(GetSession().GameState);
@@ -1538,6 +1552,13 @@ public partial class WorldClient
             }
 
             var missCount = packet.ReadUInt8();
+            // Same bounds check for miss-target loop. Floor 9 bytes per entry (GUID +
+            // missType byte); reflect adds an optional byte, so 9 * missCount is the
+            // minimum. Underestimating is fine — individual reads still succeed up to
+            // the actual end, and the outer try/catch handles any residual overrun.
+            if (missCount * 9 > packet.BytesRemaining)
+                throw new InvalidOperationException(
+                    $"SMSG_SPELL_GO parse overrun: spell={dbdata.SpellID} missCount={missCount} needs {missCount * 9} bytes but only {packet.BytesRemaining} remain (after {hitCount} hit targets)");
             for (var i = 0; i < missCount; i++)
             {
                 WowGuid128 missTarget = packet.ReadGuid().To128(GetSession().GameState);
