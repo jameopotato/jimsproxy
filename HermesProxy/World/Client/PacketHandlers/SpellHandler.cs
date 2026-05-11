@@ -315,12 +315,76 @@ public partial class WorldClient
         // Look up pending pet cast by SpellId (queue-based, FIFO order)
         if (!GetSession().GameState.TryDequeuePendingPetCast(spellId, out var pendingCast))
         {
-            Log.Event("pet.cast_failed.no_pending", new
+            // JimsProxy: CMSG_PET_ACTION (player presses a pet ability button)
+            // doesn't populate PendingPetCasts the way CMSG_PET_CAST_SPELL does,
+            // so a failed pet action arrives here with no pending entry to match.
+            // Previously we logged and dropped, leaving the modern client's pet
+            // UI in a stuck "casting" state because it never received a failure
+            // signal for the press it had locally predicted. Warlock testers
+            // report this as "pet sound stuck" / "stuck pet animation" — the
+            // modern client appears to loop the casting indicator + any tied
+            // sound until /reload.
+            //
+            // Emit a defensive fallback PetCastFailed with a deterministic
+            // CastID (matching the seed pattern HandleSpellStartOrGo uses for
+            // pet casts so a future CastID match still works) and DontReport
+            // reason — the client unwinds button + state cleanly without a
+            // misleading popup. Also send CancelSpellVisual for any visual
+            // kit anchored on press: pet auto-cast spells like 7809 / 17735 /
+            // 17850 DO have valid SpellVisualKit entries in modern Classic
+            // 1.14.2 (unlike spells 75 / 5019), so the cancel actually lands.
+            var petGuid = GetSession().GameState.CurrentPetGuid;
+            // Defense in depth: only emit the fallback when we have a real
+            // spell ID and a real pet GUID to anchor the synthesized CastID
+            // and CancelSpellVisual source. SpellID == 0 would produce a
+            // wonky CastID the client almost certainly ignores; targeting an
+            // empty pet GUID is meaningless.
+            if (!petGuid.IsEmpty() && spellId != 0)
             {
-                spell_id = spellId,
-                has_reason = hasReason,
-                legacy_reason = legacyReason,
-            });
+                uint spellVisual = GameData.GetSpellVisual(spellId);
+                uint resolvedSpellVisualId = GameData.GetSpellVisualIdFromXSpellVisual(spellVisual);
+                if (resolvedSpellVisualId != 0)
+                {
+                    CancelSpellVisual cancelVisual = new CancelSpellVisual();
+                    cancelVisual.Source = petGuid;
+                    cancelVisual.SpellVisualID = (int)resolvedSpellVisualId;
+                    SendPacketToClient(cancelVisual);
+                }
+
+                PetCastFailed fallback = new PetCastFailed();
+                fallback.SpellID = spellId;
+                fallback.Reason = (uint)SpellCastResultClassic.DontReport;
+                fallback.CastID = WowGuid128.Create(
+                    HighGuidType703.Cast,
+                    SpellCastSource.Normal,
+                    (uint)(GetSession().GameState.CurrentMapId ?? 0),
+                    spellId,
+                    (ulong)spellId + petGuid.GetCounter());
+                SendPacketToClient(fallback);
+
+                Log.Event("pet.cast_failed.no_pending", new
+                {
+                    spell_id = spellId,
+                    has_reason = hasReason,
+                    legacy_reason = legacyReason,
+                    fallback_sent = true,
+                    pet_guid_low = petGuid.GetCounter(),
+                    spell_visual = spellVisual,
+                    resolved_visual_id = resolvedSpellVisualId,
+                });
+            }
+            else
+            {
+                Log.Event("pet.cast_failed.no_pending", new
+                {
+                    spell_id = spellId,
+                    has_reason = hasReason,
+                    legacy_reason = legacyReason,
+                    fallback_sent = false,
+                    pet_guid_empty = petGuid.IsEmpty(),
+                    spell_id_zero = spellId == 0,
+                });
+            }
             return;
         }
 
