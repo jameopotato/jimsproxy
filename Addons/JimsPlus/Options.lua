@@ -57,6 +57,11 @@ y = y - 28
 local cbTaxiFix = CreateCheckbox(panel, y,
     "Hide early-landing button",
     "Hides the \"Stop at next flight path\" button during flights.\nVanilla servers don't support early landing — clicking it\ndoes nothing. This removes the misleading button.")
+y = y - 28
+
+local cbTooltipFix = CreateCheckbox(panel, y,
+    "Off-class armor / weapon red text  |cFFFF6600(reload required)|r",
+    "Recolors armor type and weapon type to red on item tooltips and vendor\nrows when your class can't use the item (e.g. \"Mail\" on a rogue, \"Plate\"\non a hunter), based on the proficiencies you've actually trained.\n\nThe 1.14 Classic Era client gets this signal from a hardcoded table\nthe proxy can't reach over the wire — this addon does the recolor\nclient-side.\n\nChanges take effect after /reload.")
 y = y - 40
 
 ---------------------------------------------------------------------------
@@ -88,6 +93,7 @@ local function RefreshCheckboxes()
     local db = namespace.db or JimsPlusDB or {}
     cbPetFix:SetChecked(db.petFix == true)
     cbTaxiFix:SetChecked(db.taxiFix == true)
+    cbTooltipFix:SetChecked(db.tooltipFix == true)
 
     local cdb = JimsPlusCastbars and JimsPlusCastbars.db
     if cdb then
@@ -123,6 +129,14 @@ cbTaxiFix:SetScript("OnClick", function(self)
         namespace.db.taxiFix = enabled
     end
     print("|cFF00FF00[JimsPlus]|r Early-landing button " .. (enabled and "hidden" or "shown") .. ". Type /reload to apply.")
+end)
+
+cbTooltipFix:SetScript("OnClick", function(self)
+    local enabled = self:GetChecked() and true or false
+    if namespace.db then
+        namespace.db.tooltipFix = enabled
+    end
+    print("|cFF00FF00[JimsPlus]|r Off-class armor red text " .. (enabled and "enabled" or "disabled") .. ". Type /reload to apply.")
 end)
 
 for _, info in ipairs(castbarUnits) do
