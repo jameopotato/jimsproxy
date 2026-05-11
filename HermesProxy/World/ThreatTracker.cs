@@ -269,10 +269,23 @@ public sealed class ThreatTracker
             }
             SendToClient(update);
 
+            _lastHighest.TryGetValue(mob, out var prevHighest);
+            bool highestChanged = prevHighest != newHighest;
+
+            Log.Event("threat.emit_update", new
+            {
+                mob_low = mob.GetCounter(),
+                threater_count = list.Count,
+                highest_low = newHighest.GetCounter(),
+                highest_value = (long)highestValue,
+                highest_is_local = newHighest == _session.GameState.CurrentPlayerGuid,
+                highest_changed = highestChanged,
+                threaters = ThreaterSnapshot(list),
+            });
+
             // Emit HIGHEST only when the top changes — saves churn but keeps
             // tank-aggro indicators (red border, nameplate color) snappy.
-            _lastHighest.TryGetValue(mob, out var prevHighest);
-            if (prevHighest != newHighest)
+            if (highestChanged)
             {
                 _lastHighest[mob] = newHighest;
                 var highest = new HighestThreatUpdatePkt
@@ -289,8 +302,33 @@ public sealed class ThreatTracker
                     });
                 }
                 SendToClient(highest);
+
+                Log.Event("threat.highest_changed", new
+                {
+                    mob_low = mob.GetCounter(),
+                    prev_highest_low = prevHighest.GetCounter(),
+                    new_highest_low = newHighest.GetCounter(),
+                    new_highest_is_local = newHighest == _session.GameState.CurrentPlayerGuid,
+                    new_highest_value = (long)highestValue,
+                });
             }
         }
+    }
+
+    // Compact one-line representation of a mob's threater list for the JSONL
+    // bundle. Keeps the snapshot small — counter + value pairs — so it's
+    // readable in a diagnostic without flooding context.
+    private static string ThreaterSnapshot(Dictionary<WowGuid128, double> list)
+    {
+        var sb = new System.Text.StringBuilder();
+        bool first = true;
+        foreach (var (threater, value) in list)
+        {
+            if (!first) sb.Append(',');
+            first = false;
+            sb.Append(threater.GetCounter()).Append('=').Append((long)value);
+        }
+        return sb.ToString();
     }
 
     // Wipe everything — used on session disconnect / character switch. Doesn't
@@ -352,7 +390,22 @@ public sealed class ThreatTracker
     public void OnDamage(WowGuid128 attacker, WowGuid128 victim, int spellId, double rawDamage)
     {
         if (rawDamage <= 0) return;
-        if (!IsRelevantThreater(attacker)) return;
+        if (!IsRelevantThreater(attacker))
+        {
+            // Tester bundles will show this when a damage event fires but
+            // we filtered the attacker out of the group / pet / self set —
+            // e.g. a stranger's pet hitting our shared mob, or a groupmate
+            // who hasn't been seen in CurrentGroups yet (login race).
+            Log.Event("threat.drop_irrelevant_attacker", new
+            {
+                attacker_low = attacker.GetCounter(),
+                attacker_high = attacker.GetHighType().ToString(),
+                victim_low = victim.GetCounter(),
+                spell_id = spellId,
+                damage = (long)rawDamage,
+            });
+            return;
+        }
         if (victim == default) return;
 
         double abilityMultiplier = ThreatModules.GetDamageMultiplier(spellId);
