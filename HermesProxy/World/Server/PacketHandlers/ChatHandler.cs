@@ -234,7 +234,7 @@ public partial class WorldSocket
     {
         if (packet.Params.Prefix == "JP")
         {
-            GetSession().GameState.JimsPlusSideband = packet.Params.Text == "1";
+            HandleJimsPlusSideband(packet.Params.Text);
             return;
         }
 
@@ -260,7 +260,7 @@ public partial class WorldSocket
     {
         if (packet.Params.Prefix == "JP")
         {
-            GetSession().GameState.JimsPlusSideband = packet.Params.Text == "1";
+            HandleJimsPlusSideband(packet.Params.Text);
             return;
         }
 
@@ -442,5 +442,67 @@ public partial class WorldSocket
         if (session?.WorldClient == null) return;
         var msg = new ChatPkt(session, ChatMessageTypeModern.System, text);
         session.WorldClient.SendPacketToClient(msg);
+    }
+
+    // JimsProxy sideband: addon-driven commands the 1.14 modern client wire
+    // protocol no longer carries. Body grammar:
+    //   "1" / "0"          — handshake on/off (legacy castbar/HC interop)
+    //   "<cmd>\t<args>..." — structured command, e.g. "Z\tStormwind City"
+    private void HandleJimsPlusSideband(string body)
+    {
+        if (string.IsNullOrEmpty(body)) return;
+
+        if (body == "0" || body == "1")
+        {
+            GetSession().GameState.JimsPlusSideband = body == "1";
+            return;
+        }
+
+        int tab = body.IndexOf('\t');
+        if (tab <= 0) return;
+
+        string cmd = body.Substring(0, tab);
+        string args = body.Substring(tab + 1);
+
+        switch (cmd)
+        {
+            case "Z":
+                HandleZoneSideband(args);
+                break;
+        }
+    }
+
+    // Zone sideband: addon's ZONE_CHANGED_NEW_AREA hook reports the player's
+    // new zone name (GetRealZoneText). vmangos's Player::UpdateLocalChannels
+    // is a server-side no-op — the 1.12 native client drives zone-channel
+    // rejoin itself via CMSG_LEAVE/JOIN, but the 1.14 modern client doesn't.
+    // We synthesize that behavior here so General/Trade/LocalDefense flip
+    // to the new zone without a relog.
+    private void HandleZoneSideband(string zoneName)
+    {
+        if (string.IsNullOrWhiteSpace(zoneName)) return;
+        zoneName = zoneName.Trim();
+
+        if (!GameData.AreaIdsByName.TryGetValue(zoneName, out uint newZoneId))
+        {
+            Log.Event("chat.zone_sideband.unknown_name", new { zone_name = zoneName });
+            return;
+        }
+
+        var gs = GetSession().GameState;
+        uint oldZoneId = gs.CurrentZoneId;
+        if (oldZoneId == newZoneId) return;
+
+        var worldClient = GetSession().WorldClient;
+        Log.Event("chat.zone_sideband", new
+        {
+            zone_name = zoneName,
+            old_zone_id = oldZoneId,
+            new_zone_id = newZoneId,
+            world_client_alive = worldClient != null,
+        });
+
+        gs.CurrentZoneId = newZoneId;
+        worldClient?.SyncZoneChannels(oldZoneId, newZoneId);
     }
 }

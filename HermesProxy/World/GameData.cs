@@ -52,6 +52,7 @@ public static partial class GameData
     public static FrozenDictionary<uint, CreatureModelCollisionHeight> CreatureModelCollisionHeights = FrozenDictionary<uint, CreatureModelCollisionHeight>.Empty;
     public static FrozenDictionary<uint, uint> TransportPeriods = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, string> AreaNames = FrozenDictionary<uint, string>.Empty;
+    public static FrozenDictionary<string, uint> AreaIdsByName = FrozenDictionary<string, uint>.Empty;
     public static FrozenDictionary<uint, uint> RaceFaction = FrozenDictionary<uint, uint>.Empty;
     public static FrozenSet<uint> DispellSpells = FrozenSet<uint>.Empty;
     public static Dictionary<uint, List<float>> SpellEffectPoints = [];
@@ -1321,14 +1322,21 @@ public static partial class GameData
         var path = Path.Combine("CSV", $"AreaNames.csv");
         using var reader = Sep.Reader(o => o with { HasHeader = true, Unescape = true }).FromFile(path);
         var dict = new Dictionary<uint, string>(EstimateRowCount(path, 40));
+        var byName = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var row in reader)
         {
             uint id = uint.Parse(row[0].Span);
             string name = row[1].ToString();
             dict.Add(id, name);
+            // First-write-wins. Round-trips name → id → name correctly because
+            // GetAreaName(id) yields the same string back regardless of which
+            // duplicate-named area we picked, so zone-channel suffix matching
+            // ("General - <name>") stays consistent.
+            byName.TryAdd(name, id);
         }
         AreaNames = dict.ToFrozenDictionary();
+        AreaIdsByName = byName.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
     }
 
     public static void LoadRaceFaction()

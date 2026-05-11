@@ -11,6 +11,7 @@ Options.lua
 PetFix.lua
 TaxiFix.lua
 TooltipFix.lua
+ZoneSync.lua
 castbars/PoolManager.lua
 castbars/AnchorManager.lua
 castbars/Data.lua

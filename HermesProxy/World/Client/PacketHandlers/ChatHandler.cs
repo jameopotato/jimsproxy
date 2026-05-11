@@ -749,4 +749,41 @@ public partial class WorldClient
         packet.WriteCString(channelName);
         SendPacketToServer(packet);
     }
+
+    // JimsProxy: vmangos's Player::UpdateLocalChannels is empty (comment:
+    // "Updated client-side") — the 1.12 native client drives zone-based chat
+    // channel rejoin itself by sending CMSG_LEAVE/JOIN with zone-suffixed
+    // names on every zone change. The 1.14 modern client doesn't do this, so
+    // the proxy has to. Called from SMSG_INIT_WORLD_STATES (capitals/BGs/
+    // instances) and from the JimsPlus JP zone sideband (overland transitions).
+    public void SyncZoneChannels(uint oldZoneId, uint newZoneId)
+    {
+        string oldZoneName = GameData.GetAreaName(oldZoneId);
+        string newZoneName = GameData.GetAreaName(newZoneId);
+        var channels = GameData.GetChatChannelsWithFlags(ChannelFlags.AutoJoin | ChannelFlags.ZoneBased);
+
+        Log.Event("chat.zone_sync.enter", new
+        {
+            old_zone_id = oldZoneId,
+            new_zone_id = newZoneId,
+            old_zone_name = oldZoneName,
+            new_zone_name = newZoneName,
+            channel_count = channels.Count,
+        });
+
+        if (string.IsNullOrEmpty(newZoneName)) return;
+
+        foreach (var channel in channels)
+        {
+            string newName = channel.Name + " - " + newZoneName;
+            if (!string.IsNullOrEmpty(oldZoneName))
+            {
+                string oldName = channel.Name + " - " + oldZoneName;
+                Log.Event("chat.zone_sync.leave", new { channel = oldName });
+                SendChatLeaveChannel(1, oldName);
+            }
+            Log.Event("chat.zone_sync.join", new { channel = newName });
+            SendChatJoinChannel(1, newName, "");
+        }
+    }
 }

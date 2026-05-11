@@ -51,17 +51,9 @@ public partial class WorldClient
 
         if (GetSession().GameState.CurrentZoneId != states.ZoneID)
         {
-            string oldZoneName = GameData.GetAreaName(GetSession().GameState.CurrentZoneId);
-            string newZoneName = GameData.GetAreaName(states.ZoneID);
+            uint oldZoneId = GetSession().GameState.CurrentZoneId;
             GetSession().GameState.CurrentZoneId = states.ZoneID;
-            if (!String.IsNullOrEmpty(oldZoneName) && !String.IsNullOrEmpty(newZoneName))
-            {
-                foreach (var channel in GameData.GetChatChannelsWithFlags(ChannelFlags.AutoJoin | ChannelFlags.ZoneBased))
-                {
-                    SendChatLeaveChannel(1, channel.Name + " - " + oldZoneName);
-                    SendChatJoinChannel(1, channel.Name + " - " + newZoneName, "");
-                }
-            }
+            SyncZoneChannels(oldZoneId, states.ZoneID);
         }
     }
 
