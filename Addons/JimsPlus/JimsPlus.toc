@@ -7,6 +7,7 @@
 ## Version: 1.0.1
 
 Core.lua
+Options.lua
 PetFix.lua
 TaxiFix.lua
 castbars/PoolManager.lua

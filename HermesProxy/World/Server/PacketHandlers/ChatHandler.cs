@@ -232,8 +232,16 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CHAT_ADDON_MESSAGE)]
     void HandleAddonMessage(ChatAddonMessage packet)
     {
+        if (packet.Params.Prefix == "JP")
+        {
+            GetSession().GameState.JimsPlusSideband = packet.Params.Text == "1";
+            return;
+        }
+
         uint language = (uint)Language.Addon;
-        string text = packet.Params.Prefix + '\t' + packet.Params.Text;
+        string body = AddonInteropTranslator.TranslateOutbound(packet.Params.Prefix, packet.Params.Text);
+        if (string.IsNullOrEmpty(body)) return;
+        string text = packet.Params.Prefix + '\t' + body;
 
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
         {
@@ -250,8 +258,16 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CHAT_ADDON_MESSAGE_TARGETED)]
     void HandleAddonMessageTargeted(ChatAddonMessageTargeted packet)
     {
+        if (packet.Params.Prefix == "JP")
+        {
+            GetSession().GameState.JimsPlusSideband = packet.Params.Text == "1";
+            return;
+        }
+
         uint language = (uint)Language.Addon;
-        string text = packet.Params.Prefix + '\t' + packet.Params.Text;
+        string body = AddonInteropTranslator.TranslateOutbound(packet.Params.Prefix, packet.Params.Text);
+        if (string.IsNullOrEmpty(body)) return;
+        string text = packet.Params.Prefix + '\t' + body;
         string channelName = packet.ChannelGuid.IsEmpty() ? "" :
             GetSession().GameState.GetChannelName((int)packet.ChannelGuid.GetCounter());
 

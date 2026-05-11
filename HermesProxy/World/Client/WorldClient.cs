@@ -589,7 +589,8 @@ public partial class WorldClient
                     HandleAuthResponse(packet);
                     break;
                 case Opcode.SMSG_ADDON_INFO:
-                    break; // don't need to handle
+                    HandleAddonInfo(packet);
+                    break;
                 default:
                     if (_packetHandlers.ContainsKey(universalOpcode))
                     {
@@ -660,6 +661,62 @@ public partial class WorldClient
         SendDelayedPacketsToServerOnOpcode(universalOpcode);
     }
 
+    // Diagnostic-only handler for SMSG_ADDON_INFO. Parses the server's response
+    // to the addon section we sent in CMSG_AUTH_SESSION and emits a structured
+    // event so bug bundles capture the round-trip. Modern client never sees
+    // this opcode — it's already in IsIgnorableDuringHandshake.
+    private void HandleAddonInfo(WorldPacket packet)
+    {
+        // GetData() returns the full WorldPacket buffer, opcode at [0..1] and the
+        // body at [2..]. The 2-byte opcode was consumed by WorldPacket(byte[]).ctor.
+        byte[] body = packet.GetData();
+        const int OpcodeHeaderLen = 2;
+        int bodyLen = body.Length - OpcodeHeaderLen;
+        if (bodyLen <= 0)
+        {
+            Log.Event("auth.addon_info.empty", new { });
+            return;
+        }
+        byte[] payload = new byte[bodyLen];
+        Buffer.BlockCopy(body, OpcodeHeaderLen, payload, 0, bodyLen);
+
+        byte[]? receivedFlags = AuthSessionAddons.ParseAddonInfoResponse(payload);
+        if (receivedFlags == null)
+        {
+            Log.Event("auth.addon_info.parse_failed", new
+            {
+                payload_size = payload.Length,
+            });
+            return;
+        }
+
+        byte[] derivedFlags = AuthSessionAddons.Derive();
+        bool mismatch = false;
+        for (int i = 0; i < 4; i++)
+        {
+            if (receivedFlags[i] != derivedFlags[i]) { mismatch = true; break; }
+        }
+
+        if (mismatch)
+        {
+            // Server's flag-field validation rejected our bytes and pushed
+            // replacement values. Shouldn't happen given Derive()'s clamping;
+            // if it does, investigate Derive() logic.
+            Log.Event("auth.addon_info.server_override", new
+            {
+                derived = BitConverter.ToUInt32(derivedFlags, 0),
+                server = BitConverter.ToUInt32(receivedFlags, 0),
+            });
+        }
+        else
+        {
+            Log.Event("auth.addon_info.echoed_match", new
+            {
+                flags = BitConverter.ToUInt32(receivedFlags, 0),
+            });
+        }
+    }
+
     private void HandleAuthChallenge(WorldPacket packet)
     {
         if (Settings.ServerBuild >= ClientVersionBuild.V3_3_5a_12340)
@@ -718,9 +775,18 @@ public partial class WorldClient
 
         packet.WriteBytes(authResponse);
 
-        // packet.WriteUInt32(zero); // length of addon data
-        Span<byte> addonBytes = [208, 1, 0, 0, 120, 156, 117, 207, 61, 14, 194, 48, 12, 5, 224, 114, 14, 184, 12, 97, 64, 149, 154, 133, 150, 25, 153, 196, 173, 172, 38, 78, 21, 82, 126, 58, 113, 66, 206, 68, 81, 133, 24, 98, 188, 126, 126, 79, 182, 114, 52, 77, 16, 237, 105, 59, 154, 68, 129, 143, 101, 177, 242, 183, 77, 85, 204, 163, 190, 166, 32, 37, 135, 45, 161, 179, 154, 152, 60, 12, 210, 18, 177, 37, 238, 230, 130, 87, 102, 187, 224, 207, 144, 170, 208, 9, 185, 197, 26, 188, 39, 9, 35, 180, 73, 188, 105, 175, 235, 49, 94, 241, 33, 227, 72, 206, 42, 224, 94, 212, 146, 47, 3, 154, 79, 237, 58, 183, 132, 190, 14, 166, 199, 180, 252, 146, 167, 53, 152, 24, 102, 121, 102, 114, 0, 178, 51, 196, 12, 26, 112, 200, 242, 27, 77, 4, 139, 117, 79, 206, 253, 99, 98, 140, 178, 145, 71, 13, 12, 29, 198, 159, 190, 1, 43, 0, 141, 195];
+        // Build the addon-data section programmatically from the canonical
+        // Blizzard_* addon records (replaces the old hardcoded byte literal
+        // captured from a wire trace). See AuthSessionAddons for the wire
+        // format and the server quirk that requires non-zero flag bytes.
+        byte[] flagBytes = AuthSessionAddons.Derive();
+        byte[] addonBytes = AuthSessionAddons.BuildAddonAuthSection(flagBytes);
         packet.WriteBytes(addonBytes);
+
+        Log.Event("auth.addon_section.sent", new
+        {
+            flags_uint32 = BitConverter.ToUInt32(flagBytes, 0),
+        });
 
         SendPacket(packet);
 

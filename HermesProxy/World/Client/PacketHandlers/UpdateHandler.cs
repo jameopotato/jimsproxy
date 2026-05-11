@@ -48,6 +48,14 @@ public partial class WorldClient
         // those mount GUIDs around aggro/death time.
         int cachedEntry = GetSession().GameState.GetLegacyFieldValueInt32(guid, ObjectField.OBJECT_FIELD_ENTRY);
         int cachedDisplayId = GetSession().GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
+
+        // JimsProxy (target-buffs-stuck-after-render-roundtrip): drop the
+        // four per-target aura tables for this guid. Without this, the
+        // modern client surfaces stale buffs when the unit re-enters
+        // render distance — fresh OBJECT_UPDATE deltas don't reliably
+        // overwrite the old slot data before the addon's first read.
+        int aurasEvicted = GetSession().GameState.EvictUnitAuraState(guid);
+
         Log.Event("object.destroy", new
         {
             guid = guid.ToString(),
@@ -55,6 +63,7 @@ public partial class WorldClient
             guid_entry = guid.GetEntry(),
             cached_entry = cachedEntry,
             cached_display_id = cachedDisplayId,
+            auras_evicted = aurasEvicted,
         });
 
         lock (GetSession().GameState.ObjectCacheLock)
@@ -63,6 +72,15 @@ public partial class WorldClient
             GetSession().GameState.ObjectCacheModern.Remove(guid);
         }
         GetSession().GameState.LastAuraCasterOnTarget.Remove(guid);
+
+        // JimsProxy (PR #161 follow-up — destroy-hook fast path): if any pending
+        // cast was aimed at this GUID, evict it now and emit synthetic
+        // CastFailed(BadTargets). Faster than waiting up to 2.5s for the
+        // watchdog and carries the correct popup reason since we know exactly
+        // why the cast can't proceed (target was just destroyed). Covers the
+        // Kronos "target dies mid-cast, no trailing CAST_FAILED" scenario at
+        // the source of the problem instead of the watchdog catch-all.
+        GetSession().EvictPendingCastsForDestroyedTarget(guid);
 
         UpdateObject updateObject = new UpdateObject(GetSession().GameState);
         updateObject.DestroyedGuids.Add(guid);
@@ -111,7 +129,14 @@ public partial class WorldClient
                     PrintString($"Guid = {guid.ToString()}", i);
 
                     ObjectUpdate updateData = new ObjectUpdate(guid, UpdateTypeModern.Values, GetSession());
-                    AuraUpdate auraUpdate = new AuraUpdate(guid, false);
+                    // JimsProxy (aura-refresh-after-far-objects): if this unit
+                    // was just FarObjects-evicted, the modern client dropped
+                    // the unit's aura state on OutOfRangeGuids — a delta
+                    // AuraUpdate has nothing to merge against and the buff
+                    // bar lingers stale. Promote this AuraUpdate to a full
+                    // refresh so the modern client reseeds from scratch.
+                    bool needsFullAuraRefresh = GetSession().GameState.NeedsFullAuraRefresh.Remove(guid);
+                    AuraUpdate auraUpdate = new AuraUpdate(guid, needsFullAuraRefresh);
                     PowerUpdate powerUpdate = new PowerUpdate(guid);
                     ReadValuesUpdateBlock(packet, guid, updateData, auraUpdate, powerUpdate, i);
 
@@ -161,6 +186,10 @@ public partial class WorldClient
 
                     ObjectUpdate updateData = new ObjectUpdate(guid, UpdateTypeModern.CreateObject1, GetSession());
                     AuraUpdate auraUpdate = new AuraUpdate(guid, true);
+                    // CREATE already uses UpdateAll=true; just clear the
+                    // FarObjects bookkeeping so a later Values update for
+                    // this guid doesn't double-promote.
+                    GetSession().GameState.NeedsFullAuraRefresh.Remove(guid);
                     ReadCreateObjectBlock(packet, guid, updateData, auraUpdate, i);
 
                     if (updateData.Guid == GetSession().GameState.CurrentPlayerGuid)
@@ -196,6 +225,7 @@ public partial class WorldClient
 
                     ObjectUpdate updateData = new ObjectUpdate(guid, UpdateTypeModern.CreateObject2, GetSession());
                     AuraUpdate auraUpdate = new AuraUpdate(guid, true);
+                    GetSession().GameState.NeedsFullAuraRefresh.Remove(guid);
                     ReadCreateObjectBlock(packet, guid, updateData, auraUpdate, i);
 
                     if (guid.IsItem() && updateData.ObjectData.EntryID != null &&
@@ -376,6 +406,31 @@ public partial class WorldClient
                 GetSession().GameState.ObjectCacheModern.Remove(guid);
             }
             GetSession().GameState.LastAuraCasterOnTarget.Remove(guid);
+            // JimsProxy (aura-refresh-after-far-objects): aura state only
+            // applies to units (players, creatures, pets, vehicles). Skip
+            // gameobjects, items, dynamic objects, corpses, etc. — sending
+            // an AuraUpdate for those is at best ignored and at worst
+            // malformed traffic the client logs as an error.
+            bool guidIsUnit = guid.IsPlayer() || guid.IsCreature();
+            if (guidIsUnit)
+            {
+                // JimsProxy (aura-refresh-after-far-objects): mark this guid so
+                // the next Values OBJECT_UPDATE for it arrives as
+                // AuraUpdate(UpdateAll=true). The modern client just dropped the
+                // unit's aura state on OutOfRangeGuids; without the promotion,
+                // a later delta merges against nothing and the buff bar lingers
+                // stale until the user reloads the UI.
+                GetSession().GameState.NeedsFullAuraRefresh.Add(guid);
+                // Proactively wipe the modern client's buff/debuff bar for this
+                // unit. The target frame keeps showing the last-known auras
+                // after the unit leaves render — sending an empty AuraUpdate
+                // with UpdateAll=true wipes them immediately so PvPers don't
+                // see stale debuff icons (e.g. Detect Magic) hanging on a
+                // target that ran out of range. Re-entry via CreateObject1/2
+                // carries the full aura state from the legacy server, so the
+                // bar repopulates correctly when the unit returns.
+                SendPacketToClient(new AuraUpdate(guid, true));
+            }
 
             // If the pet is too far away, sends a SMSG_UPDATE_OBJECT protocol
             if (GetSession().GameState.CurrentPetGuid == guid)
@@ -2243,16 +2298,22 @@ public partial class WorldClient
                         if (spellId != 0)
                         {
                             channelSpells[guid] = spellId;
-                            var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
-                                $"JP_CH:S:{guidStr}:{spellId}");
-                            SendPacketToClient(chatPkt);
+                            if (GetSession().GameState.JimsPlusSideband)
+                            {
+                                var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                                    $"JP_CH:S:{guidStr}:{spellId}");
+                                SendPacketToClient(chatPkt);
+                            }
                         }
                         else
                         {
                             channelSpells.TryRemove(guid, out _);
-                            var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
-                                $"JP_CH:X:{guidStr}");
-                            SendPacketToClient(chatPkt);
+                            if (GetSession().GameState.JimsPlusSideband)
+                            {
+                                var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
+                                    $"JP_CH:X:{guidStr}");
+                                SendPacketToClient(chatPkt);
+                            }
                         }
                     }
                 }
@@ -2326,6 +2387,17 @@ public partial class WorldClient
             if (UNIT_NPC_EMOTESTATE >= 0 && updateMaskArray[UNIT_NPC_EMOTESTATE])
             {
                 updateData.UnitData.EmoteState = updates[UNIT_NPC_EMOTESTATE].Int32Value;
+                // JimsProxy (emote-state-diag 2026-05-07): user reports /dance staying active
+                // through movement on Kronos. Capture every EMOTESTATE update so we can see
+                // whether the server sends EMOTESTATE=0 on move (proxy is dropping it) or never
+                // sends it at all (server-side bug, fix via proxy synthesis on movement).
+                Framework.Logging.Log.Event("emote.state.update", new
+                {
+                    target_low = guid.GetCounter(),
+                    is_player_target = guid == GetSession().GameState.CurrentPlayerGuid,
+                    new_emote_state = updateData.UnitData.EmoteState,
+                    is_create = isCreate,
+                });
             }
             int UNIT_TRAINING_POINTS = LegacyVersion.GetUpdateField(UnitField.UNIT_TRAINING_POINTS);
             if (UNIT_TRAINING_POINTS >= 0 && updateMaskArray[UNIT_TRAINING_POINTS])
@@ -2523,6 +2595,16 @@ public partial class WorldClient
                             else
                             {
                                 GetSession().GameState.GetAuraDuration(guid, i, out durationLeft, out durationFull);
+                                // JimsProxy (Cheap-Shot-aura-duration 2026-05-07): mirror the
+                                // SpellHandler refresh path's CSV fallback. On a cold cache (fresh
+                                // enemy debuff via OBJECT_UPDATE before any SMSG_AURA_UPDATE fires)
+                                // GetAuraDuration returns 0 for both values, leaving the modern
+                                // client with no duration → UnitAura returns 0/0 → stun-watch
+                                // addons (TidyPlates, CCC, ElvUI) show no countdown. Spell 1833
+                                // (Cheap Shot, flat 4 s) is the primary case; any other spell with
+                                // an AuraDurations CSV row also benefits.
+                                if (durationFull <= 0)
+                                    durationFull = GameData.GetAuraSpellDuration((uint)aura.AuraData.SpellID);
                             }
 
                             if (durationLeft > 0 && durationFull > 0)

@@ -72,6 +72,7 @@ public static partial class GameData
     // SMSG_SPELL_START forwarded so the modern client can initialize the channel bar.
     // Sourced from SpellMisc DBC (Attributes_1 & 0x44), same data as JimsPlus castbars.
     public static FrozenSet<uint> ChanneledSpells = FrozenSet<uint>.Empty;
+
     public static FrozenSet<uint> AuraSpells = FrozenSet<uint>.Empty;
     public static FrozenDictionary<uint, int> AuraDurations = FrozenDictionary<uint, int>.Empty;
     // JimsProxy: vanilla 1.12 spell aura effects, keyed by spell id, each value is the array of

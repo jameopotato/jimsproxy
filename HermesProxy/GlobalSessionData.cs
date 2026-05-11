@@ -52,6 +52,7 @@ public sealed class GameSessionData
 {
     public bool HasWsgHordeFlagCarrier;
     public bool HasWsgAllyFlagCarrier;
+    public bool JimsPlusSideband;
     public bool ChannelDisplayList;
     public bool ShowPlayedTime;
     public bool IsInFarSight;
@@ -69,6 +70,14 @@ public sealed class GameSessionData
     // SendPacketToClient or fired control-grant packets at a session that had moved on.
     public CancellationTokenSource? TaxiDismountCts;
     public long TaxiDismountFiresAtTickMs;
+    // JimsProxy (dance-stuck-on-movement 2026-05-07): the modern Classic 1.14 client treats
+    // certain ONESHOT emote IDs (notably EMOTE_ONESHOT_DANCE = 10) as looping animations
+    // client-side and only stops them on a new SMSG_EMOTE arriving. Vanilla 1.12 servers
+    // (Kronos / Twinstar) don't broadcast a stop emote when the player moves, so the dance
+    // loops indefinitely. Track the last looping emote so HandlePlayerMove can synthesize
+    // a stop SMSG_EMOTE on the first movement-start packet.
+    public uint LastLoopingEmoteId; // 0 means no active loop
+    public long LastLoopingEmoteTickMs;
     public string? TaxiAttemptId;
     public bool IsWaitingForNewWorld;
     public bool IsWaitingForWorldPortAck;
@@ -219,9 +228,17 @@ public sealed class GameSessionData
         }
     }
 
-    public void ClearHeldCastTimeCast()
+    // JimsProxy (silent-hold GCD sweep 2026-05-07): returns the dropped cast so callers
+    // can ack-fail it to the modern client. Without the ack the button stays lit forever
+    // when a cast bar is interrupted (ESC, kick, target death, OOM mid-cast).
+    public ClientCastRequest? ClearHeldCastTimeCast()
     {
-        lock (_gcdLock) { _heldCastTimeCast = null; }
+        lock (_gcdLock)
+        {
+            var dropped = _heldCastTimeCast;
+            _heldCastTimeCast = null;
+            return dropped;
+        }
     }
 
     public bool HasNonStartedPendingCastForSpell(uint spellId)
@@ -325,6 +342,24 @@ public sealed class GameSessionData
     public Dictionary<byte, Dictionary<byte, int>> FlatSpellMods = [];
     public Dictionary<byte, Dictionary<byte, int>> PctSpellMods = [];
     public Dictionary<WowGuid128, Dictionary<uint, WowGuid128>> LastAuraCasterOnTarget = [];
+    // JimsProxy (aura-refresh-after-far-objects): GUIDs the legacy server
+    // just told us to remove via FarObjects. The modern client drops the
+    // unit's aura state on OutOfRangeGuids, so the next Values update for
+    // any of these units must arrive as AuraUpdate(UpdateAll=true) to
+    // reseed the buff/debuff bar from scratch — otherwise the next delta
+    // is merged against state the client no longer has, and the previous
+    // buff bar lingers stale until reload.
+    public HashSet<WowGuid128> NeedsFullAuraRefresh = [];
+    // JimsProxy (synth-spell-start-for-autoshot): timestamp of the most recent
+    // natural SMSG_SPELL_START forwarded for the local player's ranged auto
+    // attack (Auto Shot 75 / Shoot 5019). The 1.12 server only emits SPELL_START
+    // at toggle/retarget — every subsequent auto-repeat tick arrives as a bare
+    // SPELL_GO. Modern Classic 1.14 servers emit SPELL_START per tick, so any
+    // CAST_START-driven swing-timer addon (e.g. Kaedin's swing timer) only
+    // fires once per series via the proxy. HandleSpellGo synthesizes a
+    // SPELL_START before the GO when no natural one was forwarded recently
+    // (window: AutoShotSynthSpellStartGapMs).
+    public Dictionary<uint, long> LastNaturalAutoShotSpellStartMs = [];
     public TradeSession? CurrentTrade = null;
     public HashSet<uint> RequestedItemHotfixes = [];
     public HashSet<uint> RequestedItemSparseHotfixes = [];
@@ -349,10 +384,23 @@ public sealed class GameSessionData
 
     }
 
-    public static GameSessionData CreateNewGameSessionData(GlobalSessionData globalSession)
+    public static GameSessionData CreateNewGameSessionData(GlobalSessionData globalSession, GameSessionData? previous = null)
     {
         var self = new GameSessionData();
         self.CurrentPlayerStorage = new CurrentPlayerStorage(globalSession);
+
+        // Realm-scoped caches survive a /camp on a native 1.12 client (NameCache, ignore
+        // list, guild membership of other players are all per-realm files, not per-character).
+        // Wiping them on logout caused SMSG_INSPECT_RESULT to silently bail at the
+        // CachedPlayers lookup whenever the modern client's own persistent name cache
+        // satisfied the unit-frame name without issuing a fresh CMSG_QUERY_PLAYER_NAME —
+        // the proxy then had no entry to fill the inspect Name/Class/Race/Sex fields.
+        if (previous != null)
+        {
+            self.CachedPlayers = previous.CachedPlayers;
+            self.PlayerGuildIds = previous.PlayerGuildIds;
+            self.IgnoredPlayers = previous.IgnoredPlayers;
+        }
         return self;
     }
 
@@ -466,8 +514,14 @@ public sealed class GameSessionData
         if (updates == null)
             return 0;
 
-        uint itemId = updates[OBJECT_FIELD_ENTRY].UInt32Value;
-        return itemId;
+        // JimsProxy (mc-player-pet-bar 2026-05-07): players don't have OBJECT_FIELD_ENTRY in
+        // their cached field set, so a raw indexer access throws KeyNotFoundException ('3')
+        // when called for an MC'd player target. Several callers (notably the SMSG_PET_SPELLS
+        // handler in PetHandler.cs) catch broadly and silently drop their entire output —
+        // empty pet bar in BG MC. Treat missing field as "no entry" and return 0.
+        if (!updates.TryGetValue(OBJECT_FIELD_ENTRY, out var entryField))
+            return 0;
+        return entryField.UInt32Value;
     }
     public void SetFlatSpellMod(byte spellMod, byte spellMask, int amount)
     {
@@ -739,6 +793,21 @@ public sealed class GameSessionData
         if (UnitAuraCaster.TryGetValue(guid, out var dict))
             dict.Remove(slot);
     }
+    // JimsProxy (target-buffs-stuck-after-render-roundtrip): drop all
+    // per-target aura state when a unit is destroyed (left render
+    // distance, despawned, or died). Without this, the modern client
+    // surfaces stale buffs the next time the target re-enters render.
+    // Returns the number of (slot,duration) entries evicted from
+    // UnitAuraDurationLeft so the caller can record diagnostics.
+    public int EvictUnitAuraState(WowGuid128 guid)
+    {
+        int evicted = UnitAuraDurationLeft.TryGetValue(guid, out var leftDict) ? leftDict.Count : 0;
+        UnitAuraDurationUpdateTime.Remove(guid);
+        UnitAuraDurationLeft.Remove(guid);
+        UnitAuraDurationFull.Remove(guid);
+        UnitAuraCaster.Remove(guid);
+        return evicted;
+    }
     public WowGuid128 GetAuraCaster(WowGuid128 target, byte slot)
     {
         if (UnitAuraCaster.TryGetValue(target, out var dict) &&
@@ -896,6 +965,110 @@ public sealed class GameSessionData
                 return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// JimsProxy (PR #161 follow-up): walks PendingNormalCasts and PendingPetCasts,
+    /// dequeues any entry whose WatchdogDeadlineMs has expired, and returns the
+    /// evicted entries via the out parameters. Caller (GlobalSessionData
+    /// .RunWatchdogEviction) emits the synthetic packets via InstanceSocket.
+    /// Pure data operation — no socket dependency, easy to unit-test.
+    /// </summary>
+    /// <summary>
+    /// JimsProxy (PR #161 follow-up — movement preemption): walks
+    /// PendingNormalCasts and marks every HasStarted=true cast-time spell
+    /// (StartedCastTimeMs>0) as MovementCancelled. Trailing SMSG_SPELL_FAILURE
+    /// / SMSG_CAST_FAILED for these casts are suppressed (modern client
+    /// already cancelled its own cast bar via client-side movement prediction).
+    /// Also arms the watchdog so even if the legacy server never sends the
+    /// trailing failure, the leak heals at the next cast event. Returns the
+    /// number of casts marked, for diagnostics. Instants and not-yet-started
+    /// casts are ignored (movement doesn't cancel them in vanilla).
+    /// </summary>
+    public int MarkStartedCastsMovementCancelled(long watchdogDeadlineMs)
+    {
+        int marked = 0;
+        foreach (var cast in PendingNormalCasts)
+        {
+            if (cast.HasStarted && cast.StartedCastTimeMs > 0)
+            {
+                cast.MovementCancelled = true;
+                if (cast.WatchdogDeadlineMs == 0)
+                    cast.WatchdogDeadlineMs = watchdogDeadlineMs;
+                marked++;
+            }
+        }
+        return marked;
+    }
+
+    /// <summary>
+    /// JimsProxy (PR #161 follow-up — destroy-hook fast path): walks pending
+    /// queues and dequeues any cast whose TargetGuid matches the destroyed
+    /// unit. Returns evicted entries for the caller to emit synthetic
+    /// CastFailed packets with a more accurate reason (BadTargets) than the
+    /// watchdog's DontReport, since we know exactly why the cast can't
+    /// proceed: the target was destroyed.
+    /// </summary>
+    public void DrainPendingCastsForDestroyedTarget(WowGuid128 destroyedGuid,
+        out List<ClientCastRequest> normalEvicted,
+        out List<ClientCastRequest> petEvicted)
+    {
+        normalEvicted = new List<ClientCastRequest>();
+        petEvicted = new List<ClientCastRequest>();
+        if (destroyedGuid.IsEmpty())
+            return;
+
+        var keepNormal = new List<ClientCastRequest>();
+        while (PendingNormalCasts.TryDequeue(out var cast))
+        {
+            if (!cast.TargetGuid.IsEmpty() && cast.TargetGuid == destroyedGuid)
+                normalEvicted.Add(cast);
+            else
+                keepNormal.Add(cast);
+        }
+        foreach (var c in keepNormal)
+            PendingNormalCasts.Enqueue(c);
+
+        var keepPet = new List<ClientCastRequest>();
+        while (PendingPetCasts.TryDequeue(out var cast))
+        {
+            if (!cast.TargetGuid.IsEmpty() && cast.TargetGuid == destroyedGuid)
+                petEvicted.Add(cast);
+            else
+                keepPet.Add(cast);
+        }
+        foreach (var c in keepPet)
+            PendingPetCasts.Enqueue(c);
+    }
+
+    public void DrainExpiredWatchdogCasts(long nowMs,
+        out List<ClientCastRequest> normalEvicted,
+        out List<ClientCastRequest> petEvicted)
+    {
+        normalEvicted = new List<ClientCastRequest>();
+        petEvicted = new List<ClientCastRequest>();
+
+        var keepNormal = new List<ClientCastRequest>();
+        while (PendingNormalCasts.TryDequeue(out var cast))
+        {
+            if (cast.WatchdogDeadlineMs > 0 && cast.WatchdogDeadlineMs < nowMs)
+                normalEvicted.Add(cast);
+            else
+                keepNormal.Add(cast);
+        }
+        foreach (var c in keepNormal)
+            PendingNormalCasts.Enqueue(c);
+
+        var keepPet = new List<ClientCastRequest>();
+        while (PendingPetCasts.TryDequeue(out var cast))
+        {
+            if (cast.WatchdogDeadlineMs > 0 && cast.WatchdogDeadlineMs < nowMs)
+                petEvicted.Add(cast);
+            else
+                keepPet.Add(cast);
+        }
+        foreach (var c in keepPet)
+            PendingPetCasts.Enqueue(c);
     }
 
     /// <summary>
@@ -1619,6 +1792,35 @@ public class ClientCastRequest
     // The GCD hold gate in HandleSpellGo uses this instead of HasStarted so Kronos-flavored
     // instants still trigger BeginGcd. See JimsProxy issue #43 follow-up.
     public uint StartedCastTimeMs;
+
+    // JimsProxy (PR #161 follow-up): when HandleSpellFailure peeks this entry
+    // (instead of dequeuing) so the trailing SMSG_CAST_FAILED can deliver the
+    // real reason, set this to TickCount64 + 2500ms. If HandleCastFailed
+    // doesn't dequeue within the window (Kronos can drop the trailing CAST_FAILED
+    // on cast-time + target-dies), EvictExpiredWatchdogCasts force-dequeues
+    // and emits a synthetic SpellPrepare + CastFailed(DontReport) to clear
+    // button-lit state instead of leaking a HasStarted=true entry that
+    // permanently blocks HasStartedNormalCast(). 0 = no watchdog active.
+    public long WatchdogDeadlineMs;
+
+    // JimsProxy (PR #161 follow-up — destroy-hook fast path): captured from
+    // CastSpell.Cast.Target.Unit at enqueue time. When HandleDestroyObject
+    // sees this GUID, the proxy can immediately evict any pending casts that
+    // were aimed at it (target died / despawned) and emit a synthetic
+    // CastFailed(BadTargets) — much faster than waiting up to 2.5s for the
+    // watchdog. Empty/default GUID = self-cast or no unit target (e.g. AoE
+    // ground-target spells), which the destroy hook ignores.
+    public WowGuid128 TargetGuid;
+
+    // JimsProxy (PR #161 follow-up — movement preemption): set true when the
+    // proxy detects a CMSG_MOVE_START_* opcode while this cast-time spell is
+    // in progress (HasStarted=true && StartedCastTimeMs>0). Vanilla cancels
+    // any cast-time spell on movement, and the modern 1.14 client predicts
+    // this client-side — so when this flag is set the trailing
+    // SMSG_SPELL_FAILURE suppresses its broadcast (no misleading "in combat"
+    // popup) and the trailing SMSG_CAST_FAILED forwards as DontReport so the
+    // client gets its CMSG_CANCEL_CAST ack without a popup.
+    public bool MovementCancelled;
 }
 public class ArenaTeamData
 {
@@ -1705,6 +1907,128 @@ public class GlobalSessionData
         GameState = GameSessionData.CreateNewGameSessionData(this);
         AuthClient = new AuthClient(this);
         ThreatTracker = new ThreatTracker(this);
+    }
+
+    /// <summary>
+    /// JimsProxy (PR #161 follow-up — destroy-hook fast path): when
+    /// SMSG_DESTROY_OBJECT arrives for a unit, evict any pending casts aimed
+    /// at it. Reason=BadTargets because we know exactly why the cast can't
+    /// proceed (target was destroyed) and the modern client renders the
+    /// correct popup ("Invalid target"). Faster than the 2.5s watchdog —
+    /// fires within ~RTT of the destroy packet.
+    /// </summary>
+    public void EvictPendingCastsForDestroyedTarget(WowGuid128 destroyedGuid)
+    {
+        if (InstanceSocket == null) return;
+        if (destroyedGuid.IsEmpty()) return;
+
+        GameState.DrainPendingCastsForDestroyedTarget(destroyedGuid,
+            out var normalEvicted,
+            out var petEvicted);
+
+        foreach (var cast in normalEvicted)
+        {
+            Log.Event("cast.destroy_evicted", new
+            {
+                queue = "normal",
+                spell_id = cast.SpellId,
+                client_cast_id = cast.ClientGUID.ToString(),
+                target_low = cast.TargetGuid.GetCounter(),
+                had_started = cast.HasStarted,
+            });
+            if (!cast.HasStarted)
+            {
+                SpellPrepare prepare = new();
+                prepare.ClientCastID = cast.ClientGUID;
+                prepare.ServerCastID = cast.ServerGUID;
+                InstanceSocket.SendPacket(prepare);
+            }
+            CastFailed failed = new();
+            failed.SpellID = cast.SpellId;
+            failed.SpellXSpellVisualID = cast.SpellXSpellVisualId;
+            failed.Reason = (byte)SpellCastResultClassic.BadTargets;
+            failed.CastID = cast.ServerGUID;
+            InstanceSocket.SendPacket(failed);
+        }
+
+        foreach (var cast in petEvicted)
+        {
+            Log.Event("cast.destroy_evicted", new
+            {
+                queue = "pet",
+                spell_id = cast.SpellId,
+                client_cast_id = cast.ClientGUID.ToString(),
+                target_low = cast.TargetGuid.GetCounter(),
+                had_started = cast.HasStarted,
+            });
+            PetCastFailed failed = new();
+            failed.SpellID = cast.SpellId;
+            failed.Reason = (uint)SpellCastResultClassic.BadTargets;
+            failed.CastID = cast.ServerGUID;
+            InstanceSocket.SendPacket(failed);
+        }
+    }
+
+    /// <summary>
+    /// JimsProxy (PR #161 follow-up): drain any expired watchdog peeks from the
+    /// pending-cast queues and emit synthetic SpellPrepare + CastFailed(DontReport)
+    /// (or PetCastFailed) for each so the modern client's button-lit / cast-bar
+    /// state clears. Called from the top of every spell-event handler so a leak
+    /// from "no trailing CAST_FAILED arrived" is at most one cast event old.
+    /// Reason=DontReport because the trailing CAST_FAILED that would have carried
+    /// the real reason never arrived — we don't know which to show.
+    /// </summary>
+    public void RunWatchdogEviction()
+    {
+        if (InstanceSocket == null)
+            return;
+
+        long nowMs = Environment.TickCount64;
+        GameState.DrainExpiredWatchdogCasts(nowMs,
+            out var normalEvicted,
+            out var petEvicted);
+
+        foreach (var cast in normalEvicted)
+        {
+            Log.Event("cast.watchdog_evicted", new
+            {
+                queue = "normal",
+                spell_id = cast.SpellId,
+                client_cast_id = cast.ClientGUID.ToString(),
+                had_started = cast.HasStarted,
+                ms_overdue = nowMs - cast.WatchdogDeadlineMs,
+            });
+            if (!cast.HasStarted)
+            {
+                SpellPrepare prepare = new();
+                prepare.ClientCastID = cast.ClientGUID;
+                prepare.ServerCastID = cast.ServerGUID;
+                InstanceSocket.SendPacket(prepare);
+            }
+            CastFailed failed = new();
+            failed.SpellID = cast.SpellId;
+            failed.SpellXSpellVisualID = cast.SpellXSpellVisualId;
+            failed.Reason = (byte)SpellCastResultClassic.DontReport;
+            failed.CastID = cast.ServerGUID;
+            InstanceSocket.SendPacket(failed);
+        }
+
+        foreach (var cast in petEvicted)
+        {
+            Log.Event("cast.watchdog_evicted", new
+            {
+                queue = "pet",
+                spell_id = cast.SpellId,
+                client_cast_id = cast.ClientGUID.ToString(),
+                had_started = cast.HasStarted,
+                ms_overdue = nowMs - cast.WatchdogDeadlineMs,
+            });
+            PetCastFailed failed = new();
+            failed.SpellID = cast.SpellId;
+            failed.Reason = (uint)SpellCastResultClassic.DontReport;
+            failed.CastID = cast.ServerGUID;
+            InstanceSocket.SendPacket(failed);
+        }
     }
 
     public void StoreGuildRankNames(uint guildId, List<string> ranks)
@@ -2335,7 +2659,7 @@ public class GlobalSessionData
             InstanceSocket = null!;
         }
 
-        GameState = GameSessionData.CreateNewGameSessionData(this);
+        GameState = GameSessionData.CreateNewGameSessionData(this, GameState);
         // Threat lists are tied to the previous character's mob/unit GUIDs;
         // wipe so the new login starts clean.
         ThreatTracker.Reset();
