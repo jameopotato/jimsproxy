@@ -136,7 +136,8 @@ public partial class WorldClient
 
                 cooldown.Category = packet.ReadUInt16();
                 cooldown.Duration = packet.ReadUInt32();
-                cooldown.CategoryDuration = packet.ReadUInt32();
+                if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_1_0_9767))
+                    cooldown.CategoryDuration = packet.ReadUInt32();
 
                 spells.Cooldowns.Add(cooldown);
             }
