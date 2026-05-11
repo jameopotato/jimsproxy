@@ -223,7 +223,14 @@ public partial class WorldClient
             }
             return;
         }
-        
+
+        // JimsProxy HealComm bridge: rewrite inbound HealComm-1.0 addon
+        // messages from 1.12-native players into LibHealComm-4.0 form so
+        // the modern client's LHC40 prefix consumes them. Must run before
+        // CheckAddonPrefix because "HealComm" is never registered with
+        // the modern client (LHC40 is the registered prefix).
+        TryHealCommInboundTranslate(sender, senderName, language, ref text);
+
         string addonPrefix = "";
         if (!ChatPkt.CheckAddonPrefix(GetSession().GameState.AddonPrefixes, ref language, ref text, ref addonPrefix))
             return;
@@ -288,6 +295,21 @@ public partial class WorldClient
                 });
                 return $"|Hitem:{itemId}:{enchant}:0:0:0:0:{suffixModern}:0:60:0:0:0|h";
             });
+    }
+
+    private void TryHealCommInboundTranslate(WowGuid128 sender, string senderName, uint language, ref string text)
+    {
+        if (language != (uint)Language.Addon || string.IsNullOrEmpty(text))
+            return;
+        int tabIdx = text.IndexOf('\t');
+        if (tabIdx <= 0)
+            return;
+        string prefix = text.Substring(0, tabIdx);
+        string body = text.Substring(tabIdx + 1);
+        if (GetSession().HealCommBridge.TryTranslateInboundAddon(sender, senderName, ref prefix, ref body))
+        {
+            text = prefix + '\t' + body;
+        }
     }
 
     [PacketHandler(Opcode.SMSG_CHAT, ClientVersionBuild.V2_0_1_6180)]
@@ -413,6 +435,9 @@ public partial class WorldClient
             }
             return;
         }
+
+        // JimsProxy HealComm bridge: see HandleServerChatMessageVanilla above.
+        TryHealCommInboundTranslate(sender, senderName, language, ref text);
 
         string addonPrefix = "";
         if (!ChatPkt.CheckAddonPrefix(GetSession().GameState.AddonPrefixes, ref language, ref text, ref addonPrefix))

@@ -191,6 +191,12 @@ public partial class WorldClient
         if (packet.CanRead())
             arg2 = packet.ReadInt32();
 
+        // JimsProxy HealComm bridge: SMSG_CAST_FAILED targets the local
+        // caster directly, so any pending resurrection cast tracked for
+        // us is now cancelled — emit HC-1.0 stop so 1.12-native listeners
+        // clear the rez indicator on their unit frames.
+        GetSession().HealCommBridge.OnLocalPlayerSpellStop(spellId);
+
         // Check special casts first - try next melee, then auto repeat
         ClientCastRequest? specialCast = null;
         bool isAutoRepeat = false;
@@ -614,6 +620,15 @@ public partial class WorldClient
         // depends on that path for target-frame cast-bar dismiss on Kick / Counterspell.
         bool casterIsLocalPlayer = GetSession().GameState.CurrentPlayerGuid == casterUnit;
         bool casterIsLocalPet    = GetSession().GameState.CurrentPetGuid    == casterUnit;
+
+        // JimsProxy HealComm bridge: emit HC-1.0 stop for any in-flight
+        // resurrection cast that just failed/got interrupted. No-op for
+        // non-rez spells (the bridge tracks rez state internally).
+        if (casterIsLocalPlayer)
+        {
+            GetSession().HealCommBridge.OnLocalPlayerSpellStop(spellId);
+        }
+
         // Ranged auto-attack exception (mirrors the SPELL_START allowlist in
         // HandleSpellStart): for Auto Shot (75) / Shoot (5019), the modern
         // client requires SMSG_SPELL_FAILURE to cancel the bow-draw / wand-aim
@@ -960,6 +975,20 @@ public partial class WorldClient
             });
         }
 
+        // JimsProxy HealComm bridge: dismiss any active synthesized SpellStart
+        // for this remote caster + spell BEFORE forwarding the real one. The
+        // bridge synthesizes SMSG_SPELL_START from inbound HC-1.0 addon comms
+        // because vanilla servers gate-broadcast SPELL_START (out-of-range
+        // raid healers' casts never reach the modern client). When the real
+        // SPELL_START does arrive (caster came into update range mid-cast),
+        // we need to clear the synth's cast bar so the client doesn't render
+        // two overlapping bars for the same cast. Gated to non-player-non-pet
+        // so the pet-instant-buff suppression below is unaffected.
+        if (!casterIsLocalPlayer && !casterIsLocalPet)
+        {
+            GetSession().HealCommBridge.OnRealSpellStartFromOther(spell.Cast.CasterUnit, (uint)spell.Cast.SpellID);
+        }
+
         // JimsProxy (pet-instant-buff-double-sound): suppress SMSG_SPELL_START for pet
         // server-driven AUTO-CASTS that are instant. For these, SPELL_START + SPELL_GO
         // arrive in the same millisecond — the modern Classic 1.14 client's SpellVisualKit
@@ -985,6 +1014,17 @@ public partial class WorldClient
         }
 
         SendPacketToClient(spell);
+
+        // JimsProxy HealComm bridge: when local player begins a resurrection
+        // cast, synthesize HC-1.0 "Resurrection/{name}/start/" addon outbound
+        // so 1.12-native HealComm-1.0 listeners (Luna unit frames) light up
+        // the incoming-rez indicator on the corpse. Modern peers ignore the
+        // "HealComm" prefix; their Luna uses the native UnitHasIncomingRes
+        // API driven by the SMSG_SPELL_START we just forwarded above.
+        if (casterIsLocalPlayer)
+        {
+            GetSession().HealCommBridge.OnLocalPlayerSpellStart((uint)spell.Cast.SpellID, spell.Cast.Target.Unit);
+        }
 
         // Send cast-time sideband for non-self casters so the addon gets
         // the server-reported cast time instead of GetSpellInfo() which
@@ -1053,6 +1093,18 @@ public partial class WorldClient
                     gap_ms = gapMs,
                 });
             }
+        }
+
+        // JimsProxy HealComm bridge: SMSG_SPELL_GO for the local player marks
+        // natural completion of a tracked cast. If it's a resurrection, clear
+        // the pending tracker so a later same-spell-id failure can't emit a
+        // spurious HC-1.0 stop, and so stale entries don't accumulate across
+        // successful rezzes in the session. No HC-1.0 stop is emitted for
+        // natural completion — Luna clears its rez indicator on its own via
+        // the target's SPELL_AURA_APPLIED for the Resurrection Request buff.
+        if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit)
+        {
+            GetSession().HealCommBridge.OnLocalPlayerSpellCompleted((uint)spell.Cast.SpellID);
         }
 
         // Dequeue completed cast (queue-based, FIFO order)
