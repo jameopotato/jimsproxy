@@ -664,10 +664,13 @@ public partial class WorldClient
         bool overrideReasonForLocalBroadcast = false;
         bool skipBroadcastFailure = false;
         // 1.14 needs SMSG_SPELL_FAILURE to retract the bow-draw / wand-aim visual
-        // for ranged auto-attacks (Auto Shot 75, Shoot 5019); CastFailed +
-        // CANCEL_AUTO_REPEAT alone leaves the bow stuck drawn. Other instants
-        // can drop the broadcast entirely -- there's no animation to cancel.
-        bool isRangedAutoAttack = spellId == 75 || spellId == 5019;
+        // for ranged auto-attacks; CastFailed + CANCEL_AUTO_REPEAT alone leaves the
+        // bow stuck drawn. Other instants can drop the broadcast entirely -- there's
+        // no animation to cancel.
+        // Source of truth: AutoRepeatSpells CSV (same set HandleCastSpell uses for
+        // the isAutoRepeat early-return). Avoids missing wand/shoot ranks that aren't
+        // 5019 and Auto Shot variants that aren't 75.
+        bool isRangedAutoAttack = GameData.AutoRepeatSpells.Contains((uint)spellId);
 
         // JimsProxy: PEEK (don't dequeue) so the trailing SMSG_CAST_FAILED — which
         // carries the real failure reason on vmangos/Twinstar after Spell::SendInterrupted
@@ -844,7 +847,21 @@ public partial class WorldClient
         //      casting pose is not part of that prediction.
         // User reports the same stuck-visual on Auto Shot (75) every session.
         // Mirrors the pet block above — purely additive, idempotent on the client.
-        if (casterIsLocalPlayer && wasStarted && !sentCancelVisual)
+        //
+        // 2026-05-11 follow-up (ranged-auto-repeat stuck sound): The original gate
+        // also requires wasStarted=true (i.e. a matching PendingNormalCasts entry).
+        // Wand/Auto-Shot AUTO-REPEAT ticks after the first shot have no such entry
+        // — the client sends CMSG_CAST_SPELL once, then the server fires SPELL_START
+        // + SPELL_GO autonomously for each repeat. After the first SPELL_GO clears
+        // the queue, subsequent failures (target out of range, target dead) fall
+        // through to the else-branch with wasStarted=false. Bundle
+        // jimsproxy-20260511-114307 captured 28 such failures for spell 5019
+        // (Shoot/wand), all with sentCancelVisual=false → looping wand-aim sound
+        // until /reload. SPELL_START is forwarded for all local-player spells (PR
+        // #72's instant-suppression was removed once SpellFailure switched to peek),
+        // so for auto-repeat ticks the visual is live on the client regardless of
+        // whether the pending queue tracked it.
+        if (casterIsLocalPlayer && (wasStarted || isRangedAutoAttack) && !sentCancelVisual)
         {
             resolvedSpellVisualId = GameData.GetSpellVisualIdFromXSpellVisual(spellVisual);
             if (resolvedSpellVisualId != 0)
@@ -873,6 +890,7 @@ public partial class WorldClient
             foundActiveCastId,
             sentInterruptLog,
             sentCancelVisual,
+            spellVisual,
             resolvedSpellVisualId,
             // Diagnostic: actual content of synthesized cleanup packets
             interruptLogCasterLow,
@@ -970,8 +988,7 @@ public partial class WorldClient
         // invisibly — the shots still hit (via SPELL_GO) but the character never
         // animates, which is what the user observed for Hunter Auto Shot.
         // Whitelist these so they bypass the issue-#43 instant-suppression.
-        bool isRangedAutoAttack = spell.Cast.SpellID == 75      // Auto Shot
-                                  || spell.Cast.SpellID == 5019; // Shoot (Wand)
+        bool isRangedAutoAttack = GameData.AutoRepeatSpells.Contains((uint)spell.Cast.SpellID);
         bool isChanneled = GameData.IsChanneledSpell((uint)spell.Cast.SpellID);
         // PR #72 originally suppressed SPELL_START for local player instants to prevent
         // GCD-lock-on-failure. Root cause was HandleSpellFailure dequeuing the pending cast
@@ -1100,7 +1117,7 @@ public partial class WorldClient
         // (Kaedin's swing timer, Quartz, etc.) only fire once per series
         // through the proxy. Synthesize a SPELL_START before the GO when
         // no natural one was forwarded within AutoShotSynthSpellStartGapMs.
-        bool isRangedAutoAttack = spell.Cast.SpellID == 75 || spell.Cast.SpellID == 5019;
+        bool isRangedAutoAttack = GameData.AutoRepeatSpells.Contains((uint)spell.Cast.SpellID);
         if (isRangedAutoAttack &&
             spell.Cast.CasterUnit == GetSession().GameState.CurrentPlayerGuid)
         {
