@@ -305,6 +305,23 @@ public static partial class GameData
         return null;
     }
 
+    // Used by the slot-mismatch preservation path in GenerateItemEffectUpdateIfNeeded:
+    // CSV reference data sometimes holds the same SpellID for an item at a different
+    // slot than the legacy server places it (TBC-era moved item-use effects from
+    // slot 0 down to slot 1+). We relocate the existing record instead of
+    // remove-and-add so CSV's SpellCategoryID + CoolDownMSec survive.
+    public static ItemEffect? FindItemEffectBySpellId(uint itemId, int spellId, byte excludeSlot)
+    {
+        foreach (var item in ItemEffectStore)
+        {
+            if (item.Value.ParentItemID == itemId &&
+                item.Value.SpellID == spellId &&
+                item.Value.LegacySlotIndex != excludeSlot)
+                return item.Value;
+        }
+        return null;
+    }
+
     public static uint GetFirstFreeId<T>(Dictionary<uint, T> dict, uint after = 0)
     {
         uint candidate = after + 1;
@@ -3845,11 +3862,30 @@ public static partial class GameData
         return null;
     }
 
+    // Records relocated by the slot-mismatch preservation path below. Future queries
+    // for the same item must not run the wrongCategory/wrongCooldown comparison: it
+    // treats "server didn't echo the field" (TriggeredSpellCategories[slot]=0) as
+    // disagreement with our CSV values and would strip them on the second query
+    // (e.g. on player relog). Once relocated, the record is authoritative.
+    internal static readonly HashSet<int> PreservedItemEffectIds = new();
+
     public static Server.Packets.HotFixMessage? GenerateItemEffectUpdateIfNeeded(ItemTemplate item, byte slot)
     {
         ItemEffect? effect = GetItemEffectByItemId(item.Entry, slot);
         if (effect != null)
         {
+            // Relocated CSV records: leave alone on subsequent queries as long as the
+            // server-provided fields (SpellID/TriggerType/Charges) still match what we
+            // already have. The CSV-only fields (SpellCategoryID, CoolDownMSec,
+            // CategoryCoolDownMSec) stay preserved.
+            if (PreservedItemEffectIds.Contains(effect.Id) &&
+                effect.SpellID == item.TriggeredSpellIds[slot] &&
+                effect.TriggerType == (sbyte)item.TriggeredSpellTypes[slot] &&
+                effect.Charges == (short)item.TriggeredSpellCharges[slot])
+            {
+                return null;
+            }
+
             // compare to spell data
             bool wrongCategory = false;
             bool wrongCooldown = false;
@@ -3878,6 +3914,11 @@ public static partial class GameData
                 wrongCategory ||
                 effect.SpellID != item.TriggeredSpellIds[slot])
             {
+                // Reaching the mutation block means at least one server-provided field
+                // diverged from the existing record, so the slot-mismatch preservation
+                // guarantee no longer holds — drop the marker before the record changes.
+                PreservedItemEffectIds.Remove(effect.Id);
+
                 if (item.TriggeredSpellIds[slot] > 0)
                 {
                     Log.Print(LogType.Storage, $"ItemEffect for item #{item.Entry} slot #{slot} needs to be updated.");
@@ -3924,6 +3965,42 @@ public static partial class GameData
         }
         else if (item.TriggeredSpellIds[slot] > 0)
         {
+            // Slot-mismatch preservation: if the modern CSV holds an ItemEffect with this
+            // same SpellID for this item but at a different slot than the legacy server
+            // places it, relocate the existing CSV record (carrying SpellCategoryID,
+            // CoolDownMSec, CategoryCoolDownMSec) instead of remove-and-add. The default
+            // pair would strip the shared category cooldown — for vanilla healthstones
+            // that loses category 1153 + 120s and the modern client renders neither the
+            // "Use:" tooltip line nor the heal animation, even though the heal numerically
+            // lands. CSV ItemEffect2.csv lines 820 / 822-823 / 833 / 1133 (items
+            // 5509/5510/5511/5512/9421) are the warlock healthstone case.
+            ItemEffect? mismatch = FindItemEffectBySpellId(item.Entry, item.TriggeredSpellIds[slot], slot);
+            if (mismatch != null)
+            {
+                byte previousSlot = mismatch.LegacySlotIndex;
+                mismatch.LegacySlotIndex = slot;
+                mismatch.TriggerType = (sbyte)item.TriggeredSpellTypes[slot];
+                mismatch.Charges = (short)item.TriggeredSpellCharges[slot];
+                // Preserve SpellCategoryID, CoolDownMSec, CategoryCoolDownMSec, SpellID from CSV.
+                CollectionsMarshal.GetValueRefOrAddDefault(ItemEffectStore, (uint)mismatch.Id, out _) = mismatch;
+                PreservedItemEffectIds.Add(mismatch.Id);
+                UpdateHotfix(mismatch);
+
+                Log.Event("hotfix.itemeffect.preserved", new
+                {
+                    item_entry = item.Entry,
+                    spell_id = mismatch.SpellID,
+                    csv_slot = previousSlot,
+                    legacy_slot = slot,
+                    preserved_category = mismatch.SpellCategoryID,
+                    preserved_cooldown_ms = mismatch.CoolDownMSec,
+                    preserved_category_cooldown_ms = mismatch.CategoryCoolDownMSec,
+                    record_id = mismatch.Id,
+                });
+
+                return GenerateHotFixMessage(mismatch);
+            }
+
             // there is a spell so add new record
             //Log.Print(LogType.Storage, $"ItemEffect for item #{item.Entry} slot #{slot} needs to be created.");
             effect = AddItemEffectRecord(item, slot);
