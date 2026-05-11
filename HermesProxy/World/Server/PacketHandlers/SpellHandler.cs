@@ -332,9 +332,20 @@ public partial class WorldSocket
                     });
                     if (displaced != null)
                         SendCastFailedWithoutPrepare(displaced);
-                    // Don't ack-fail castRequest — keep the modern client's action-button GCD
-                    // anticipation lit until SpellPrepare arrives at SPELL_START time for the
-                    // refired cast. Matches the smooth feel of native 1.14.
+                    // Send SpellPrepare immediately on hold-accept so the client has a
+                    // ClientCastID → ServerCastID mapping to match any future SMSG_SPELL_FAILURE
+                    // for this cast. Mirrors the off-GCD path below — see that comment for the
+                    // underlying contract. Without this, server rejections (LoS / range /
+                    // out-of-mana race) arriving for the eventually-fired held cast leave the
+                    // action button permanently lit because SpellFailure has no SpellPrepare
+                    // to match against. Symptom is most prevalent on low-ping (~50ms) clients
+                    // in populated zones, where the proxy's hold delay + SMSG backlog from
+                    // other casters extends the time the client spends in queued-press state.
+                    SpellPrepare prepare = new SpellPrepare();
+                    prepare.ClientCastID = castRequest.ClientGUID;
+                    prepare.ServerCastID = castRequest.ServerGUID;
+                    SendPacket(prepare);
+                    castRequest.HasSentPrepare = true;
                     return;
                 }
 
@@ -387,9 +398,21 @@ public partial class WorldSocket
                             SendCastFailedWithoutPrepare(displaced);
                         }
 
-                        // Don't send SpellPrepare here — hide the queue from the client.
-                        // SpellPrepare will be sent at SPELL_GO time (Client/SpellHandler.cs
-                        // line 734-739) so button, animation, and GCD sweep all start together.
+                        // Send SpellPrepare immediately on hold-accept so the client has a
+                        // ClientCastID → ServerCastID mapping to match any future
+                        // SMSG_SPELL_FAILURE for this cast. Mirrors the off-GCD path below —
+                        // see that comment for the underlying contract. Without this, server
+                        // rejections (LoS / range / cooldown race) for the eventually-fired
+                        // held cast leave the action button permanently lit because
+                        // SpellFailure has no SpellPrepare to match against. Symptom is most
+                        // prevalent on low-ping (~50ms) clients in populated zones, where
+                        // the proxy's hold delay + SMSG backlog from other casters extends
+                        // the time the client spends in queued-press state.
+                        SpellPrepare prepare = new SpellPrepare();
+                        prepare.ClientCastID = castRequest.ClientGUID;
+                        prepare.ServerCastID = castRequest.ServerGUID;
+                        SendPacket(prepare);
+                        castRequest.HasSentPrepare = true;
                         return;
                     }
                     // Else: GCD expired between IsGcdHoldActive() and TryHoldCastDuringGcd() —
@@ -432,7 +455,15 @@ public partial class WorldSocket
                     });
                     if (displaced != null)
                         SendCastFailedWithoutPrepare(displaced);
-                    // Don't send SpellPrepare for the NEW hold — hide the queue from the client.
+                    // Send SpellPrepare on hold-accept so the client has a SpellPrepare to
+                    // match against any future SMSG_SPELL_FAILURE for this cast. Same
+                    // reasoning as the cast-time and GCD hold paths above — see the off-GCD
+                    // comment below (~line 460) for the underlying contract.
+                    SpellPrepare prepare = new SpellPrepare();
+                    prepare.ClientCastID = castRequest.ClientGUID;
+                    prepare.ServerCastID = castRequest.ServerGUID;
+                    SendPacket(prepare);
+                    castRequest.HasSentPrepare = true;
                     return;
                 }
 
