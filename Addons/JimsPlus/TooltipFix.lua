@@ -478,17 +478,23 @@ local function ApplyTooltipFeatures(tooltip, link)
         else
             subclassNames = SUBCLASS_TOOLTIP_NAMES.weapon[subClassId]
         end
-        -- Build candidate list: subclass display names + the equip-loc
-        -- display string (e.g. "Two-Hand" for INVTYPE_2HWEAPON, "Feet"
-        -- for INVTYPE_FEET) so the slot/hand line on the left recolors
-        -- alongside the subclass line on the right.
+        -- Build candidate list: subclass display names ONLY. We deliberately
+        -- skip the equip-loc string (e.g. "Two-Hand", "Finger", "Waist",
+        -- "Main Hand") — slot/hand lines have no proficiency relationship:
+        -- everyone can wear a ring, everyone can equip an offhand slot, and
+        -- one-hand weapons are the same hand-type regardless of weapon
+        -- subclass. The "you can't use this" signal lives entirely on the
+        -- subclass line (Sword/Mace/Leather/Plate/etc.), so that's the only
+        -- line we recolor.
+        --
+        -- Bonus side-effect: items whose subclass has no SUBCLASS_TOOLTIP_NAMES
+        -- entry (Fishing Poles subClass 20, Miscellaneous subClass 14 for
+        -- Mining Picks / Blacksmith Hammers / similar profession tools) now
+        -- get an empty candidate list and no recolor — which is the desired
+        -- behavior since those items have no proficiency requirement.
         local candidateNames = {}
         if subclassNames then
             for _, n in ipairs(subclassNames) do table.insert(candidateNames, n) end
-        end
-        local equipLocStr = equipLoc and _G[equipLoc]
-        if equipLocStr and equipLocStr ~= "" then
-            table.insert(candidateNames, equipLocStr)
         end
         if #candidateNames > 0 then
             -- Tooltip type-line color reflects ONLY proficiency, not level.
