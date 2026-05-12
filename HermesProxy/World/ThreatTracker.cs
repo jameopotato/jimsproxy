@@ -506,7 +506,8 @@ public sealed class ThreatTracker
 
         double abilityMultiplier = ThreatModules.GetDamageMultiplier(spellId);
         double passiveModifier = GetPassiveModifier(attacker);
-        double scaledThreat = rawDamage * abilityMultiplier * passiveModifier;
+        double talentMultiplier = GetSpellTalentMultiplier(attacker, spellId);
+        double scaledThreat = rawDamage * abilityMultiplier * passiveModifier * talentMultiplier;
         AddThreat(victim, attacker, scaledThreat);
 
         if (_threatLists.TryGetValue(victim, out var list) &&
@@ -566,7 +567,10 @@ public sealed class ThreatTracker
         }
 
         double passiveModifier = GetPassiveModifier(healer);
-        double totalThreat = effectiveHeal * 0.5 * passiveModifier;
+        // School-gated talent on heals: paladin Imp Righteous Fury boosts holy
+        // heal threat when RF aura is active. Other classes' heals are no-op.
+        double talentMultiplier = GetSpellTalentMultiplier(healer, spellId);
+        double totalThreat = effectiveHeal * 0.5 * passiveModifier * talentMultiplier;
         double threatPerMob = totalThreat / mobsThreateningTarget.Count;
 
         foreach (var mob in mobsThreateningTarget)
@@ -710,10 +714,86 @@ public sealed class ThreatTracker
     // Talent rank spell ID arrays — ordered rank 1 → rank N. Matched against
     // CurrentPlayerKnownSpells ∪ SynthesizedTalentRanks via GetTalentRank.
     // Source: 1.14.2 Talent.dbc cross-referenced against SpellName.dbc.
-    // (Defiance talent_id 144, Feral Instinct 799, Silent Resolve 352.)
-    private static readonly uint[] DefianceRanks       = { 12303, 12788, 12789, 12791, 12792 };
-    private static readonly uint[] FeralInstinctRanks  = { 16947, 16948, 16949, 16950, 16951 };
-    private static readonly uint[] SilentResolveRanks  = { 14523, 14784, 14785, 14786, 14787 };
+    //
+    // Flat-passive layer (apply on GetPassiveModifier):
+    //   Defiance        (Warrior Protection, talent_id 144)
+    //   Feral Instinct  (Druid Feral Combat, talent_id 799)
+    //   Silent Resolve  (Priest Discipline,  talent_id 352)
+    //
+    // School-gated layer (apply on GetSpellTalentMultiplier):
+    //   Shadow Affinity        (Priest Shadow,         talent_id 461)
+    //   Druid Subtlety         (Druid Restoration,     talent_id 841)
+    //   Improved Righteous Fury (Paladin Holy,         talent_id 1501)
+    //                                                   gated on RF aura 25780 active
+    private static readonly uint[] DefianceRanks            = { 12303, 12788, 12789, 12791, 12792 };
+    private static readonly uint[] FeralInstinctRanks       = { 16947, 16948, 16949, 16950, 16951 };
+    private static readonly uint[] SilentResolveRanks       = { 14523, 14784, 14785, 14786, 14787 };
+    private static readonly uint[] ShadowAffinityRanks      = { 15272, 15318, 15320 };
+    private static readonly uint[] DruidSubtletyRanks       = { 17118, 17119, 17120, 17121, 17122 };
+    private static readonly uint[] ImpRighteousFuryRanks    = { 20468, 20469, 20470 };
+
+    private const uint RighteousFuryAura = 25780;
+
+    // School-affected spell-ID sets, transcribed from LibThreatClassic2's
+    // ClassModules/Classic/{Priest,Druid,Paladin}.lua. Each set is the canonical
+    // list of vanilla spells the corresponding talent's multiplier applies to.
+    //
+    // Curated lists rather than school lookup because the proxy doesn't carry
+    // SpellMisc.SchoolMask in a queryable form; LTC2 also curates because
+    // school-based gating alone would miss heal/damage variants that share a
+    // spell family but differ in school (e.g. paladin Hammer of Wrath is Holy
+    // damage; Hammer of Justice is no-school CC — both Hammer-named).
+
+    private static readonly HashSet<uint> ShadowAffinitySpells = new()
+    {
+        // Shadow Word: Pain (R1..8)
+        589, 594, 970, 992, 2767, 10892, 10893, 10894,
+        // Mind Blast (R1..9)
+        8092, 8102, 8103, 8104, 8105, 8106, 10945, 10946, 10947,
+        // Mind Flay (R1..6)
+        15407, 17311, 17312, 17313, 17314, 18807,
+        // Devouring Plague (R1..5)
+        2944, 19276, 19277, 19278, 19279,
+        // Vampiric Embrace (passive damage→heal — counted as shadow threat)
+        15286,
+    };
+
+    private static readonly HashSet<uint> DruidSubtletySpells = new()
+    {
+        // Moonfire (R1..10)
+        8921, 8924, 8925, 8926, 8927, 8928, 8929, 9833, 9834, 9835,
+        // Starfire (R1..7)
+        2912, 8949, 8950, 8951, 9875, 9876, 25298,
+        // Wrath (R1..6)
+        5176, 5177, 5178, 6780, 8905, 9912,
+        // Hurricane (R1..3)
+        16914, 17401, 17402,
+    };
+
+    // Spells the Righteous Fury (+ Imp RF) multiplier applies to. Holy damage
+    // and Holy heals — paladin's RF aura boosts threat for both. List taken
+    // from LTC2 Paladin.lua's HolyHealIDs + holyShieldIDs + paladin damage
+    // catalogue. Heal-side application is gated to RF being active (no RF =
+    // baseline 1.0); damage-side is gated likewise.
+    private static readonly HashSet<uint> PaladinRighteousFurySpells = new()
+    {
+        // Consecration (R1..6)
+        26573, 20116, 20922, 20923, 20924, 27983,
+        // Holy Shield damage proc (R1..3) — also has its own 1.2x abilityMul
+        20925, 20927, 20928,
+        // Holy Shock damage (R1..3)
+        25912, 25911, 25902,
+        // Holy Shock heal (R1..3)
+        25903, 25913, 25914,
+        // Hammer of Wrath (R1..3)
+        24239, 24274, 24275,
+        // Holy Light (R1..9)
+        635, 639, 647, 1026, 1042, 3472, 10328, 10329, 25292,
+        // Flash of Light (R1..6)
+        19750, 19939, 19940, 19941, 19942, 19943,
+        // Lay on Hands (R1..3)
+        633, 2800, 10310,
+    };
 
     // Returns the highest rank (1..N) of a talent the player has, or 0 if untaken.
     // Walks the rank ids in ascending order; the last index that matches the
@@ -775,6 +855,76 @@ public sealed class ThreatTracker
         }
 
         return modifier;
+    }
+
+    // Per-spell talent multiplier for school-gated talents. Reads the local
+    // player's known-spells set to detect ranks; non-local-player attackers
+    // always get 1.0 since we can't see their talents. The aura-gated case
+    // (Paladin RF active) is checked here too.
+    //
+    // Applies on top of GetPassiveModifier — so a Paladin tank with 3/3 IRF
+    // and RF active gets the flat passive (1.0 currently — paladins have no
+    // flat-passive talent in the LTC2 model) × IRF multiplier of 1.9 for any
+    // PaladinRighteousFurySpells.Contains(spellId) damage/heal event.
+    public double GetSpellTalentMultiplier(WowGuid128 attacker, int spellId)
+    {
+        if (spellId <= 0) return 1.0;
+        if (attacker != _session.GameState.CurrentPlayerGuid) return 1.0;
+        uint sid = (uint)spellId;
+        var playerClass = (Class)_session.GameState.CurrentPlayerClass;
+        switch (playerClass)
+        {
+            case Class.Priest:
+                if (ShadowAffinitySpells.Contains(sid))
+                {
+                    int rank = GetTalentRank(ShadowAffinityRanks);
+                    // LTC2 explicit array: [0.92, 0.84, 0.75] — rank 3 is NOT
+                    // 1-3*0.08=0.76 (the lib hard-codes the 0.75 for a slightly
+                    // steeper drop at 3/3).
+                    return rank switch { 1 => 0.92, 2 => 0.84, 3 => 0.75, _ => 1.0 };
+                }
+                return 1.0;
+            case Class.Druid:
+                if (DruidSubtletySpells.Contains(sid))
+                {
+                    int rank = GetTalentRank(DruidSubtletyRanks);
+                    if (rank > 0)
+                        return 1.0 - (0.04 * rank);
+                }
+                return 1.0;
+            case Class.Paladin:
+                if (PaladinRighteousFurySpells.Contains(sid) && IsRighteousFuryActive())
+                {
+                    int rank = GetTalentRank(ImpRighteousFuryRanks);
+                    // LTC2 Paladin.lua: righteousFuryMod = 1 + 0.6 * (1 + irfRanks[rank+1])
+                    // irfRanks = {0, 0.16, 0.33, 0.5}.
+                    double irfBonus = rank switch { 1 => 0.16, 2 => 0.33, 3 => 0.50, _ => 0.0 };
+                    return 1.0 + 0.6 * (1.0 + irfBonus);
+                }
+                return 1.0;
+            default:
+                return 1.0;
+        }
+    }
+
+    // Scans the player's aura list for Righteous Fury (25780). Used to gate
+    // Improved Righteous Fury multiplication in GetSpellTalentMultiplier.
+    // Same scan shape as ScanStanceFormAura but with a single target spell id.
+    private bool IsRighteousFuryActive()
+    {
+        var fields = _session.GameState.GetCachedObjectFieldsLegacy(_session.GameState.CurrentPlayerGuid);
+        if (fields == null) return false;
+        int unitFieldAura = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
+        if (unitFieldAura < 0) return false;
+        int slots = LegacyVersion.GetAuraSlotsCount();
+        for (int i = 0; i < slots; i++)
+        {
+            if (!fields.TryGetValue(unitFieldAura + i, out var field))
+                continue;
+            if (field.UInt32Value == RighteousFuryAura)
+                return true;
+        }
+        return false;
     }
 
     // Computes the talent-layered multiplier to apply on top of the class+stance
