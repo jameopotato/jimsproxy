@@ -656,37 +656,42 @@ public sealed class ThreatTracker
     }
 
     // -----------------------------------------------------------------------
-    // Phase 5 — passive threat multipliers from class + stance / form.
+    // Phase 6 — passive threat multipliers from class + stance / form + talents.
     //
-    // Vanilla LibThreatClassic2 reads GetShapeshiftForm() and class talents to
-    // compute a `passiveThreatModifiers` value applied to every flat-add threat
-    // operation. We can't introspect talents from the proxy side (they live in
-    // the client), so we ship the no-talent baselines:
+    // Mirrors LibThreatClassic2's per-class `passiveThreatModifiers` model. The
+    // proxy reads the player's known-spells set (now reliable thanks to the
+    // talent-rank injection fix: CurrentPlayerKnownSpells holds the highest
+    // rank the server has granted, SynthesizedTalentRanks holds proxy-injected
+    // predecessor ranks). Highest rank of each talent is resolved by walking
+    // the rank IDs from low to high and remembering the highest match.
     //
+    // Baselines (apply unconditionally):
     //   Warrior:
-    //     Defensive Stance (71)   → 1.30  (no Defiance)
+    //     Defensive Stance (71)   → 1.30  ×  (1 + 0.03 × Defiance rank)
     //     Berserker Stance (2458) → 0.80
     //     Battle Stance (2457) /
     //       no stance             → 0.80  (matches the lib's quirk; lib treats
     //                                      non-Defensive warriors as 0.8, see
     //                                      ClassModules/Classic/Warrior.lua)
-    //
     //   Druid:
     //     Bear / Dire Bear Form
-    //       (5487 / 9634)         → 1.30  (no Feral Instinct)
+    //       (5487 / 9634)         → 1.30  ×  (1 + 0.03 × Feral Instinct rank)
     //     Cat (768) /
     //       Travel (783) /
     //       Aquatic (1066)        → 0.71
     //     Caster                  → 1.00
-    //
-    //   Rogue:                    → 0.71  (always; passive at ClassEnable)
+    //   Rogue:                    → 0.71  (always; the lib's 0.71 IS the rogue
+    //                                      passive — vanilla rogue Subtlety
+    //                                      tab has no flat-threat talent on
+    //                                      top of this)
+    //   Priest                    → 1.00  ×  (1 - 0.04 × Silent Resolve rank)
     //   All other classes:        → 1.00
     //
-    // Future Phase 6+ will layer talent reads (Defiance, Feral Instinct,
-    // Subtlety, Shadow Affinity, Improved PWS) on top — those need the proxy
-    // to start mirroring talent state from CMSG_LEARN_TALENT and
-    // SMSG_INITIALIZE_FACTIONS-era talent data. Until then, these baselines
-    // run ~3-9% under the actual server-side numbers for talented characters.
+    // Talent rank IDs sourced from CSV/TalentSpellRanks.csv (built from the
+    // 1.14.2 Talent.dbc) — same data the talent-rank injection fix relies on.
+    // Per-rank values pulled from LibThreatClassic2's ClassModules/Classic/
+    // {Warrior,Druid,Priest}.lua so what we compute matches what existing
+    // threat addons compute server-side from GetTalentInfo.
 
     // Stance / form spell IDs we watch on the player's aura table. HashSet so
     // the per-event scan is O(slots) with O(1) per-slot membership check.
@@ -702,6 +707,34 @@ public sealed class ThreatTracker
         1066,  // Druid — Aquatic Form
     };
 
+    // Talent rank spell ID arrays — ordered rank 1 → rank N. Matched against
+    // CurrentPlayerKnownSpells ∪ SynthesizedTalentRanks via GetTalentRank.
+    // Source: 1.14.2 Talent.dbc cross-referenced against SpellName.dbc.
+    // (Defiance talent_id 144, Feral Instinct 799, Silent Resolve 352.)
+    private static readonly uint[] DefianceRanks       = { 12303, 12788, 12789, 12791, 12792 };
+    private static readonly uint[] FeralInstinctRanks  = { 16947, 16948, 16949, 16950, 16951 };
+    private static readonly uint[] SilentResolveRanks  = { 14523, 14784, 14785, 14786, 14787 };
+
+    // Returns the highest rank (1..N) of a talent the player has, or 0 if untaken.
+    // Walks the rank ids in ascending order; the last index that matches the
+    // player's known-spells set is the talent's current rank. Reads both the
+    // real server-tracked CurrentPlayerKnownSpells and the proxy-injected
+    // SynthesizedTalentRanks — without the latter, only the highest rank would
+    // be visible (vanilla LearnTalent RemoveSpell's predecessors).
+    private int GetTalentRank(uint[] rankIds)
+    {
+        var known = _session.GameState.CurrentPlayerKnownSpells;
+        var synth = _session.GameState.SynthesizedTalentRanks;
+        int highest = 0;
+        for (int i = 0; i < rankIds.Length; i++)
+        {
+            uint sid = rankIds[i];
+            if (known.Contains(sid) || synth.Contains(sid))
+                highest = i + 1;
+        }
+        return highest;
+    }
+
     // Returns the passive multiplier to apply to threater's flat-add threat.
     // Phase 6.1 generalised to any group threater: class via party-list
     // lookup (or local-player class for self), stance / form via the
@@ -716,6 +749,14 @@ public sealed class ThreatTracker
         var threaterClass = GetThreaterClass(threater);
         uint formAura = ScanStanceFormAura(threater);
         double modifier = ComputePassiveModifier(threaterClass, formAura);
+
+        // Talent layer only applies to the local player — the proxy can read its
+        // own known-spells set but has no view into group members' talents.
+        // Without this gate, group members would carry the local player's talent
+        // multiplier (wrong), since the GetTalentMultiplier helper reads our
+        // session's CurrentPlayerKnownSpells / SynthesizedTalentRanks.
+        if (threater == _session.GameState.CurrentPlayerGuid)
+            modifier *= GetTalentMultiplier(threaterClass, formAura);
 
         _passiveCache.TryGetValue(threater, out var cached);
         if (cached.stanceForm != formAura || cached.modifier != modifier)
@@ -734,6 +775,51 @@ public sealed class ThreatTracker
         }
 
         return modifier;
+    }
+
+    // Computes the talent-layered multiplier to apply on top of the class+stance
+    // baseline. Returns 1.0 for any class without known threat-talents (Hunter,
+    // Mage, Shaman, Warlock, Paladin pre-Holy-spec — Paladin Imp Righteous Fury
+    // is school-gated and lives in a separate code path).
+    //
+    // Each modifier follows the per-rank formula from LibThreatClassic2's
+    // matching ClassModule. Talents that gate on a specific stance/form return
+    // 1.0 outside the gating condition so respecs and form switches take effect
+    // on the next GetPassiveModifier call without flushing any state.
+    private double GetTalentMultiplier(Class playerClass, uint formAura)
+    {
+        switch (playerClass)
+        {
+            case Class.Warrior:
+                // Defiance: +0.03 / rank, Defensive Stance only.
+                if (formAura == 71)
+                {
+                    int rank = GetTalentRank(DefianceRanks);
+                    if (rank > 0)
+                        return 1.0 + (0.03 * rank);
+                }
+                return 1.0;
+
+            case Class.Druid:
+                // Feral Instinct: +0.03 / rank, Bear / Dire Bear only.
+                if (formAura == 5487 || formAura == 9634)
+                {
+                    int rank = GetTalentRank(FeralInstinctRanks);
+                    if (rank > 0)
+                        return 1.0 + (0.03 * rank);
+                }
+                return 1.0;
+
+            case Class.Priest:
+                // Silent Resolve: −0.04 / rank, applies to all damage and heals.
+                int srRank = GetTalentRank(SilentResolveRanks);
+                if (srRank > 0)
+                    return 1.0 - (0.04 * srRank);
+                return 1.0;
+
+            default:
+                return 1.0;
+        }
     }
 
     private Class GetThreaterClass(WowGuid128 guid)
