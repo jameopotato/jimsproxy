@@ -1642,6 +1642,57 @@ public partial class WorldClient
             }
 
             var missCount = packet.ReadUInt8();
+            // Vanilla TC-1.12 forks (Kronos) emit an extra uint8 between the hit
+            // section and targetFlags that the proxy reads as missCount. Treating
+            // it as a real miss target sends the parser into a bogus 8-byte GUID +
+            // missType read, shredding alignment and overrunning the Vector3 in
+            // target data — which #180 catches but then drains the player's active
+            // cast queue, making their cast bar vanish mid-cast.
+            // The phantom byte varies (0x01, 0x03 observed). Detect it by either:
+            //  (a) the would-be missType peek lands on an invalid value (>Reflect=11), OR
+            //  (b) missCount demands more bytes than the packet can possibly hold —
+            //      a real server never claims more misses than data.
+            // Real misses (vmangos-style) have a valid missType and fit the packet.
+            // Gated to vanilla only: TBC+ uses uint32 targetFlags and a different trailer
+            // alignment, so the heuristic's invariants don't translate cleanly and could
+            // mask unrelated parse drift instead of throwing.
+            if (missCount > 0 && LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+            {
+                bool isPhantom = false;
+                string phantomReason = "";
+
+                if (missCount * 9 > packet.BytesRemaining)
+                {
+                    isPhantom = true;
+                    phantomReason = "overrun";
+                }
+                else
+                {
+                    packet.Skip(8); // past would-be miss GUID
+                    byte peekMissType = packet.ReadUInt8();
+                    packet.Skip(-9); // rewind to start of miss section
+                    if (peekMissType > (byte)SpellMissInfo.Reflect)
+                    {
+                        isPhantom = true;
+                        phantomReason = $"invalid_misstype_{peekMissType}";
+                    }
+                }
+
+                if (isPhantom)
+                {
+                    Log.Event("spell.spell_go.phantom_misscount_skipped", new
+                    {
+                        spell_id = dbdata.SpellID,
+                        misscount_byte = missCount,
+                        reason = phantomReason,
+                        cast_flags = dbdata.CastFlags,
+                        hit_count = hitCount,
+                        bytes_remaining = packet.BytesRemaining,
+                    });
+                    missCount = 0;
+                }
+            }
+
             // Same bounds check for miss-target loop. Floor 9 bytes per entry (GUID +
             // missType byte); reflect adds an optional byte, so 9 * missCount is the
             // minimum. Underestimating is fine — individual reads still succeed up to
