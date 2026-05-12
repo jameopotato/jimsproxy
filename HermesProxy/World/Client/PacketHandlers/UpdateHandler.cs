@@ -3970,7 +3970,18 @@ public partial class WorldClient
                     cms = GameData.GetDisplayInfo((uint)displayId).DisplayScale;
 
                 bool isWarlockPet = WarlockPetDisplayIds.Contains(displayId);
-                float k = isWarlockPet ? K_warlock : K_hunter;
+                // Bat-family hunter pets render ~2× oversized at K=1.5 — same symptom
+                // and same K=0.75 correction as warlock pets. Detection by ModelId so
+                // we cover every DisplayID using the bat M2 (25 in our CSV today, more
+                // if future content adds bats reusing the model). ModelId 411 was
+                // identified via Ressan the Needler (DisplayId 9750, ModelId 411,
+                // ModelScale 1.0) — Wowhead-confirmed bat, user-reported 2× oversize
+                // in-world 2026-05-11.
+                uint modelIdForFamilyDetect = (displayId > 0)
+                    ? GameData.GetDisplayInfo((uint)displayId).ModelId
+                    : 0;
+                bool isBatPet = modelIdForFamilyDetect == 411;
+                float k = (isWarlockPet || isBatPet) ? K_warlock : K_hunter;
 
                 // Skip normalization if CMS data is missing/invalid — fall back to a flat
                 // K multiply so the pet still gets a size bump rather than passing through
@@ -3987,7 +3998,7 @@ public partial class WorldClient
                     display_id = displayId,
                     creature_model_scale = cms,
                     k = k,
-                    family = isWarlockPet ? "warlock" : "hunter",
+                    family = isWarlockPet ? "warlock" : (isBatPet ? "hunter-bat" : "hunter"),
                     raw_scale = rawScale,
                     emitted_scale = emit,
                     matched_via = (currentPetGuid != default && guid == currentPetGuid) ? "current_pet_guid" : "summoned_by",
