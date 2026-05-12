@@ -4031,6 +4031,22 @@ public partial class WorldClient
                 {
                     Session.GameState.PetScaleResolvePending[guid] = new PendingPetScale(
                         guid, (uint)petEntry, (uint)displayId, rawScale, cms, isWarlockPet);
+
+                    // The modern client caches creature templates in its WDB
+                    // folder and skips CMSG_QUERY_CREATURE on subsequent sessions —
+                    // which means SMSG_QUERY_CREATURE_RESPONSE never reaches the
+                    // proxy and PetScaleResolvePending never drains. Issue our
+                    // OWN CMSG_QUERY_CREATURE to the legacy server (the response
+                    // path is the same handler — cache + drain pending).
+                    // Tracked via PetScaleProxyQueriedEntries to avoid spamming
+                    // the server with repeated queries for the same entry.
+                    if (Session.GameState.PetScaleProxyQueriedEntries.Add((uint)petEntry))
+                    {
+                        WorldPacket queryPacket = new WorldPacket(Opcode.CMSG_QUERY_CREATURE);
+                        queryPacket.WriteUInt32((uint)petEntry);
+                        queryPacket.WriteGuid(new WowGuid64(HighGuidTypeLegacy.Creature, (uint)petEntry, 1));
+                        SendPacketToServer(queryPacket);
+                    }
                 }
 
                 // Skip normalization if CMS data is missing/invalid — fall back to a flat

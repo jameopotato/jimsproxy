@@ -163,6 +163,10 @@ public sealed class GameSessionData
     // when the matching template arrives — entries with matching petEntry get a
     // synthesized SCALE_X re-emit with the family-correct K.
     public Dictionary<WowGuid128, PendingPetScale> PetScaleResolvePending = new();
+    // Tracks creature entries the proxy has issued its own CMSG_QUERY_CREATURE
+    // for — guards against spamming repeated queries when the modern client's
+    // WDB cache satisfied a creature query and the proxy never saw the response.
+    public HashSet<uint> PetScaleProxyQueriedEntries = new();
     public string LeftChannelName = "";
     public bool IsPassingOnLoot;
     public int GroupUpdateCounter;
