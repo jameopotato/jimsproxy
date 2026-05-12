@@ -115,6 +115,17 @@ internal static class ThreatModules
     // LibThreatClassic2 ClassModules/Classic/*.lua.
     // -----------------------------------------------------------------------
 
+    // Priest Power Word: Shield — cast-time flat threat per rank. Values from
+    // LTC2 ClassModules/Classic/Priest.lua threatAmounts["pws"]. The threat
+    // tracker layers Imp PW:S (talent rank-based 1.05 - 1.15 multiplier) and
+    // Silent Resolve (via passive modifier) on top.
+    private static readonly Dictionary<int, double> PowerWordShieldAmount = new()
+    {
+        [17]    = 22,    [592]   = 44,    [600]   = 79,    [3747]  = 117,
+        [6065]  = 150.5, [6066]  = 190.5, [10898] = 242,   [10899] = 302.5,
+        [10900] = 381.5, [10901] = 471,
+    };
+
     // Hunter
     private static readonly Dictionary<int, double> DistractingShotAmount = new()
     {
@@ -501,6 +512,25 @@ internal static class ThreatModules
 
         var vanish = PlayerZeroAllMobs("vanish");
         foreach (var id in new[] { 1856, 1857 }) map[id] = vanish;
+
+        // Priest Power Word: Shield — fixed per-rank cast threat × Imp PW:S
+        // multiplier, distributed across mobs in combat with the shield target.
+        // Per-rank amounts mirror LTC2 ClassModules/Classic/Priest.lua's
+        // threatAmounts["pws"] table; Imp PW:S layer is read from the player's
+        // known-spells set via ThreatTracker.GetImpPwsMultiplier (Talent.dbc
+        // ranks 14748 / 14768 / 14769, formula 1 + 0.05 × rank).
+        var pws = (ThreatHandler)((tracker, session, spellId, caster, hitTargets) =>
+        {
+            if (caster != session.GameState.CurrentPlayerGuid) return;
+            if (!PowerWordShieldAmount.TryGetValue(spellId, out double baseAmount)) return;
+            // PW:S targets a single recipient (the shield buff target). Use the
+            // first hit target as the shield recipient — same convention as the
+            // other single-target handlers. Threat distributes to mobs in combat
+            // with that recipient inside OnPowerWordShield.
+            var shieldTarget = hitTargets.Count > 0 ? hitTargets[0] : caster;
+            tracker.OnPowerWordShield(caster, shieldTarget, spellId, baseAmount);
+        });
+        foreach (var id in PowerWordShieldAmount.Keys) map[id] = pws;
 
         // Paladin
         map[4987] = PlayerAddToAllMobs("cleanse", 40);

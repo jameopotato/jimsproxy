@@ -41,6 +41,7 @@ public class TalentThreatModifierTests
     private static readonly uint[] ShadowAffinityRanks   = { 15272, 15318, 15320 };
     private static readonly uint[] DruidSubtletyRanks    = { 17118, 17119, 17120, 17121, 17122 };
     private static readonly uint[] ImpRighteousFuryRanks = { 20468, 20469, 20470 };
+    private static readonly uint[] ImpPwsRanks           = { 14748, 14768, 14769 };
 
     // === Rank detection: highest known rank wins ===
 
@@ -283,6 +284,43 @@ public class TalentThreatModifierTests
     public void ImpRighteousFuryRanks_AreCanonical()
     {
         Assert.Equal(new uint[] { 20468, 20469, 20470 }, ImpRighteousFuryRanks);
+    }
+
+    // === Imp PW:S: Priest, +0.05/rank, applies to PW:S cast threat ===
+
+    [Theory]
+    [InlineData(0, 1.00)]
+    [InlineData(1, 1.05)]
+    [InlineData(2, 1.10)]
+    [InlineData(3, 1.15)]
+    public void ImpPws_PerRank_Multiplier(int rank, double expected)
+    {
+        double mod = rank > 0 ? 1.0 + (0.05 * rank) : 1.0;
+        Assert.Equal(expected, mod, precision: 4);
+    }
+
+    [Fact]
+    public void ImpPwsRanks_AreCanonical()
+    {
+        Assert.Equal(new uint[] { 14748, 14768, 14769 }, ImpPwsRanks);
+    }
+
+    [Fact]
+    public void PowerWordShieldAmounts_MatchLtcTable()
+    {
+        // LTC2 ClassModules/Classic/Priest.lua threatAmounts["pws"] — copied
+        // verbatim. Pinned here so a future refresh that reshuffles values is
+        // caught immediately.
+        var pwsTable = new Dictionary<uint, double>
+        {
+            [17]    = 22,    [592]   = 44,    [600]   = 79,    [3747]  = 117,
+            [6065]  = 150.5, [6066]  = 190.5, [10898] = 242,   [10899] = 302.5,
+            [10900] = 381.5, [10901] = 471,
+        };
+        Assert.Equal(10, pwsTable.Count);
+        Assert.Equal(22,    pwsTable[17]);     // R1
+        Assert.Equal(471,   pwsTable[10901]);  // R10
+        Assert.Equal(150.5, pwsTable[6065]);   // R5 (half-point amount preserved)
     }
 
     [Fact]

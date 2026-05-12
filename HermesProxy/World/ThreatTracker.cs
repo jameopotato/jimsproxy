@@ -504,6 +504,7 @@ public sealed class ThreatTracker
         }
         if (victim == default) return;
 
+        SnapshotTalentStateIfChanged();
         double abilityMultiplier = ThreatModules.GetDamageMultiplier(spellId);
         double passiveModifier = GetPassiveModifier(attacker);
         double talentMultiplier = GetSpellTalentMultiplier(attacker, spellId);
@@ -522,6 +523,7 @@ public sealed class ThreatTracker
                 damage = (long)rawDamage,
                 ability_mult = abilityMultiplier,
                 passive_mod = passiveModifier,
+                talent_mult = talentMultiplier,
                 threat_added = (long)scaledThreat,
                 new_total = (long)newTotal,
                 threater_count = list.Count,
@@ -566,6 +568,7 @@ public sealed class ThreatTracker
             return;
         }
 
+        SnapshotTalentStateIfChanged();
         double passiveModifier = GetPassiveModifier(healer);
         // School-gated talent on heals: paladin Imp Righteous Fury boosts holy
         // heal threat when RF aura is active. Other classes' heals are no-op.
@@ -583,6 +586,7 @@ public sealed class ThreatTracker
             spell_id = spellId,
             effective_heal = (long)effectiveHeal,
             passive_mod = passiveModifier,
+            talent_mult = talentMultiplier,
             mobs_split = mobsThreateningTarget.Count,
             threat_per_mob = (long)threatPerMob,
             total_threat = (long)totalThreat,
@@ -731,6 +735,7 @@ public sealed class ThreatTracker
     private static readonly uint[] ShadowAffinityRanks      = { 15272, 15318, 15320 };
     private static readonly uint[] DruidSubtletyRanks       = { 17118, 17119, 17120, 17121, 17122 };
     private static readonly uint[] ImpRighteousFuryRanks    = { 20468, 20469, 20470 };
+    private static readonly uint[] ImpPwsRanks              = { 14748, 14768, 14769 };
 
     private const uint RighteousFuryAura = 25780;
 
@@ -813,6 +818,106 @@ public sealed class ThreatTracker
                 highest = i + 1;
         }
         return highest;
+    }
+
+    // Cached snapshot of detected talent ranks so the diagnostic event below
+    // only fires when the rank set actually changes (login, learn, respec).
+    // Initialized to all -1 sentinels so the first call after construction
+    // always emits a baseline snapshot for tester observability.
+    private (int defiance, int feralInstinct, int silentResolve,
+             int shadowAffinity, int druidSubtlety, int impRighteousFury,
+             int impPws) _lastTalentSnapshot = (-1, -1, -1, -1, -1, -1, -1);
+
+    // Emits a `threat.talent_snapshot` JSONL event whenever the detected
+    // talent-rank set differs from the last observation. Lets a solo tester
+    // run the proxy, log in on any character, attack any mob once, and grep
+    // the bundle for the snapshot line to confirm the talent injection +
+    // detection pipeline is working — even for characters that are too low
+    // level to have any of these talents (all ranks would log as 0).
+    private void SnapshotTalentStateIfChanged()
+    {
+        var playerClass = (Class)_session.GameState.CurrentPlayerClass;
+        int defiance       = playerClass == Class.Warrior ? GetTalentRank(DefianceRanks)         : 0;
+        int feralInstinct  = playerClass == Class.Druid   ? GetTalentRank(FeralInstinctRanks)    : 0;
+        int silentResolve  = playerClass == Class.Priest  ? GetTalentRank(SilentResolveRanks)    : 0;
+        int shadowAffinity = playerClass == Class.Priest  ? GetTalentRank(ShadowAffinityRanks)   : 0;
+        int druidSubtlety  = playerClass == Class.Druid   ? GetTalentRank(DruidSubtletyRanks)    : 0;
+        int irf            = playerClass == Class.Paladin ? GetTalentRank(ImpRighteousFuryRanks) : 0;
+        int impPws         = playerClass == Class.Priest  ? GetTalentRank(ImpPwsRanks)           : 0;
+        var current = (defiance, feralInstinct, silentResolve, shadowAffinity, druidSubtlety, irf, impPws);
+        if (current == _lastTalentSnapshot)
+            return;
+        _lastTalentSnapshot = current;
+        Log.Event("threat.talent_snapshot", new
+        {
+            player_class = (byte)playerClass,
+            defiance_rank = defiance,
+            feral_instinct_rank = feralInstinct,
+            silent_resolve_rank = silentResolve,
+            shadow_affinity_rank = shadowAffinity,
+            druid_subtlety_rank = druidSubtlety,
+            imp_righteous_fury_rank = irf,
+            imp_pws_rank = impPws,
+            real_known_count = _session.GameState.CurrentPlayerKnownSpells.Count,
+            synthesized_count = _session.GameState.SynthesizedTalentRanks.Count,
+        });
+    }
+
+    // Returns the Imp PW:S multiplier (1.0 + 0.05 × rank). Called from the
+    // PW:S cast handler in ThreatModules. Public so the cast handler can
+    // pre-multiply the table amount before adding threat.
+    public double GetImpPwsMultiplier()
+    {
+        if (_session.GameState.CurrentPlayerClass != (byte)Class.Priest)
+            return 1.0;
+        int rank = GetTalentRank(ImpPwsRanks);
+        return rank > 0 ? 1.0 + (0.05 * rank) : 1.0;
+    }
+
+    // PW:S cast threat: fixed per-rank amount × Imp PWS × passive (Silent
+    // Resolve included via GetPassiveModifier) × distribution across all
+    // mobs in combat with the shield recipient. Same shape as OnHeal but
+    // uses the table amount instead of effective-heal × 0.5.
+    public void OnPowerWordShield(WowGuid128 caster, WowGuid128 shieldTarget, int spellId, double baseAmount)
+    {
+        if (baseAmount <= 0) return;
+        if (caster != _session.GameState.CurrentPlayerGuid) return;
+        if (shieldTarget == default) return;
+
+        List<WowGuid128>? mobsInCombat = null;
+        foreach (var (mob, list) in _threatLists)
+        {
+            if (list.ContainsKey(shieldTarget))
+            {
+                mobsInCombat ??= new List<WowGuid128>();
+                mobsInCombat.Add(mob);
+            }
+        }
+        if (mobsInCombat == null || mobsInCombat.Count == 0)
+            return;
+
+        SnapshotTalentStateIfChanged();
+        double passive = GetPassiveModifier(caster);
+        double impPwsMult = GetImpPwsMultiplier();
+        double totalThreat = baseAmount * impPwsMult * passive;
+        double threatPerMob = totalThreat / mobsInCombat.Count;
+
+        foreach (var mob in mobsInCombat)
+            AddThreat(mob, caster, threatPerMob);
+
+        Log.Event("threat.spell.power_word_shield", new
+        {
+            spell_id = spellId,
+            shield_target_low = shieldTarget.GetCounter(),
+            base_amount = baseAmount,
+            imp_pws_mult = impPwsMult,
+            passive_mod = passive,
+            mobs_split = mobsInCombat.Count,
+            threat_per_mob = (long)threatPerMob,
+            total_threat = (long)totalThreat,
+        });
+
+        EmitDirty();
     }
 
     // Returns the passive multiplier to apply to threater's flat-add threat.
