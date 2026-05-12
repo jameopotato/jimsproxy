@@ -796,10 +796,31 @@ public partial class WorldClient
             channel_count = channels.Count,
         });
 
+        // Skip first-login init (oldZoneId==0). The 1.14 modern client auto-joins
+        // default channels itself ~1.7s after login with its own zone-suffix
+        // strings (General/LocalDefense use the current zone name, Trade uses
+        // the literal "City"). Pre-empting with proxy JOINs races the client:
+        // server YouJoined arrives before the client has allocated a slot,
+        // gets orphaned, and the client's own JOIN then gets PlayerAlreadyMember.
+        // Net result: slot binds to no live channel — user sees echoes but
+        // can't send (greyed). Trade survives by accident because proxy used
+        // "Trade - <zone>" while client used "Trade - City" (two different
+        // server-side channels, no race on the client-driven one).
+        if (oldZoneId == 0) return;
+
         if (string.IsNullOrEmpty(newZoneName)) return;
 
         foreach (var channel in channels)
         {
+            // Skip OnlyInCities channels (Trade, GuildRecruitment, LFG). The
+            // modern client manages these as "<Name> - City" (literal) across
+            // all cities and never sends LEAVE/JOIN on zone changes. If the
+            // proxy LEAVEs/JOINs them as "<Name> - <ZoneName>", the server
+            // creates ad-hoc custom channels per zone and the matching
+            // YouJoined re-binds the modern client's slot to a stale name —
+            // slot greys out on subsequent zone transitions.
+            if ((channel.Flags & ChannelFlags.OnlyInCities) != 0) continue;
+
             string newName = channel.Name + " - " + newZoneName;
             if (!string.IsNullOrEmpty(oldZoneName))
             {
