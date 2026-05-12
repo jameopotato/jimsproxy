@@ -50,6 +50,13 @@ public static partial class GameData
     public static FrozenDictionary<uint, uint> Gems = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, CreatureDisplayInfo> CreatureDisplayInfos = FrozenDictionary<uint, CreatureDisplayInfo>.Empty;
     public static FrozenDictionary<uint, CreatureModelCollisionHeight> CreatureModelCollisionHeights = FrozenDictionary<uint, CreatureModelCollisionHeight>.Empty;
+    // JimsProxy (pet-scale-family-table): CreatureFamily.dbc carries Blizzard's
+    // per-family pet scale formula — MinScale at level 1, MaxScale at level 60,
+    // linear interpolation between. Used by the pet inverse-CMS bake-in in
+    // UpdateHandler so every hunter pet family scales to vanilla-correct size
+    // based on its actual level, replacing the empirical K_hunter / K_warlock
+    // constants for any family present in this table.
+    public static FrozenDictionary<int, CreatureFamilyData> CreatureFamilies = FrozenDictionary<int, CreatureFamilyData>.Empty;
     public static FrozenDictionary<uint, uint> TransportPeriods = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, string> AreaNames = FrozenDictionary<uint, string>.Empty;
     public static FrozenDictionary<string, uint> AreaIdsByName = FrozenDictionary<string, uint>.Empty;
@@ -752,6 +759,7 @@ public static partial class GameData
             LoadGems,
             LoadCreatureDisplayInfo,
             LoadCreatureModelCollisionHeights,
+            LoadCreatureFamilies,
             LoadTransports,
             LoadAreaNames,
             LoadRaceFaction,
@@ -1300,6 +1308,44 @@ public static partial class GameData
             dict.Add(modelId, new CreatureModelCollisionHeight(modelScale, collisionHeight, collisionHeightMounted));
         }
         CreatureModelCollisionHeights = dict.ToFrozenDictionary();
+    }
+
+    // JimsProxy (pet-scale-family-table): CreatureFamily.dbc dumped from
+    // wago.tools Classic Era 1.14.2.42597 (build matches the rest of our
+    // CSV refresh). Columns we care about:
+    //   ID, Name_lang, MinScale, MinScaleLevel, MaxScale, MaxScaleLevel
+    // The remaining columns (PetFoodMask, PetTalentType, IconFileID, SkillLine_*)
+    // are not used by the proxy and are ignored at load.
+    public static void LoadCreatureFamilies()
+    {
+        var path = Path.Combine("CSV", "CreatureFamily.csv");
+        using var reader = Sep.Reader(o => o with { HasHeader = true, Unescape = true }).FromFile(path);
+        var dict = new Dictionary<int, CreatureFamilyData>(32);
+
+        foreach (var row in reader)
+        {
+            int id = int.Parse(row[0].Span);
+            // row[1] = Name_lang (skipped — diagnostic only)
+            float minScale = float.Parse(row[2].Span);
+            int minScaleLevel = int.Parse(row[3].Span);
+            float maxScale = float.Parse(row[4].Span);
+            int maxScaleLevel = int.Parse(row[5].Span);
+            dict.Add(id, new CreatureFamilyData(id, minScale, minScaleLevel, maxScale, maxScaleLevel));
+        }
+        CreatureFamilies = dict.ToFrozenDictionary();
+    }
+
+    // Linear interpolation of MinScale → MaxScale across MinScaleLevel → MaxScaleLevel.
+    // Returns 1.0 if family is unknown or level falls outside the range bounds.
+    public static float GetPetFamilyScaleForLevel(int familyId, int level)
+    {
+        if (!CreatureFamilies.TryGetValue(familyId, out var f))
+            return 1.0f;
+        if (f.MaxScaleLevel <= f.MinScaleLevel)
+            return f.MinScale;
+        int clamped = Math.Clamp(level, f.MinScaleLevel, f.MaxScaleLevel);
+        float t = (float)(clamped - f.MinScaleLevel) / (f.MaxScaleLevel - f.MinScaleLevel);
+        return f.MinScale + (f.MaxScale - f.MinScale) * t;
     }
 
     public static void LoadTransports()
@@ -5025,6 +5071,7 @@ public static partial class GameData
 
     public record CreatureDisplayInfo(uint ModelId, float DisplayScale);
     public record CreatureModelCollisionHeight(float ModelScale, float Height, float MountHeight);
+    public record CreatureFamilyData(int Id, float MinScale, int MinScaleLevel, float MaxScale, int MaxScaleLevel);
 
     // Hotfix structures
     public sealed class AreaTrigger

@@ -3970,18 +3970,57 @@ public partial class WorldClient
                     cms = GameData.GetDisplayInfo((uint)displayId).DisplayScale;
 
                 bool isWarlockPet = WarlockPetDisplayIds.Contains(displayId);
-                // Bat-family hunter pets render ~2× oversized at K=1.5 — same symptom
-                // and same K=0.75 correction as warlock pets. Detection by ModelId so
-                // we cover every DisplayID using the bat M2 (25 in our CSV today, more
-                // if future content adds bats reusing the model). ModelId 411 was
-                // identified via Ressan the Needler (DisplayId 9750, ModelId 411,
-                // ModelScale 1.0) — Wowhead-confirmed bat, user-reported 2× oversize
-                // in-world 2026-05-11.
-                uint modelIdForFamilyDetect = (displayId > 0)
-                    ? GameData.GetDisplayInfo((uint)displayId).ModelId
-                    : 0;
-                bool isBatPet = modelIdForFamilyDetect == 411;
-                float k = (isWarlockPet || isBatPet) ? K_warlock : K_hunter;
+
+                // JimsProxy (pet-scale-family-table): primary K comes from the
+                // Classic 1.14 CreatureFamily DBC (MinScale/MaxScale lerped by
+                // pet level). This is Blizzard's per-family pet scale formula —
+                // bat 0.4→0.7, boar 0.6→1.0, wolf 0.7→1.0, cat 0.7→1.1, etc. —
+                // verified against our empirical bat (K=0.75 at high level vs
+                // family-table 0.7) and boar (K=1.0 at L60 vs family-table 1.0)
+                // tunings. Replaces the previous per-modelId switch which can
+                // be retired once all families are observed working from data.
+                //
+                // Family lookup chain:
+                //   1. Pet entry (creature_template ID) from cached UNIT_FIELD_ENTRY
+                //   2. GameData.GetCreatureTemplate(entry).Family — populated by
+                //      QueryHandler when the modern client queries the creature.
+                //   3. GameData.GetPetFamilyScaleForLevel(family, level) — lerps.
+                // Level comes from UNIT_FIELD_LEVEL (current update or cache).
+                //
+                // Fallbacks (in order):
+                //   - CreatureTemplate not yet cached → fall back to legacy K_hunter
+                //   - Family not in CreatureFamily table (rare, custom server) → K_hunter
+                //   - Warlock pet (DisplayId in hardcoded set) → CreatureFamily lookup
+                //     also covers Imp/Felhunter/Voidwalker/Succubus, so prefer it
+                int petLevel = 0;
+                int UNIT_FIELD_LEVEL_idx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_LEVEL);
+                if (UNIT_FIELD_LEVEL_idx >= 0
+                    && UNIT_FIELD_LEVEL_idx < updateMaskArray.Length
+                    && updateMaskArray[UNIT_FIELD_LEVEL_idx])
+                    petLevel = updates[UNIT_FIELD_LEVEL_idx].Int32Value;
+                else
+                    petLevel = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_LEVEL);
+
+                int petEntry = (int)guid.GetEntry();
+                int familyId = 0;
+                float? familyTableK = null;
+                string? familyName = null;
+                if (petEntry > 0)
+                {
+                    var template = GameData.GetCreatureTemplate((uint)petEntry);
+                    if (template != null)
+                    {
+                        familyId = template.Family;
+                        if (familyId > 0 && GameData.CreatureFamilies.TryGetValue(familyId, out var fam))
+                        {
+                            familyTableK = GameData.GetPetFamilyScaleForLevel(familyId, petLevel);
+                            familyName = "family-" + familyId;
+                        }
+                    }
+                }
+
+                float k = familyTableK
+                    ?? (isWarlockPet ? K_warlock : K_hunter);
 
                 // Skip normalization if CMS data is missing/invalid — fall back to a flat
                 // K multiply so the pet still gets a size bump rather than passing through
@@ -3998,7 +4037,11 @@ public partial class WorldClient
                     display_id = displayId,
                     creature_model_scale = cms,
                     k = k,
-                    family = isWarlockPet ? "warlock" : (isBatPet ? "hunter-bat" : "hunter"),
+                    family = familyName ?? (isWarlockPet ? "warlock" : "hunter"),
+                    family_id = familyId,
+                    pet_level = petLevel,
+                    pet_entry = petEntry,
+                    k_source = familyTableK.HasValue ? "family-table" : (isWarlockPet ? "k-warlock-fallback" : "k-hunter-fallback"),
                     raw_scale = rawScale,
                     emitted_scale = emit,
                     matched_via = (currentPetGuid != default && guid == currentPetGuid) ? "current_pet_guid" : "summoned_by",
