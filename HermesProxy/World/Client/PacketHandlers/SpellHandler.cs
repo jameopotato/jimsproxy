@@ -1004,10 +1004,19 @@ public partial class WorldClient
             // SMSG_SPELL_START even for these) apart from real cast-time spells.
             pendingCast.StartedCastTimeMs = spell.Cast.CastTime;
 
-            SpellPrepare prepare = new();
-            prepare.ClientCastID = pendingCast.ClientGUID;
-            prepare.ServerCastID = spell.Cast.CastID;
-            SendPacketToClient(prepare);
+            // Skip SpellPrepare if the hold-accept path (or off-GCD path) already sent
+            // one for this cast. Without this guard, held casts get a duplicate
+            // SpellPrepare (one at hold-accept, one here); the modern client treats
+            // duplicates as idempotent, but suppressing the second is cleaner and makes
+            // the contract explicit.
+            if (!pendingCast.HasSentPrepare)
+            {
+                SpellPrepare prepare = new();
+                prepare.ClientCastID = pendingCast.ClientGUID;
+                prepare.ServerCastID = spell.Cast.CastID;
+                SendPacketToClient(prepare);
+                pendingCast.HasSentPrepare = true;
+            }
 
             // Clear non-started casts and send failures for them
             // (keeps the started cast so SPELL_GO can dequeue it)
