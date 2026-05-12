@@ -33,6 +33,14 @@ public partial class WorldClient
         18223,  // Dreadsteed
     }.ToFrozenSet();
 
+    // K factor for non-pet NPC inverse-CMS bake-in: K = vanilla CreatureModelScale
+    // per DisplayID, loaded from CSV/CreatureDisplayInfoVanilla.csv (authoritative,
+    // extracted from 1.12.1.5875 CreatureDisplayInfo.dbc). emit = (wire/CMS_m) × CMS_v
+    // reduces to CMS_v² / CMS_m which equals what the 1.12 client rendered (CMS × CMS × MS).
+    // Per-DisplayID, not per-ModelID — different visual variants of the same model have
+    // different CMS values, and this matters for parity.
+    // Default for missing entries: 1.0 (the assumption is "no vanilla scale override").
+
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_DESTROY_OBJECT)]
     void HandleDestroyObject(WorldPacket packet)
@@ -3992,24 +4000,24 @@ public partial class WorldClient
                                   && updateData.UnitData.SummonedBy != null
                                   && (WowGuid128)updateData.UnitData.SummonedBy == localPlayerGuid);
 
+            // DisplayID for CMS lookup. Prefer current update (most up-to-date for
+            // shapeshift/morph cases); fall back to GameState cache for delta updates.
+            int displayId = 0;
+            int UNIT_FIELD_DISPLAYID_idx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_DISPLAYID);
+            if (UNIT_FIELD_DISPLAYID_idx >= 0
+                && UNIT_FIELD_DISPLAYID_idx < updateMaskArray.Length
+                && updateMaskArray[UNIT_FIELD_DISPLAYID_idx])
+                displayId = updates[UNIT_FIELD_DISPLAYID_idx].Int32Value;
+            else
+                displayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
+
+            float rawScale = (float)updateData.ObjectData.Scale;
+            float cms = 0f;
+            if (displayId > 0)
+                cms = GameData.GetDisplayInfo((uint)displayId).DisplayScale;
+
             if (isLocalPet)
             {
-                // DisplayID for CMS lookup. Prefer current update (most up-to-date for
-                // shapeshift/morph cases); fall back to GameState cache for delta updates.
-                int displayId = 0;
-                int UNIT_FIELD_DISPLAYID_idx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_DISPLAYID);
-                if (UNIT_FIELD_DISPLAYID_idx >= 0
-                    && UNIT_FIELD_DISPLAYID_idx < updateMaskArray.Length
-                    && updateMaskArray[UNIT_FIELD_DISPLAYID_idx])
-                    displayId = updates[UNIT_FIELD_DISPLAYID_idx].Int32Value;
-                else
-                    displayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
-
-                float rawScale = (float)updateData.ObjectData.Scale;
-                float cms = 0f;
-                if (displayId > 0)
-                    cms = GameData.GetDisplayInfo((uint)displayId).DisplayScale;
-
                 bool isWarlockPet = WarlockPetDisplayIds.Contains(displayId);
                 float k = isWarlockPet ? K_warlock : K_hunter;
 
@@ -4033,6 +4041,50 @@ public partial class WorldClient
                     emitted_scale = emit,
                     matched_via = (currentPetGuid != default && guid == currentPetGuid) ? "current_pet_guid" : "summoned_by",
                     cms_fallback = cms <= 0,
+                });
+            }
+            else if (objectType == ObjectType.Unit && cms > 0)
+            {
+                // Non-pet vanilla NPC scale: bridge Kronos (TC-1.12) wire convention to
+                // modern Classic 1.14 client rendering. Vanilla 1.12 server-side
+                // creature_template.scale equals CreatureModelScale per DisplayID, sent
+                // verbatim on the wire. The 1.12 client renders wire × CMS_v × ModelScale.
+                // Modern 1.14 client renders wire × CMS_m × ModelScale with its own (often
+                // different) CMS_m. Naïve forwarding produces CMS_v × CMS_m × MS — over-
+                // or undersized depending on the CMS_v/CMS_m ratio (most visibly: ogres
+                // and tigress at 1.5×–3× vanilla size before this fix).
+                //
+                // Correct emit = CMS_v² / CMS_m, factored as (wire/CMS_m) × CMS_v. When
+                // the modern client multiplies by its CMS_m at render, the result is
+                // CMS_v² × ModelScale = exactly what the 1.12 client rendered for the
+                // same DisplayID. Per-DisplayID, not per-ModelID — different visual
+                // variants of the same model can have different CMS_v values.
+                //
+                // CMS_v source: HermesProxy/CSV/CreatureDisplayInfoVanilla.csv (8,495
+                // entries extracted from 1.12.1.5875 CreatureDisplayInfo.dbc via Ladik's
+                // MPQ Editor + custom DBC parser). Missing entries fall back to K=1.0
+                // (assume no vanilla scale override, matches modern rendering).
+                //
+                // Players excluded (their wire_scale != CMS, so this math doesn't apply).
+                // Pets handled by the K_hunter/K_warlock path above — different mechanism
+                // because tamed pet rendering has additional factors per PR #117 tuning.
+                const float K_npc_default = 1.0f;
+                float K_npc = (displayId > 0 && GameData.VanillaCreatureModelScales.TryGetValue((uint)displayId, out var cmsVanilla))
+                    ? cmsVanilla
+                    : K_npc_default;
+                float emit = (rawScale / cms) * K_npc;
+                updateData.ObjectData.Scale = emit;
+
+                Log.Event("unit.npc_scale.applied", new
+                {
+                    guid = guid.ToString(),
+                    entry = updateData.ObjectData.EntryID,
+                    display_id = displayId,
+                    vanilla_cms = K_npc,
+                    modern_cms = cms,
+                    raw_scale = rawScale,
+                    emitted_scale = emit,
+                    k_source = GameData.VanillaCreatureModelScales.ContainsKey((uint)displayId) ? "vanilla_dbc" : "default",
                 });
             }
         }
