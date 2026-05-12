@@ -502,8 +502,11 @@ internal static class ThreatModules
         // Druid Growl is a player taunt (bear form).
         map[6795] = PlayerSetToTop("growl_druid");
 
-        // Mage
-        map[2139] = PlayerSingleTargetFlat("counterspell", new Dictionary<int, double> { [2139] = 300 });
+        // Mage Counterspell ranks 1-2 — flat 300 threat per LTC2 Mage.lua.
+        var counterspell = PlayerSingleTargetFlat("counterspell",
+            new Dictionary<int, double> { [2139] = 300, [18469] = 300 });
+        map[2139] = counterspell;
+        map[18469] = counterspell;
         map[475]  = PlayerAddToAllMobs("remove_lesser_curse", 14);
 
         // Rogue
