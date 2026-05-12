@@ -4120,10 +4120,20 @@ public partial class WorldClient
                 // Pets handled by the K_hunter/K_warlock + family-table + vanilla-CMS
                 // chain in the isLocalPet branch above.
                 const float K_npc_default = 1.0f;
-                float K_npc = (displayId > 0 && GameData.VanillaCreatureModelScales.TryGetValue((uint)displayId, out var cmsVanilla))
-                    ? cmsVanilla
-                    : K_npc_default;
-                float npcEmit = (rawScale / cms) * K_npc;
+                float cmsVanilla = 0f;
+                bool hasVanillaCms = displayId > 0 && GameData.VanillaCreatureModelScales.TryGetValue((uint)displayId, out cmsVanilla);
+                float K_npc = hasVanillaCms ? cmsVanilla : K_npc_default;
+
+                // Twinstar pre-scales wire on creatures whose creature_template.scale
+                // column was set to CMS_v in their DB (vs unset = server default 1.0).
+                // For those, wire already encodes the vanilla factor; modern client's
+                // wire × CMS_m × ModelScale render then yields CMS_v² × ModelScale —
+                // ~2.2× too big for ogres at CMS_v=2.2. Strip the pre-scaling so the
+                // client lands at vanilla baseline. CMS_v > 1.01 guard prevents
+                // false-firing on the wire==CMS_v==1.0 case (every normal creature).
+                bool wirePreScaled = hasVanillaCms && cmsVanilla > 1.01f && MathF.Abs(rawScale - cmsVanilla) < 0.01f;
+                float effectiveWire = wirePreScaled ? 1.0f : rawScale;
+                float npcEmit = (effectiveWire / cms) * K_npc;
                 updateData.ObjectData.Scale = npcEmit;
 
                 Log.Event("unit.npc_scale.applied", new
@@ -4134,8 +4144,10 @@ public partial class WorldClient
                     vanilla_cms = K_npc,
                     modern_cms = cms,
                     raw_scale = rawScale,
+                    effective_wire = effectiveWire,
+                    wire_pre_scaled = wirePreScaled,
                     emitted_scale = npcEmit,
-                    k_source = GameData.VanillaCreatureModelScales.ContainsKey((uint)displayId) ? "vanilla_dbc" : "default",
+                    k_source = hasVanillaCms ? "vanilla_dbc" : "default",
                 });
             }
         }
