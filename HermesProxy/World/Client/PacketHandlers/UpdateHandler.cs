@@ -3907,39 +3907,40 @@ public partial class WorldClient
             }
         }
 
-        // JimsProxy (pet-scale-vanilla-parity): the local player's pet (warlock or hunter)
-        // renders visibly smaller in modern 1.14 Classic than the vanilla 1.12 reference,
-        // even though CreatureDisplayInfo and CreatureModelData scale data is byte-
-        // identical between the two builds (extracted both sets and diffed — only 39 of
-        // ~10,500 DisplayIDs differ in CreatureModelScale, none of them pet display IDs).
-        // Root cause unverified — likely an undocumented client-side scale modifier on
-        // local-player pet units in modern Classic. A flat global multiplier doesn't work
-        // because the modern client compounds it with the per-display CreatureModelScale:
-        // a Felhunter (CMS 0.5) at 1.5× still renders too small while a Dire Wolf (CMS
-        // 1.5) at 1.5× ends up at ~2.2 effective and looks ridiculous.
+        // JimsProxy (pet-scale-vanilla-parity): the local player's pet (warlock
+        // or hunter) renders at the wrong size in modern 1.14 Classic vs vanilla
+        // 1.12 reference. Modern Classic's per-display CreatureModelScale
+        // dropped the intrinsic M_native that vanilla M2 files baked in, so the
+        // proxy applies a per-family correction K via inverse-CMS bake-in:
         //
-        // Inverse-CMS scaling cancels that variance: emit (wire / CreatureModelScale) × K
-        // so the modern client's wire × ModelScale × CMS multiply collapses to wire ×
-        // ModelScale × K — every pet gets a uniform K bump regardless of its CMS quirks.
-        // K = 1.5 is the empirical "felt right at 1.12" tuning value for hunter pets.
+        //   emit (wire / CMS) × K
+        //   modern renders emit × CMS × ModelScale = wire × K × ModelScale
+        //   ≈ vanilla's wire × M_native when K is chosen per family.
         //
-        // Server-side combat reach and bounding radius are untouched, so range checks,
-        // melee hit detection, and ability targeting are unchanged. Only the visual scale
-        // forwarded to the client is modified; click hitbox grows with the visual.
+        // K resolution (see pet block below):
+        //   1. Primary — CreatureFamily DBC MaxScale (e.g. bat 0.7, boar 1.0,
+        //      wolf 1.0, imp 0.5). The vanilla server already lerps level
+        //      growth via wire SCALE_X, so we use the family-flat MaxScale.
+        //   2. Fallback when CreatureTemplate hasn't been received yet —
+        //      legacy K_hunter / K_warlock constants. Pet GUID is recorded in
+        //      PetScaleResolvePending so QueryHandler re-emits SCALE_X with
+        //      the correct K once the template arrives.
         //
-        // Detection: prefer CurrentPetGuid match (set when SMSG_PET_SPELLS_MESSAGE arrives,
-        // typically before the pet's first CREATE_OBJECT). Fallback to SUMMONEDBY in this
-        // update matching CurrentPlayerGuid so the first CREATE_OBJECT for a pet (which
-        // carries SUMMONEDBY) gets normalized even if CurrentPetGuid hasn't latched yet.
-        // Only fires when SCALE_X is present in this update (Scale != null) — a delta
-        // values update without SCALE_X leaves the already-normalized scale sticky on the
+        // Server-side combat reach and bounding radius are untouched, so range
+        // checks, melee hit detection, and ability targeting are unchanged.
+        // Only the visual scale forwarded to the client is modified; click
+        // hitbox grows with the visual.
+        //
+        // Detection: prefer CurrentPetGuid match (set when SMSG_PET_SPELLS_MESSAGE
+        // arrives, typically before the pet's first CREATE_OBJECT). Fallback
+        // to SUMMONEDBY in this update matching CurrentPlayerGuid so the first
+        // CREATE_OBJECT for a pet (which carries SUMMONEDBY) gets normalized
+        // even if CurrentPetGuid hasn't latched yet. Only fires when SCALE_X
+        // is present in this update (Scale != null) — a delta values update
+        // without SCALE_X leaves the already-normalized scale sticky on the
         // client and avoids compounding multiplications across updates.
-        // K_hunter validated against Dire Wolf side-by-side vs 1.12 (commit 17a08c7).
-        // K_warlock = K_hunter / 2 — tester screenshots 2026-05-06 showed every warlock
-        // pet (Imp/Felhunter/Voidwalker/Succubus) rendering ~2x oversized at K=1.5
-        // uniformly across CMS values; halving the constant lands them at 1.12 size.
-        const float K_hunter  = 1.5f;
-        const float K_warlock = 0.75f;
+        const float K_hunter  = 1.5f;   // fallback only — pre-family-table tuning
+        const float K_warlock = 0.75f;  // fallback only — pre-family-table tuning
         if (LegacyVersion.ExpansionVersion == 1
             && updateData.ObjectData.Scale != null
             && (objectType == ObjectType.Unit || objectType == ObjectType.Player || objectType == ObjectType.ActivePlayer))
@@ -3972,32 +3973,35 @@ public partial class WorldClient
                 bool isWarlockPet = WarlockPetDisplayIds.Contains(displayId);
 
                 // JimsProxy (pet-scale-family-table): primary K comes from the
-                // Classic 1.14 CreatureFamily DBC (MinScale/MaxScale lerped by
-                // pet level). This is Blizzard's per-family pet scale formula —
-                // bat 0.4→0.7, boar 0.6→1.0, wolf 0.7→1.0, cat 0.7→1.1, etc. —
-                // verified against our empirical bat (K=0.75 at high level vs
-                // family-table 0.7) and boar (K=1.0 at L60 vs family-table 1.0)
-                // tunings. Replaces the previous per-modelId switch which can
-                // be retired once all families are observed working from data.
+                // Classic 1.14 CreatureFamily DBC, using each family's MaxScale
+                // value as a flat correction. We deliberately do NOT lerp by
+                // pet level — the vanilla server already applies the
+                // MinScale→MaxScale lerp via UNIT_FIELD_SCALE_X on the wire
+                // (verified empirically: Bruce L16 boar arrived with
+                // raw_scale=0.7 = the exact 0.6→1.0 lerp value for boar at L16).
+                // Applying the lerp a second time on the proxy would
+                // double-multiply and undersize every pet.
+                //
+                // MaxScale acts as the per-family M_native/ModelScale correction
+                // the modern client is missing — Blizzard's 1.14 Classic data
+                // dropped the per-model intrinsic scale that vanilla 1.12 baked
+                // into M2 files. Validated values: bat 0.7, boar 1.0, wolf 1.0,
+                // cat 1.1, voidwalker 0.8, imp 0.5, succubus 1.0.
                 //
                 // Family lookup chain:
-                //   1. Pet entry (creature_template ID) from cached UNIT_FIELD_ENTRY
-                //   2. GameData.GetCreatureTemplate(entry).Family — populated by
-                //      QueryHandler when the modern client queries the creature.
-                //   3. GameData.GetPetFamilyScaleForLevel(family, level) — lerps.
-                // Level comes from UNIT_FIELD_LEVEL (current update or cache).
+                //   1. petEntry = OBJECT_FIELD_ENTRY (creature_template ID).
+                //      For Pet-high-GUIDs, guid.GetEntry() returns the pet
+                //      INSTANCE number — different from the template ID.
+                //   2. GameData.GetCreatureTemplate(entry).Family — populated
+                //      by QueryHandler when the creature is queried (either by
+                //      the modern client or by the proxy itself, see below).
+                //   3. GameData.GetPetFamilyScale(family) → family.MaxScale.
                 //
-                // Fallbacks (in order):
-                //   - CreatureTemplate not yet cached → fall back to legacy K_hunter
-                //   - Family not in CreatureFamily table (rare, custom server) → K_hunter
-                //   - Warlock pet (DisplayId in hardcoded set) → CreatureFamily lookup
-                //     also covers Imp/Felhunter/Voidwalker/Succubus, so prefer it
-                // For Pet-high-GUIDs (warlock minions, hunter pets, charmed mobs),
-                // `guid.GetEntry()` returns the per-instance pet number, NOT the
-                // creature_template ID. The creature_template ID lives in
-                // OBJECT_FIELD_ENTRY which the SCALE_X branch already copied into
-                // updateData.ObjectData.EntryID, OR (for delta updates that
-                // don't carry ENTRY) the GameState legacy field cache.
+                // Fallback when CreatureTemplate isn't cached yet: legacy
+                // K_hunter=1.5 / K_warlock=0.75 constants, and the pet GUID is
+                // recorded in PetScaleResolvePending so the next
+                // SMSG_QUERY_CREATURE_RESPONSE for this entry can re-emit
+                // SCALE_X with the correct K.
                 int petEntry = updateData.ObjectData.EntryID != null
                     ? (int)updateData.ObjectData.EntryID
                     : Session.GameState.GetLegacyFieldValueInt32(guid, ObjectField.OBJECT_FIELD_ENTRY);
