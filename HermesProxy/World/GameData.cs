@@ -57,6 +57,15 @@ public static partial class GameData
     // based on its actual level, replacing the empirical K_hunter / K_warlock
     // constants for any family present in this table.
     public static FrozenDictionary<int, CreatureFamilyData> CreatureFamilies = FrozenDictionary<int, CreatureFamilyData>.Empty;
+    // JimsProxy (npc-scale-vanilla-parity): vanilla CreatureModelScale per DisplayID,
+    // extracted authoritatively from the 1.12.1.5875 client's CreatureDisplayInfo.dbc.
+    // Used as the render-factor compensation when bridging Kronos (TC-1.12, wire=CMS_v)
+    // to modern Classic 1.14 (renders wire × CMS_m × ModelScale). Inverse-CMS bake-in
+    // becomes: emit = (wire / CMS_m) × CMS_v = CMS_v² / CMS_m, which equals what the
+    // vanilla 1.12 client rendered (CMS_v × CMS_v × ModelScale). Per-DisplayID not per-
+    // ModelID — different display variants of the same model have different CMS values.
+    // 8,495 entries.
+    public static FrozenDictionary<uint, float> VanillaCreatureModelScales = FrozenDictionary<uint, float>.Empty;
     public static FrozenDictionary<uint, uint> TransportPeriods = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, string> AreaNames = FrozenDictionary<uint, string>.Empty;
     public static FrozenDictionary<string, uint> AreaIdsByName = FrozenDictionary<string, uint>.Empty;
@@ -760,6 +769,7 @@ public static partial class GameData
             LoadCreatureDisplayInfo,
             LoadCreatureModelCollisionHeights,
             LoadCreatureFamilies,
+            LoadVanillaCreatureModelScales,
             LoadTransports,
             LoadAreaNames,
             LoadRaceFaction,
@@ -1348,6 +1358,24 @@ public static partial class GameData
         if (!CreatureFamilies.TryGetValue(familyId, out var f))
             return 1.0f;
         return f.MaxScale;
+    }
+
+    public static void LoadVanillaCreatureModelScales()
+    {
+        var path = Path.Combine("CSV", "CreatureDisplayInfoVanilla.csv");
+        if (!File.Exists(path))
+            return;
+        using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+        var dict = new Dictionary<uint, float>(8500);
+        foreach (var row in reader)
+        {
+            if (!uint.TryParse(row[0].Span, out uint displayId))
+                continue;
+            if (!float.TryParse(row[1].Span, System.Globalization.CultureInfo.InvariantCulture, out float cms))
+                continue;
+            dict[displayId] = cms;
+        }
+        VanillaCreatureModelScales = dict.ToFrozenDictionary();
     }
 
     public static void LoadTransports()
