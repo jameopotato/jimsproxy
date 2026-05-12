@@ -2070,47 +2070,6 @@ public partial class WorldClient
             if (UNIT_FIELD_DISPLAYID >= 0 && updateMaskArray[UNIT_FIELD_DISPLAYID])
             {
                 updateData.UnitData.DisplayID = updates[UNIT_FIELD_DISPLAYID].Int32Value;
-
-                // JimsProxy (npc-scale-vanilla-parity): set UNIT_FIELD_DISPLAY_SCALE = 1/CMS
-                // so the modern client's `wire × CMS × DisplayScale` collapses to `wire`,
-                // matching vanilla 1.12's rendering of `wire × M` (where M is a per-model
-                // constant, NOT the same as CreatureModelScale). Verified empirically against
-                // matched-camera screenshots of Varimathras DisplayID 11658 (CMS 1.2):
-                //   * Vanilla 1.12 client:    Varimathras renders at 2.07× player height
-                //   * Modern with no comp:    Varimathras renders at 2.41× player height
-                //                             (over by ~16%, ratio 2.41/2.07 ≈ CMS itself)
-                //   * Modern with 1/CMS comp: Varimathras renders at ~2.01× (within 3% of
-                //                             vanilla — eyeball margin).
-                // The original developer's intuition was right; my "vanilla also multiplies
-                // by CMS" hypothesis was wrong. Vanilla 1.12 effectively ignores CreatureModel-
-                // Scale at render time (uses model's native size + wire scale only).
-                //
-                // The bundled CreatureDisplayInfo.csv has been refreshed from wago.tools so
-                // the lookup is now accurate (was previously stale, with ~2k spurious diffs
-                // from current modern Classic data).
-                //
-                // Pet path is independent — pets use the inverse-CMS bake-in at the SCALE_X
-                // read site (pet-scale-vanilla-parity). The 1.14 client doesn't honor
-                // UNIT_FIELD_DISPLAY_SCALE for local-player-pet units (verified by direct
-                // 1.12 vs proxy screenshots of a Felhunter and Dire Wolf), so the pet fix
-                // bakes its correction into wire SCALE_X instead.
-                if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
-                {
-                    uint dispId = (uint)updateData.UnitData.DisplayID;
-                    float complete = GameData.GetUnitCompleteDisplayScale(dispId);
-                    if (complete > 0)
-                        updateData.UnitData.DisplayScale = 1.0f / complete;
-
-                    Log.Event("unit.scale.display_scale_set", new
-                    {
-                        guid = guid.ToString(),
-                        entry = updateData.ObjectData.EntryID,
-                        display_id = dispId,
-                        modern_cms = GameData.GetDisplayInfo(dispId).DisplayScale,
-                        complete_display_scale = complete,
-                        emitted_display_scale = (float)(updateData.UnitData.DisplayScale ?? 1.0f),
-                    });
-                }
             }
             int UNIT_FIELD_NATIVEDISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_NATIVEDISPLAYID);
             if (UNIT_FIELD_NATIVEDISPLAYID >= 0 && updateMaskArray[UNIT_FIELD_NATIVEDISPLAYID])
