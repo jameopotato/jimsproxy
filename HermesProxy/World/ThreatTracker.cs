@@ -763,18 +763,6 @@ public sealed class ThreatTracker
         15286,
     };
 
-    private static readonly HashSet<uint> DruidSubtletySpells = new()
-    {
-        // Moonfire (R1..10)
-        8921, 8924, 8925, 8926, 8927, 8928, 8929, 9833, 9834, 9835,
-        // Starfire (R1..7)
-        2912, 8949, 8950, 8951, 9875, 9876, 25298,
-        // Wrath (R1..6)
-        5176, 5177, 5178, 6780, 8905, 9912,
-        // Hurricane (R1..3)
-        16914, 17401, 17402,
-    };
-
     // Spells the Righteous Fury (+ Imp RF) multiplier applies to. Holy damage
     // and Holy heals — paladin's RF aura boosts threat for both. List taken
     // from LTC2 Paladin.lua's HolyHealIDs + holyShieldIDs + paladin damage
@@ -798,6 +786,16 @@ public sealed class ThreatTracker
         19750, 19939, 19940, 19941, 19942, 19943,
         // Lay on Hands (R1..3)
         633, 2800, 10310,
+        // Judgement: server emits damage via "umbrella" IDs and per-seal IDs.
+        // 23590 is the most common engine event; 20184/85/86/87/88, 20271, 20286,
+        // 20425 cover Justice/Light/Wisdom/Righteousness/Crusader/Command variants.
+        23590, 23591, 20271, 20184, 20185, 20186, 20187, 20188, 20286, 20425,
+        // Seal of Righteousness damage proc (R1..8) — fires on every melee swing
+        20154, 20287, 20288, 20289, 20290, 20291, 20292, 20293, 21084, 25713,
+        // Holy Wrath (R1..2)
+        2812, 10318,
+        // Exorcism (R1..6)
+        879, 5614, 5615, 10312, 10313, 10314,
     };
 
     // Returns the highest rank (1..N) of a talent the player has, or 0 if untaken.
@@ -990,12 +988,9 @@ public sealed class ThreatTracker
                 }
                 return 1.0;
             case Class.Druid:
-                if (DruidSubtletySpells.Contains(sid))
-                {
-                    int rank = GetTalentRank(DruidSubtletyRanks);
-                    if (rank > 0)
-                        return 1.0 - (0.04 * rank);
-                }
+                // Druid Subtlety moved to GetTalentMultiplier (universal passive,
+                // applies to heals too — was previously gated to Balance damage
+                // spells only, missing the resto-druid heal-threat reduction).
                 return 1.0;
             case Class.Paladin:
                 if (PaladinRighteousFurySpells.Contains(sid) && IsRighteousFuryActive())
@@ -1056,14 +1051,21 @@ public sealed class ThreatTracker
                 return 1.0;
 
             case Class.Druid:
+            {
+                double mult = 1.0;
                 // Feral Instinct: +0.03 / rank, Bear / Dire Bear only.
                 if (formAura == 5487 || formAura == 9634)
                 {
-                    int rank = GetTalentRank(FeralInstinctRanks);
-                    if (rank > 0)
-                        return 1.0 + (0.03 * rank);
+                    int fiRank = GetTalentRank(FeralInstinctRanks);
+                    if (fiRank > 0) mult *= 1.0 + (0.03 * fiRank);
                 }
-                return 1.0;
+                // Subtlety (Restoration tier 1): −0.04 / rank, applies to all
+                // spells (damage AND heals). Universal per LTC2 Druid.lua —
+                // not school-gated, despite the name's overlap with rogue Subtlety.
+                int subRank = GetTalentRank(DruidSubtletyRanks);
+                if (subRank > 0) mult *= 1.0 - (0.04 * subRank);
+                return mult;
+            }
 
             case Class.Priest:
                 // Silent Resolve: −0.04 / rank, applies to all damage and heals.

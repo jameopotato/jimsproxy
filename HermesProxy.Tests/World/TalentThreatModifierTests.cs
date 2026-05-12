@@ -217,7 +217,7 @@ public class TalentThreatModifierTests
         Assert.DoesNotContain(8004u, shadowSet); // Lesser Heal — not in set
     }
 
-    // === Druid Subtlety: Druid, -0.04/rank, Arcane/Nature damage only ===
+    // === Druid Subtlety: Druid, -0.04/rank, universal (damage AND heals) ===
 
     [Theory]
     [InlineData(1, 0.96)]
@@ -235,21 +235,19 @@ public class TalentThreatModifierTests
         Assert.Equal(new uint[] { 17118, 17119, 17120, 17121, 17122 }, DruidSubtletyRanks);
     }
 
-    [Fact]
-    public void DruidSubtlety_AppliesOnlyToArcaneNatureSpells_SmokeMembership()
+    [Theory]
+    [InlineData(0, 0, 1.0)]                 // no talent, no form
+    [InlineData(5, 0, 0.80)]                // full subtlety, no form: -20%
+    [InlineData(0, 5, 1.15)]                // no subtlety, bear+5 feral: +15%
+    [InlineData(5, 5, 0.80 * 1.15)]         // both stacked: multiplicative (= 0.92)
+    public void DruidPassive_SubtletyAndFeralInstinct_StackMultiplicatively(int subRank, int fiRank, double expected)
     {
-        var subtletySet = new HashSet<uint>
-        {
-            8921, 8924, 8925, 8926, 8927, 8928, 8929, 9833, 9834, 9835, // Moonfire
-            2912, 8949, 8950, 8951, 9875, 9876, 25298,                  // Starfire
-            5176, 5177, 5178, 6780, 8905, 9912,                         // Wrath
-            16914, 17401, 17402,                                         // Hurricane
-        };
-        Assert.Contains(8921u, subtletySet);       // Moonfire R1
-        Assert.Contains(25298u, subtletySet);      // Starfire R7
-        Assert.Contains(9912u, subtletySet);       // Wrath R6
-        Assert.DoesNotContain(6807u, subtletySet); // Maul (physical) — not in set
-        Assert.DoesNotContain(8042u, subtletySet); // Earth Shock (shaman) — not in set
+        // Subtlety is universal (heals included); Feral Instinct gates on bear form.
+        // GetTalentMultiplier in production multiplies them when both apply.
+        double sub = subRank > 0 ? 1.0 - (0.04 * subRank) : 1.0;
+        double fi  = fiRank  > 0 ? 1.0 + (0.03 * fiRank)  : 1.0;
+        double mult = sub * fi;
+        Assert.Equal(expected, mult, precision: 4);
     }
 
     // === Improved Righteous Fury: Paladin, requires RF aura active ===
