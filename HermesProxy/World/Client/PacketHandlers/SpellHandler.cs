@@ -1644,7 +1644,10 @@ public partial class WorldClient
             //  (b) missCount demands more bytes than the packet can possibly hold —
             //      a real server never claims more misses than data.
             // Real misses (vmangos-style) have a valid missType and fit the packet.
-            if (missCount > 0)
+            // Gated to vanilla only: TBC+ uses uint32 targetFlags and a different trailer
+            // alignment, so the heuristic's invariants don't translate cleanly and could
+            // mask unrelated parse drift instead of throwing.
+            if (missCount > 0 && LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
             {
                 bool isPhantom = false;
                 string phantomReason = "";
