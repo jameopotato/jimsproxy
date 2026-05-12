@@ -1246,6 +1246,53 @@ public partial class WorldClient
             questLog.EndTime = updates[index + timerOffset].UInt32Value;
         }
 
+        if (questLog != null && questLog.QuestID != null && questLog.QuestID != 0)
+        {
+            // Overlay item-objective progress that vmangos never makes available via this
+            // log slot. vmangos's SendQuestUpdateAddItem writes item counters to
+            // SetQuestSlotCounter(slot + GOcount, item_idx, count) — a DIFFERENT log slot
+            // than the quest occupies (Player.cpp:14583-14586). In vanilla 1.12 the native
+            // client recomputes item progress from inventory so the misrouted counter
+            // doesn't matter, but the modern 1.14 client trusts the ObjectiveProgress array
+            // verbatim — so without this overlay, mixed-objective quests like #358
+            // "Graverobbers" (2 kills + Embalming Ichor x8) render the item objective
+            // perpetually at 0/N even when the server allows turn-in via its separate
+            // m_itemcount[] tracking. Preference order: proxy's running-total dict (kept in
+            // sync by SMSG_QUEST_UPDATE_ADD_ITEM) → inventory count fallback (mirrors what
+            // vmangos's GetItemCount() returns for the same input).
+            var template = GameData.GetQuestTemplate((uint)questLog.QuestID);
+            if (template != null)
+            {
+                var itemProgress = GetSession().GameState.QuestItemObjectiveProgress;
+                foreach (var obj in template.Objectives)
+                {
+                    if (obj.Type != QuestObjectiveType.Item)
+                        continue;
+                    if (obj.StorageIndex < 0 || obj.StorageIndex >= questLog.ObjectiveProgress.Length)
+                        continue;
+
+                    uint resolved = 0;
+                    bool fromDict = false;
+                    var key = ((uint)questLog.QuestID, obj.StorageIndex);
+                    if (itemProgress.TryGetValue(key, out uint dictCount))
+                    {
+                        resolved = dictCount;
+                        fromDict = true;
+                    }
+                    else if (obj.ObjectID > 0)
+                    {
+                        resolved = GetSession().GameState.CountItemsByEntry((uint)obj.ObjectID);
+                    }
+
+                    if (resolved > 0 || fromDict)
+                    {
+                        short clamped = (short)Math.Min(resolved, (uint)(obj.Amount > 0 ? obj.Amount : (int)resolved));
+                        questLog.ObjectiveProgress[obj.StorageIndex] = clamped;
+                    }
+                }
+            }
+        }
+
         return questLog;
     }
 
@@ -2751,7 +2798,29 @@ public partial class WorldClient
                 int questsCount = LegacyVersion.GetQuestLogSize();
                 for (int i = 0; i < questsCount; i++)
                 {
-                    updateData.PlayerData.QuestLog[i] = ReadQuestLogEntry(i, updateMaskArray, updates)!;
+                    var entry = ReadQuestLogEntry(i, updateMaskArray, updates)!;
+                    updateData.PlayerData.QuestLog[i] = entry;
+
+                    // Proactive template query for quests in the log without a cached
+                    // template (mirrors the pet-scale CMSG_QUERY_CREATURE path). The 1.14
+                    // client caches quest templates in WDB and will not re-query for
+                    // quests it already knows, so ReadQuestLogEntry's item-objective
+                    // overlay can't populate ObjectiveProgress[item_storage] without the
+                    // template. Without this, mixed-objective quests (e.g. #358
+                    // "Graverobbers" — 2 kills + Embalming Ichor x8) render the item
+                    // objective at 0/N on the modern client even though the server
+                    // permits turn-in. The response will land in QueryHandler, populate
+                    // the template, and the next OBJECT_UPDATE for the player (typically
+                    // any combat tick or quest-state change) will overlay the correct
+                    // item progress.
+                    if (entry != null && entry.QuestID != null && entry.QuestID > 0 &&
+                        GameData.GetQuestTemplate((uint)entry.QuestID) == null &&
+                        GetSession().GameState.ProxyIssuedQuestInfoQueries.Add((uint)entry.QuestID))
+                    {
+                        WorldPacket queryPacket = new WorldPacket(Opcode.CMSG_QUERY_QUEST_INFO);
+                        queryPacket.WriteUInt32((uint)entry.QuestID);
+                        SendPacketToServer(queryPacket);
+                    }
                 }
             }
             int PLAYER_CHOSEN_TITLE = LegacyVersion.GetUpdateField(PlayerField.PLAYER_CHOSEN_TITLE);

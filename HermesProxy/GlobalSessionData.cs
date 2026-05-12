@@ -149,6 +149,14 @@ public sealed class GameSessionData
     // so we always send a valid family, cleared only on explicit pet dismiss.
     public ConcurrentDictionary<WowGuid128, ushort> CachedPetCreatureFamily = new();
     public Dictionary<uint, WowGuid128> CachedPetNumbers = new();
+    // Tracks quest ids the proxy has issued its own CMSG_QUERY_QUEST_INFO for.
+    // The 1.14 client caches quest templates in WDB and will not re-query for
+    // quests it already knows, so SMSG_QUERY_QUEST_INFO_RESPONSE never reaches
+    // the proxy and the QuestTemplate stays empty. That breaks the item-objective
+    // overlay in ReadQuestLogEntry (no template = no item objectives to overlay).
+    // We proactively query on first sight of any quest in the player's log
+    // without a cached template; this set prevents spamming.
+    public HashSet<uint> ProxyIssuedQuestInfoQueries = new();
     public string LeftChannelName = "";
     public bool IsPassingOnLoot;
     public int GroupUpdateCounter;
@@ -594,6 +602,82 @@ public sealed class GameSessionData
     {
         uint count = GetLegacyFieldValueUInt32(itemGuid, ItemField.ITEM_FIELD_STACK_COUNT);
         return count > 0 ? count : 1;
+    }
+    //MIRASU - count all instances of itemEntry across equipped + backpack + bag contents.
+    //MIRASU   Mirrors vmangos Player::GetItemCount(item, /*inBankAlso=*/false). Used as a
+    //MIRASU   fallback for quest item-objective progress when the proxy hasn't yet seen a
+    //MIRASU   SMSG_QUEST_UPDATE_ADD_ITEM credit (typical case: player relogs mid-quest with
+    //MIRASU   the item already in inventory; vmangos writes item counters to slot+GOcount
+    //MIRASU   in PLAYER_QUEST_LOG, which is unreadable by the modern client because that
+    //MIRASU   "extra" log slot belongs to a different quest in vanilla's allocation scheme,
+    //MIRASU   so the modern client renders item objectives at 0/N until we synthesize the
+    //MIRASU   count ourselves).
+    public uint CountItemsByEntry(uint itemEntry)
+    {
+        if (itemEntry == 0)
+            return 0;
+
+        uint total = 0;
+        int objectFieldEntry = LegacyVersion.GetUpdateField(ObjectField.OBJECT_FIELD_ENTRY);
+        if (objectFieldEntry < 0)
+            return 0;
+
+        //MIRASU - equipped slots 0..18 + backpack 23..38. Skip the bag slots themselves
+        //MIRASU   (19..22) — we iterate their contents in the separate loop below.
+        for (int slot = 0; slot < World.Enums.Vanilla.InventorySlots.ItemEnd; slot++)
+        {
+            if (slot >= World.Enums.Vanilla.InventorySlots.BagStart && slot < World.Enums.Vanilla.InventorySlots.BagEnd)
+                continue;
+
+            var itemGuid64 = GetInventorySlotItem(slot);
+            if (itemGuid64 == WowGuid64.Empty)
+                continue;
+
+            var itemGuid128 = itemGuid64.To128(this);
+            var itemFields = GetCachedObjectFieldsLegacy(itemGuid128);
+            if (itemFields == null)
+                continue;
+
+            if (itemFields.TryGetValue(objectFieldEntry, out var entryVal) && entryVal.UInt32Value == itemEntry)
+                total += GetItemStackCount(itemGuid128);
+        }
+
+        int containerSlotField = LegacyVersion.GetUpdateField(ContainerField.CONTAINER_FIELD_SLOT_1);
+        int numSlotsField = LegacyVersion.GetUpdateField(ContainerField.CONTAINER_FIELD_NUM_SLOTS);
+        if (containerSlotField < 0 || numSlotsField < 0)
+            return total;
+
+        for (int bagIdx = World.Enums.Vanilla.InventorySlots.BagStart; bagIdx < World.Enums.Vanilla.InventorySlots.BagEnd; bagIdx++)
+        {
+            var bagGuid64 = GetInventorySlotItem(bagIdx);
+            if (bagGuid64 == WowGuid64.Empty)
+                continue;
+
+            var bagGuid128 = bagGuid64.To128(this);
+            var bagFields = GetCachedObjectFieldsLegacy(bagGuid128);
+            if (bagFields == null)
+                continue;
+            if (!bagFields.TryGetValue(numSlotsField, out var numSlotsValue))
+                continue;
+            int numSlots = (int)numSlotsValue.UInt32Value;
+
+            for (int s = 0; s < numSlots; s++)
+            {
+                var slotGuid64 = bagFields.GetGuidValue(containerSlotField + s * 2);
+                if (slotGuid64 == WowGuid64.Empty)
+                    continue;
+
+                var slotGuid128 = slotGuid64.To128(this);
+                var slotFields = GetCachedObjectFieldsLegacy(slotGuid128);
+                if (slotFields == null)
+                    continue;
+
+                if (slotFields.TryGetValue(objectFieldEntry, out var entryVal) && entryVal.UInt32Value == itemEntry)
+                    total += GetItemStackCount(slotGuid128);
+            }
+        }
+
+        return total;
     }
     public (byte containerSlot, byte slot)? FindItemInInventory(WowGuid64 itemGuid64)
     {
