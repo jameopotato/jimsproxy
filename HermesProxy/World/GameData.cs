@@ -1312,6 +1312,11 @@ public static partial class GameData
     public static void LoadCreatureFamilies()
     {
         var path = Path.Combine("CSV", "CreatureFamily.csv");
+        if (!File.Exists(path))
+        {
+            Log.Print(LogType.Error, $"MISSING CSV: {path} — reinstall the proxy or re-extract hermes-bundle.zip to restore missing data files");
+            return;
+        }
         using var reader = Sep.Reader(o => o with { HasHeader = true, Unescape = true }).FromFile(path);
         var dict = new Dictionary<int, CreatureFamilyData>(32);
 
@@ -1338,7 +1343,10 @@ public static partial class GameData
     {
         var path = Path.Combine("CSV", "CreatureDisplayInfoVanilla.csv");
         if (!File.Exists(path))
+        {
+            Log.Print(LogType.Error, $"MISSING CSV: {path} — reinstall the proxy or re-extract hermes-bundle.zip to restore missing data files");
             return;
+        }
         using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
         var dict = new Dictionary<uint, float>(8500);
         foreach (var row in reader)
@@ -1356,7 +1364,10 @@ public static partial class GameData
     {
         var path = Path.Combine("CSV", "TalentSpellRanks.csv");
         if (!System.IO.File.Exists(path))
+        {
+            Log.Print(LogType.Error, $"MISSING CSV: {path} — reinstall the proxy or re-extract hermes-bundle.zip to restore missing data files");
             return;
+        }
         using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
         var predecessors = new Dictionary<uint, uint[]>(2048);
         var siblings = new Dictionary<uint, uint[]>(2048);
