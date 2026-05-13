@@ -4225,16 +4225,16 @@ public partial class WorldClient
                 float effectiveWire = wirePreScaled ? 1.0f : rawScale;
                 float npcEmit = (effectiveWire / cms) * K_npc;
 
-                // M2 mesh-adjust: per-ModelId compensation for 1.14 render-time scale
-                // divergences that don't appear in any DBC/M2 file (see M2MeshAdjust
-                // table comment). Applied AFTER the CMS bake-in so it stacks cleanly.
+                // M2 mesh-adjust: per-ModelId compensation now handled via
+                // CreatureDisplayInfo CMS hotfix (CSV/Hotfix/CreatureDisplayInfo1.csv)
+                // so the modern client's intrinsic CMS already carries the K factor.
+                // NPCs render at wire × hotfix_CMS × ModelScale, matching the K-applied
+                // target without a proxy wire multiplier. Keeping the variable for the
+                // diagnostic event but not applying it here.
                 int modelIdForAdjust = displayId > 0 ? (int)GameData.GetDisplayInfo((uint)displayId).ModelId : 0;
                 float meshAdjust = 1.0f;
                 if (modelIdForAdjust > 0 && M2MeshAdjust.TryGetValue(modelIdForAdjust, out var adj))
-                {
                     meshAdjust = adj;
-                    npcEmit *= meshAdjust;
-                }
                 updateData.ObjectData.Scale = npcEmit;
 
                 Log.Event("unit.npc_scale.applied", new
@@ -4255,25 +4255,22 @@ public partial class WorldClient
             }
             else if (objectType == ObjectType.Player || objectType == ObjectType.ActivePlayer)
             {
-                // Players bypass the NPC inverse-CMS path because their wire_scale isn't
-                // CMS_v — it's the server-side per-character scale (typically 1.0 for
-                // unmounted humanoids). But the per-ModelId M2 mesh-adjust still applies:
-                // tauren players (DisplayID 59 male, 60 female per ChrRaces) render larger
-                // in 1.14 than 1.12 with identical wire+DBC, so we compensate here too.
+                // K=0.75 for tauren is now baked into the CreatureDisplayInfo CMS hotfix
+                // (CSV/Hotfix/CreatureDisplayInfo1.csv) — id 59 CMS = 1.0125, id 60 CMS = 0.75.
+                // The 1.14 client renders all paths as wire × CMS × ModelScale, so the
+                // hotfix CMS alone yields the K-applied target without a proxy wire
+                // multiplier. Post-shift recompute uses the same CMS, so login and
+                // post-shift now match. Diagnostic event for visibility.
                 int modelIdForAdjust = displayId > 0 ? (int)GameData.GetDisplayInfo((uint)displayId).ModelId : 0;
                 if (modelIdForAdjust > 0 && M2MeshAdjust.TryGetValue(modelIdForAdjust, out var playerAdj))
                 {
-                    float playerEmit = rawScale * playerAdj;
-                    updateData.ObjectData.Scale = playerEmit;
-
-                    Log.Event("unit.player_scale.applied", new
+                    Log.Event("unit.player_scale.skipped", new
                     {
                         guid = guid.ToString(),
                         display_id = displayId,
                         model_id = modelIdForAdjust,
                         raw_scale = rawScale,
-                        mesh_adjust = playerAdj,
-                        emitted_scale = playerEmit,
+                        reason = "k_baked_in_cms_hotfix",
                     });
                 }
             }
