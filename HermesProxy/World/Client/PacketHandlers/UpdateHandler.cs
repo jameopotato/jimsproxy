@@ -2682,8 +2682,12 @@ public partial class WorldClient
                             if (castUnit == default)
                                 aura.AuraData.Flags |= AuraFlagsModern.NoCaster;
                         }
-                        else if (updateMaskArray[UNIT_FIELD_AURA + i])
+                        else
                         {
+                            // Slot cleared (UNIT_FIELD_AURA + i is in the mask with spellId == 0).
+                            // Forward the empty AuraInfo so the client removes the icon, and drop
+                            // the cached per-slot state so a later refresh doesn't inherit stale
+                            // duration / caster from the previous occupant.
                             GetSession().GameState.ClearAuraDuration(guid, i);
                             GetSession().GameState.ClearAuraCaster(guid, i);
                             Framework.Logging.Log.Event("aura.slot.cleared", new
@@ -2697,22 +2701,7 @@ public partial class WorldClient
                                 is_player_target = guid == GetSession().GameState.CurrentPlayerGuid,
                             });
                         }
-                        else
-                        {
-                            // levels or apps mask without UNIT_FIELD_AURA mask — slot likely already
-                            // empty server-side. Modern client never gets a clear for this case.
-                            Framework.Logging.Log.Event("aura.slot.skipped", new
-                            {
-                                target_low = guid.GetCounter(),
-                                slot = i,
-                                mask_aura = _maskAura,
-                                mask_levels = _maskLevels,
-                                mask_apps = _maskApps,
-                                is_player_target = guid == GetSession().GameState.CurrentPlayerGuid,
-                            });
-                        }
-                        if (aura.AuraData != null || updateMaskArray[UNIT_FIELD_AURA + i])
-                            auraUpdate.Auras.Add(aura);
+                        auraUpdate.Auras.Add(aura);
 
                         // JimsProxy (vanilla synthesized spell stats): mirror active aura spell
                         // ids for the player so the synthesis pass can walk them alongside
