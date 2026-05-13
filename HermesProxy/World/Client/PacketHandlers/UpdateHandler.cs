@@ -33,6 +33,22 @@ public partial class WorldClient
         18223,  // Dreadsteed
     }.ToFrozenSet();
 
+    // Per-ModelId render-time compensation for divergences invisible to DBC/M2 files.
+    // Confirmed 2026-05-12 via same-server 1.12 vs 1.14 parity (static-prop reference
+    // proves equal camera): vertex positions, bone hierarchy by key_bone_id, CMS, and
+    // CreatureModelData.ModelScale all agree across builds, yet 1.14 renders tauren
+    // visibly larger. Best hypothesis: a hardcoded race scale in the 1.14 client's
+    // character render path that we can't reach from data. Eye-balled 0.85 from
+    // screenshot pair; tune via the unit.m2_mesh_adjust.applied JSONL event.
+    // ModelId 59 = Male Tauren (NPC + player per ChrRaces.MaleDisplayID),
+    // ModelId 60 = Female Tauren (FemaleDisplayID). Players use same DisplayIDs as
+    // NPCs, so this table covers both via the same model_id lookup.
+    private static readonly FrozenDictionary<int, float> M2MeshAdjust = new Dictionary<int, float>
+    {
+        { 59, 0.75f },
+        { 60, 0.75f },
+    }.ToFrozenDictionary();
+
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_DESTROY_OBJECT)]
     void HandleDestroyObject(WorldPacket packet)
@@ -4200,12 +4216,25 @@ public partial class WorldClient
                 // column was set to CMS_v in their DB (vs unset = server default 1.0).
                 // For those, wire already encodes the vanilla factor; modern client's
                 // wire × CMS_m × ModelScale render then yields CMS_v² × ModelScale —
-                // ~2.2× too big for ogres at CMS_v=2.2. Strip the pre-scaling so the
-                // client lands at vanilla baseline. CMS_v > 1.01 guard prevents
-                // false-firing on the wire==CMS_v==1.0 case (every normal creature).
-                bool wirePreScaled = hasVanillaCms && cmsVanilla > 1.01f && MathF.Abs(rawScale - cmsVanilla) < 0.01f;
+                // ~2.2× too big for ogres at CMS_v=2.2, or ~half-size for Small Crag
+                // Boar at CMS_v=0.5. Strip the pre-scaling so the client lands at
+                // vanilla baseline. Symmetric guard — fires when CMS_v deviates from
+                // 1.0 in either direction (covers oversize ogres and undersize boars),
+                // skips the wire==CMS_v==1.0 case where every normal creature lives.
+                bool wirePreScaled = hasVanillaCms && MathF.Abs(cmsVanilla - 1.0f) > 0.01f && MathF.Abs(rawScale - cmsVanilla) < 0.01f;
                 float effectiveWire = wirePreScaled ? 1.0f : rawScale;
                 float npcEmit = (effectiveWire / cms) * K_npc;
+
+                // M2 mesh-adjust: per-ModelId compensation for 1.14 render-time scale
+                // divergences that don't appear in any DBC/M2 file (see M2MeshAdjust
+                // table comment). Applied AFTER the CMS bake-in so it stacks cleanly.
+                int modelIdForAdjust = displayId > 0 ? (int)GameData.GetDisplayInfo((uint)displayId).ModelId : 0;
+                float meshAdjust = 1.0f;
+                if (modelIdForAdjust > 0 && M2MeshAdjust.TryGetValue(modelIdForAdjust, out var adj))
+                {
+                    meshAdjust = adj;
+                    npcEmit *= meshAdjust;
+                }
                 updateData.ObjectData.Scale = npcEmit;
 
                 Log.Event("unit.npc_scale.applied", new
@@ -4213,14 +4242,40 @@ public partial class WorldClient
                     guid = guid.ToString(),
                     entry = updateData.ObjectData.EntryID,
                     display_id = displayId,
+                    model_id = modelIdForAdjust,
                     vanilla_cms = K_npc,
                     modern_cms = cms,
                     raw_scale = rawScale,
                     effective_wire = effectiveWire,
                     wire_pre_scaled = wirePreScaled,
+                    mesh_adjust = meshAdjust,
                     emitted_scale = npcEmit,
                     k_source = hasVanillaCms ? "vanilla_dbc" : "default",
                 });
+            }
+            else if (objectType == ObjectType.Player || objectType == ObjectType.ActivePlayer)
+            {
+                // Players bypass the NPC inverse-CMS path because their wire_scale isn't
+                // CMS_v — it's the server-side per-character scale (typically 1.0 for
+                // unmounted humanoids). But the per-ModelId M2 mesh-adjust still applies:
+                // tauren players (DisplayID 59 male, 60 female per ChrRaces) render larger
+                // in 1.14 than 1.12 with identical wire+DBC, so we compensate here too.
+                int modelIdForAdjust = displayId > 0 ? (int)GameData.GetDisplayInfo((uint)displayId).ModelId : 0;
+                if (modelIdForAdjust > 0 && M2MeshAdjust.TryGetValue(modelIdForAdjust, out var playerAdj))
+                {
+                    float playerEmit = rawScale * playerAdj;
+                    updateData.ObjectData.Scale = playerEmit;
+
+                    Log.Event("unit.player_scale.applied", new
+                    {
+                        guid = guid.ToString(),
+                        display_id = displayId,
+                        model_id = modelIdForAdjust,
+                        raw_scale = rawScale,
+                        mesh_adjust = playerAdj,
+                        emitted_scale = playerEmit,
+                    });
+                }
             }
         }
     }
