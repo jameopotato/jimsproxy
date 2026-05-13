@@ -481,6 +481,152 @@ public static partial class GameData
         return formula.BaseMs + formula.PerCpMs * comboPoints;
     }
 
+    // JimsProxy: talent-modified aura durations. The legacy server applies the talent-
+    // scaled duration server-side at cast time but doesn't echo it back for ENEMY
+    // debuffs — only self-cast auras get SMSG_UPDATE_AURA_DURATION. AuraDurations1.csv
+    // holds the un-talented base from LibClassicDurations / SpellDuration.dbc, so an
+    // Improved Shadow Word: Pain 18s + 6s (2/2 ranks) lands as a 18 s ticker on the
+    // enemy's bar without this table.
+    //
+    // Each entry describes a single rank of a player spell (rank-specific because the
+    // base differs across ranks for e.g. Bash). At evaluation time we look up which
+    // ranks of the modifier talent are in the player's known-spells set and apply the
+    // formula. Ported from LibClassicDurations classAbilities.lua `duration = function`
+    // blocks that reference Talent(...). Set-bonus and pvpduration paths are skipped
+    // (Phase 1) — they require equipped-item tracking and explicit PvP-zone detection.
+    public sealed record TalentDurationFormula(
+        float BaseSeconds,
+        uint[] RankSpellIds,
+        float PerRankAddSeconds = 0f,
+        float PerRankMultiplier = 0f,
+        bool GateRequired = false);
+
+    public static readonly FrozenDictionary<uint, TalentDurationFormula> TalentDurationModifiers =
+        new Dictionary<uint, TalentDurationFormula>
+        {
+            // Druid — Brutal Impact (16940 R1, 16941 R2): +0.5 s per rank to Bash/Pounce
+            { 5211, new(2f, new uint[] { 16940, 16941 }, PerRankAddSeconds: 0.5f) }, // Bash R1
+            { 6798, new(3f, new uint[] { 16940, 16941 }, PerRankAddSeconds: 0.5f) }, // Bash R2
+            { 8983, new(4f, new uint[] { 16940, 16941 }, PerRankAddSeconds: 0.5f) }, // Bash R3
+            { 9005, new(2f, new uint[] { 16940, 16941 }, PerRankAddSeconds: 0.5f) }, // Pounce R1
+            { 9823, new(2f, new uint[] { 16940, 16941 }, PerRankAddSeconds: 0.5f) }, // Pounce R2
+            { 9827, new(2f, new uint[] { 16940, 16941 }, PerRankAddSeconds: 0.5f) }, // Pounce R3
+
+            // Priest — Improved SW:P (15275 R1, 15317 R2): +3 s per rank, all 8 SW:P ranks share 18 s base
+            { 589,   new(18f, new uint[] { 15275, 15317 }, PerRankAddSeconds: 3f) },
+            { 594,   new(18f, new uint[] { 15275, 15317 }, PerRankAddSeconds: 3f) },
+            { 970,   new(18f, new uint[] { 15275, 15317 }, PerRankAddSeconds: 3f) },
+            { 992,   new(18f, new uint[] { 15275, 15317 }, PerRankAddSeconds: 3f) },
+            { 2767,  new(18f, new uint[] { 15275, 15317 }, PerRankAddSeconds: 3f) },
+            { 10892, new(18f, new uint[] { 15275, 15317 }, PerRankAddSeconds: 3f) },
+            { 10893, new(18f, new uint[] { 15275, 15317 }, PerRankAddSeconds: 3f) },
+            { 10894, new(18f, new uint[] { 15275, 15317 }, PerRankAddSeconds: 3f) },
+
+            // Priest — Shadow Weaving prereq (15257 R1, 15331-15334): aura 15258 only ticks if you have the talent
+            { 15258, new(15f, new uint[] { 15257, 15331, 15332, 15333, 15334 }, GateRequired: true) },
+
+            // Rogue — Improved Gouge (13741, 13793, 13792): +0.5 s per rank, all 5 Gouge ranks share 4 s base
+            { 1776,  new(4f, new uint[] { 13741, 13793, 13792 }, PerRankAddSeconds: 0.5f) },
+            { 1777,  new(4f, new uint[] { 13741, 13793, 13792 }, PerRankAddSeconds: 0.5f) },
+            { 8629,  new(4f, new uint[] { 13741, 13793, 13792 }, PerRankAddSeconds: 0.5f) },
+            { 11285, new(4f, new uint[] { 13741, 13793, 13792 }, PerRankAddSeconds: 0.5f) },
+            { 11286, new(4f, new uint[] { 13741, 13793, 13792 }, PerRankAddSeconds: 0.5f) },
+
+            // Warrior — Booming Voice (12321 R1, 12835-12838 R5): ×(1 + 0.1 × rank) to Battle/Demo Shout
+            { 6673,  new(120f, new uint[] { 12321, 12835, 12836, 12837, 12838 }, PerRankMultiplier: 0.1f) }, // Battle Shout R1
+            { 5242,  new(120f, new uint[] { 12321, 12835, 12836, 12837, 12838 }, PerRankMultiplier: 0.1f) },
+            { 6192,  new(120f, new uint[] { 12321, 12835, 12836, 12837, 12838 }, PerRankMultiplier: 0.1f) },
+            { 11549, new(120f, new uint[] { 12321, 12835, 12836, 12837, 12838 }, PerRankMultiplier: 0.1f) },
+            { 11550, new(120f, new uint[] { 12321, 12835, 12836, 12837, 12838 }, PerRankMultiplier: 0.1f) },
+            { 11551, new(120f, new uint[] { 12321, 12835, 12836, 12837, 12838 }, PerRankMultiplier: 0.1f) },
+            { 25289, new(120f, new uint[] { 12321, 12835, 12836, 12837, 12838 }, PerRankMultiplier: 0.1f) },
+            { 1160,  new(30f,  new uint[] { 12321, 12835, 12836, 12837, 12838 }, PerRankMultiplier: 0.1f) }, // Demo Shout R1
+            { 6190,  new(30f,  new uint[] { 12321, 12835, 12836, 12837, 12838 }, PerRankMultiplier: 0.1f) },
+            { 11554, new(30f,  new uint[] { 12321, 12835, 12836, 12837, 12838 }, PerRankMultiplier: 0.1f) },
+            { 11555, new(30f,  new uint[] { 12321, 12835, 12836, 12837, 12838 }, PerRankMultiplier: 0.1f) },
+            { 11556, new(30f,  new uint[] { 12321, 12835, 12836, 12837, 12838 }, PerRankMultiplier: 0.1f) },
+
+            // Warrior — Improved Disarm (12313, 12804, 12807): +1 s per rank to Disarm
+            { 676, new(10f, new uint[] { 12313, 12804, 12807 }, PerRankAddSeconds: 1f) },
+
+            // Warlock — Improved Succubus (18754, 18755, 18756): ×(1 + 0.1 × rank) to Seduction
+            { 6358, new(15f, new uint[] { 18754, 18755, 18756 }, PerRankMultiplier: 0.1f) },
+
+            // Paladin — Improved Blessing of Freedom (20174, 20175): +3 s per rank
+            { 1044, new(10f, new uint[] { 20174, 20175 }, PerRankAddSeconds: 3f) },
+
+            // Paladin — Improved Judgement (20359, 20360, 20361): +10 s per rank to Judgement of Light/Wisdom
+            { 20185, new(10f, new uint[] { 20359, 20360, 20361 }, PerRankAddSeconds: 10f) }, // JoL R1
+            { 20344, new(10f, new uint[] { 20359, 20360, 20361 }, PerRankAddSeconds: 10f) },
+            { 20345, new(10f, new uint[] { 20359, 20360, 20361 }, PerRankAddSeconds: 10f) },
+            { 20346, new(10f, new uint[] { 20359, 20360, 20361 }, PerRankAddSeconds: 10f) },
+            { 20186, new(10f, new uint[] { 20359, 20360, 20361 }, PerRankAddSeconds: 10f) }, // JoW R1
+            { 20354, new(10f, new uint[] { 20359, 20360, 20361 }, PerRankAddSeconds: 10f) },
+            { 20355, new(10f, new uint[] { 20359, 20360, 20361 }, PerRankAddSeconds: 10f) },
+
+            // Hunter — Clever Traps (19239, 19245): ×(1 + 0.15 × rank) to Freezing Trap
+            { 3355,  new(10f, new uint[] { 19239, 19245 }, PerRankMultiplier: 0.15f) },
+            { 14308, new(15f, new uint[] { 19239, 19245 }, PerRankMultiplier: 0.15f) },
+            { 14309, new(20f, new uint[] { 19239, 19245 }, PerRankMultiplier: 0.15f) },
+
+            // Mage — Permafrost (11175 R1, 12569 R2, 12571 R3): +1 s per rank to Frostbolt slow / Cone of Cold / Frost Armor Chilled
+            { 116,   new(5f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) }, // Frostbolt R1
+            { 205,   new(6f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) },
+            { 837,   new(6f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) },
+            { 7322,  new(7f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) },
+            { 8406,  new(7f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) },
+            { 8407,  new(8f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) },
+            { 8408,  new(8f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) },
+            { 10179, new(9f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) },
+            { 10180, new(9f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) },
+            { 10181, new(9f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) },
+            { 25304, new(9f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) },
+            { 120,   new(8f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) }, // Cone of Cold R1
+            { 8492,  new(8f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) },
+            { 10159, new(8f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) },
+            { 10160, new(8f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) },
+            { 10161, new(8f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) },
+            { 6136,  new(5f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) }, // Frost Armor Chilled
+            { 7321,  new(5f, new uint[] { 11175, 12569, 12571 }, PerRankAddSeconds: 1f) }, // Ice Armor Chilled
+
+            // Mage — gated prerequisite auras: only show duration when the prereq talent is taken.
+            { 22959, new(30f, new uint[] { 11095, 12872, 12873 }, GateRequired: true) }, // Fire Vulnerability (needs Imp Scorch)
+            { 12579, new(15f, new uint[] { 11180, 28592, 28593, 28594, 28595 }, GateRequired: true) }, // Winter's Chill stack
+        }.ToFrozenDictionary();
+
+    /// <summary>
+    /// JimsProxy (talent-modified duration): if <paramref name="spellId"/> is in the
+    /// talent-modifier table, returns the talent-scaled duration in milliseconds based
+    /// on the player's known-spells set (used as a proxy for "rank you have learned of
+    /// the modifier talent"). Returns null otherwise — caller falls back to CSV. Only
+    /// safe for casts assumed to come from the LOCAL PLAYER; other casters with different
+    /// talent loadouts would land on the same value, but the fallback path is dominated
+    /// by self-cast scenarios in practice.
+    /// </summary>
+    public static int? TryGetTalentDuration(uint spellId, System.Collections.Generic.HashSet<uint> knownSpells)
+    {
+        if (knownSpells == null || knownSpells.Count == 0)
+            return null;
+        if (!TalentDurationModifiers.TryGetValue(spellId, out var f))
+            return null;
+
+        int rank = 0;
+        for (int i = 0; i < f.RankSpellIds.Length; i++)
+        {
+            if (knownSpells.Contains(f.RankSpellIds[i]))
+                rank = i + 1;
+        }
+        if (f.GateRequired && rank == 0)
+            return null;
+
+        float seconds;
+        if (f.PerRankMultiplier > 0f)
+            seconds = f.BaseSeconds * (1f + rank * f.PerRankMultiplier);
+        else
+            seconds = f.BaseSeconds + rank * f.PerRankAddSeconds;
+        return (int)(seconds * 1000f);
+    }
+
     /// <summary>
     /// JimsProxy: true if the spell is a CP-scaling enemy-debuff finisher we compute
     /// duration for locally. Used by the CMSG_CAST_SPELL handler to decide whether to
