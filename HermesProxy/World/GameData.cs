@@ -3974,8 +3974,7 @@ public static partial class GameData
     // LegacySlotIndex=1, but the vanilla 1.12 server places the use-spell at slot 0.
     // Without an override the modern client never finds the spell at slot 1 and
     // strips the "Use:" tooltip line / blocks action-bar binding. Pairs are
-    // (record_id, parent_item_id) per CSV/ItemEffect2.csv lines 820/822-823/833/1133
-    // plus 5513 (Twinstar repurposed to Mana Jade, same slot bug).
+    // (record_id, parent_item_id) per CSV/ItemEffect2.csv lines 820/822-823/833/1133.
     //
     // The reactive path in GenerateItemEffectUpdateIfNeeded fixes this when an item
     // is freshly queried via CMSG_ITEM_QUERY_SINGLE, but the client only queries
@@ -3990,9 +3989,22 @@ public static partial class GameData
         (97906u, 5510),
         (97937u, 5511),
         (97875u, 5512),
-        (97663u, 5513),
         (99320u, 9421),
     };
+
+    // Mage mana gems were removed in retail; the modern client's SpellDB no longer
+    // recognizes vanilla "Restore Mana" rank spells (5405, 10052, 10053, 10054).
+    // Pre-#196 the client rendered the Use: line via its untouched retail ItemEffect
+    // record (whatever Blizzard left behind), and right-click consume worked because
+    // the legacy server handles the cast. PR #196's slot-mismatch hotfix overwrites
+    // those records with the vanilla SpellID, which the client can't resolve →
+    // Use: line vanishes and the item becomes inert.
+    //
+    // Items 5513/5514 are the only mana gems present in our ItemEffect CSVs (record
+    // ids 97663 / 97664). Citrine (5515) / Ruby (5516) have no CSV record so the
+    // slot-mismatch path never fires for them. Excluding 5513/5514 from the override
+    // restores the working pre-#196 behavior without affecting healthstones.
+    internal static readonly HashSet<uint> ManaGemItemEntries = new() { 5513u, 5514u, 5515u, 5516u };
 
     public static List<Server.Packets.HotFixMessage> PushKnownItemEffectFixes()
     {
@@ -4031,6 +4043,13 @@ public static partial class GameData
 
     public static Server.Packets.HotFixMessage? GenerateItemEffectUpdateIfNeeded(ItemTemplate item, byte slot)
     {
+        // Mana gems: leave the client's cached retail ItemEffect record untouched. Any
+        // mutation pushed via hotfix binds the record to a vanilla "Restore Mana" spell
+        // id the modern client's SpellDB doesn't know, stripping the Use: line. See
+        // ManaGemItemEntries above for the full rationale.
+        if (ManaGemItemEntries.Contains(item.Entry))
+            return null;
+
         ItemEffect? effect = GetItemEffectByItemId(item.Entry, slot);
         if (effect != null)
         {
