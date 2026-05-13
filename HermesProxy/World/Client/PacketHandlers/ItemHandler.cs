@@ -1,4 +1,5 @@
 ﻿using Framework;
+using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
@@ -183,7 +184,8 @@ public partial class WorldClient
     void HandleInventoryChangeFailureVanilla(WorldPacket packet)
     {
         InventoryChangeFailure failure = new();
-        failure.BagResult = LegacyVersion.ConvertInventoryResult(packet.ReadUInt8());
+        byte rawResult = packet.ReadUInt8();
+        failure.BagResult = LegacyVersion.ConvertInventoryResult(rawResult);
         if (failure.BagResult == InventoryResult.Ok)
             return;
 
@@ -197,6 +199,14 @@ public partial class WorldClient
         failure.Item[0] = packet.ReadGuid().To128(GetSession().GameState);
         failure.Item[1] = packet.ReadGuid().To128(GetSession().GameState);
         failure.ContainerBSlot = packet.ReadUInt8();
+
+        Log.Event("inventory.change.failure", new
+        {
+            raw_result = rawResult,
+            result = failure.BagResult.ToString(),
+            item0 = failure.Item[0].ToString(),
+            item1 = failure.Item[1].ToString(),
+        });
 
         SendPacketToClient(failure);
 

@@ -1,4 +1,5 @@
 ﻿using Framework;
+using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
@@ -47,6 +48,16 @@ public partial class WorldClient
             var uiType = (LootSlotTypeLegacy)packet.ReadUInt8();
             lootItem.UIType = uiType.CastEnum<LootSlotTypeModern>();
             loot.Items.Add(lootItem);
+
+            Log.Event("loot.item", new
+            {
+                item_id = lootItem.Loot.ItemID,
+                slot = lootItem.LootListID,
+                quantity = lootItem.Quantity,
+                ui_type_legacy = (uint)uiType,
+                ui_type_modern = (uint)lootItem.UIType,
+                target_guid = targetGuid.ToString(),
+            });
         }
         SendMasterLootListIfApplicable();
         SendPacketToClient(loot);
