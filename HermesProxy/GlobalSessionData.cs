@@ -98,6 +98,14 @@ public sealed class GameSessionData
     public string? TaxiAttemptId;
     public bool IsWaitingForNewWorld;
     public bool IsWaitingForWorldPortAck;
+    // JimsProxy (zep-stuck-no-move 2026-05-14): set to a sentinel MoveCounter when
+    // HandleNewWorld emits a synthesized SMSG_MOVE_TELEPORT to clear the modern
+    // client's stale MOVEMENTFLAG_ONTRANSPORT after a cross-continent transport
+    // (zep/boat) zone change. The legacy server never sent that teleport, so the
+    // matching CMSG_MOVE_TELEPORT_ACK must be dropped before reaching the legacy
+    // server (per project_kronos_three_delayed_kick_sources, a spurious teleport-ack
+    // can feed malformed-packet kick counters on Kronos). 0 means none pending.
+    public uint PendingSyntheticTransportClearAckCounter;
     public bool IsFirstEnterWorld;
     public bool IsConnectedToInstance;
     public Queue<ServerPacket> PendingUninstancedPackets = new(); // Here packets are queued while IsConnectedToInstance = false;
