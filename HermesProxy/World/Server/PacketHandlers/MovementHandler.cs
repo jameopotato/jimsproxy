@@ -129,6 +129,25 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MOVE_TELEPORT_ACK)]
     void HandleMoveTeleportAck(MoveTeleportAck teleport)
     {
+        // JimsProxy (zep-stuck-no-move 2026-05-14): if this ack corresponds to the
+        // synthesized SMSG_MOVE_TELEPORT emitted by HandleNewWorld to clear stale
+        // MOVEMENTFLAG_ONTRANSPORT, drop it — the legacy server never sent the
+        // teleport and would treat the unsolicited MSG_MOVE_TELEPORT_ACK as
+        // malformed input.
+        uint pendingSentinel = GetSession().GameState.PendingSyntheticTransportClearAckCounter;
+        if (pendingSentinel != 0 &&
+            teleport.MoveCounter == pendingSentinel &&
+            teleport.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
+            Framework.Logging.Log.Event("movement.transport_clear.ack_dropped", new
+            {
+                player_low = teleport.MoverGUID.GetCounter(),
+                move_counter = teleport.MoveCounter,
+            });
+            return;
+        }
+
         WorldPacket packet = new WorldPacket(Opcode.MSG_MOVE_TELEPORT_ACK);
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_2_0_10192))
             packet.WritePackedGuid(teleport.MoverGUID.To64());
