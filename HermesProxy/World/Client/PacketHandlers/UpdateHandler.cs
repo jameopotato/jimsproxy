@@ -1295,11 +1295,21 @@ public partial class WorldClient
                         resolved = dictCount;
                         fromDict = true;
                     }
-                    else if (obj.ObjectID > 0 && GetSession().GameState.IsFirstEnterWorld)
+                    else if (obj.ObjectID > 0)
                     {
-                        // Inventory walk fallback only during login — after that,
-                        // SMSG_QUEST_UPDATE_ADD_ITEM credit packets keep the dict
-                        // in sync and the walk is unnecessary overhead.
+                        // Inventory-walk fallback whenever the running-total dict
+                        // doesn't yet have an entry for this objective. The dict
+                        // is populated by SMSG_QUEST_UPDATE_ADD_ITEM credit packets,
+                        // but those NEVER fire for items the player logged in already
+                        // holding (e.g. quest items collected in a prior session) —
+                        // so a player relogging mid-quest with N items in bag would
+                        // otherwise render 0/N forever once IsFirstEnterWorld flipped
+                        // false on the first zone/teleport. Tester report 2026-05-13:
+                        // quest #546 "Souvenirs of Death" stuck at 0/30 with 30 skulls
+                        // in bag. The walk is ~60 slot reads × item-objective count,
+                        // and only runs when an OBJECT_UPDATE touches PLAYER_QUEST_LOG
+                        // fields (login + quest pickup/abandon/progress) — that's
+                        // sparse, not per-frame.
                         resolved = GetSession().GameState.CountItemsByEntry((uint)obj.ObjectID);
                     }
 
