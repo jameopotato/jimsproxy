@@ -205,7 +205,9 @@ public partial class WorldClient
         // transport-clear ack we were watching for. Clear the sentinel so a future
         // legitimate ack carrying the same MoveCounter cannot be eaten.
         if (guid == GetSession().GameState.CurrentPlayerGuid)
+        {
             GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
+        }
         SendPacketToClient(teleport);
     }
 
@@ -279,10 +281,15 @@ public partial class WorldClient
             GetSession().GameState.IsWaitingForWorldPortAck = true;
 
             // --- START FIX: Map Transition Race Condition ---
-            // Simulates a legacy HDD load time. Gives the 1.12 server a 2-second 
-            // head start to buffer heavy object updates (like 40-man zeppelins) 
-            // before the 1.14 client instantly loads the map and causes a desync.
-            System.Threading.Thread.Sleep(2000);
+            // JimsProxy (zep-transfer-stuck 2026-05-15): trimmed 2000ms → 50ms.
+            // The long sleep was suspected of contributing to the post-transfer
+            // stuck-movement repro (synth-clear arriving deep into the modern
+            // client's loading-screen window). 50ms keeps a tiny scheduling
+            // breath for the 1.12 server to start streaming destination-map
+            // object updates without forcing a multi-second delay. Revert to
+            // 2000 if desync (missing players/NPCs at destination on heavy
+            // transports) returns.
+            System.Threading.Thread.Sleep(50);
             // --- END FIX ---
 
             SendPacketToClient(teleport);

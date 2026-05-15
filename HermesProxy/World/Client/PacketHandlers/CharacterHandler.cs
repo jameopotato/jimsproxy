@@ -262,6 +262,19 @@ public partial class WorldClient
         verify.Pos.Orientation = packet.ReadFloat();
         SendPacketToClient(verify);
 
+        // JimsProxy (zep-relog-diag 2026-05-15): emit the server-issued login
+        // position so a bundle can be cross-referenced with the subsequent
+        // player UpdateObject's transport state. Fires once per login —
+        // negligible volume, persistent diagnostic for transport/login bugs.
+        Framework.Logging.Log.Event("world.login_verify.pos", new
+        {
+            map_id = verify.MapID,
+            x = verify.Pos.X,
+            y = verify.Pos.Y,
+            z = verify.Pos.Z,
+            orientation = verify.Pos.Orientation,
+        });
+
         GetSession().GameState.IsInWorld = true;
 
         WorldServerInfo info = new();

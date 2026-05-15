@@ -997,6 +997,33 @@ public partial class WorldClient
 
             ApplyHoverOverrideIfNeeded(guid, moveInfo);
 
+            // JimsProxy (zep-relog-diag 2026-05-15): emit a diagnostic on the
+            // player's own UpdateObject only when transport state transitions
+            // (first observation at login, on→off, off→on, or guid swap).
+            // Skips steady-state refreshes so log volume stays low. Persistent
+            // hook for triaging zep / boat transport bugs from JSONL bundles.
+            if (guid == GetSession().GameState.CurrentPlayerGuid)
+            {
+                var prevTransport = GetSession().GameState.DiagLastObservedPlayerTransportGuid;
+                if (prevTransport == null || prevTransport.Value != moveInfo.TransportGuid)
+                {
+                    Framework.Logging.Log.Event("movement.player_update.transport_state", new
+                    {
+                        prev_transport_guid = prevTransport?.ToString() ?? "<unobserved>",
+                        transport_guid = moveInfo.TransportGuid.ToString(),
+                        on_transport_flag = ((MovementFlagWotLK)moveInfo.Flags).HasAnyFlag(MovementFlagWotLK.OnTransport),
+                        raw_flags = moveInfo.Flags,
+                        position = $"{moveInfo.Position.X:F2},{moveInfo.Position.Y:F2},{moveInfo.Position.Z:F2}",
+                        orientation = moveInfo.Orientation,
+                        transport_offset = $"{moveInfo.TransportOffset.X:F2},{moveInfo.TransportOffset.Y:F2},{moveInfo.TransportOffset.Z:F2}",
+                        transport_seat = moveInfo.TransportSeat,
+                        map_id = GetSession().GameState.CurrentMapId,
+                    });
+
+                    GetSession().GameState.DiagLastObservedPlayerTransportGuid = moveInfo.TransportGuid;
+                }
+            }
+
             var moveFlags = moveInfo.Flags;
 
             moveInfo.WalkSpeed = packet.ReadFloat();
@@ -1210,6 +1237,7 @@ public partial class WorldClient
             moveInfo.ValidateMovementInfo();
             updateData.CreateData.MoveInfo = moveInfo;
         }
+
     }
 
     private WowGuid64 GetGuidValue64<T>(Dictionary<int, UpdateField> UpdateFields, T field) where T : System.Enum
@@ -4369,4 +4397,5 @@ public partial class WorldClient
             }
         }
     }
+
 }

@@ -106,6 +106,12 @@ public sealed class GameSessionData
     // server (per project_kronos_three_delayed_kick_sources, a spurious teleport-ack
     // can feed malformed-packet kick counters on Kronos). 0 means none pending.
     public uint PendingSyntheticTransportClearAckCounter;
+
+    // JimsProxy (zep-relog-diag 2026-05-15): tracks the player's last-observed
+    // TransportGuid across UpdateObject reads so the diagnostic in
+    // UpdateHandler.ReadMovementUpdateBlock fires only on state transitions.
+    public WowGuid128? DiagLastObservedPlayerTransportGuid;
+
     public bool IsFirstEnterWorld;
     public bool IsConnectedToInstance;
     public Queue<ServerPacket> PendingUninstancedPackets = new(); // Here packets are queued while IsConnectedToInstance = false;
