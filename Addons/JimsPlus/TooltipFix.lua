@@ -388,6 +388,9 @@ local function PlayerCanUse(itemClassId, itemSubClassId)
         end
         return trained
     elseif itemClassId == ITEM_CLASS_WEAPON then
+        if itemSubClassId == 14 or itemSubClassId == 20 then
+            return true
+        end
         local trained = trainedWeaponSubs[itemSubClassId] == true
         if namespace.JPTT_DEBUG then
             print(string.format("|cFFFFAA00[JimsPlus TT]|r PlayerCanUse=%s (weapon) sub=%s",
@@ -622,22 +625,9 @@ local function FixMerchantUsability()
                         rowSlot:SetVertexColor(r, g, b)
                     end
 
-                    -- Item name text. Restore the proper item-quality color
-                    -- when usable; force red when not, to match the rest
-                    -- of the tinting.
-                    local nameFs = _G["MerchantItem" .. i .. "Name"]
-                    if nameFs and nameFs.SetTextColor then
-                        if usable then
-                            local qc = ITEM_QUALITY_COLORS and ITEM_QUALITY_COLORS[quality or 1]
-                            if qc then
-                                nameFs:SetTextColor(qc.r, qc.g, qc.b)
-                            else
-                                nameFs:SetTextColor(1, 1, 1)
-                            end
-                        else
-                            nameFs:SetTextColor(0.9, 0, 0)
-                        end
-                    end
+                    -- Leave item name text at the client's default yellow.
+                    -- Proficiency is communicated via icon/border tinting;
+                    -- vanilla never recolors the name text for proficiency.
                 end
             end
         end
@@ -706,24 +696,9 @@ local function FixQuestRewardUsability()
                         end
                     end
 
-                    -- Reward name text. Restore quality color when usable;
-                    -- force red when not.
-                    local nameFs = button.Name
-                    if not nameFs and btnName ~= "" then
-                        nameFs = _G[btnName .. "Name"]
-                    end
-                    if nameFs and nameFs.SetTextColor then
-                        if usable then
-                            local qc = ITEM_QUALITY_COLORS and ITEM_QUALITY_COLORS[quality or 1]
-                            if qc then
-                                nameFs:SetTextColor(qc.r, qc.g, qc.b)
-                            else
-                                nameFs:SetTextColor(1, 1, 1)
-                            end
-                        else
-                            nameFs:SetTextColor(0.9, 0, 0)
-                        end
-                    end
+                    -- Leave reward name text at the client's default color.
+                    -- Proficiency is communicated via icon/border tinting;
+                    -- vanilla never recolors the name text for proficiency.
                 end
             end
         end
