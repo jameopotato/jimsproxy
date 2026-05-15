@@ -251,8 +251,20 @@ public partial class WorldClient
         }
         else
         {
-            Disconnect();
-            // JimsProxy realm-swap fix: previously called GetSession().OnDisconnect()
+            // CompareExchange MUST run before Disconnect(). Disconnect() also nulls
+            // session.WorldClient at line ~184 (if (GetSession().WorldClient == this)
+            // GetSession().WorldClient = null;), so calling Disconnect() first leaves
+            // CompareExchange comparing against a null field and reporting
+            // wasActiveWorldClient=false even when this WorldClient WAS the active one.
+            // The bug: legacy server closes a healthy connection → HandleDisconnect runs
+            // → Disconnect() nulls the field → CompareExchange sees null → suppresses the
+            // reconnect → modern client stays connected but every CMSG drops via the
+            // c2s.dropped_during_disconnect path until the client surrenders ~50s later.
+            // Issue #229 (BG-exit DC repro on Kronos V). The silent-stall watchdog at
+            // SendKeepAlivePing already uses the correct order — this brings the
+            // FIN/RST paths into consistency.
+            //
+            // JimsProxy realm-swap context: previously called GetSession().OnDisconnect()
             // here, which tore down the entire BNet session including any newly-created
             // WorldClient for a different realm during a swap. Now: only null our slot
             // if it's still pointing at us (a fresh swap may have already replaced it
@@ -266,6 +278,7 @@ public partial class WorldClient
                 var prior = Interlocked.CompareExchange(ref session.WorldClient, null, this);
                 wasActiveWorldClient = ReferenceEquals(prior, this);
             }
+            Disconnect();
             Log.Event("session.ondisconnect.suppressed", new
             {
                 reason = "worldclient_legacy_disconnect",
@@ -343,8 +356,10 @@ public partial class WorldClient
                 _isSuccessful = false;
             else
             {
-                Disconnect();
-                // JimsProxy realm-swap fix: see WorldClient.HandleDisconnect.
+                // Same ordering rule as HandleDisconnect: CompareExchange before
+                // Disconnect() so Disconnect's internal null-assignment doesn't
+                // falsely set wasActiveWorldClient=false. See HandleDisconnect's
+                // comment for the full rationale (issue #229).
                 var session = GetSession();
                 bool wasActiveWorldClient = false;
                 if (session != null)
@@ -352,6 +367,7 @@ public partial class WorldClient
                     var prior = Interlocked.CompareExchange(ref session.WorldClient, null, this);
                     wasActiveWorldClient = ReferenceEquals(prior, this);
                 }
+                Disconnect();
                 Log.Event("session.ondisconnect.suppressed", new
                 {
                     reason = "worldclient_receive_loop_exception",
