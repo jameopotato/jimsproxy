@@ -442,12 +442,27 @@ public partial class WorldClient
         }
         if (matches.Count == 0) return;
 
-        float k = (familyId > 0)
-            ? GameData.GetPetFamilyScale(familyId)
-            : (matches[0].IsWarlockPet ? 0.75f : 1.5f);
-
+        // JimsProxy: K lookup chain matches UpdateHandler's isLocalPet branch —
+        // per-DisplayID vanilla CMS wins over family-table MaxScale, because
+        // CSV/CreatureDisplayInfoVanilla.csv tunes specific display variants
+        // (e.g. Imp displayId 4449 → 2.0) that family-table aggregates would
+        // otherwise overwrite. Previously this resolver used family-table K
+        // only — and re-emitted SCALE_X 200-300ms after summon with the
+        // family value, shrinking the imp back from 2.0 to 0.5 once the
+        // CMSG_QUERY_CREATURE response landed (user-visible "pet shrinks
+        // when buff happens" — actually template-query timing).
         foreach (var p in matches)
         {
+            float? vanillaCmsK = (p.DisplayId > 0 && GameData.VanillaCreatureModelScales.TryGetValue(p.DisplayId, out var vCms))
+                ? vCms
+                : (float?)null;
+            float? familyTableK = (familyId > 0)
+                ? GameData.GetPetFamilyScale(familyId)
+                : (float?)null;
+            float k = vanillaCmsK
+                ?? familyTableK
+                ?? (p.IsWarlockPet ? 0.75f : 1.5f);
+
             float emit = (p.Cms > 0)
                 ? (p.RawScale / p.Cms) * k
                 : p.RawScale * k;
@@ -463,8 +478,12 @@ public partial class WorldClient
             {
                 guid = p.Guid.ToString(),
                 entry = p.Entry,
+                display_id = p.DisplayId,
                 family_id = familyId,
                 k = k,
+                k_source = vanillaCmsK.HasValue ? "vanilla-dbc"
+                           : familyTableK.HasValue ? "family-table"
+                           : (p.IsWarlockPet ? "k-warlock-fallback" : "k-hunter-fallback"),
                 raw_scale = p.RawScale,
                 emitted_scale = emit,
             });
