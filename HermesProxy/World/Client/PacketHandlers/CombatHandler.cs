@@ -181,6 +181,12 @@ public partial class WorldClient
         GetSession().GameState.DeferredAttackStop = false;
         CancelCombat combat = new();
         SendPacketToClient(combat);
+
+        // Drop every mob's threat list — vanilla 1.12 doesn't emit a
+        // "threat ended" signal, so without this the modern client retains
+        // every mob we ever fought and Luna / ThreatPlates leave red
+        // indicators lit on stale nameplates.
+        GetSession().ThreatTracker.OnLocalPlayerLeftCombat();
     }
     [PacketHandler(Opcode.SMSG_AI_REACTION)]
     void HandleAIReaction(WorldPacket packet)

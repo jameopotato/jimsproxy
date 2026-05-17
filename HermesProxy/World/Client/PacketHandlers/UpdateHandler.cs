@@ -1475,7 +1475,8 @@ public partial class WorldClient
 
         if (GameData.SpellEffectPoints.TryGetValue(spellId, out var basePoints))
             data.Points = basePoints;
-        int duration = GameData.GetAuraSpellDuration(spellId);
+        int? talentDuration = GameData.TryGetTalentDuration(spellId, GetSession().GameState.CurrentPlayerKnownSpells);
+        int duration = talentDuration ?? GameData.GetAuraSpellDuration(spellId);
         if (duration > 0)
         {
             data.Duration = duration;
@@ -2715,7 +2716,11 @@ public partial class WorldClient
                                 // (Cheap Shot, flat 4 s) is the primary case; any other spell with
                                 // an AuraDurations CSV row also benefits.
                                 if (durationFull <= 0)
-                                    durationFull = GameData.GetAuraSpellDuration((uint)aura.AuraData.SpellID);
+                                {
+                                    uint auraSpellId = (uint)aura.AuraData.SpellID;
+                                    int? talentDur = GameData.TryGetTalentDuration(auraSpellId, GetSession().GameState.CurrentPlayerKnownSpells);
+                                    durationFull = talentDur ?? GameData.GetAuraSpellDuration(auraSpellId);
+                                }
                             }
 
                             if (durationLeft > 0 && durationFull > 0)

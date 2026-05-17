@@ -1,5 +1,7 @@
 using Framework.Logging;
+using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
+using System;
 using System.Collections.Generic;
 
 namespace HermesProxy.World;
@@ -102,6 +104,10 @@ internal static class ThreatModules
 
         // Paladin Holy Shield reflect damage (R1..3)
         [20925] = 1.2, [20927] = 1.2, [20928] = 1.2,
+
+        // Warrior Execute (R1..5) — finisher designed as threat spike
+        [5308] = 1.25, [20658] = 1.25, [20660] = 1.25,
+        [20661] = 1.25, [20662] = 1.25,
     };
 
     public static double GetDamageMultiplier(int spellId)
@@ -114,6 +120,17 @@ internal static class ThreatModules
     // Per-spell threat tables (rank → amount). Numbers come straight from
     // LibThreatClassic2 ClassModules/Classic/*.lua.
     // -----------------------------------------------------------------------
+
+    // Priest Power Word: Shield — cast-time flat threat per rank. Values from
+    // LTC2 ClassModules/Classic/Priest.lua threatAmounts["pws"]. The threat
+    // tracker layers Imp PW:S (talent rank-based 1.05 - 1.15 multiplier) and
+    // Silent Resolve (via passive modifier) on top.
+    private static readonly Dictionary<int, double> PowerWordShieldAmount = new()
+    {
+        [17]    = 22,    [592]   = 44,    [600]   = 79,    [3747]  = 117,
+        [6065]  = 150.5, [6066]  = 190.5, [10898] = 242,   [10899] = 302.5,
+        [10900] = 381.5, [10901] = 471,
+    };
 
     // Hunter
     private static readonly Dictionary<int, double> DistractingShotAmount = new()
@@ -136,6 +153,45 @@ internal static class ThreatModules
     {
         [1742] = -30, [1753] = -55, [1754] = -85,
         [1755] = -125, [1756] = -175, [16697] = -225,
+    };
+
+    // Warlock Voidwalker — Torment (single-target high threat, AP-scaled).
+    private static readonly Dictionary<int, double> TormentAmount = new()
+    {
+        [3716]  = 45,  [7809]  = 75,  [7810]  = 125,
+        [7811]  = 215, [11774] = 300, [11775] = 395,
+    };
+
+    // Warlock Voidwalker — Suffering (AoE high threat, AP-scaled, per-target).
+    private static readonly Dictionary<int, double> SufferingAmount = new()
+    {
+        [17735] = 150, [17750] = 300,
+        [17751] = 450, [17752] = 600,
+    };
+
+    // Warlock Succubus — Soothing Kiss. Pet self-debuff: reduces the pet's
+    // OWN threat on the kissed mob (Succubus de-aggro tool, NOT a player-
+    // targeted threat-wipe). Negative flat — same shape as Cower.
+    private static readonly Dictionary<int, double> SoothingKissAmount = new()
+    {
+        [6360] = -45, [7813] = -75,
+        [11784] = -127, [11785] = -165,
+    };
+
+    // Hunter pet — Intimidation (Beast Mastery 31-point talent). 5-sec stun
+    // + taunt-equivalent flat threat for the pet on the target. Per LTC2
+    // Pet.lua line 50-55: flat 580 single-target.
+    private static readonly Dictionary<int, double> IntimidationAmount = new()
+    {
+        [24394] = 580,
+    };
+
+    // Hunter pet — Scorpid Poison (ranks 1-4). Tiny flat per cast, but the
+    // pet fires it on auto-attack rotation so it accumulates over a fight.
+    // Per LTC2 Pet.lua line 58-62: flat 5 per rank, no AP scaling.
+    private static readonly Dictionary<int, double> ScorpidPoisonAmount = new()
+    {
+        [24640] = 5, [24583] = 5, [24586] = 5, [24587] = 5,
     };
 
     // Warrior — sunderFactor = 261/58, with R5 hardcoded to 261.
@@ -303,14 +359,24 @@ internal static class ThreatModules
             if (hitTargets.Count == 0) return;
             if (!amounts.TryGetValue(spellId, out double amount)) return;
 
+            // Gear set-bonus multiplier (Warrior Might 8-set: Sunder x1.15;
+            // Rogue Bloodfang 5-set: Feint x1.25). Returns 1.0 for spells
+            // outside the gated list, so non-set-affected flats pass through
+            // unchanged.
+            var playerClass = (Class)session.GameState.CurrentPlayerClass;
+            double gearMult = ThreatSetBonuses.GetGearSpellMultiplier(session.GameState, playerClass, spellId);
+            double finalAmount = amount * gearMult;
+
             var target = hitTargets[0];
-            tracker.AddModifiedThreat(target, caster, amount);
+            tracker.AddModifiedThreat(target, caster, finalAmount);
 
             Log.Event("threat.spell." + eventTag, new
             {
                 spell_id = spellId,
                 target_low = target.GetCounter(),
-                amount,
+                amount = finalAmount,
+                base_amount = amount,
+                gear_mult = gearMult,
             });
         };
 
@@ -352,6 +418,104 @@ internal static class ThreatModules
                 spell_id = spellId,
                 target_low = target.GetCounter(),
                 amount,
+            });
+        };
+
+    // JimsProxy (pet-ap-scaling 2026-05-17): LibThreatClassic2 Pet.lua applies
+    // an AP-scaled bonus on top of rank-flat threat for several pet abilities:
+    //
+    //   threat = rankFlat + max(0, petAP - (petLevel * apLevelMalus - apBaseBonus)) * apFactor
+    //
+    // Per-ability constants from LTC2 (verified 2026-05-17):
+    //
+    //                                apBaseBonus  apLevelMalus  apFactor
+    //   Hunter pet Growl              1235.6      28.14         5.7
+    //   Voidwalker Torment             123         0            0.385
+    //   Voidwalker Suffering (AoE)     124         0            0.547
+    //
+    // Growl's high apFactor (5.7) + steep level term mean the threshold flips
+    // sign at petLevel ~44 — below that the formula would produce silly large
+    // bonuses for low-AP pets. gateOnPositiveThreshold=true skips the bonus
+    // when the threshold is negative (Growl only). Torment/Suffering have
+    // apLevelMalus=0 → threshold is constant negative; their small apFactor
+    // (≤0.547) keeps bonuses sane at all pet levels, so they don't need the
+    // gate.
+    //
+    // Without these scaled bonuses, raid-geared L60 pets were under-credited
+    // (TinyThreat addon showing pet threat lower than expected, 2026-05-17
+    // log jimsproxy-20260517-114718.jsonl).
+    private static ThreatHandler PetCasterAPScaled(
+        string eventTag,
+        Dictionary<int, double> rankFlats,
+        double apBaseBonus,
+        double apLevelMalus,
+        double apFactor,
+        bool gateOnPositiveThreshold,
+        bool aoeAllTargets = false)
+        => (tracker, session, spellId, caster, hitTargets) =>
+        {
+            if (caster != session.GameState.CurrentPetGuid) return;
+            if (hitTargets.Count == 0) return;
+            if (!rankFlats.TryGetValue(spellId, out double rankFlat)) return;
+
+            double apBonus = 0;
+            uint petLevel = 0;
+            int petBaseAP = 0;
+            int petApModPos = 0;
+            int petApModNeg = 0;
+            int petAP = 0;
+            var fields = session.GameState.GetCachedObjectFieldsLegacy(caster);
+            if (fields != null)
+            {
+                int levelIdx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_LEVEL);
+                int apIdx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_ATTACK_POWER);
+                int apModsIdx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_ATTACK_POWER_MODS);
+                if (levelIdx >= 0 && fields.TryGetValue(levelIdx, out var levelField))
+                    petLevel = levelField.UInt32Value;
+                if (apIdx >= 0 && fields.TryGetValue(apIdx, out var apField))
+                    petBaseAP = apField.Int32Value;
+                // Legacy UNIT_FIELD_ATTACK_POWER_MODS packs pos/neg buff
+                // magnitudes into one int (low 16 = neg, high 16 = pos).
+                // LTC2's UnitAttackPower("pet") returns base + pos + neg
+                // where neg is negative, so effective = base + pos − neg.
+                // Without this, an Aspect-of-the-Hawk / Battle Shout / TSA
+                // buffed pet reads as just base AP and falls under the
+                // LTC2 threshold, gating out the Growl AP bonus entirely.
+                if (apModsIdx >= 0 && fields.TryGetValue(apModsIdx, out var apModsField))
+                {
+                    int packed = apModsField.Int32Value;
+                    petApModNeg = packed & 0xFFFF;
+                    petApModPos = (packed >> 16) & 0xFFFF;
+                }
+                petAP = petBaseAP + petApModPos - petApModNeg;
+
+                double threshold = petLevel * apLevelMalus - apBaseBonus;
+                bool gated = gateOnPositiveThreshold && threshold <= 0;
+                if (!gated)
+                    apBonus = Math.Max(0, petAP - threshold) * apFactor;
+            }
+
+            double amount = rankFlat + apBonus;
+            int targetCount = aoeAllTargets ? hitTargets.Count : 1;
+            for (int i = 0; i < targetCount; i++)
+            {
+                var target = hitTargets[i];
+                tracker.AddModifiedThreat(target, caster, amount);
+            }
+
+            Log.Event("threat.spell." + eventTag, new
+            {
+                spell_id = spellId,
+                target_low = hitTargets[0].GetCounter(),
+                target_count = targetCount,
+                amount,
+                rank_flat = rankFlat,
+                ap_bonus = apBonus,
+                pet_level = petLevel,
+                pet_ap = petAP,
+                pet_base_ap = petBaseAP,
+                pet_ap_mod_pos = petApModPos,
+                pet_ap_mod_neg = petApModNeg,
             });
         };
 
@@ -436,12 +600,37 @@ internal static class ThreatModules
 
         map[5384] = PlayerZeroAllMobs("feign_death");
 
-        // Pet
-        var petGrowl = PetSingleTargetFlat("growl", GrowlAmount);
+        // Pet — Hunter
+        var petGrowl = PetCasterAPScaled("growl", GrowlAmount,
+            apBaseBonus: 1235.6, apLevelMalus: 28.14, apFactor: 5.7,
+            gateOnPositiveThreshold: true);
         foreach (var id in GrowlAmount.Keys) map[id] = petGrowl;
 
         var petCower = PetSingleTargetFlat("cower_pet", CowerPetAmount);
         foreach (var id in CowerPetAmount.Keys) map[id] = petCower;
+
+        // Pet — Warlock Voidwalker
+        var petTorment = PetCasterAPScaled("torment", TormentAmount,
+            apBaseBonus: 123, apLevelMalus: 0, apFactor: 0.385,
+            gateOnPositiveThreshold: false);
+        foreach (var id in TormentAmount.Keys) map[id] = petTorment;
+
+        var petSuffering = PetCasterAPScaled("suffering", SufferingAmount,
+            apBaseBonus: 124, apLevelMalus: 0, apFactor: 0.547,
+            gateOnPositiveThreshold: false, aoeAllTargets: true);
+        foreach (var id in SufferingAmount.Keys) map[id] = petSuffering;
+
+        // Pet — Warlock Succubus
+        var petSoothingKiss = PetSingleTargetFlat("soothing_kiss", SoothingKissAmount);
+        foreach (var id in SoothingKissAmount.Keys) map[id] = petSoothingKiss;
+
+        // Pet — Hunter Intimidation (Beast Mastery 31-point talent).
+        var petIntimidation = PetSingleTargetFlat("intimidation", IntimidationAmount);
+        foreach (var id in IntimidationAmount.Keys) map[id] = petIntimidation;
+
+        // Pet — Hunter Scorpid Poison (auto-cast on-attack).
+        var petScorpidPoison = PetSingleTargetFlat("scorpid_poison", ScorpidPoisonAmount);
+        foreach (var id in ScorpidPoisonAmount.Keys) map[id] = petScorpidPoison;
 
         // Warrior
         var sunder = PlayerSingleTargetFlat("sunder_armor", SunderArmorAmount);
@@ -491,8 +680,11 @@ internal static class ThreatModules
         // Druid Growl is a player taunt (bear form).
         map[6795] = PlayerSetToTop("growl_druid");
 
-        // Mage
-        map[2139] = PlayerSingleTargetFlat("counterspell", new Dictionary<int, double> { [2139] = 300 });
+        // Mage Counterspell ranks 1-2 — flat 300 threat per LTC2 Mage.lua.
+        var counterspell = PlayerSingleTargetFlat("counterspell",
+            new Dictionary<int, double> { [2139] = 300, [18469] = 300 });
+        map[2139] = counterspell;
+        map[18469] = counterspell;
         map[475]  = PlayerAddToAllMobs("remove_lesser_curse", 14);
 
         // Rogue
@@ -501,6 +693,25 @@ internal static class ThreatModules
 
         var vanish = PlayerZeroAllMobs("vanish");
         foreach (var id in new[] { 1856, 1857 }) map[id] = vanish;
+
+        // Priest Power Word: Shield — fixed per-rank cast threat × Imp PW:S
+        // multiplier, distributed across mobs in combat with the shield target.
+        // Per-rank amounts mirror LTC2 ClassModules/Classic/Priest.lua's
+        // threatAmounts["pws"] table; Imp PW:S layer is read from the player's
+        // known-spells set via ThreatTracker.GetImpPwsMultiplier (Talent.dbc
+        // ranks 14748 / 14768 / 14769, formula 1 + 0.05 × rank).
+        var pws = (ThreatHandler)((tracker, session, spellId, caster, hitTargets) =>
+        {
+            if (caster != session.GameState.CurrentPlayerGuid) return;
+            if (!PowerWordShieldAmount.TryGetValue(spellId, out double baseAmount)) return;
+            // PW:S targets a single recipient (the shield buff target). Use the
+            // first hit target as the shield recipient — same convention as the
+            // other single-target handlers. Threat distributes to mobs in combat
+            // with that recipient inside OnPowerWordShield.
+            var shieldTarget = hitTargets.Count > 0 ? hitTargets[0] : caster;
+            tracker.OnPowerWordShield(caster, shieldTarget, spellId, baseAmount);
+        });
+        foreach (var id in PowerWordShieldAmount.Keys) map[id] = pws;
 
         // Paladin
         map[4987] = PlayerAddToAllMobs("cleanse", 40);

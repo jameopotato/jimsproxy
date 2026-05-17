@@ -2273,9 +2273,9 @@ public partial class WorldClient
         SendPacketToClient(spell);
 
         // Threat translation: heal threat = 0.5 x effective heal, distributed
-        // across every mob in combat with the heal target. Overheal generates
-        // no threat — feed only the effective amount.
-        long effectiveHeal = (long)spell.HealAmount - (long)spell.OverHeal;
+        // across every mob in combat with the heal target. Overheal AND absorbed
+        // generate no threat — feed only the amount that actually landed on hp.
+        long effectiveHeal = (long)spell.HealAmount - (long)spell.OverHeal - (long)spell.Absorbed;
         if (effectiveHeal > 0)
         {
             GetSession().ThreatTracker.OnHeal(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, effectiveHeal);
@@ -2460,10 +2460,27 @@ public partial class WorldClient
         }
         if (hotHeal > 0)
         {
-            // HoT ticks don't carry overheal info on the wire, so we feed
-            // the raw amount. Slight overcount when the target is at max hp;
-            // acceptable at this stage.
-            GetSession().ThreatTracker.OnHeal(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, hotHeal);
+            // HoT ticks don't carry overheal on the wire; compute it from the
+            // unit HP cache so a Rejuv tick on a topped-off target produces
+            // 0 threat instead of full-tick threat (resto-druid raid healing).
+            ComputeOverHealFromCache(spell.TargetGUID, (int)hotHeal, wireHadOverheal: false,
+                out uint hotOverheal, out _, out _, out _);
+            double effectiveHotHeal = hotHeal - hotOverheal;
+            if (effectiveHotHeal > 0)
+                GetSession().ThreatTracker.OnHeal(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, effectiveHotHeal);
+        }
+
+        // Periodic energize threat (Spirit Tap, Innervate, Mana Tide ticks,
+        // Vampiric Embrace mana-return). Each effect can carry its own
+        // power type via SchoolMaskOrPower — process per-effect rather than
+        // summing.
+        foreach (var effect in spell.Effects)
+        {
+            if (effect.Effect == (uint)AuraType.PeriodicEnergize && effect.Amount > 0)
+            {
+                var powerType = (PowerType)effect.SchoolMaskOrPower;
+                GetSession().ThreatTracker.OnEnergize(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, powerType, effect.Amount);
+            }
         }
     }
 
@@ -2477,6 +2494,11 @@ public partial class WorldClient
         spell.Type = (PowerType)packet.ReadUInt32();
         spell.Amount = packet.ReadInt32();
         SendPacketToClient(spell);
+
+        // Threat translation: energize generates caster-side threat per LTC2
+        // (mana ×0.5, others ×5). Server pre-caps amount to actual gain so
+        // zero-gain energizes don't reach us.
+        GetSession().ThreatTracker.OnEnergize(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, spell.Type, spell.Amount);
     }
 
     [PacketHandler(Opcode.SMSG_SPELL_DELAYED)]
@@ -2868,7 +2890,10 @@ public partial class WorldClient
             {
                 GetSession().GameState.GetAuraDuration(target, slot, out durationLeft, out durationFull);
                 if (durationFull <= 0)
-                    durationFull = GameData.GetAuraSpellDuration(spellId);
+                {
+                    int? talentDur = GameData.TryGetTalentDuration(spellId, GetSession().GameState.CurrentPlayerKnownSpells);
+                    durationFull = talentDur ?? GameData.GetAuraSpellDuration(spellId);
+                }
             }
 
             if (durationFull > 0)

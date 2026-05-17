@@ -44,13 +44,28 @@ public sealed class ThreatTracker
     // SMSG_HIGHEST_THREAT_UPDATE when the top actually changes.
     private readonly Dictionary<WowGuid128, WowGuid128> _lastHighest = new();
 
+    // Vanilla aggro hysteresis: a challenger must exceed the current tank's
+    // threat by N% before aggro flips. LibThreatClassic2 picks the margin
+    // per challenger class:
+    //   1.10 — Warrior, Rogue, Druid in Bear/Cat form (melee)
+    //   1.30 — Hunter, Mage, Priest, Warlock, Shaman, Paladin, caster druid
+    //   1.10 — unknown / other players (LTC2 default for classId == nil)
+    // Without per-class margins a hunter at 1.2× pet threat would show as
+    // "pulling" in TinyThreat even though the server still hands aggro to
+    // the pet (ranged class needs 1.30×). See GetAggroFlipMargin below;
+    // values cross-referenced against LibThreatClassic2.lua line 1708.
+    private const double AggroFlipMarginMelee = 1.10;
+    private const double AggroFlipMarginRanged = 1.30;
+
     private readonly GlobalSessionData _session;
 
-    // Passive threat multiplier cache. Recomputed on every threat operation
-    // (cheap) but the threat.passive_modifier event only emits on change,
-    // so testers can spot stance / form transitions without spamming logs.
-    private double _cachedPassiveModifier = 1.0;
-    private uint _cachedStanceFormAuraId = 0;
+    // Passive threat multiplier cache, keyed by threater GUID. Recomputed
+    // on every threat operation (cheap) but the threat.passive_modifier
+    // event only emits on change, so testers can spot stance / form
+    // transitions without spamming logs. Phase 6.0 widened from a single
+    // pair (local player only) to a per-threater dict so groupmates'
+    // stance / form changes are also tracked.
+    private readonly Dictionary<WowGuid128, (uint stanceForm, double modifier)> _passiveCache = new();
 
     public ThreatTracker(GlobalSessionData session)
     {
@@ -67,7 +82,8 @@ public sealed class ThreatTracker
     public void AddModifiedThreat(WowGuid128 mob, WowGuid128 threater, double rawAmount)
     {
         double modifier = GetPassiveModifier(threater);
-        AddThreat(mob, threater, rawAmount * modifier);
+        double auraMult = ScanThreatMultiplierAuras(threater);
+        AddThreat(mob, threater, rawAmount * modifier * auraMult);
     }
 
     // Add (or subtract, if amount is negative) raw threat from a threater
@@ -129,6 +145,42 @@ public sealed class ThreatTracker
         }
     }
 
+    // NPC-module primitive: multiply a SPECIFIC threater's threat on a SPECIFIC
+    // mob by a factor. Used by boss knock-back / fear-style abilities (Broodlord
+    // Knock Away, Ebonroc/Firemaw/Flamegor Wing Buffet, Onyxia Knock Away,
+    // Hakkar Aspect of Arlokk, Ouro Sand Blast). LTC2's ModifyThreat shape.
+    public void MultiplyTargetThreat(WowGuid128 mob, WowGuid128 threater, double factor)
+    {
+        if (mob == default || threater == default) return;
+        if (!_threatLists.TryGetValue(mob, out var list)) return;
+        if (!list.TryGetValue(threater, out double current)) return;
+
+        double updated = current * factor;
+        if (updated < 0) updated = 0;
+        list[threater] = updated;
+        _dirty.Add(mob);
+    }
+
+    // NPC-module primitive: wipe every threater off a mob's list (full raid
+    // threat reset). Used by Ragnaros Wrath, Shazzrah Gate, Kel'Thuzad Chains,
+    // Noth Blink. Empties the threater dict but keeps the mob entry (it's
+    // still in combat with the raid — they just have to re-build threat).
+    public void WipeRaidThreatOnMob(WowGuid128 mob)
+    {
+        if (mob == default) return;
+        if (!_threatLists.TryGetValue(mob, out var list)) return;
+        if (list.Count == 0) return;
+
+        list.Clear();
+        _lastHighest.Remove(mob);
+        _dirty.Add(mob);
+
+        Framework.Logging.Log.Event("threat.npc_raid_wipe", new
+        {
+            mob_low = mob.GetCounter(),
+        });
+    }
+
     // Bring threater up to the current top of mob's list (taunt semantics).
     // Used by Warrior Taunt, Mocking Blow, Druid Growl. If the threater is
     // already at or above the top, no-op. Marks dirty on success so the next
@@ -165,7 +217,8 @@ public sealed class ThreatTracker
         if (threater == default || rawAmount == 0) return;
 
         double modifier = GetPassiveModifier(threater);
-        double scaledAmount = rawAmount * modifier;
+        double auraMult = ScanThreatMultiplierAuras(threater);
+        double scaledAmount = rawAmount * modifier * auraMult;
 
         foreach (var (mob, list) in _threatLists)
         {
@@ -243,17 +296,99 @@ public sealed class ThreatTracker
             if (!_threatLists.TryGetValue(mob, out var list) || list.Count == 0)
                 continue;
 
-            // Find the top threater. Ties broken arbitrarily — vanilla itself
-            // has tie-breaking quirks but they don't matter for display.
-            WowGuid128 newHighest = default;
-            double highestValue = -1;
+            // Find the raw top threater (max value, no hysteresis).
+            WowGuid128 rawTop = default;
+            double rawTopValue = -1;
             foreach (var (threater, value) in list)
             {
-                if (value > highestValue)
+                if (value > rawTopValue)
                 {
-                    highestValue = value;
-                    newHighest = threater;
+                    rawTopValue = value;
+                    rawTop = threater;
                 }
+            }
+
+            // Apply vanilla aggro hysteresis. Vanilla 1.12 requires a melee
+            // challenger to exceed the current tank's threat by 10% (130% for
+            // ranged) before aggro flips. Numerically passing the top by 1
+            // threat point is NOT enough — the server holds aggro on the
+            // current tank until the threshold is crossed.
+            //
+            // Why this matters for addons: the modern client computes
+            // UnitThreatSituation status against HighestThreatGUID. If we
+            // re-flip the top on every close-tie swing (two players doing
+            // similar damage, tank + DPS within 10%, etc.), each threater
+            // briefly becomes "the highest" and the modern client reports
+            // status 2-3 for both, painting Luna red on every party member
+            // simultaneously. Holding the current top until the 110%
+            // threshold is crossed restores vanilla's "one tank, one aggro"
+            // feel — DPS sit at status 0/1 (hidden / yellow) while the actual
+            // tank sits at status 3 (red).
+            _lastHighest.TryGetValue(mob, out var prevHighest);
+            WowGuid128 newHighest;
+            double highestValue;
+            bool aggroFlipHeld = false;
+            if (prevHighest == default || !list.TryGetValue(prevHighest, out var prevValue))
+            {
+                // No prior top, or prior top has dropped off the list (left
+                // party / died / despawned). No hysteresis to apply — pick
+                // the raw top.
+                newHighest = rawTop;
+                highestValue = rawTopValue;
+            }
+            else if (rawTop == prevHighest)
+            {
+                // Current top still on top — no flip to consider.
+                newHighest = prevHighest;
+                highestValue = prevValue;
+            }
+            else
+            {
+                // Per-challenger margin: melee classes (warrior / rogue / bear /
+                // cat druid) need 1.10×, ranged casters & hunters need 1.30×.
+                double margin = GetAggroFlipMargin(rawTop);
+                if (rawTopValue >= prevValue * margin)
+                {
+                    // Challenger crossed the class-specific threshold — flip.
+                    newHighest = rawTop;
+                    highestValue = rawTopValue;
+                }
+                else
+                {
+                    // Challenger numerically ahead but inside the hysteresis
+                    // band — vanilla server would still target prev. Hold.
+                    newHighest = prevHighest;
+                    highestValue = prevValue;
+                    aggroFlipHeld = true;
+                }
+            }
+
+            // Server-truth override: the mob's UNIT_FIELD_TARGET is what the
+            // server actually has as the aggro target. LTC2's predict-by-margin
+            // logic claims "you're pulling" as soon as our model exceeds the
+            // current tank by 1.30× (ranged) / 1.10× (melee), but flat-threat
+            // bonuses (Distracting Shot, Mocking Blow, Misdirection) routinely
+            // push the model past that threshold without the server agreeing.
+            // Snap to actual server target so TinyThreat / ThreatPlates show
+            // who the mob is REALLY hitting instead of who LTC2 predicts.
+            WowGuid128 serverTarget = ReadMobCurrentTarget(mob);
+            bool snappedToServerTarget = false;
+            if (serverTarget != default && serverTarget != newHighest &&
+                list.TryGetValue(serverTarget, out var serverTargetValue))
+            {
+                Log.Event("threat.snap_to_server_target", new
+                {
+                    mob_low = mob.GetCounter(),
+                    predicted_top_low = newHighest.GetCounter(),
+                    predicted_top_value = (long)highestValue,
+                    server_target_low = serverTarget.GetCounter(),
+                    server_target_value = (long)serverTargetValue,
+                    predicted_was_local = newHighest == _session.GameState.CurrentPlayerGuid,
+                    server_target_is_local = serverTarget == _session.GameState.CurrentPlayerGuid,
+                });
+                newHighest = serverTarget;
+                highestValue = serverTargetValue;
+                snappedToServerTarget = true;
             }
 
             var update = new ThreatUpdatePkt { UnitGUID = mob };
@@ -267,10 +402,36 @@ public sealed class ThreatTracker
             }
             SendToClient(update);
 
+            bool highestChanged = prevHighest != newHighest;
+
+            if (aggroFlipHeld)
+            {
+                Log.Event("threat.aggro_flip_held", new
+                {
+                    mob_low = mob.GetCounter(),
+                    held_threater_low = prevHighest.GetCounter(),
+                    held_value = (long)highestValue,
+                    challenger_low = rawTop.GetCounter(),
+                    challenger_value = (long)rawTopValue,
+                    margin_required = GetAggroFlipMargin(rawTop),
+                });
+            }
+
+            Log.Event("threat.emit_update", new
+            {
+                mob_low = mob.GetCounter(),
+                threater_count = list.Count,
+                highest_low = newHighest.GetCounter(),
+                highest_value = (long)highestValue,
+                highest_is_local = newHighest == _session.GameState.CurrentPlayerGuid,
+                highest_changed = highestChanged,
+                snapped_to_server_target = snappedToServerTarget,
+                threaters = ThreaterSnapshot(list),
+            });
+
             // Emit HIGHEST only when the top changes — saves churn but keeps
             // tank-aggro indicators (red border, nameplate color) snappy.
-            _lastHighest.TryGetValue(mob, out var prevHighest);
-            if (prevHighest != newHighest)
+            if (highestChanged)
             {
                 _lastHighest[mob] = newHighest;
                 var highest = new HighestThreatUpdatePkt
@@ -287,8 +448,33 @@ public sealed class ThreatTracker
                     });
                 }
                 SendToClient(highest);
+
+                Log.Event("threat.highest_changed", new
+                {
+                    mob_low = mob.GetCounter(),
+                    prev_highest_low = prevHighest.GetCounter(),
+                    new_highest_low = newHighest.GetCounter(),
+                    new_highest_is_local = newHighest == _session.GameState.CurrentPlayerGuid,
+                    new_highest_value = (long)highestValue,
+                });
             }
         }
+    }
+
+    // Compact one-line representation of a mob's threater list for the JSONL
+    // bundle. Keeps the snapshot small — counter + value pairs — so it's
+    // readable in a diagnostic without flooding context.
+    private static string ThreaterSnapshot(Dictionary<WowGuid128, double> list)
+    {
+        var sb = new System.Text.StringBuilder();
+        bool first = true;
+        foreach (var (threater, value) in list)
+        {
+            if (!first) sb.Append(',');
+            first = false;
+            sb.Append(threater.GetCounter()).Append('=').Append((long)value);
+        }
+        return sb.ToString();
     }
 
     // Wipe everything — used on session disconnect / character switch. Doesn't
@@ -298,6 +484,32 @@ public sealed class ThreatTracker
         _threatLists.Clear();
         _lastHighest.Clear();
         _dirty.Clear();
+    }
+
+    // Called from SMSG_CANCEL_COMBAT — the legacy server told the local player
+    // they've left combat. The 1.12 server does NOT broadcast leave-combat
+    // for other party members and doesn't emit a "drop the threat list" packet
+    // for mobs that evade / run away / lose interest. Without an explicit
+    // clear, the modern client retains the stale threat list and Luna /
+    // ThreatPlates keep their red indicators lit on every nameplate the
+    // player fought during the session.
+    //
+    // Aggressive but matches vanilla feel: if WE'RE not in combat, nothing
+    // should display threat anywhere. If a groupmate is still fighting, their
+    // own subsequent damage events will re-populate the relevant mob's list.
+    public void OnLocalPlayerLeftCombat()
+    {
+        if (_threatLists.Count == 0) return;
+
+        var mobsCleared = _threatLists.Count;
+        var mobsToClear = new List<WowGuid128>(_threatLists.Keys);
+        foreach (var mob in mobsToClear)
+            ClearMob(mob);
+
+        Log.Event("threat.local_player_left_combat", new
+        {
+            mobs_cleared = mobsCleared,
+        });
     }
 
     // Called from the SMSG_DESTROY_OBJECT handler. Two cases to clean up:
@@ -350,12 +562,68 @@ public sealed class ThreatTracker
     public void OnDamage(WowGuid128 attacker, WowGuid128 victim, int spellId, double rawDamage)
     {
         if (rawDamage <= 0) return;
-        if (!IsLocalThreater(attacker)) return;
+        if (!IsRelevantThreater(attacker))
+        {
+            // Before dropping, check NPC-boss damage handlers. Some bosses
+            // (Ouro Sand Blast, Broodlord/drake Knock Away, Wing Buffet,
+            // Molten Giant Knock Away) modify the DAMAGED player's threat
+            // on the boss when the spell connects. Direction is inverted:
+            // attacker = NPC boss, victim = friendly player whose threat
+            // gets modified ON the boss.
+            if (spellId != 0)
+            {
+                uint npcEntry = ThreatNPCModules.GetCreatureEntry(_session.GameState, attacker);
+                if (npcEntry != 0 &&
+                    ThreatNPCModules.TryHandleNPCDamage(this, attacker, npcEntry, spellId, victim))
+                {
+                    EmitDirty();
+                    return;
+                }
+            }
+
+            // Tester bundles will show this when a damage event fires but
+            // we filtered the attacker out of the group / pet / self set —
+            // e.g. a stranger's pet hitting our shared mob, or a groupmate
+            // who hasn't been seen in CurrentGroups yet (login race).
+            Log.Event("threat.drop_irrelevant_attacker", new
+            {
+                attacker_low = attacker.GetCounter(),
+                attacker_high = attacker.GetHighType().ToString(),
+                victim_low = victim.GetCounter(),
+                spell_id = spellId,
+                damage = (long)rawDamage,
+            });
+            return;
+        }
         if (victim == default) return;
 
+        SnapshotTalentStateIfChanged();
         double abilityMultiplier = ThreatModules.GetDamageMultiplier(spellId);
         double passiveModifier = GetPassiveModifier(attacker);
-        double scaledThreat = rawDamage * abilityMultiplier * passiveModifier;
+        double talentMultiplier = GetSpellTalentMultiplier(attacker, spellId);
+
+        // Set-bonus gear adjustments (Mage Arcanist x0.85, Warlock Nemesis x0.8
+        // on Destruction, Warlock Plagueheart x0.75, Rogue Bonescythe x0.92,
+        // Mage Netherwind -100/-20 flat). Player-only; pets / guardians don't
+        // carry sets. Layered on top of ability/passive/talent multipliers.
+        double gearMultiplier = 1.0;
+        double gearFlat = 0.0;
+        if (attacker == _session.GameState.CurrentPlayerGuid)
+        {
+            var playerClass = (Class)_session.GameState.CurrentPlayerClass;
+            gearMultiplier = ThreatSetBonuses.GetGearDamageMultiplier(_session.GameState, playerClass, spellId);
+            gearFlat = ThreatSetBonuses.GetGearDamageFlatAdjust(_session.GameState, playerClass, spellId);
+        }
+
+        // Aura-based threat multiplier (Blessing of Salvation x0.7, Greater
+        // Bless of Salvation x0.7, Tranquil Air totem x0.8). Stacks
+        // multiplicatively. Salvation alone is the single biggest raid threat
+        // correction — every buffed raider's threat goes down 30% from where
+        // we'd otherwise compute it.
+        double auraMultiplier = ScanThreatMultiplierAuras(attacker);
+
+        double scaledThreat = (rawDamage * abilityMultiplier * gearMultiplier + gearFlat) * passiveModifier * talentMultiplier * auraMultiplier;
+        if (scaledThreat < 0) scaledThreat = 0;
         AddThreat(victim, attacker, scaledThreat);
 
         if (_threatLists.TryGetValue(victim, out var list) &&
@@ -370,6 +638,7 @@ public sealed class ThreatTracker
                 damage = (long)rawDamage,
                 ability_mult = abilityMultiplier,
                 passive_mod = passiveModifier,
+                talent_mult = talentMultiplier,
                 threat_added = (long)scaledThreat,
                 new_total = (long)newTotal,
                 threater_count = list.Count,
@@ -392,33 +661,68 @@ public sealed class ThreatTracker
     public void OnHeal(WowGuid128 healer, WowGuid128 healTarget, int spellId, double effectiveHeal)
     {
         if (effectiveHeal <= 0) return;
-        if (!IsLocalThreater(healer)) return;
+        if (!IsRelevantThreater(healer)) return;
         if (healTarget == default) return;
 
-        // Collect mobs whose threater list contains the heal target.
-        List<WowGuid128>? mobsThreateningTarget = null;
+        // LTC2 ThreatClassModuleCore.lua line 1148 (prototype:AddThreat):
+        //
+        //     threat = threat / EncounterMobs()
+        //     for k, v in pairs(self.targetThreat) do
+        //         self:AddTargetThreat(k, threat)
+        //     end
+        //
+        // self.targetThreat is the CASTER's mob list, not the heal target's.
+        // So heal threat lands on mobs the HEALER is fighting — not mobs the
+        // recipient is fighting. Mend Pet (hunter healing pet) is the canonical
+        // case: hunter at range firing on Mob A, bear tanking A+B+C. Mend Pet
+        // tick threat goes ONLY to Mob A (hunter's combat list). Bear retains
+        // pet-only threat on B and C. Validated via 2026-05-17 log
+        // jimsproxy-20260517-135658.jsonl (TinyThreat showed hunter at top on
+        // bear-only mobs because we were splitting on recipient mobs instead).
+        List<WowGuid128>? mobsThreateningHealer = null;
         foreach (var (mob, list) in _threatLists)
         {
-            if (list.ContainsKey(healTarget))
+            if (list.ContainsKey(healer))
             {
-                mobsThreateningTarget ??= new List<WowGuid128>();
-                mobsThreateningTarget.Add(mob);
+                mobsThreateningHealer ??= new List<WowGuid128>();
+                mobsThreateningHealer.Add(mob);
             }
         }
 
-        if (mobsThreateningTarget == null || mobsThreateningTarget.Count == 0)
+        if (mobsThreateningHealer == null || mobsThreateningHealer.Count == 0)
         {
-            // Healed someone we don't know is in combat — drop. Avoids
-            // putting threat on every mob we've ever fought just because we
-            // healed a friendly out of nowhere.
+            // Healer isn't on any mob's threat list — pure-healer-out-of-combat
+            // case. Server doesn't generate heal threat either; drop.
             return;
         }
 
+        SnapshotTalentStateIfChanged();
         double passiveModifier = GetPassiveModifier(healer);
-        double totalThreat = effectiveHeal * 0.5 * passiveModifier;
-        double threatPerMob = totalThreat / mobsThreateningTarget.Count;
+        // School-gated talent on heals: paladin Imp Righteous Fury boosts holy
+        // heal threat when RF aura is active. Other classes' heals are no-op.
+        double talentMultiplier = GetSpellTalentMultiplier(healer, spellId);
 
-        foreach (var mob in mobsThreateningTarget)
+        // Set-bonus heal-threat scalar (Priest Vestments of Faith 8-set: x0.9).
+        double gearHealMultiplier = 1.0;
+        if (healer == _session.GameState.CurrentPlayerGuid)
+        {
+            var playerClass = (Class)_session.GameState.CurrentPlayerClass;
+            gearHealMultiplier = ThreatSetBonuses.GetGearHealMultiplier(_session.GameState, playerClass);
+        }
+
+        // Aura-based threat multiplier (Salvation x0.7 etc.) applies to heal
+        // threat just like damage threat — LTC2 puts it in threatMods() which
+        // wraps all threat output regardless of source event.
+        double auraMultiplier = ScanThreatMultiplierAuras(healer);
+
+        double totalThreat = effectiveHeal * 0.5 * passiveModifier * talentMultiplier * gearHealMultiplier * auraMultiplier;
+        // LTC2 divides by EncounterMobs() — total mobs in the encounter, not
+        // just the caster's combat list. We approximate with the caster's mob
+        // count (close enough for solo/small-group; full encounter sync is a
+        // group-threat-sync follow-up).
+        double threatPerMob = totalThreat / mobsThreateningHealer.Count;
+
+        foreach (var mob in mobsThreateningHealer)
             AddThreat(mob, healer, threatPerMob);
 
         Log.Event("threat.heal_added", new
@@ -428,9 +732,80 @@ public sealed class ThreatTracker
             spell_id = spellId,
             effective_heal = (long)effectiveHeal,
             passive_mod = passiveModifier,
-            mobs_split = mobsThreateningTarget.Count,
+            talent_mult = talentMultiplier,
+            mobs_split = mobsThreateningHealer.Count,
             threat_per_mob = (long)threatPerMob,
             total_threat = (long)totalThreat,
+        });
+
+        EmitDirty();
+    }
+
+    // LTC2 ExemptGains: spells that should NOT generate energize threat.
+    //   34299 — Improved Leader of the Pack (heal-side, no threat)
+    //   33778 — Lifebloom final bloom (overheal-like effect)
+    private static bool IsEnergizeExempt(int spellId) =>
+        spellId == 34299 || spellId == 33778;
+
+    // Per-challenger aggro flip margin, matching LibThreatClassic2's
+    // GetPullAggroRangeModifier (LibThreatClassic2.lua line 1679-1713).
+    // Returns the multiplier the challenger's threat must exceed the current
+    // top's threat by before we flip SMSG_HIGHEST_THREAT_UPDATE. Pets and
+    // unknown threaters default to 1.10 (LTC2's nil-classId branch).
+    private double GetAggroFlipMargin(WowGuid128 challenger)
+    {
+        if (challenger == _session.GameState.CurrentPlayerGuid)
+        {
+            var playerClass = (Class)_session.GameState.CurrentPlayerClass;
+            if (playerClass == Class.Warrior || playerClass == Class.Rogue)
+                return AggroFlipMarginMelee;
+            if (playerClass == Class.Druid)
+            {
+                uint formAura = ScanStanceFormAura(challenger);
+                // 5487 Bear, 9634 Dire Bear, 768 Cat — melee forms only.
+                if (formAura == 5487 || formAura == 9634 || formAura == 768)
+                    return AggroFlipMarginMelee;
+                return AggroFlipMarginRanged;
+            }
+            return AggroFlipMarginRanged;
+        }
+
+        if (challenger == _session.GameState.CurrentPetGuid)
+            return AggroFlipMarginMelee;
+
+        return AggroFlipMarginMelee;
+    }
+
+    // Energize-event threat. LibThreatClassic2 fires on SPELL_ENERGIZE and
+    // SPELL_PERIODIC_ENERGIZE: mana gain × 0.5, all other power types × 5.
+    // Threat goes to the CASTER and is added to EVERY mob the caster is on
+    // (replicated, not split — matches LTC2's per-mob iteration in
+    // ThreatClassModuleCore.lua line 588). Server pre-caps the amount to
+    // actual gain (zero-gain energizes don't fire), so no client-side cap
+    // math needed proxy-side.
+    public void OnEnergize(WowGuid128 caster, WowGuid128 recipient, int spellId, PowerType powerType, double amount)
+    {
+        if (amount <= 0) return;
+        if (!IsRelevantThreater(caster)) return;
+        if (IsEnergizeExempt(spellId)) return;
+
+        double multiplier = powerType == PowerType.Mana ? 0.5 : 5.0;
+        double rawThreat = amount * multiplier;
+
+        // AddThreatToAllMobs applies the passive modifier internally and
+        // skips mobs the caster isn't already on (no aggro pull from
+        // off-combat energize — matches lib semantics).
+        AddThreatToAllMobs(caster, rawThreat);
+
+        Framework.Logging.Log.Event("threat.energize", new
+        {
+            caster_low = caster.GetCounter(),
+            recipient_low = recipient.GetCounter(),
+            spell_id = spellId,
+            power_type = powerType.ToString(),
+            amount = (long)amount,
+            multiplier,
+            raw_threat = (long)rawThreat,
         });
 
         EmitDirty();
@@ -444,23 +819,70 @@ public sealed class ThreatTracker
     {
         if (caster == default) return;
 
-        if (!ThreatModules.TryHandle(this, _session, spellId, caster, hitTargets))
+        // First try player/pet handlers. If matched, flush + return.
+        if (ThreatModules.TryHandle(this, _session, spellId, caster, hitTargets))
+        {
+            EmitDirty();
             return;
+        }
 
-        EmitDirty();
+        // Fall through to NPC-boss handlers (Ragnaros Wrath, Shazzrah Gate,
+        // Hakkar Aspect of Arlokk, Onyxia Knock Away, etc.). Resolve the
+        // caster's creature entry from cached object fields, then look up
+        // (entry, spellId). targetGuid = first hit-target (the wipe-source
+        // boss abilities are single-target; raid-wide wipes ignore it).
+        uint npcEntry = ThreatNPCModules.GetCreatureEntry(_session.GameState, caster);
+        if (npcEntry != 0)
+        {
+            WowGuid128 targetGuid = hitTargets.Count > 0 ? hitTargets[0] : default;
+            if (ThreatNPCModules.TryHandleNPCCast(this, caster, npcEntry, spellId, targetGuid))
+            {
+                EmitDirty();
+                return;
+            }
+        }
+
     }
 
-    // True if the given GUID is the local player or a unit they currently own
-    // (pet, totem, guardian). Pet ownership is read from UNIT_FIELD_SUMMONEDBY
+    // True if the given GUID is the local player, a unit they own (pet,
+    // totem, guardian), any party / raid member, or a pet owned by any
+    // party / raid member. Pet ownership is read from UNIT_FIELD_SUMMONEDBY
     // on the unit's cached fields, which the legacy server populates and the
     // proxy mirrors. We re-check on every event rather than caching because
     // pets get swapped (Hunter Call Pet, Warlock summon swap) and the cost
     // of one dictionary lookup per damage event is negligible.
-    private bool IsLocalThreater(WowGuid128 guid)
+    //
+    // JimsProxy Phase 6.0 (group-aware threat): widened from local-player +
+    // local-pet to the full party / raid so addons (Details TinyThreat,
+    // TidyPlates_ThreatPlates) see threat for everyone in your group, not
+    // just yourself. Vanilla 1.12 servers broadcast combat-log packets
+    // (SMSG_ATTACKER_STATE_UPDATE, SMSG_SPELL_NON_MELEE_DAMAGE_LOG) to
+    // every client in range, so each proxy can compute group-wide threat
+    // unilaterally — no peer cooperation needed for in-range groupmates.
+    // Reads the mob's UNIT_FIELD_TARGET from the cached legacy fields. This
+    // is the unit the server says the mob is actually attacking — the only
+    // source of ground truth for who has aggro, since vanilla doesn't
+    // broadcast threat values over the wire. Returns default when the mob
+    // isn't cached, the field isn't mapped, or the mob has no current
+    // target (out of combat / mid-spawn).
+    private WowGuid128 ReadMobCurrentTarget(WowGuid128 mob)
+    {
+        if (mob.IsEmpty()) return default;
+        var fields = _session.GameState.GetCachedObjectFieldsLegacy(mob);
+        if (fields == null) return default;
+        int targetIdx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_TARGET);
+        if (targetIdx < 0) return default;
+        WowGuid64 target64 = fields.GetGuidValue(targetIdx);
+        if (target64 == WowGuid64.Empty) return default;
+        return target64.To128(_session.GameState);
+    }
+
+    private bool IsRelevantThreater(WowGuid128 guid)
     {
         if (guid == default) return false;
         var playerGuid = _session.GameState.CurrentPlayerGuid;
         if (guid == playerGuid) return true;
+        if (IsAnyPartyMember(guid)) return true;
 
         var fields = _session.GameState.GetCachedObjectFieldsLegacy(guid);
         if (fields == null) return false;
@@ -472,41 +894,65 @@ public sealed class ThreatTracker
         if (summonedBy64 == WowGuid64.Empty) return false;
 
         WowGuid128 summonedBy128 = summonedBy64.To128(_session.GameState);
-        return summonedBy128 == playerGuid;
+        return summonedBy128 == playerGuid || IsAnyPartyMember(summonedBy128);
+    }
+
+    // Iterates both home + battleground party slots so we recognise
+    // everyone in the user's current group regardless of context.
+    private bool IsAnyPartyMember(WowGuid128 guid)
+    {
+        if (guid == default) return false;
+        var groups = _session.GameState.CurrentGroups;
+        for (int i = 0; i < groups.Length; i++)
+        {
+            var group = groups[i];
+            if (group == null) continue;
+            foreach (var member in group.PlayerList)
+            {
+                if (member.GUID == guid)
+                    return true;
+            }
+        }
+        return false;
     }
 
     // -----------------------------------------------------------------------
-    // Phase 5 — passive threat multipliers from class + stance / form.
+    // Phase 6 — passive threat multipliers from class + stance / form + talents.
     //
-    // Vanilla LibThreatClassic2 reads GetShapeshiftForm() and class talents to
-    // compute a `passiveThreatModifiers` value applied to every flat-add threat
-    // operation. We can't introspect talents from the proxy side (they live in
-    // the client), so we ship the no-talent baselines:
+    // Mirrors LibThreatClassic2's per-class `passiveThreatModifiers` model. The
+    // proxy reads the player's known-spells set (now reliable thanks to the
+    // talent-rank injection fix: CurrentPlayerKnownSpells holds the highest
+    // rank the server has granted, SynthesizedTalentRanks holds proxy-injected
+    // predecessor ranks). Highest rank of each talent is resolved by walking
+    // the rank IDs from low to high and remembering the highest match.
     //
+    // Baselines (apply unconditionally):
     //   Warrior:
-    //     Defensive Stance (71)   → 1.30  (no Defiance)
+    //     Defensive Stance (71)   → 1.30  ×  (1 + 0.03 × Defiance rank)
     //     Berserker Stance (2458) → 0.80
     //     Battle Stance (2457) /
     //       no stance             → 0.80  (matches the lib's quirk; lib treats
     //                                      non-Defensive warriors as 0.8, see
     //                                      ClassModules/Classic/Warrior.lua)
-    //
     //   Druid:
     //     Bear / Dire Bear Form
-    //       (5487 / 9634)         → 1.30  (no Feral Instinct)
+    //       (5487 / 9634)         → 1.30  ×  (1 + 0.03 × Feral Instinct rank)
     //     Cat (768) /
     //       Travel (783) /
     //       Aquatic (1066)        → 0.71
     //     Caster                  → 1.00
-    //
-    //   Rogue:                    → 0.71  (always; passive at ClassEnable)
+    //   Rogue:                    → 0.71  (always; the lib's 0.71 IS the rogue
+    //                                      passive — vanilla rogue Subtlety
+    //                                      tab has no flat-threat talent on
+    //                                      top of this)
+    //   Priest                    → 1.00  ×  (1 - 0.04 × Silent Resolve rank)
     //   All other classes:        → 1.00
     //
-    // Future Phase 6+ will layer talent reads (Defiance, Feral Instinct,
-    // Subtlety, Shadow Affinity, Improved PWS) on top — those need the proxy
-    // to start mirroring talent state from CMSG_LEARN_TALENT and
-    // SMSG_INITIALIZE_FACTIONS-era talent data. Until then, these baselines
-    // run ~3-9% under the actual server-side numbers for talented characters.
+    // Talent rank IDs sourced from CSV/TalentSpellRanks.csv (built from the
+    // 1.14.2 Talent.dbc) — same data the talent-rank injection fix relies on.
+    // Per-rank values pulled from LibThreatClassic2's ClassModules/Classic/
+    // {Warrior,Druid,Priest}.lua so what we compute matches what existing
+    // threat addons compute server-side from GetTalentInfo.
 
     // Stance / form spell IDs we watch on the player's aura table. HashSet so
     // the per-event scan is O(slots) with O(1) per-slot membership check.
@@ -522,41 +968,392 @@ public sealed class ThreatTracker
         1066,  // Druid — Aquatic Form
     };
 
+    // Talent rank spell ID arrays — ordered rank 1 → rank N. Matched against
+    // CurrentPlayerKnownSpells ∪ SynthesizedTalentRanks via GetTalentRank.
+    // Source: 1.14.2 Talent.dbc cross-referenced against SpellName.dbc.
+    //
+    // Flat-passive layer (apply on GetPassiveModifier):
+    //   Defiance        (Warrior Protection, talent_id 144)
+    //   Feral Instinct  (Druid Feral Combat, talent_id 799)
+    //   Silent Resolve  (Priest Discipline,  talent_id 352)
+    //
+    // School-gated layer (apply on GetSpellTalentMultiplier):
+    //   Shadow Affinity        (Priest Shadow,         talent_id 461)
+    //   Druid Subtlety         (Druid Restoration,     talent_id 841)
+    //   Improved Righteous Fury (Paladin Holy,         talent_id 1501)
+    //                                                   gated on RF aura 25780 active
+    private static readonly uint[] DefianceRanks            = { 12303, 12788, 12789, 12791, 12792 };
+    private static readonly uint[] FeralInstinctRanks       = { 16947, 16948, 16949, 16950, 16951 };
+    private static readonly uint[] SilentResolveRanks       = { 14523, 14784, 14785, 14786, 14787 };
+    private static readonly uint[] ShadowAffinityRanks      = { 15272, 15318, 15320 };
+    private static readonly uint[] DruidSubtletyRanks       = { 17118, 17119, 17120, 17121, 17122 };
+    private static readonly uint[] ImpRighteousFuryRanks    = { 20468, 20469, 20470 };
+    private static readonly uint[] ImpPwsRanks              = { 14748, 14768, 14769 };
+
+    private const uint RighteousFuryAura = 25780;
+
+    // School-affected spell-ID sets, transcribed from LibThreatClassic2's
+    // ClassModules/Classic/{Priest,Druid,Paladin}.lua. Each set is the canonical
+    // list of vanilla spells the corresponding talent's multiplier applies to.
+    //
+    // Curated lists rather than school lookup because the proxy doesn't carry
+    // SpellMisc.SchoolMask in a queryable form; LTC2 also curates because
+    // school-based gating alone would miss heal/damage variants that share a
+    // spell family but differ in school (e.g. paladin Hammer of Wrath is Holy
+    // damage; Hammer of Justice is no-school CC — both Hammer-named).
+
+    private static readonly HashSet<uint> ShadowAffinitySpells = new()
+    {
+        // Shadow Word: Pain (R1..8)
+        589, 594, 970, 992, 2767, 10892, 10893, 10894,
+        // Mind Blast (R1..9)
+        8092, 8102, 8103, 8104, 8105, 8106, 10945, 10946, 10947,
+        // Mind Flay (R1..6)
+        15407, 17311, 17312, 17313, 17314, 18807,
+        // Devouring Plague (R1..5)
+        2944, 19276, 19277, 19278, 19279,
+        // Vampiric Embrace (passive damage→heal — counted as shadow threat)
+        15286,
+    };
+
+    // Spells the Righteous Fury (+ Imp RF) multiplier applies to. Holy damage
+    // and Holy heals — paladin's RF aura boosts threat for both. List taken
+    // from LTC2 Paladin.lua's HolyHealIDs + holyShieldIDs + paladin damage
+    // catalogue. Heal-side application is gated to RF being active (no RF =
+    // baseline 1.0); damage-side is gated likewise.
+    private static readonly HashSet<uint> PaladinRighteousFurySpells = new()
+    {
+        // Consecration (R1..6)
+        26573, 20116, 20922, 20923, 20924, 27983,
+        // Holy Shield damage proc (R1..3) — also has its own 1.2x abilityMul
+        20925, 20927, 20928,
+        // Holy Shock damage (R1..3)
+        25912, 25911, 25902,
+        // Holy Shock heal (R1..3)
+        25903, 25913, 25914,
+        // Hammer of Wrath (R1..3)
+        24239, 24274, 24275,
+        // Holy Light (R1..9)
+        635, 639, 647, 1026, 1042, 3472, 10328, 10329, 25292,
+        // Flash of Light (R1..6)
+        19750, 19939, 19940, 19941, 19942, 19943,
+        // Lay on Hands (R1..3)
+        633, 2800, 10310,
+        // Judgement: server emits damage via "umbrella" IDs and per-seal IDs.
+        // 23590 is the most common engine event; 20184/85/86/87/88, 20271, 20286,
+        // 20425 cover Justice/Light/Wisdom/Righteousness/Crusader/Command variants.
+        23590, 23591, 20271, 20184, 20185, 20186, 20187, 20188, 20286, 20425,
+        // Seal of Righteousness damage proc (R1..8) — fires on every melee swing
+        20154, 20287, 20288, 20289, 20290, 20291, 20292, 20293, 21084, 25713,
+        // Holy Wrath (R1..2)
+        2812, 10318,
+        // Exorcism (R1..6)
+        879, 5614, 5615, 10312, 10313, 10314,
+    };
+
+    // Returns the highest rank (1..N) of a talent the player has, or 0 if untaken.
+    // Walks the rank ids in ascending order; the last index that matches the
+    // player's known-spells set is the talent's current rank. Reads both the
+    // real server-tracked CurrentPlayerKnownSpells and the proxy-injected
+    // SynthesizedTalentRanks — without the latter, only the highest rank would
+    // be visible (vanilla LearnTalent RemoveSpell's predecessors).
+    private int GetTalentRank(uint[] rankIds)
+    {
+        var known = _session.GameState.CurrentPlayerKnownSpells;
+        var synth = _session.GameState.SynthesizedTalentRanks;
+        int highest = 0;
+        for (int i = 0; i < rankIds.Length; i++)
+        {
+            uint sid = rankIds[i];
+            if (known.Contains(sid) || synth.Contains(sid))
+                highest = i + 1;
+        }
+        return highest;
+    }
+
+    // Cached snapshot of detected talent ranks so the diagnostic event below
+    // only fires when the rank set actually changes (login, learn, respec).
+    // Initialized to all -1 sentinels so the first call after construction
+    // always emits a baseline snapshot for tester observability.
+    private (int defiance, int feralInstinct, int silentResolve,
+             int shadowAffinity, int druidSubtlety, int impRighteousFury,
+             int impPws) _lastTalentSnapshot = (-1, -1, -1, -1, -1, -1, -1);
+
+    // Emits a `threat.talent_snapshot` JSONL event whenever the detected
+    // talent-rank set differs from the last observation. Lets a solo tester
+    // run the proxy, log in on any character, attack any mob once, and grep
+    // the bundle for the snapshot line to confirm the talent injection +
+    // detection pipeline is working — even for characters that are too low
+    // level to have any of these talents (all ranks would log as 0).
+    private void SnapshotTalentStateIfChanged()
+    {
+        var playerClass = (Class)_session.GameState.CurrentPlayerClass;
+        int defiance       = playerClass == Class.Warrior ? GetTalentRank(DefianceRanks)         : 0;
+        int feralInstinct  = playerClass == Class.Druid   ? GetTalentRank(FeralInstinctRanks)    : 0;
+        int silentResolve  = playerClass == Class.Priest  ? GetTalentRank(SilentResolveRanks)    : 0;
+        int shadowAffinity = playerClass == Class.Priest  ? GetTalentRank(ShadowAffinityRanks)   : 0;
+        int druidSubtlety  = playerClass == Class.Druid   ? GetTalentRank(DruidSubtletyRanks)    : 0;
+        int irf            = playerClass == Class.Paladin ? GetTalentRank(ImpRighteousFuryRanks) : 0;
+        int impPws         = playerClass == Class.Priest  ? GetTalentRank(ImpPwsRanks)           : 0;
+        var current = (defiance, feralInstinct, silentResolve, shadowAffinity, druidSubtlety, irf, impPws);
+        if (current == _lastTalentSnapshot)
+            return;
+        _lastTalentSnapshot = current;
+        Log.Event("threat.talent_snapshot", new
+        {
+            player_class = (byte)playerClass,
+            defiance_rank = defiance,
+            feral_instinct_rank = feralInstinct,
+            silent_resolve_rank = silentResolve,
+            shadow_affinity_rank = shadowAffinity,
+            druid_subtlety_rank = druidSubtlety,
+            imp_righteous_fury_rank = irf,
+            imp_pws_rank = impPws,
+            real_known_count = _session.GameState.CurrentPlayerKnownSpells.Count,
+            synthesized_count = _session.GameState.SynthesizedTalentRanks.Count,
+        });
+    }
+
+    // Returns the Imp PW:S multiplier (1.0 + 0.05 × rank). Called from the
+    // PW:S cast handler in ThreatModules. Public so the cast handler can
+    // pre-multiply the table amount before adding threat.
+    public double GetImpPwsMultiplier()
+    {
+        if (_session.GameState.CurrentPlayerClass != (byte)Class.Priest)
+            return 1.0;
+        int rank = GetTalentRank(ImpPwsRanks);
+        return rank > 0 ? 1.0 + (0.05 * rank) : 1.0;
+    }
+
+    // PW:S cast threat: fixed per-rank amount × Imp PWS × passive (Silent
+    // Resolve included via GetPassiveModifier) × distribution across all
+    // mobs in combat with the shield recipient. Same shape as OnHeal but
+    // uses the table amount instead of effective-heal × 0.5.
+    public void OnPowerWordShield(WowGuid128 caster, WowGuid128 shieldTarget, int spellId, double baseAmount)
+    {
+        if (baseAmount <= 0) return;
+        if (caster != _session.GameState.CurrentPlayerGuid) return;
+        if (shieldTarget == default) return;
+
+        List<WowGuid128>? mobsInCombat = null;
+        foreach (var (mob, list) in _threatLists)
+        {
+            if (list.ContainsKey(shieldTarget))
+            {
+                mobsInCombat ??= new List<WowGuid128>();
+                mobsInCombat.Add(mob);
+            }
+        }
+        if (mobsInCombat == null || mobsInCombat.Count == 0)
+            return;
+
+        SnapshotTalentStateIfChanged();
+        double passive = GetPassiveModifier(caster);
+        double impPwsMult = GetImpPwsMultiplier();
+        double totalThreat = baseAmount * impPwsMult * passive;
+        double threatPerMob = totalThreat / mobsInCombat.Count;
+
+        foreach (var mob in mobsInCombat)
+            AddThreat(mob, caster, threatPerMob);
+
+        Log.Event("threat.spell.power_word_shield", new
+        {
+            spell_id = spellId,
+            shield_target_low = shieldTarget.GetCounter(),
+            base_amount = baseAmount,
+            imp_pws_mult = impPwsMult,
+            passive_mod = passive,
+            mobs_split = mobsInCombat.Count,
+            threat_per_mob = (long)threatPerMob,
+            total_threat = (long)totalThreat,
+        });
+
+        EmitDirty();
+    }
+
     // Returns the passive multiplier to apply to threater's flat-add threat.
-    // Pet (and other local threaters that aren't the player) always return 1.0
-    // since vanilla pets carry no stance / form / class modifier.
+    // Phase 6.1 generalised to any group threater: class via party-list
+    // lookup (or local-player class for self), stance / form via the
+    // threater's own UNIT_FIELD_AURA cache. Pets / charms / unknown class
+    // fall through to 1.0 since vanilla pets carry no stance / form /
+    // class modifier.
     //
     // Side effect: emits threat.passive_modifier on every value change so
     // testers can correlate stance switches with threat shifts in the JSONL.
     private double GetPassiveModifier(WowGuid128 threater)
     {
-        if (threater != _session.GameState.CurrentPlayerGuid)
-            return 1.0;
+        var threaterClass = GetThreaterClass(threater);
+        uint formAura = ScanStanceFormAura(threater);
+        double modifier = ComputePassiveModifier(threaterClass, formAura);
 
-        uint formAura = ScanPlayerStanceFormAura();
-        var playerClass = (Class)_session.GameState.CurrentPlayerClass;
-        double modifier = ComputePassiveModifier(playerClass, formAura);
+        // Talent layer only applies to the local player — the proxy can read its
+        // own known-spells set but has no view into group members' talents.
+        // Without this gate, group members would carry the local player's talent
+        // multiplier (wrong), since the GetTalentMultiplier helper reads our
+        // session's CurrentPlayerKnownSpells / SynthesizedTalentRanks.
+        if (threater == _session.GameState.CurrentPlayerGuid)
+            modifier *= GetTalentMultiplier(threaterClass, formAura);
 
-        if (formAura != _cachedStanceFormAuraId || modifier != _cachedPassiveModifier)
+        _passiveCache.TryGetValue(threater, out var cached);
+        if (cached.stanceForm != formAura || cached.modifier != modifier)
         {
             Log.Event("threat.passive_modifier", new
             {
-                player_class = (byte)playerClass,
+                threater_low = threater.GetCounter(),
+                is_local_player = threater == _session.GameState.CurrentPlayerGuid,
+                player_class = (byte)threaterClass,
                 stance_form_spell = formAura,
                 modifier,
-                previous_modifier = _cachedPassiveModifier,
-                previous_stance_form_spell = _cachedStanceFormAuraId,
+                previous_modifier = cached.modifier,
+                previous_stance_form_spell = cached.stanceForm,
             });
-            _cachedStanceFormAuraId = formAura;
-            _cachedPassiveModifier = modifier;
+            _passiveCache[threater] = (formAura, modifier);
         }
 
         return modifier;
     }
 
-    private uint ScanPlayerStanceFormAura()
+    // Per-spell talent multiplier for school-gated talents. Reads the local
+    // player's known-spells set to detect ranks; non-local-player attackers
+    // always get 1.0 since we can't see their talents. The aura-gated case
+    // (Paladin RF active) is checked here too.
+    //
+    // Applies on top of GetPassiveModifier — so a Paladin tank with 3/3 IRF
+    // and RF active gets the flat passive (1.0 currently — paladins have no
+    // flat-passive talent in the LTC2 model) × IRF multiplier of 1.9 for any
+    // PaladinRighteousFurySpells.Contains(spellId) damage/heal event.
+    public double GetSpellTalentMultiplier(WowGuid128 attacker, int spellId)
+    {
+        if (spellId <= 0) return 1.0;
+        if (attacker != _session.GameState.CurrentPlayerGuid) return 1.0;
+        uint sid = (uint)spellId;
+        var playerClass = (Class)_session.GameState.CurrentPlayerClass;
+        switch (playerClass)
+        {
+            case Class.Priest:
+                if (ShadowAffinitySpells.Contains(sid))
+                {
+                    int rank = GetTalentRank(ShadowAffinityRanks);
+                    // LTC2 explicit array: [0.92, 0.84, 0.75] — rank 3 is NOT
+                    // 1-3*0.08=0.76 (the lib hard-codes the 0.75 for a slightly
+                    // steeper drop at 3/3).
+                    return rank switch { 1 => 0.92, 2 => 0.84, 3 => 0.75, _ => 1.0 };
+                }
+                return 1.0;
+            case Class.Druid:
+                // Druid Subtlety moved to GetTalentMultiplier (universal passive,
+                // applies to heals too — was previously gated to Balance damage
+                // spells only, missing the resto-druid heal-threat reduction).
+                return 1.0;
+            case Class.Paladin:
+                if (PaladinRighteousFurySpells.Contains(sid) && IsRighteousFuryActive())
+                {
+                    int rank = GetTalentRank(ImpRighteousFuryRanks);
+                    // LTC2 Paladin.lua: righteousFuryMod = 1 + 0.6 * (1 + irfRanks[rank+1])
+                    // irfRanks = {0, 0.16, 0.33, 0.5}.
+                    double irfBonus = rank switch { 1 => 0.16, 2 => 0.33, 3 => 0.50, _ => 0.0 };
+                    return 1.0 + 0.6 * (1.0 + irfBonus);
+                }
+                return 1.0;
+            default:
+                return 1.0;
+        }
+    }
+
+    // Scans the player's aura list for Righteous Fury (25780). Used to gate
+    // Improved Righteous Fury multiplication in GetSpellTalentMultiplier.
+    // Same scan shape as ScanStanceFormAura but with a single target spell id.
+    private bool IsRighteousFuryActive()
     {
         var fields = _session.GameState.GetCachedObjectFieldsLegacy(_session.GameState.CurrentPlayerGuid);
+        if (fields == null) return false;
+        int unitFieldAura = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
+        if (unitFieldAura < 0) return false;
+        int slots = LegacyVersion.GetAuraSlotsCount();
+        for (int i = 0; i < slots; i++)
+        {
+            if (!fields.TryGetValue(unitFieldAura + i, out var field))
+                continue;
+            if (field.UInt32Value == RighteousFuryAura)
+                return true;
+        }
+        return false;
+    }
+
+    // Computes the talent-layered multiplier to apply on top of the class+stance
+    // baseline. Returns 1.0 for any class without known threat-talents (Hunter,
+    // Mage, Shaman, Warlock, Paladin pre-Holy-spec — Paladin Imp Righteous Fury
+    // is school-gated and lives in a separate code path).
+    //
+    // Each modifier follows the per-rank formula from LibThreatClassic2's
+    // matching ClassModule. Talents that gate on a specific stance/form return
+    // 1.0 outside the gating condition so respecs and form switches take effect
+    // on the next GetPassiveModifier call without flushing any state.
+    private double GetTalentMultiplier(Class playerClass, uint formAura)
+    {
+        switch (playerClass)
+        {
+            case Class.Warrior:
+                // Defiance: +0.03 / rank, Defensive Stance only.
+                if (formAura == 71)
+                {
+                    int rank = GetTalentRank(DefianceRanks);
+                    if (rank > 0)
+                        return 1.0 + (0.03 * rank);
+                }
+                return 1.0;
+
+            case Class.Druid:
+            {
+                double mult = 1.0;
+                // Feral Instinct: +0.03 / rank, Bear / Dire Bear only.
+                if (formAura == 5487 || formAura == 9634)
+                {
+                    int fiRank = GetTalentRank(FeralInstinctRanks);
+                    if (fiRank > 0) mult *= 1.0 + (0.03 * fiRank);
+                }
+                // Subtlety (Restoration tier 1): −0.04 / rank, applies to all
+                // spells (damage AND heals). Universal per LTC2 Druid.lua —
+                // not school-gated, despite the name's overlap with rogue Subtlety.
+                int subRank = GetTalentRank(DruidSubtletyRanks);
+                if (subRank > 0) mult *= 1.0 - (0.04 * subRank);
+                return mult;
+            }
+
+            case Class.Priest:
+                // Silent Resolve: −0.04 / rank, applies to all damage and heals.
+                int srRank = GetTalentRank(SilentResolveRanks);
+                if (srRank > 0)
+                    return 1.0 - (0.04 * srRank);
+                return 1.0;
+
+            default:
+                return 1.0;
+        }
+    }
+
+    private Class GetThreaterClass(WowGuid128 guid)
+    {
+        if (guid == _session.GameState.CurrentPlayerGuid)
+            return (Class)_session.GameState.CurrentPlayerClass;
+
+        var groups = _session.GameState.CurrentGroups;
+        for (int i = 0; i < groups.Length; i++)
+        {
+            var group = groups[i];
+            if (group == null) continue;
+            foreach (var member in group.PlayerList)
+            {
+                if (member.GUID == guid)
+                    return member.ClassId;
+            }
+        }
+        return Class.None;
+    }
+
+    private uint ScanStanceFormAura(WowGuid128 guid)
+    {
+        var fields = _session.GameState.GetCachedObjectFieldsLegacy(guid);
         if (fields == null) return 0;
 
         int unitFieldAura = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
@@ -572,6 +1369,48 @@ public sealed class ThreatTracker
                 return spellId;
         }
         return 0;
+    }
+
+    // LTC2 BuffModifiers / DebuffModifiers — auras that multiply a unit's
+    // threat output globally. Vanilla 1.12 set; TBC+ auras (Pain Suppression,
+    // Arcane Shroud, etc.) deliberately omitted since our scope is vanilla.
+    // Source: ThreatClassModuleCore.lua line 190-289 (BuffHandlers /
+    // DebuffHandlers blocks that set buffThreatMultipliers / debuffThreatMultipliers).
+    //
+    // Blessing of Salvation is THE raid threat reducer — every tank gets it
+    // (or Greater Bless of Salvation from a paladin). Tranquil Air is the
+    // shaman alternative. Without these, every buffed raider's threat shows
+    // ~30%+ higher in TinyThreat than server reality.
+    private static readonly Dictionary<uint, double> ThreatMultiplierAuras = new()
+    {
+        [1038]  = 0.7,   // Blessing of Salvation
+        [25895] = 0.7,   // Greater Blessing of Salvation
+        [25909] = 0.8,   // Tranquil Air Totem (shaman raid aura)
+    };
+
+    // Stacked multiplier from all threat-multiplier auras currently on the
+    // unit. Returns 1.0 if no matching auras (most common case). Iterates
+    // the unit's aura slots once and multiplies in each match — order doesn't
+    // matter since multiplication commutes.
+    private double ScanThreatMultiplierAuras(WowGuid128 guid)
+    {
+        var fields = _session.GameState.GetCachedObjectFieldsLegacy(guid);
+        if (fields == null) return 1.0;
+
+        int unitFieldAura = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
+        if (unitFieldAura < 0) return 1.0;
+
+        double mult = 1.0;
+        int slots = LegacyVersion.GetAuraSlotsCount();
+        for (int i = 0; i < slots; i++)
+        {
+            if (!fields.TryGetValue(unitFieldAura + i, out var field))
+                continue;
+            uint spellId = field.UInt32Value;
+            if (spellId != 0 && ThreatMultiplierAuras.TryGetValue(spellId, out double m))
+                mult *= m;
+        }
+        return mult;
     }
 
     private static double ComputePassiveModifier(Class playerClass, uint stanceFormAura)
