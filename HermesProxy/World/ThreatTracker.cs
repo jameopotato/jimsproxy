@@ -144,6 +144,42 @@ public sealed class ThreatTracker
         }
     }
 
+    // NPC-module primitive: multiply a SPECIFIC threater's threat on a SPECIFIC
+    // mob by a factor. Used by boss knock-back / fear-style abilities (Broodlord
+    // Knock Away, Ebonroc/Firemaw/Flamegor Wing Buffet, Onyxia Knock Away,
+    // Hakkar Aspect of Arlokk, Ouro Sand Blast). LTC2's ModifyThreat shape.
+    public void MultiplyTargetThreat(WowGuid128 mob, WowGuid128 threater, double factor)
+    {
+        if (mob == default || threater == default) return;
+        if (!_threatLists.TryGetValue(mob, out var list)) return;
+        if (!list.TryGetValue(threater, out double current)) return;
+
+        double updated = current * factor;
+        if (updated < 0) updated = 0;
+        list[threater] = updated;
+        _dirty.Add(mob);
+    }
+
+    // NPC-module primitive: wipe every threater off a mob's list (full raid
+    // threat reset). Used by Ragnaros Wrath, Shazzrah Gate, Kel'Thuzad Chains,
+    // Noth Blink. Empties the threater dict but keeps the mob entry (it's
+    // still in combat with the raid — they just have to re-build threat).
+    public void WipeRaidThreatOnMob(WowGuid128 mob)
+    {
+        if (mob == default) return;
+        if (!_threatLists.TryGetValue(mob, out var list)) return;
+        if (list.Count == 0) return;
+
+        list.Clear();
+        _lastHighest.Remove(mob);
+        _dirty.Add(mob);
+
+        Framework.Logging.Log.Event("threat.npc_raid_wipe", new
+        {
+            mob_low = mob.GetCounter(),
+        });
+    }
+
     // Bring threater up to the current top of mob's list (taunt semantics).
     // Used by Warrior Taunt, Mocking Blow, Druid Growl. If the threater is
     // already at or above the top, no-op. Marks dirty on success so the next
@@ -497,6 +533,23 @@ public sealed class ThreatTracker
         if (rawDamage <= 0) return;
         if (!IsRelevantThreater(attacker))
         {
+            // Before dropping, check NPC-boss damage handlers. Some bosses
+            // (Ouro Sand Blast, Broodlord/drake Knock Away, Wing Buffet,
+            // Molten Giant Knock Away) modify the DAMAGED player's threat
+            // on the boss when the spell connects. Direction is inverted:
+            // attacker = NPC boss, victim = friendly player whose threat
+            // gets modified ON the boss.
+            if (spellId != 0)
+            {
+                uint npcEntry = ThreatNPCModules.GetCreatureEntry(_session.GameState, attacker);
+                if (npcEntry != 0 &&
+                    ThreatNPCModules.TryHandleNPCDamage(this, attacker, npcEntry, spellId, victim))
+                {
+                    EmitDirty();
+                    return;
+                }
+            }
+
             // Tester bundles will show this when a damage event fires but
             // we filtered the attacker out of the group / pet / self set —
             // e.g. a stranger's pet hitting our shared mob, or a groupmate
@@ -723,10 +776,29 @@ public sealed class ThreatTracker
     {
         if (caster == default) return;
 
-        if (!ThreatModules.TryHandle(this, _session, spellId, caster, hitTargets))
+        // First try player/pet handlers. If matched, flush + return.
+        if (ThreatModules.TryHandle(this, _session, spellId, caster, hitTargets))
+        {
+            EmitDirty();
             return;
+        }
 
-        EmitDirty();
+        // Fall through to NPC-boss handlers (Ragnaros Wrath, Shazzrah Gate,
+        // Hakkar Aspect of Arlokk, Onyxia Knock Away, etc.). Resolve the
+        // caster's creature entry from cached object fields, then look up
+        // (entry, spellId). targetGuid = first hit-target (the wipe-source
+        // boss abilities are single-target; raid-wide wipes ignore it).
+        uint npcEntry = ThreatNPCModules.GetCreatureEntry(_session.GameState, caster);
+        if (npcEntry != 0)
+        {
+            WowGuid128 targetGuid = hitTargets.Count > 0 ? hitTargets[0] : default;
+            if (ThreatNPCModules.TryHandleNPCCast(this, caster, npcEntry, spellId, targetGuid))
+            {
+                EmitDirty();
+                return;
+            }
+        }
+
     }
 
     // True if the given GUID is the local player, a unit they own (pet,
