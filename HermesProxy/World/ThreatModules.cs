@@ -169,6 +169,15 @@ internal static class ThreatModules
         [17751] = 450, [17752] = 600,
     };
 
+    // Warlock Succubus — Soothing Kiss. Pet self-debuff: reduces the pet's
+    // OWN threat on the kissed mob (Succubus de-aggro tool, NOT a player-
+    // targeted threat-wipe). Negative flat — same shape as Cower.
+    private static readonly Dictionary<int, double> SoothingKissAmount = new()
+    {
+        [6360] = -45, [7813] = -75,
+        [11784] = -127, [11785] = -165,
+    };
+
     // Warrior — sunderFactor = 261/58, with R5 hardcoded to 261.
     private static readonly Dictionary<int, double> SunderArmorAmount = new()
     {
@@ -563,6 +572,10 @@ internal static class ThreatModules
             apBaseBonus: 124, apLevelMalus: 0, apFactor: 0.547,
             gateOnPositiveThreshold: false, aoeAllTargets: true);
         foreach (var id in SufferingAmount.Keys) map[id] = petSuffering;
+
+        // Pet — Warlock Succubus
+        var petSoothingKiss = PetSingleTargetFlat("soothing_kiss", SoothingKissAmount);
+        foreach (var id in SoothingKissAmount.Keys) map[id] = petSoothingKiss;
 
         // Warrior
         var sunder = PlayerSingleTargetFlat("sunder_armor", SunderArmorAmount);
