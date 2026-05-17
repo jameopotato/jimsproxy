@@ -1,5 +1,7 @@
 using Framework.Logging;
+using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
+using System;
 using System.Collections.Generic;
 
 namespace HermesProxy.World;
@@ -147,6 +149,20 @@ internal static class ThreatModules
     {
         [1742] = -30, [1753] = -55, [1754] = -85,
         [1755] = -125, [1756] = -175, [16697] = -225,
+    };
+
+    // Warlock Voidwalker — Torment (single-target high threat, AP-scaled).
+    private static readonly Dictionary<int, double> TormentAmount = new()
+    {
+        [3716]  = 45,  [7809]  = 75,  [7810]  = 125,
+        [7811]  = 215, [11774] = 300, [11775] = 395,
+    };
+
+    // Warlock Voidwalker — Suffering (AoE high threat, AP-scaled, per-target).
+    private static readonly Dictionary<int, double> SufferingAmount = new()
+    {
+        [17735] = 150, [17750] = 300,
+        [17751] = 450, [17752] = 600,
     };
 
     // Warrior — sunderFactor = 261/58, with R5 hardcoded to 261.
@@ -366,6 +382,83 @@ internal static class ThreatModules
             });
         };
 
+    // JimsProxy (pet-ap-scaling 2026-05-17): LibThreatClassic2 Pet.lua applies
+    // an AP-scaled bonus on top of rank-flat threat for several pet abilities:
+    //
+    //   threat = rankFlat + max(0, petAP - (petLevel * apLevelMalus - apBaseBonus)) * apFactor
+    //
+    // Per-ability constants from LTC2 (verified 2026-05-17):
+    //
+    //                                apBaseBonus  apLevelMalus  apFactor
+    //   Hunter pet Growl              1235.6      28.14         5.7
+    //   Voidwalker Torment             123         0            0.385
+    //   Voidwalker Suffering (AoE)     124         0            0.547
+    //
+    // Growl's high apFactor (5.7) + steep level term mean the threshold flips
+    // sign at petLevel ~44 — below that the formula would produce silly large
+    // bonuses for low-AP pets. gateOnPositiveThreshold=true skips the bonus
+    // when the threshold is negative (Growl only). Torment/Suffering have
+    // apLevelMalus=0 → threshold is constant negative; their small apFactor
+    // (≤0.547) keeps bonuses sane at all pet levels, so they don't need the
+    // gate.
+    //
+    // Without these scaled bonuses, raid-geared L60 pets were under-credited
+    // (TinyThreat addon showing pet threat lower than expected, 2026-05-17
+    // log jimsproxy-20260517-114718.jsonl).
+    private static ThreatHandler PetCasterAPScaled(
+        string eventTag,
+        Dictionary<int, double> rankFlats,
+        double apBaseBonus,
+        double apLevelMalus,
+        double apFactor,
+        bool gateOnPositiveThreshold,
+        bool aoeAllTargets = false)
+        => (tracker, session, spellId, caster, hitTargets) =>
+        {
+            if (caster != session.GameState.CurrentPetGuid) return;
+            if (hitTargets.Count == 0) return;
+            if (!rankFlats.TryGetValue(spellId, out double rankFlat)) return;
+
+            double apBonus = 0;
+            uint petLevel = 0;
+            int petAP = 0;
+            var fields = session.GameState.GetCachedObjectFieldsLegacy(caster);
+            if (fields != null)
+            {
+                int levelIdx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_LEVEL);
+                int apIdx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_ATTACK_POWER);
+                if (levelIdx >= 0 && fields.TryGetValue(levelIdx, out var levelField))
+                    petLevel = levelField.UInt32Value;
+                if (apIdx >= 0 && fields.TryGetValue(apIdx, out var apField))
+                    petAP = apField.Int32Value;
+
+                double threshold = petLevel * apLevelMalus - apBaseBonus;
+                bool gated = gateOnPositiveThreshold && threshold <= 0;
+                if (!gated)
+                    apBonus = Math.Max(0, petAP - threshold) * apFactor;
+            }
+
+            double amount = rankFlat + apBonus;
+            int targetCount = aoeAllTargets ? hitTargets.Count : 1;
+            for (int i = 0; i < targetCount; i++)
+            {
+                var target = hitTargets[i];
+                tracker.AddModifiedThreat(target, caster, amount);
+            }
+
+            Log.Event("threat.spell." + eventTag, new
+            {
+                spell_id = spellId,
+                target_low = hitTargets[0].GetCounter(),
+                target_count = targetCount,
+                amount,
+                rank_flat = rankFlat,
+                ap_bonus = apBonus,
+                pet_level = petLevel,
+                pet_ap = petAP,
+            });
+        };
+
     private static ThreatHandler PlayerSetToTop(string eventTag)
         => (tracker, session, spellId, caster, hitTargets) =>
         {
@@ -447,12 +540,25 @@ internal static class ThreatModules
 
         map[5384] = PlayerZeroAllMobs("feign_death");
 
-        // Pet
-        var petGrowl = PetSingleTargetFlat("growl", GrowlAmount);
+        // Pet — Hunter
+        var petGrowl = PetCasterAPScaled("growl", GrowlAmount,
+            apBaseBonus: 1235.6, apLevelMalus: 28.14, apFactor: 5.7,
+            gateOnPositiveThreshold: true);
         foreach (var id in GrowlAmount.Keys) map[id] = petGrowl;
 
         var petCower = PetSingleTargetFlat("cower_pet", CowerPetAmount);
         foreach (var id in CowerPetAmount.Keys) map[id] = petCower;
+
+        // Pet — Warlock Voidwalker
+        var petTorment = PetCasterAPScaled("torment", TormentAmount,
+            apBaseBonus: 123, apLevelMalus: 0, apFactor: 0.385,
+            gateOnPositiveThreshold: false);
+        foreach (var id in TormentAmount.Keys) map[id] = petTorment;
+
+        var petSuffering = PetCasterAPScaled("suffering", SufferingAmount,
+            apBaseBonus: 124, apLevelMalus: 0, apFactor: 0.547,
+            gateOnPositiveThreshold: false, aoeAllTargets: true);
+        foreach (var id in SufferingAmount.Keys) map[id] = petSuffering;
 
         // Warrior
         var sunder = PlayerSingleTargetFlat("sunder_armor", SunderArmorAmount);
