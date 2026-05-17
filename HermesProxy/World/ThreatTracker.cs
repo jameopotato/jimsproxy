@@ -44,15 +44,18 @@ public sealed class ThreatTracker
     // SMSG_HIGHEST_THREAT_UPDATE when the top actually changes.
     private readonly Dictionary<WowGuid128, WowGuid128> _lastHighest = new();
 
-    // Vanilla melee aggro hysteresis: a challenger must exceed the current
-    // tank's threat by 10% before aggro flips. Without this, two threaters
-    // doing similar damage rapidly swap the "highest" position on every
-    // damage event and the modern client paints Luna red on every party
-    // member simultaneously. 1.10 = melee threshold; ranged is 1.30 but
-    // we can't tell from a damage event whether the challenger is in melee
-    // range so we use the more permissive value (matches the local-player
-    // case which is by far the dominant one).
-    private const double AggroFlipMargin = 1.10;
+    // Vanilla aggro hysteresis: a challenger must exceed the current tank's
+    // threat by N% before aggro flips. LibThreatClassic2 picks the margin
+    // per challenger class:
+    //   1.10 — Warrior, Rogue, Druid in Bear/Cat form (melee)
+    //   1.30 — Hunter, Mage, Priest, Warlock, Shaman, Paladin, caster druid
+    //   1.10 — unknown / other players (LTC2 default for classId == nil)
+    // Without per-class margins a hunter at 1.2× pet threat would show as
+    // "pulling" in TinyThreat even though the server still hands aggro to
+    // the pet (ranged class needs 1.30×). See GetAggroFlipMargin below;
+    // values cross-referenced against LibThreatClassic2.lua line 1708.
+    private const double AggroFlipMarginMelee = 1.10;
+    private const double AggroFlipMarginRanged = 1.30;
 
     private readonly GlobalSessionData _session;
 
@@ -301,19 +304,25 @@ public sealed class ThreatTracker
                 newHighest = prevHighest;
                 highestValue = prevValue;
             }
-            else if (rawTopValue >= prevValue * AggroFlipMargin)
-            {
-                // Challenger crossed the 110% threshold — flip.
-                newHighest = rawTop;
-                highestValue = rawTopValue;
-            }
             else
             {
-                // Challenger numerically ahead but inside the hysteresis
-                // band — vanilla server would still target prev. Hold.
-                newHighest = prevHighest;
-                highestValue = prevValue;
-                aggroFlipHeld = true;
+                // Per-challenger margin: melee classes (warrior / rogue / bear /
+                // cat druid) need 1.10×, ranged casters & hunters need 1.30×.
+                double margin = GetAggroFlipMargin(rawTop);
+                if (rawTopValue >= prevValue * margin)
+                {
+                    // Challenger crossed the class-specific threshold — flip.
+                    newHighest = rawTop;
+                    highestValue = rawTopValue;
+                }
+                else
+                {
+                    // Challenger numerically ahead but inside the hysteresis
+                    // band — vanilla server would still target prev. Hold.
+                    newHighest = prevHighest;
+                    highestValue = prevValue;
+                    aggroFlipHeld = true;
+                }
             }
 
             var update = new ThreatUpdatePkt { UnitGUID = mob };
@@ -338,7 +347,7 @@ public sealed class ThreatTracker
                     held_value = (long)highestValue,
                     challenger_low = rawTop.GetCounter(),
                     challenger_value = (long)rawTopValue,
-                    margin_required = AggroFlipMargin,
+                    margin_required = GetAggroFlipMargin(rawTop),
                 });
             }
 
@@ -564,22 +573,35 @@ public sealed class ThreatTracker
         if (!IsRelevantThreater(healer)) return;
         if (healTarget == default) return;
 
-        // Collect mobs whose threater list contains the heal target.
-        List<WowGuid128>? mobsThreateningTarget = null;
+        // LTC2 ThreatClassModuleCore.lua line 1148 (prototype:AddThreat):
+        //
+        //     threat = threat / EncounterMobs()
+        //     for k, v in pairs(self.targetThreat) do
+        //         self:AddTargetThreat(k, threat)
+        //     end
+        //
+        // self.targetThreat is the CASTER's mob list, not the heal target's.
+        // So heal threat lands on mobs the HEALER is fighting — not mobs the
+        // recipient is fighting. Mend Pet (hunter healing pet) is the canonical
+        // case: hunter at range firing on Mob A, bear tanking A+B+C. Mend Pet
+        // tick threat goes ONLY to Mob A (hunter's combat list). Bear retains
+        // pet-only threat on B and C. Validated via 2026-05-17 log
+        // jimsproxy-20260517-135658.jsonl (TinyThreat showed hunter at top on
+        // bear-only mobs because we were splitting on recipient mobs instead).
+        List<WowGuid128>? mobsThreateningHealer = null;
         foreach (var (mob, list) in _threatLists)
         {
-            if (list.ContainsKey(healTarget))
+            if (list.ContainsKey(healer))
             {
-                mobsThreateningTarget ??= new List<WowGuid128>();
-                mobsThreateningTarget.Add(mob);
+                mobsThreateningHealer ??= new List<WowGuid128>();
+                mobsThreateningHealer.Add(mob);
             }
         }
 
-        if (mobsThreateningTarget == null || mobsThreateningTarget.Count == 0)
+        if (mobsThreateningHealer == null || mobsThreateningHealer.Count == 0)
         {
-            // Healed someone we don't know is in combat — drop. Avoids
-            // putting threat on every mob we've ever fought just because we
-            // healed a friendly out of nowhere.
+            // Healer isn't on any mob's threat list — pure-healer-out-of-combat
+            // case. Server doesn't generate heal threat either; drop.
             return;
         }
 
@@ -598,9 +620,13 @@ public sealed class ThreatTracker
         }
 
         double totalThreat = effectiveHeal * 0.5 * passiveModifier * talentMultiplier * gearHealMultiplier;
-        double threatPerMob = totalThreat / mobsThreateningTarget.Count;
+        // LTC2 divides by EncounterMobs() — total mobs in the encounter, not
+        // just the caster's combat list. We approximate with the caster's mob
+        // count (close enough for solo/small-group; full encounter sync is a
+        // group-threat-sync follow-up).
+        double threatPerMob = totalThreat / mobsThreateningHealer.Count;
 
-        foreach (var mob in mobsThreateningTarget)
+        foreach (var mob in mobsThreateningHealer)
             AddThreat(mob, healer, threatPerMob);
 
         Log.Event("threat.heal_added", new
@@ -611,7 +637,7 @@ public sealed class ThreatTracker
             effective_heal = (long)effectiveHeal,
             passive_mod = passiveModifier,
             talent_mult = talentMultiplier,
-            mobs_split = mobsThreateningTarget.Count,
+            mobs_split = mobsThreateningHealer.Count,
             threat_per_mob = (long)threatPerMob,
             total_threat = (long)totalThreat,
         });
@@ -624,6 +650,35 @@ public sealed class ThreatTracker
     //   33778 — Lifebloom final bloom (overheal-like effect)
     private static bool IsEnergizeExempt(int spellId) =>
         spellId == 34299 || spellId == 33778;
+
+    // Per-challenger aggro flip margin, matching LibThreatClassic2's
+    // GetPullAggroRangeModifier (LibThreatClassic2.lua line 1679-1713).
+    // Returns the multiplier the challenger's threat must exceed the current
+    // top's threat by before we flip SMSG_HIGHEST_THREAT_UPDATE. Pets and
+    // unknown threaters default to 1.10 (LTC2's nil-classId branch).
+    private double GetAggroFlipMargin(WowGuid128 challenger)
+    {
+        if (challenger == _session.GameState.CurrentPlayerGuid)
+        {
+            var playerClass = (Class)_session.GameState.CurrentPlayerClass;
+            if (playerClass == Class.Warrior || playerClass == Class.Rogue)
+                return AggroFlipMarginMelee;
+            if (playerClass == Class.Druid)
+            {
+                uint formAura = ScanStanceFormAura(challenger);
+                // 5487 Bear, 9634 Dire Bear, 768 Cat — melee forms only.
+                if (formAura == 5487 || formAura == 9634 || formAura == 768)
+                    return AggroFlipMarginMelee;
+                return AggroFlipMarginRanged;
+            }
+            return AggroFlipMarginRanged;
+        }
+
+        if (challenger == _session.GameState.CurrentPetGuid)
+            return AggroFlipMarginMelee;
+
+        return AggroFlipMarginMelee;
+    }
 
     // Energize-event threat. LibThreatClassic2 fires on SPELL_ENERGIZE and
     // SPELL_PERIODIC_ENERGIZE: mana gain × 0.5, all other power types × 5.
