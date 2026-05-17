@@ -508,7 +508,22 @@ public sealed class ThreatTracker
         double abilityMultiplier = ThreatModules.GetDamageMultiplier(spellId);
         double passiveModifier = GetPassiveModifier(attacker);
         double talentMultiplier = GetSpellTalentMultiplier(attacker, spellId);
-        double scaledThreat = rawDamage * abilityMultiplier * passiveModifier * talentMultiplier;
+
+        // Set-bonus gear adjustments (Mage Arcanist x0.85, Warlock Nemesis x0.8
+        // on Destruction, Warlock Plagueheart x0.75, Rogue Bonescythe x0.92,
+        // Mage Netherwind -100/-20 flat). Player-only; pets / guardians don't
+        // carry sets. Layered on top of ability/passive/talent multipliers.
+        double gearMultiplier = 1.0;
+        double gearFlat = 0.0;
+        if (attacker == _session.GameState.CurrentPlayerGuid)
+        {
+            var playerClass = (Class)_session.GameState.CurrentPlayerClass;
+            gearMultiplier = ThreatSetBonuses.GetGearDamageMultiplier(_session.GameState, playerClass, spellId);
+            gearFlat = ThreatSetBonuses.GetGearDamageFlatAdjust(_session.GameState, playerClass, spellId);
+        }
+
+        double scaledThreat = (rawDamage * abilityMultiplier * gearMultiplier + gearFlat) * passiveModifier * talentMultiplier;
+        if (scaledThreat < 0) scaledThreat = 0;
         AddThreat(victim, attacker, scaledThreat);
 
         if (_threatLists.TryGetValue(victim, out var list) &&
@@ -573,7 +588,16 @@ public sealed class ThreatTracker
         // School-gated talent on heals: paladin Imp Righteous Fury boosts holy
         // heal threat when RF aura is active. Other classes' heals are no-op.
         double talentMultiplier = GetSpellTalentMultiplier(healer, spellId);
-        double totalThreat = effectiveHeal * 0.5 * passiveModifier * talentMultiplier;
+
+        // Set-bonus heal-threat scalar (Priest Vestments of Faith 8-set: x0.9).
+        double gearHealMultiplier = 1.0;
+        if (healer == _session.GameState.CurrentPlayerGuid)
+        {
+            var playerClass = (Class)_session.GameState.CurrentPlayerClass;
+            gearHealMultiplier = ThreatSetBonuses.GetGearHealMultiplier(_session.GameState, playerClass);
+        }
+
+        double totalThreat = effectiveHeal * 0.5 * passiveModifier * talentMultiplier * gearHealMultiplier;
         double threatPerMob = totalThreat / mobsThreateningTarget.Count;
 
         foreach (var mob in mobsThreateningTarget)

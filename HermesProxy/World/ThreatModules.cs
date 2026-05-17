@@ -343,14 +343,24 @@ internal static class ThreatModules
             if (hitTargets.Count == 0) return;
             if (!amounts.TryGetValue(spellId, out double amount)) return;
 
+            // Gear set-bonus multiplier (Warrior Might 8-set: Sunder x1.15;
+            // Rogue Bloodfang 5-set: Feint x1.25). Returns 1.0 for spells
+            // outside the gated list, so non-set-affected flats pass through
+            // unchanged.
+            var playerClass = (Class)session.GameState.CurrentPlayerClass;
+            double gearMult = ThreatSetBonuses.GetGearSpellMultiplier(session.GameState, playerClass, spellId);
+            double finalAmount = amount * gearMult;
+
             var target = hitTargets[0];
-            tracker.AddModifiedThreat(target, caster, amount);
+            tracker.AddModifiedThreat(target, caster, finalAmount);
 
             Log.Event("threat.spell." + eventTag, new
             {
                 spell_id = spellId,
                 target_low = target.GetCounter(),
-                amount,
+                amount = finalAmount,
+                base_amount = amount,
+                gear_mult = gearMult,
             });
         };
 
