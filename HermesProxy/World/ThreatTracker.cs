@@ -363,6 +363,34 @@ public sealed class ThreatTracker
                 }
             }
 
+            // Server-truth override: the mob's UNIT_FIELD_TARGET is what the
+            // server actually has as the aggro target. LTC2's predict-by-margin
+            // logic claims "you're pulling" as soon as our model exceeds the
+            // current tank by 1.30× (ranged) / 1.10× (melee), but flat-threat
+            // bonuses (Distracting Shot, Mocking Blow, Misdirection) routinely
+            // push the model past that threshold without the server agreeing.
+            // Snap to actual server target so TinyThreat / ThreatPlates show
+            // who the mob is REALLY hitting instead of who LTC2 predicts.
+            WowGuid128 serverTarget = ReadMobCurrentTarget(mob);
+            bool snappedToServerTarget = false;
+            if (serverTarget != default && serverTarget != newHighest &&
+                list.TryGetValue(serverTarget, out var serverTargetValue))
+            {
+                Log.Event("threat.snap_to_server_target", new
+                {
+                    mob_low = mob.GetCounter(),
+                    predicted_top_low = newHighest.GetCounter(),
+                    predicted_top_value = (long)highestValue,
+                    server_target_low = serverTarget.GetCounter(),
+                    server_target_value = (long)serverTargetValue,
+                    predicted_was_local = newHighest == _session.GameState.CurrentPlayerGuid,
+                    server_target_is_local = serverTarget == _session.GameState.CurrentPlayerGuid,
+                });
+                newHighest = serverTarget;
+                highestValue = serverTargetValue;
+                snappedToServerTarget = true;
+            }
+
             var update = new ThreatUpdatePkt { UnitGUID = mob };
             foreach (var (threater, value) in list)
             {
@@ -397,6 +425,7 @@ public sealed class ThreatTracker
                 highest_value = (long)highestValue,
                 highest_is_local = newHighest == _session.GameState.CurrentPlayerGuid,
                 highest_changed = highestChanged,
+                snapped_to_server_target = snappedToServerTarget,
                 threaters = ThreaterSnapshot(list),
             });
 
@@ -830,6 +859,24 @@ public sealed class ThreatTracker
     // (SMSG_ATTACKER_STATE_UPDATE, SMSG_SPELL_NON_MELEE_DAMAGE_LOG) to
     // every client in range, so each proxy can compute group-wide threat
     // unilaterally — no peer cooperation needed for in-range groupmates.
+    // Reads the mob's UNIT_FIELD_TARGET from the cached legacy fields. This
+    // is the unit the server says the mob is actually attacking — the only
+    // source of ground truth for who has aggro, since vanilla doesn't
+    // broadcast threat values over the wire. Returns default when the mob
+    // isn't cached, the field isn't mapped, or the mob has no current
+    // target (out of combat / mid-spawn).
+    private WowGuid128 ReadMobCurrentTarget(WowGuid128 mob)
+    {
+        if (mob.IsEmpty()) return default;
+        var fields = _session.GameState.GetCachedObjectFieldsLegacy(mob);
+        if (fields == null) return default;
+        int targetIdx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_TARGET);
+        if (targetIdx < 0) return default;
+        WowGuid64 target64 = fields.GetGuidValue(targetIdx);
+        if (target64 == WowGuid64.Empty) return default;
+        return target64.To128(_session.GameState);
+    }
+
     private bool IsRelevantThreater(WowGuid128 guid)
     {
         if (guid == default) return false;
