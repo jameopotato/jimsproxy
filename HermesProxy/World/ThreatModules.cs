@@ -104,6 +104,10 @@ internal static class ThreatModules
 
         // Paladin Holy Shield reflect damage (R1..3)
         [20925] = 1.2, [20927] = 1.2, [20928] = 1.2,
+
+        // Warrior Execute (R1..5) — finisher designed as threat spike
+        [5308] = 1.25, [20658] = 1.25, [20660] = 1.25,
+        [20661] = 1.25, [20662] = 1.25,
     };
 
     public static double GetDamageMultiplier(int spellId)
