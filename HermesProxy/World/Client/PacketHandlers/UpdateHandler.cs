@@ -50,6 +50,38 @@ public partial class WorldClient
         { 60, 0.75f },
     }.ToFrozenDictionary();
 
+    // Spells whose modern Classic SpellEffect.db2 carries an EffectAura=61 (MOD_SCALE)
+    // with positive BasePoints — the 1.14 client applies a flat +N% scale on top of
+    // wire × CMS × ModelScale whenever the unit has one of these auras. Vanilla 1.12
+    // client either didn't parse 17205 as MOD_SCALE or had different effect data, so
+    // mobs that carry the aura by design (Winterfall furbolg are all drunk on
+    // firewater) render ~+24% bigger on 1.14 than on 1.12 native.
+    //
+    // Filter rule (see ShouldDropModScaleAura): drop the aura from outgoing
+    // SMSG_AURA_UPDATE when the unit's high GUID type is Creature. Players, pets, and
+    // vehicles still see the size effect — a player drinking the Winterfall Firewater
+    // ITEM (which casts 17038/17205 on self) still grows; only the world mobs lose it.
+    //
+    // List sourced from wago.tools SpellEffect DB2 build 1.14.2.42597 by filtering
+    // EffectAura==61 AND EffectBasePoints>0. Starting with just the two Winterfall
+    // Firewater rows; extend with sibling spells (Enlarge, Frenzy, Enrage, ...) as
+    // testers report other oversized mobs.
+    private static readonly FrozenSet<uint> ModScaleSpellIds = new HashSet<uint>
+    {
+        8269,   // Enrage (BP=14) — Crushridge Warmonger "goes into a rage after seeing a friend fall in battle"
+        17038,  // Winterfall Firewater (variant A)
+        17205,  // Winterfall Firewater (variant B — observed on Winterfall furbolg)
+    }.ToFrozenSet();
+
+    internal static bool ShouldDropModScaleAura(WowGuid128 guid, uint spellId)
+    {
+        if (LegacyVersion.ExpansionVersion != 1)
+            return false;
+        if (!ModScaleSpellIds.Contains(spellId))
+            return false;
+        return guid.GetHighType() == HighGuidType.Creature;
+    }
+
     // (DisplayId, wire * 1000 rounded) pairs where Twinstar's bias on top of CMS_v
     // is the deliberate vanilla-intended visible scale, not a pre-scaled sibling.
     // The wirePreScaled heuristic would otherwise catch and shrink these to CMS_v,
@@ -92,6 +124,38 @@ public partial class WorldClient
         EncodeScaleBiasKey(11346, 1.40f),  // Xavian Felsworn
         EncodeScaleBiasKey(11797, 1.62f),  // Maggran Earthbinder
     }.ToFrozenSet();
+
+    // Per-display baseline emit for force-strip mode (wirePreScaled fires
+    // regardless of ratio). Default if not in dict: 1.0 (modern client default
+    // scale × CMS × ModelScale render). Lift above 1.0 when CMS × MS alone
+    // looks too small for visually-prominent mob types.
+    //
+    // Use for creatures whose 1.12 native render should be a uniform target
+    // across ALL server-side wire variants (including above the 1.5 × CMS_v
+    // heuristic bound). The Winterfall furbolg entries were set 2026-05-17
+    // after side-by-side iteration with the user.
+    private static readonly FrozenDictionary<int, float> ScaleForceStripBaseline = new Dictionary<int, float>
+    {
+        { 6211,  1.2f  },  // Winterfall Ursa        (entry 7442, CMS_v 1.3, wire 1.3)
+        { 6818,  1.2f  },  // Winterfall Totemic     (entry 7441, CMS_v 1.3, wire 1.62)
+        { 6828,  1.2f  },  // Winterfall Shaman      (entry 7440, CMS_v 1.4 — handles 1.75 unbuffed + 2.1875 buffed)
+        { 6829,  1.2f  },  // Winterfall Pathfinder  (entry 7438, CMS_v 1.5 — handles 1.5 + 1.875 variants)
+        { 6830,  1.2f  },  // Winterfall Den Watcher (entry 7439, CMS_v 1.4 — handles 1.4 + 1.75 variants)
+        { 11568, 0.85f },  // Crushridge Enforcer    (entry 2257, CMS_v 1.9 — base too big at 1.0 strip; 0.85 → render 1.62)
+    }.ToFrozenDictionary();
+
+    // Per-(display, wire) override that wins over ScaleForceStripBaseline. Use
+    // to give "buffed" wire variants a moderate visual bump over the baseline,
+    // preserving the server's wire-ratio intent without piling on the full
+    // +24% MOD_SCALE aura the modern client would otherwise add. Encoding:
+    // same (displayId, wire * 1000) key as ScaleExemptDeliberateBias.
+    private static readonly FrozenDictionary<long, float> ScaleForceStripEmitOverride = new Dictionary<long, float>
+    {
+        // Winterfall Shaman buffed (wire 2.1875 = unbuffed × 1.25). Emit 1.5
+        // = baseline 1.2 × 1.25 → renders 25% larger than unbuffed Shaman
+        // (matches server wire-ratio intent).
+        { EncodeScaleBiasKey(6828, 2.1875f), 1.5f },
+    }.ToFrozenDictionary();
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static long EncodeScaleBiasKey(uint displayId, float wire)
@@ -2788,7 +2852,23 @@ public partial class WorldClient
                             });
                         }
                         if (aura.AuraData != null || updateMaskArray[UNIT_FIELD_AURA + i])
-                            auraUpdate.Auras.Add(aura);
+                        {
+                            if (aura.AuraData != null && ShouldDropModScaleAura(guid, (uint)aura.AuraData.SpellID))
+                            {
+                                Framework.Logging.Log.Event("aura.slot.dropped_mod_scale_npc", new
+                                {
+                                    target_low = guid.GetCounter(),
+                                    high_type = guid.GetHighType().ToString(),
+                                    slot = i,
+                                    spell_id = aura.AuraData.SpellID,
+                                    source = "object_update",
+                                });
+                            }
+                            else
+                            {
+                                auraUpdate.Auras.Add(aura);
+                            }
+                        }
 
                         // JimsProxy (vanilla synthesized spell stats): mirror active aura spell
                         // ids for the player so the synthesis pass can walk them alongside
@@ -4337,13 +4417,24 @@ public partial class WorldClient
                 // display_scale1 audit — see ScaleExemptDeliberateBias above.
                 bool isDeliberateBias = displayId > 0
                     && ScaleExemptDeliberateBias.Contains(EncodeScaleBiasKey((uint)displayId, rawScale));
-                bool wirePreScaled = hasVanillaCms
+                bool forceStrip = displayId > 0
+                    && ScaleForceStripBaseline.ContainsKey(displayId)
+                    && MathF.Abs(rawScale - 1.0f) > 0.01f;  // skip server-default wire
+                bool wirePreScaled = forceStrip || (hasVanillaCms
                     && !isDeliberateBias
                     && MathF.Abs(cmsVanilla - 1.0f) > 0.01f
                     && MathF.Abs(rawScale - 1.0f) > 0.01f   // skip server-default wire
-                    && rawScale >= cmsVanilla
-                    && rawScale < cmsVanilla * upperRatio;
-                float effectiveWire = wirePreScaled ? 1.0f : rawScale;
+                    && rawScale >= cmsVanilla - 0.01f       // FP epsilon: server-sent 1.7499995 still matches CMS_v 1.75
+                    && rawScale < cmsVanilla * upperRatio);
+                float stripTarget = 1.0f;
+                if (forceStrip && displayId > 0)
+                {
+                    if (ScaleForceStripBaseline.TryGetValue(displayId, out var baselineTarget))
+                        stripTarget = baselineTarget;
+                    if (ScaleForceStripEmitOverride.TryGetValue(EncodeScaleBiasKey((uint)displayId, rawScale), out var overrideTarget))
+                        stripTarget = overrideTarget;
+                }
+                float effectiveWire = wirePreScaled ? stripTarget : rawScale;
                 float npcEmit = (effectiveWire / cms) * K_npc;
 
                 // M2 mesh-adjust: per-ModelId compensation now handled via
