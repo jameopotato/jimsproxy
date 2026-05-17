@@ -2469,6 +2469,19 @@ public partial class WorldClient
             if (effectiveHotHeal > 0)
                 GetSession().ThreatTracker.OnHeal(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, effectiveHotHeal);
         }
+
+        // Periodic energize threat (Spirit Tap, Innervate, Mana Tide ticks,
+        // Vampiric Embrace mana-return). Each effect can carry its own
+        // power type via SchoolMaskOrPower — process per-effect rather than
+        // summing.
+        foreach (var effect in spell.Effects)
+        {
+            if (effect.Effect == (uint)AuraType.PeriodicEnergize && effect.Amount > 0)
+            {
+                var powerType = (PowerType)effect.SchoolMaskOrPower;
+                GetSession().ThreatTracker.OnEnergize(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, powerType, effect.Amount);
+            }
+        }
     }
 
     [PacketHandler(Opcode.SMSG_SPELL_ENERGIZE_LOG)]
@@ -2481,6 +2494,11 @@ public partial class WorldClient
         spell.Type = (PowerType)packet.ReadUInt32();
         spell.Amount = packet.ReadInt32();
         SendPacketToClient(spell);
+
+        // Threat translation: energize generates caster-side threat per LTC2
+        // (mana ×0.5, others ×5). Server pre-caps amount to actual gain so
+        // zero-gain energizes don't reach us.
+        GetSession().ThreatTracker.OnEnergize(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, spell.Type, spell.Amount);
     }
 
     [PacketHandler(Opcode.SMSG_SPELL_DELAYED)]

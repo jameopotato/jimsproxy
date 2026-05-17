@@ -595,6 +595,47 @@ public sealed class ThreatTracker
         EmitDirty();
     }
 
+    // LTC2 ExemptGains: spells that should NOT generate energize threat.
+    //   34299 — Improved Leader of the Pack (heal-side, no threat)
+    //   33778 — Lifebloom final bloom (overheal-like effect)
+    private static bool IsEnergizeExempt(int spellId) =>
+        spellId == 34299 || spellId == 33778;
+
+    // Energize-event threat. LibThreatClassic2 fires on SPELL_ENERGIZE and
+    // SPELL_PERIODIC_ENERGIZE: mana gain × 0.5, all other power types × 5.
+    // Threat goes to the CASTER and is added to EVERY mob the caster is on
+    // (replicated, not split — matches LTC2's per-mob iteration in
+    // ThreatClassModuleCore.lua line 588). Server pre-caps the amount to
+    // actual gain (zero-gain energizes don't fire), so no client-side cap
+    // math needed proxy-side.
+    public void OnEnergize(WowGuid128 caster, WowGuid128 recipient, int spellId, PowerType powerType, double amount)
+    {
+        if (amount <= 0) return;
+        if (!IsRelevantThreater(caster)) return;
+        if (IsEnergizeExempt(spellId)) return;
+
+        double multiplier = powerType == PowerType.Mana ? 0.5 : 5.0;
+        double rawThreat = amount * multiplier;
+
+        // AddThreatToAllMobs applies the passive modifier internally and
+        // skips mobs the caster isn't already on (no aggro pull from
+        // off-combat energize — matches lib semantics).
+        AddThreatToAllMobs(caster, rawThreat);
+
+        Framework.Logging.Log.Event("threat.energize", new
+        {
+            caster_low = caster.GetCounter(),
+            recipient_low = recipient.GetCounter(),
+            spell_id = spellId,
+            power_type = powerType.ToString(),
+            amount = (long)amount,
+            multiplier,
+            raw_threat = (long)rawThreat,
+        });
+
+        EmitDirty();
+    }
+
     // Called from SMSG_SPELL_GO observer for any spell cast that may modify
     // threat (Distracting Shot, Disengage, Feign Death, Growl, Cower, ...).
     // Routes to ThreatModules' per-spell-id handler. Auto-flushes the dirty
