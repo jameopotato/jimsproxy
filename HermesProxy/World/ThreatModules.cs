@@ -178,6 +178,22 @@ internal static class ThreatModules
         [11784] = -127, [11785] = -165,
     };
 
+    // Hunter pet — Intimidation (Beast Mastery 31-point talent). 5-sec stun
+    // + taunt-equivalent flat threat for the pet on the target. Per LTC2
+    // Pet.lua line 50-55: flat 580 single-target.
+    private static readonly Dictionary<int, double> IntimidationAmount = new()
+    {
+        [24394] = 580,
+    };
+
+    // Hunter pet — Scorpid Poison (ranks 1-4). Tiny flat per cast, but the
+    // pet fires it on auto-attack rotation so it accumulates over a fight.
+    // Per LTC2 Pet.lua line 58-62: flat 5 per rank, no AP scaling.
+    private static readonly Dictionary<int, double> ScorpidPoisonAmount = new()
+    {
+        [24640] = 5, [24583] = 5, [24586] = 5, [24587] = 5,
+    };
+
     // Warrior — sunderFactor = 261/58, with R5 hardcoded to 261.
     private static readonly Dictionary<int, double> SunderArmorAmount = new()
     {
@@ -586,6 +602,14 @@ internal static class ThreatModules
         // Pet — Warlock Succubus
         var petSoothingKiss = PetSingleTargetFlat("soothing_kiss", SoothingKissAmount);
         foreach (var id in SoothingKissAmount.Keys) map[id] = petSoothingKiss;
+
+        // Pet — Hunter Intimidation (Beast Mastery 31-point talent).
+        var petIntimidation = PetSingleTargetFlat("intimidation", IntimidationAmount);
+        foreach (var id in IntimidationAmount.Keys) map[id] = petIntimidation;
+
+        // Pet — Hunter Scorpid Poison (auto-cast on-attack).
+        var petScorpidPoison = PetSingleTargetFlat("scorpid_poison", ScorpidPoisonAmount);
+        foreach (var id in ScorpidPoisonAmount.Keys) map[id] = petScorpidPoison;
 
         // Warrior
         var sunder = PlayerSingleTargetFlat("sunder_armor", SunderArmorAmount);
