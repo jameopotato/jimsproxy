@@ -460,16 +460,34 @@ internal static class ThreatModules
 
             double apBonus = 0;
             uint petLevel = 0;
+            int petBaseAP = 0;
+            int petApModPos = 0;
+            int petApModNeg = 0;
             int petAP = 0;
             var fields = session.GameState.GetCachedObjectFieldsLegacy(caster);
             if (fields != null)
             {
                 int levelIdx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_LEVEL);
                 int apIdx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_ATTACK_POWER);
+                int apModsIdx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_ATTACK_POWER_MODS);
                 if (levelIdx >= 0 && fields.TryGetValue(levelIdx, out var levelField))
                     petLevel = levelField.UInt32Value;
                 if (apIdx >= 0 && fields.TryGetValue(apIdx, out var apField))
-                    petAP = apField.Int32Value;
+                    petBaseAP = apField.Int32Value;
+                // Legacy UNIT_FIELD_ATTACK_POWER_MODS packs pos/neg buff
+                // magnitudes into one int (low 16 = neg, high 16 = pos).
+                // LTC2's UnitAttackPower("pet") returns base + pos + neg
+                // where neg is negative, so effective = base + pos − neg.
+                // Without this, an Aspect-of-the-Hawk / Battle Shout / TSA
+                // buffed pet reads as just base AP and falls under the
+                // LTC2 threshold, gating out the Growl AP bonus entirely.
+                if (apModsIdx >= 0 && fields.TryGetValue(apModsIdx, out var apModsField))
+                {
+                    int packed = apModsField.Int32Value;
+                    petApModNeg = packed & 0xFFFF;
+                    petApModPos = (packed >> 16) & 0xFFFF;
+                }
+                petAP = petBaseAP + petApModPos - petApModNeg;
 
                 double threshold = petLevel * apLevelMalus - apBaseBonus;
                 bool gated = gateOnPositiveThreshold && threshold <= 0;
@@ -495,6 +513,9 @@ internal static class ThreatModules
                 ap_bonus = apBonus,
                 pet_level = petLevel,
                 pet_ap = petAP,
+                pet_base_ap = petBaseAP,
+                pet_ap_mod_pos = petApModPos,
+                pet_ap_mod_neg = petApModNeg,
             });
         };
 
