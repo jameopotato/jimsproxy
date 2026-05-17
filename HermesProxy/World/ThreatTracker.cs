@@ -82,7 +82,8 @@ public sealed class ThreatTracker
     public void AddModifiedThreat(WowGuid128 mob, WowGuid128 threater, double rawAmount)
     {
         double modifier = GetPassiveModifier(threater);
-        AddThreat(mob, threater, rawAmount * modifier);
+        double auraMult = ScanThreatMultiplierAuras(threater);
+        AddThreat(mob, threater, rawAmount * modifier * auraMult);
     }
 
     // Add (or subtract, if amount is negative) raw threat from a threater
@@ -216,7 +217,8 @@ public sealed class ThreatTracker
         if (threater == default || rawAmount == 0) return;
 
         double modifier = GetPassiveModifier(threater);
-        double scaledAmount = rawAmount * modifier;
+        double auraMult = ScanThreatMultiplierAuras(threater);
+        double scaledAmount = rawAmount * modifier * auraMult;
 
         foreach (var (mob, list) in _threatLists)
         {
@@ -584,7 +586,14 @@ public sealed class ThreatTracker
             gearFlat = ThreatSetBonuses.GetGearDamageFlatAdjust(_session.GameState, playerClass, spellId);
         }
 
-        double scaledThreat = (rawDamage * abilityMultiplier * gearMultiplier + gearFlat) * passiveModifier * talentMultiplier;
+        // Aura-based threat multiplier (Blessing of Salvation x0.7, Greater
+        // Bless of Salvation x0.7, Tranquil Air totem x0.8). Stacks
+        // multiplicatively. Salvation alone is the single biggest raid threat
+        // correction — every buffed raider's threat goes down 30% from where
+        // we'd otherwise compute it.
+        double auraMultiplier = ScanThreatMultiplierAuras(attacker);
+
+        double scaledThreat = (rawDamage * abilityMultiplier * gearMultiplier + gearFlat) * passiveModifier * talentMultiplier * auraMultiplier;
         if (scaledThreat < 0) scaledThreat = 0;
         AddThreat(victim, attacker, scaledThreat);
 
@@ -672,7 +681,12 @@ public sealed class ThreatTracker
             gearHealMultiplier = ThreatSetBonuses.GetGearHealMultiplier(_session.GameState, playerClass);
         }
 
-        double totalThreat = effectiveHeal * 0.5 * passiveModifier * talentMultiplier * gearHealMultiplier;
+        // Aura-based threat multiplier (Salvation x0.7 etc.) applies to heal
+        // threat just like damage threat — LTC2 puts it in threatMods() which
+        // wraps all threat output regardless of source event.
+        double auraMultiplier = ScanThreatMultiplierAuras(healer);
+
+        double totalThreat = effectiveHeal * 0.5 * passiveModifier * talentMultiplier * gearHealMultiplier * auraMultiplier;
         // LTC2 divides by EncounterMobs() — total mobs in the encounter, not
         // just the caster's combat list. We approximate with the caster's mob
         // count (close enough for solo/small-group; full encounter sync is a
@@ -1308,6 +1322,48 @@ public sealed class ThreatTracker
                 return spellId;
         }
         return 0;
+    }
+
+    // LTC2 BuffModifiers / DebuffModifiers — auras that multiply a unit's
+    // threat output globally. Vanilla 1.12 set; TBC+ auras (Pain Suppression,
+    // Arcane Shroud, etc.) deliberately omitted since our scope is vanilla.
+    // Source: ThreatClassModuleCore.lua line 190-289 (BuffHandlers /
+    // DebuffHandlers blocks that set buffThreatMultipliers / debuffThreatMultipliers).
+    //
+    // Blessing of Salvation is THE raid threat reducer — every tank gets it
+    // (or Greater Bless of Salvation from a paladin). Tranquil Air is the
+    // shaman alternative. Without these, every buffed raider's threat shows
+    // ~30%+ higher in TinyThreat than server reality.
+    private static readonly Dictionary<uint, double> ThreatMultiplierAuras = new()
+    {
+        [1038]  = 0.7,   // Blessing of Salvation
+        [25895] = 0.7,   // Greater Blessing of Salvation
+        [25909] = 0.8,   // Tranquil Air Totem (shaman raid aura)
+    };
+
+    // Stacked multiplier from all threat-multiplier auras currently on the
+    // unit. Returns 1.0 if no matching auras (most common case). Iterates
+    // the unit's aura slots once and multiplies in each match — order doesn't
+    // matter since multiplication commutes.
+    private double ScanThreatMultiplierAuras(WowGuid128 guid)
+    {
+        var fields = _session.GameState.GetCachedObjectFieldsLegacy(guid);
+        if (fields == null) return 1.0;
+
+        int unitFieldAura = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
+        if (unitFieldAura < 0) return 1.0;
+
+        double mult = 1.0;
+        int slots = LegacyVersion.GetAuraSlotsCount();
+        for (int i = 0; i < slots; i++)
+        {
+            if (!fields.TryGetValue(unitFieldAura + i, out var field))
+                continue;
+            uint spellId = field.UInt32Value;
+            if (spellId != 0 && ThreatMultiplierAuras.TryGetValue(spellId, out double m))
+                mult *= m;
+        }
+        return mult;
     }
 
     private static double ComputePassiveModifier(Class playerClass, uint stanceFormAura)
