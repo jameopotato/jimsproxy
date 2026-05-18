@@ -293,6 +293,26 @@ public partial class WorldSocket
             // 1.12 client would fire these mid-cast-bar and mid-GCD, so we match that.
             if (!isOffGcd)
             {
+                // JimsProxy (low-latency-mode): bypass all hold/guard paths. Forward every
+                // cast immediately. The server accepts or rejects; NOT_READY is suppressed
+                // in HandleCastFailed. Eliminates race conditions that cause stuck spells
+                // for players with very low RTT.
+                if (Settings.LowLatencyMode)
+                {
+                    lock (GetSession().GameState.PendingCastsLock)
+                    {
+                        GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
+                    }
+                    Log.Event("cast.low_latency_forward", new
+                    {
+                        spell_id = cast.Cast.SpellID,
+                        client_cast_id = castRequest.ClientGUID.ToString(),
+                    });
+                    WorldPacket llPacket = BuildCastSpellPacket(cast);
+                    SendPacketToServer(llPacket);
+                    return;
+                }
+
                 // Guard: RTT-window duplicate — same spell forwarded but not yet started
                 if (GetSession().GameState.HasNonStartedPendingCastForSpell((uint)cast.Cast.SpellID))
                 {

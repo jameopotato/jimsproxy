@@ -296,6 +296,22 @@ public partial class WorldClient
         if (packet.CanRead())
             arg2 = packet.ReadInt32();
 
+        // JimsProxy: optional suppression of transient cast errors (NotReady = GCD active,
+        // SpellInProgress = cast bar active). Useful with Low Latency Mode where mid-GCD
+        // presses reach the server and bounce back. The 1.14 client's "Suppress Error Speech"
+        // setting covers audio but not the red error text; this covers both.
+        if (Settings.SuppressSpellCastErrors &&
+            (reason == (uint)SpellCastResultVanilla.NotReady || reason == (uint)SpellCastResultVanilla.SpellInProgress))
+        {
+            GetSession().GameState.TryDequeuePendingNormalCast(spellId, out _);
+            Log.Event("cast.error_suppressed", new
+            {
+                spell_id = spellId,
+                reason_id = reason,
+            });
+            return;
+        }
+
         // JimsProxy HealComm bridge: SMSG_CAST_FAILED targets the local
         // caster directly, so any pending resurrection cast tracked for
         // us is now cancelled — emit HC-1.0 stop so 1.12-native listeners
