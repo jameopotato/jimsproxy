@@ -1,5 +1,6 @@
 ﻿using Framework;
 using Framework.GameMath;
+using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
@@ -96,9 +97,16 @@ public partial class WorldClient
         {
             vendor.Reason = packet.ReadUInt8();
             SendPacketToClient(vendor);
+            Log.Event("vendor.list.received", new
+            {
+                vendor_guid_low = vendor.VendorGUID.GetCounter(),
+                item_count = 0,
+                reason = vendor.Reason,
+            });
             return;
         }
 
+        int soldOutCount = 0;
         for (byte i = 0; i < itemsCount; i++)
         {
             VendorItem vendorItem = new();
@@ -112,10 +120,34 @@ public partial class WorldClient
             if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
                 vendorItem.ExtendedCostID = packet.ReadInt32();
             GetSession().GameState.SetItemBuyCount(vendorItem.Item.ItemID, vendorItem.StackCount);
+            if (vendorItem.Quantity == 0)
+                soldOutCount++;
             vendor.Items.Add(vendorItem);
+
+            // Diagnostic: dump every item's stock state at vendor open so we can
+            // see whether the legacy server is dynamically decrementing Quantity
+            // for sold-out slots (mangos convention: Quantity == 0 means out;
+            // Quantity == -1/0xFFFFFFFF means unlimited).
+            Log.Event("vendor.item", new
+            {
+                vendor_guid_low = vendor.VendorGUID.GetCounter(),
+                slot = vendorItem.Slot,
+                item_id = vendorItem.Item.ItemID,
+                quantity = vendorItem.Quantity,
+                stack_count = vendorItem.StackCount,
+                price = vendorItem.Price,
+                extended_cost = vendorItem.ExtendedCostID,
+            });
         }
 
         SendPacketToClient(vendor);
+
+        Log.Event("vendor.list.received", new
+        {
+            vendor_guid_low = vendor.VendorGUID.GetCounter(),
+            item_count = (int)itemsCount,
+            sold_out_count = soldOutCount,
+        });
     }
 
     [PacketHandler(Opcode.SMSG_SHOW_BANK)]

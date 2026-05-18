@@ -557,6 +557,22 @@ local function FixMerchantUsability()
         local index = (page - 1) * perPage + i
         local button = _G["MerchantItem" .. i .. "ItemButton"]
         if button and index <= total then
+            -- Sold-out detection: GetMerchantItemInfo's 5th return is numAvailable
+            -- (0 = sold out, -1 = unlimited, N = stock left). The 1.14 Classic
+            -- Era client ignores the wire's VendorItem.Quantity=0 for icon-grey
+            -- rendering, so we apply the grey here. 1.12 native client greys
+            -- these reliably — this restores parity.
+            local _, _, _, _, numAvailable = GetMerchantItemInfo(index)
+            local soldOut = (numAvailable == 0)
+
+            -- Always toggle icon desaturation per-button so a button reused
+            -- for a non-sold-out slot doesn't carry stale grey from a prior
+            -- page or vendor.
+            local iconTex = _G["MerchantItem" .. i .. "ItemButtonIconTexture"]
+            if iconTex and iconTex.SetDesaturated then
+                iconTex:SetDesaturated(soldOut)
+            end
+
             local link = GetMerchantItemLink(index)
             if link then
                 local _, _, quality, _, itemMinLevel, _, _, _, _, _, _, classId, subClassId = GetItemInfo(link)
@@ -572,8 +588,9 @@ local function FixMerchantUsability()
                     end
                     local usable = proficient and PlayerMeetsLevel(itemMinLevel)
                     local r, g, b
-                    if usable then r, g, b = 1.0, 1.0, 1.0
-                    else            r, g, b = 0.9, 0.0, 0.0 end
+                    if soldOut    then r, g, b = 0.65, 0.65, 0.65
+                    elseif usable then r, g, b = 1.0,  1.0,  1.0
+                    else               r, g, b = 0.9,  0.0,  0.0 end
 
                     -- Icon + border tint.
                     if SetItemButtonTextureVertexColor       then SetItemButtonTextureVertexColor(button, r, g, b)       end
@@ -625,9 +642,16 @@ local function FixMerchantUsability()
                         rowSlot:SetVertexColor(r, g, b)
                     end
 
-                    -- Leave item name text at the client's default yellow.
-                    -- Proficiency is communicated via icon/border tinting;
-                    -- vanilla never recolors the name text for proficiency.
+                    -- Item name text: grey only when sold out. Otherwise
+                    -- leave at the client's default — proficiency/usability
+                    -- is communicated via icon/border tinting; vanilla never
+                    -- recolored the name text for proficiency.
+                    if soldOut then
+                        local nameFs = _G["MerchantItem" .. i .. "Name"]
+                        if nameFs and nameFs.SetTextColor then
+                            nameFs:SetTextColor(0.65, 0.65, 0.65)
+                        end
+                    end
                 end
             end
         end

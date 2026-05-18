@@ -1,4 +1,5 @@
 ﻿using Framework;
+using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
@@ -27,6 +28,26 @@ public partial class WorldClient
         buy.NewQuantity = packet.ReadInt32();
         buy.QuantityBought = packet.ReadUInt32();
         SendPacketToClient(buy);
+
+        // Modern 1.14 client greys a sold-out vendor slot based on the Quantity
+        // field in SMSG_VENDOR_INVENTORY, not on SMSG_BUY_SUCCEEDED's NewQuantity.
+        // Buying the last stack leaves the icon visually available until the next
+        // full list refresh. Proxy-issue a CMSG_LIST_INVENTORY so the server
+        // resends the list with the correct Quantity (0) for the just-emptied
+        // slot, and the modern client greys it without the player having to
+        // close and reopen the vendor window.
+        if (buy.NewQuantity == 0)
+        {
+            WorldPacket refresh = new WorldPacket(Opcode.CMSG_LIST_INVENTORY);
+            refresh.WriteGuid(buy.VendorGUID.To64());
+            SendPacketToServer(refresh);
+            Log.Event("vendor.list.refresh", new
+            {
+                vendor_guid_low = buy.VendorGUID.GetCounter(),
+                reason = "buy_succeeded_zero_remaining",
+                slot = buy.Slot,
+            });
+        }
     }
     [PacketHandler(Opcode.SMSG_ITEM_PUSH_RESULT)]
     void HandleItemPushResult(WorldPacket packet)
@@ -176,8 +197,47 @@ public partial class WorldClient
         BuyFailed fail = new BuyFailed();
         fail.VendorGUID = packet.ReadGuid().To128(GetSession().GameState);
         fail.Slot = packet.ReadUInt32();
-        fail.Reason = (BuyResult)packet.ReadUInt8();
+        byte rawReason = packet.ReadUInt8();
+        fail.Reason = (BuyResult)rawReason;
         SendPacketToClient(fail);
+
+        Log.Event("vendor.buy.failed", new
+        {
+            vendor_guid_low = fail.VendorGUID.GetCounter(),
+            slot = fail.Slot,
+            reason_raw = rawReason,
+            reason_name = fail.Reason.ToString(),
+        });
+
+        // The modern 1.14 client renders the red "currently sold out" tooltip
+        // text from this reason code, but it does NOT grey the icon — that's
+        // driven by SMSG_VENDOR_INVENTORY's Quantity field, which the legacy
+        // server doesn't proactively resend on a failed buy. Tester JSONL
+        // 20260513-043134 shows 3 consecutive CMSG_BUY_ITEM → SMSG_BUY_FAILED
+        // pairs with zero intervening SMSG_VENDOR_INVENTORY refreshes.
+        //
+        // Refresh on any reason that implies the vendor's stock or slot table
+        // is now wrong relative to what the modern client thinks it knows:
+        // CantFindItem (0), ItemAlreadySold (1), ItemSoldOut (7). Skip the
+        // reasons where stock is fine and only the player state is the
+        // problem (NotEnoughtMoney/SellerDontLikeYou/DistanceTooFar/
+        // CantCarryMore/RankRequire/ReputationRequire) — no point burning a
+        // round-trip there.
+        if (fail.Reason == BuyResult.ItemSoldOut ||
+            fail.Reason == BuyResult.ItemAlreadySold ||
+            fail.Reason == BuyResult.CantFindItem)
+        {
+            WorldPacket refresh = new WorldPacket(Opcode.CMSG_LIST_INVENTORY);
+            refresh.WriteGuid(fail.VendorGUID.To64());
+            SendPacketToServer(refresh);
+            Log.Event("vendor.list.refresh", new
+            {
+                vendor_guid_low = fail.VendorGUID.GetCounter(),
+                reason = "buy_failed",
+                buy_result = fail.Reason.ToString(),
+                slot = fail.Slot,
+            });
+        }
     }
     [PacketHandler(Opcode.SMSG_INVENTORY_CHANGE_FAILURE, ClientVersionBuild.Zero, ClientVersionBuild.V2_0_1_6180)]
     void HandleInventoryChangeFailureVanilla(WorldPacket packet)
