@@ -99,13 +99,6 @@ public static class KnownBenignOpcodes
         //  for rested state, but gameplay is unaffected. Filed as backlog.)
         Opcode.SMSG_SET_REST_START,
 
-        // Added 2026-04-18 from Block 3 (priest L3-5 session):
-        // SMSG_TRAINER_BUY_SUCCEEDED is a 1.12-only s2c opcode — the modern
-        // 1.14 client doesn't have it in its opcode table and gets
-        // spell-learn confirmation from SMSG_LEARNED_SPELL instead (verified:
-        // 2x SMSG_LEARNED_SPELL translated successfully alongside the 2
-        // TRAINER_BUY_SUCCEEDED warnings in the same session).
-        Opcode.SMSG_TRAINER_BUY_SUCCEEDED,
     };
 
     /// <summary>True if the opcode is known to originate from a modern-client

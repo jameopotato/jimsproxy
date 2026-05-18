@@ -215,6 +215,40 @@ public sealed class GameSessionData
     //MIRASU   TalentRankPredecessors table and tracks the synthesized set here so the
     //MIRASU   reconcile step can withdraw them on respec.
     public System.Collections.Generic.HashSet<uint> SynthesizedTalentRanks = new();
+    // JimsProxy (Kronos IsInWorld race defense): tracks the last CMSG_TRAINER_BUY_SPELL
+    // we forwarded so we can restore the speculatively-removed predecessor if the buy
+    // fails. Kronos's RemoveSpell(prev) runs unconditionally on trainer-buy, but the
+    // SMSG_SUPERCEDED_SPELL send is gated on m_session->IsInWorld() — when that gate
+    // is briefly false, the predecessor disappears server-side without notification,
+    // and the next CMSG_CAST_SPELL for it triggers an anticheat autoban
+    // (see project_kronos_trainer_buy_predecessor_removal_bug). We mirror the removal
+    // proxy-side on send so the existing cast-block-unknown-spells guard at
+    // World/Server/PacketHandlers/SpellHandler.cs:159 catches the post-buy cast attempt
+    // and converts it into a SMSG_CAST_FAILED (you don't have this spell) instead of
+    // a real ban. On explicit SMSG_TRAINER_BUY_FAILED we restore the predecessor.
+    public uint PendingTrainerBuySpellId;
+    public uint PendingTrainerBuyRemovedPredecessor;
+    // JimsProxy: real spell ids that the most recent SMSG_TRAINER_LIST marked
+    // with TrainerSpellState=Known. Authoritative server view of "this spell
+    // is effectively learned by you" — covers both direct ownership (HasSpell)
+    // and supersede-chain ownership (HasSpell on any higher rank). Without this
+    // we can't intercept stale-click buys for spells that were just removed
+    // from CurrentPlayerKnownSpells by a SMSG_SUPERCEDED_SPELLS for the new
+    // rank: e.g., learn Apprentice Riding, then Journeyman, then click stale
+    // Apprentice in the UI — Apprentice is gone from KnownSpells but the
+    // server still treats it as effectively-known and rejects the buy with
+    // FAILED. Repopulated on every new SMSG_TRAINER_LIST so this set always
+    // reflects the latest server view.
+    public System.Collections.Generic.HashSet<uint> LastTrainerListKnownSpells = new();
+    // JimsProxy: in-flight trainer-buy tracking. Set on every forwarded
+    // CMSG_TRAINER_BUY_SPELL, cleared on the response (LEARNED, SUPERCEDED, FAILED,
+    // or a fresh trainer-list refresh). Used to drop rapid same-spell double-clicks
+    // where the second CMSG races with the first's response — both reach the
+    // server, the first succeeds, the second gets FAILED. Distinct from
+    // PendingTrainerBuy* (which only tracks buys that triggered speculative
+    // predecessor removal for the ban defense).
+    public uint InFlightTrainerBuySpellId;
+    public long InFlightTrainerBuyTickMs;
     // JimsProxy: per-unit HP cache used to compute overhealing on legacy servers
     // that don't include OverHeal in SMSG_SPELL_HEAL_LOG (1.12 vanilla). Authoritative
     // source is UNIT_FIELD_HEALTH / UNIT_FIELD_MAXHEALTH from SMSG_UPDATE_OBJECT;

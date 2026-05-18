@@ -133,6 +133,16 @@ public partial class WorldClient
         var knownSpellsSuperseded = GetSession().GameState.CurrentPlayerKnownSpells;
         knownSpellsSuperseded.Remove(supercededId);
         knownSpellsSuperseded.Add(spellId);
+        // JimsProxy: clear in-flight trainer-buy on rank-upgrade response — covers
+        // the case where the buy was a rank upgrade (server sends SUPERCEDED rather
+        // than plain LEARNED). Match on either the new or the superseded id so we
+        // don't strand stale in-flight state.
+        if (GetSession().GameState.InFlightTrainerBuySpellId == spellId
+            || GetSession().GameState.InFlightTrainerBuySpellId == supercededId)
+        {
+            GetSession().GameState.InFlightTrainerBuySpellId = 0u;
+            GetSession().GameState.InFlightTrainerBuyTickMs = 0;
+        }
         SendPacketToClient(spells);
         ReconcileTalentRankInjection();
     }
@@ -146,6 +156,21 @@ public partial class WorldClient
         // JimsProxy (cast-block-unknown-spells): track newly-learned spells so the
         // outbound CMSG_CAST_SPELL guard doesn't false-positive on trainer/talent grants.
         GetSession().GameState.CurrentPlayerKnownSpells.Add(spellId);
+        // JimsProxy (Kronos IsInWorld race defense): clear pending-trainer-buy state
+        // on confirmed learn — the speculatively-removed predecessor stays removed
+        // (server actually removed it, so proxy state now matches server state).
+        if (GetSession().GameState.PendingTrainerBuySpellId == spellId)
+        {
+            GetSession().GameState.PendingTrainerBuySpellId = 0u;
+            GetSession().GameState.PendingTrainerBuyRemovedPredecessor = 0u;
+        }
+        // JimsProxy: clear in-flight trainer-buy on confirmed learn so the next
+        // CMSG for the same spell isn't dropped as a stale duplicate.
+        if (GetSession().GameState.InFlightTrainerBuySpellId == spellId)
+        {
+            GetSession().GameState.InFlightTrainerBuySpellId = 0u;
+            GetSession().GameState.InFlightTrainerBuyTickMs = 0;
+        }
         SendPacketToClient(spells);
         ReconcileTalentRankInjection();
     }
