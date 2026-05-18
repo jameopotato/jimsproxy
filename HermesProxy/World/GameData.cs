@@ -54,6 +54,14 @@ public static partial class GameData
     public static FrozenDictionary<uint, float> VanillaCreatureModelScales = FrozenDictionary<uint, float>.Empty;
     public static FrozenDictionary<uint, uint[]> TalentRankPredecessors = FrozenDictionary<uint, uint[]>.Empty;
     public static FrozenDictionary<uint, uint[]> TalentRankSiblings = FrozenDictionary<uint, uint[]>.Empty;
+    // JimsProxy (Kronos IsInWorld race defense): spell_id -> immediate predecessor rank.
+    // Derived from 1.12.1 Spell.dbc (build 5875) name+rank grouping. Used by the
+    // CMSG_TRAINER_BUY_SPELL handler to speculatively remove the predecessor from
+    // CurrentPlayerKnownSpells, mirroring the server-side RemoveSpell(prev) that
+    // happens unconditionally on Kronos even when SMSG_SUPERCEDED_SPELL is dropped
+    // by the IsInWorld() gate. Without this, players get autobanned for casting a
+    // predecessor rank whose silent server-side removal the proxy never saw.
+    public static FrozenDictionary<uint, uint> SpellRankPredecessor = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, uint> TransportPeriods = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, string> AreaNames = FrozenDictionary<uint, string>.Empty;
     public static FrozenDictionary<string, uint> AreaIdsByName = FrozenDictionary<string, uint>.Empty;
@@ -759,6 +767,7 @@ public static partial class GameData
             LoadCreatureFamilies,
             LoadVanillaCreatureModelScales,
             LoadTalentSpellRanks,
+            LoadSpellRankChain,
             LoadTransports,
             LoadAreaNames,
             LoadRaceFaction,
@@ -1393,6 +1402,29 @@ public static partial class GameData
         }
         TalentRankPredecessors = predecessors.ToFrozenDictionary();
         TalentRankSiblings = siblings.ToFrozenDictionary();
+    }
+
+    public static void LoadSpellRankChain()
+    {
+        var path = Path.Combine("CSV", "SpellRankChain.csv");
+        if (!System.IO.File.Exists(path))
+        {
+            Log.Print(LogType.Error, $"MISSING CSV: {path} — reinstall the proxy or re-extract hermes-bundle.zip to restore missing data files");
+            return;
+        }
+        using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+        var dict = new Dictionary<uint, uint>(EstimateRowCount(path, 16));
+        foreach (var row in reader)
+        {
+            if (!uint.TryParse(row[0].Span, out uint spellId))
+                continue;
+            if (!uint.TryParse(row[1].Span, out uint prevSpell))
+                continue;
+            if (spellId == 0 || prevSpell == 0)
+                continue;
+            dict[spellId] = prevSpell;
+        }
+        SpellRankPredecessor = dict.ToFrozenDictionary();
     }
 
     public static void LoadTransports()
