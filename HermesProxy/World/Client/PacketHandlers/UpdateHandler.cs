@@ -34,6 +34,27 @@ public partial class WorldClient
         18223,  // Dreadsteed
     }.ToFrozenSet();
 
+    // Per-ModelId M_native ratio — multiplier applied to vanilla CMS_v when a
+    // model's 1.12 M2 intrinsic ModelScale differs from modern Classic's same-
+    // numbered M2 file. Multiplying CMS_v by this ratio preserves the per-
+    // DisplayID size relationships baked into the vanilla DBC (e.g., one bat
+    // skin meant to render at 0.15 stays half the size of one meant for 0.3),
+    // while compensating for the modern M2 mesh shrink.
+    //
+    // Validated 2026-05-18 on model 411 (FelBat) via two tames same session:
+    //   Ressan (displayId 9750, CMS_v=0.3): K=0.3×2.33≈0.7 → render parity 1.12.
+    //   Greater Duskbat (displayId 4734, CMS_v=0.15): expected K=0.35, renders
+    //     at half Ressan's size matching vanilla intent.
+    // Ratio derivation: see project_flying_pets_open memory.
+    //
+    // A universal family-table-MaxScale floor was tried first and rejected —
+    // it collapsed every low-CMS_v bat to the same K=0.7, erasing the vanilla
+    // intent that different bat skins are different sizes.
+    internal static readonly FrozenDictionary<int, float> M2NativeRatio = new Dictionary<int, float>
+    {
+        { 411, 2.33f },  // FelBat — 1.12 intrinsic ≈ 2.33× modern's (Ressan-validated)
+    }.ToFrozenDictionary();
+
     // Per-ModelId render-time compensation for divergences invisible to DBC/M2 files.
     // Confirmed 2026-05-12 via same-server 1.12 vs 1.14 parity (static-prop reference
     // proves equal camera): vertex positions, bone hierarchy by key_bone_id, CMS, and
@@ -4332,9 +4353,18 @@ public partial class WorldClient
                 float? vanillaCmsK = (displayId > 0 && GameData.VanillaCreatureModelScales.TryGetValue((uint)displayId, out var vCms))
                     ? vCms
                     : (float?)null;
-                float k = vanillaCmsK
-                    ?? familyTableK
-                    ?? (isWarlockPet ? K_warlock : K_hunter);
+                // Per-ModelId M_native compensation: multiply vanilla CMS_v by the
+                // model's 1.12-vs-1.14 intrinsic ratio when listed (see M2NativeRatio).
+                // Preserves per-DisplayID size relationships from vanilla DBC.
+                int modelIdForRatio = displayId > 0
+                    ? (int)GameData.GetDisplayInfo((uint)displayId).ModelId
+                    : 0;
+                bool modelRatioApplied = modelIdForRatio > 0
+                                         && vanillaCmsK.HasValue
+                                         && M2NativeRatio.TryGetValue(modelIdForRatio, out var mRatio);
+                float k = modelRatioApplied
+                    ? vanillaCmsK!.Value * M2NativeRatio[modelIdForRatio]
+                    : (vanillaCmsK ?? familyTableK ?? (isWarlockPet ? K_warlock : K_hunter));
 
                 // First-sight race: if CreatureTemplate isn't cached yet (creature
                 // query hasn't round-tripped), record the pet's data so the next
@@ -4382,7 +4412,8 @@ public partial class WorldClient
                     family = familyName ?? (isWarlockPet ? "warlock" : "hunter"),
                     family_id = familyId,
                     pet_entry = petEntry,
-                    k_source = vanillaCmsK.HasValue ? "vanilla-dbc"
+                    k_source = modelRatioApplied ? "model-native-ratio"
+                               : vanillaCmsK.HasValue ? "vanilla-dbc"
                                : familyTableK.HasValue ? "family-table"
                                : (isWarlockPet ? "k-warlock-fallback" : "k-hunter-fallback"),
                     raw_scale = rawScale,

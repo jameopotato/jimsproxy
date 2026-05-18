@@ -459,9 +459,17 @@ public partial class WorldClient
             float? familyTableK = (familyId > 0)
                 ? GameData.GetPetFamilyScale(familyId)
                 : (float?)null;
-            float k = vanillaCmsK
-                ?? familyTableK
-                ?? (p.IsWarlockPet ? 0.75f : 1.5f);
+            // Mirror UpdateHandler's isLocalPet branch: per-ModelId M_native
+            // multiplier on vanilla CMS_v (see M2NativeRatio).
+            int modelIdForRatio = p.DisplayId > 0
+                ? (int)GameData.GetDisplayInfo(p.DisplayId).ModelId
+                : 0;
+            bool modelRatioApplied = modelIdForRatio > 0
+                                     && vanillaCmsK.HasValue
+                                     && WorldClient.M2NativeRatio.TryGetValue(modelIdForRatio, out var mRatio);
+            float k = modelRatioApplied
+                ? vanillaCmsK!.Value * WorldClient.M2NativeRatio[modelIdForRatio]
+                : (vanillaCmsK ?? familyTableK ?? (p.IsWarlockPet ? 0.75f : 1.5f));
 
             float emit = (p.Cms > 0)
                 ? (p.RawScale / p.Cms) * k
@@ -481,7 +489,8 @@ public partial class WorldClient
                 display_id = p.DisplayId,
                 family_id = familyId,
                 k = k,
-                k_source = vanillaCmsK.HasValue ? "vanilla-dbc"
+                k_source = modelRatioApplied ? "model-native-ratio"
+                           : vanillaCmsK.HasValue ? "vanilla-dbc"
                            : familyTableK.HasValue ? "family-table"
                            : (p.IsWarlockPet ? "k-warlock-fallback" : "k-hunter-fallback"),
                 raw_scale = p.RawScale,
