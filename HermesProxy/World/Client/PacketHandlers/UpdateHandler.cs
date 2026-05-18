@@ -2713,9 +2713,19 @@ public partial class WorldClient
                 int aurasCount = LegacyVersion.GetAuraSlotsCount();
                 for (byte i = 0; i < aurasCount; i++)
                 {
-                    if (updateMaskArray[UNIT_FIELD_AURA + i] ||
-                        updateMaskArray[UNIT_FIELD_AURALEVELS + i / 4] ||
-                        updateMaskArray[UNIT_FIELD_AURAAPPLICATIONS + i / 4])
+                    // Only process slot i when its specific spell ID changed
+                    // (UNIT_FIELD_AURA is per-slot, one uint32 per aura slot).
+                    // UNIT_FIELD_AURALEVELS and UNIT_FIELD_AURAAPPLICATIONS pack
+                    // 4 slots into one uint32, so their mask fires when ANY of
+                    // the 4 slots in the quad change. Triggering on them caused
+                    // the "warlock recasts one DoT and all 4 visible DoTs refresh
+                    // simultaneously" bug — adjacent slots that didn't actually
+                    // change still got their aura data re-emitted, firing UNIT_AURA
+                    // on the modern client and confusing LibClassicDurations.
+                    // Legitimate per-slot refreshes (recasts) propagate via
+                    // SpellHandler.SendAuraRefreshUpdate from SMSG_SPELL_GO, which
+                    // resolves the slot by SpellID lookup and is slot-targeted.
+                    if (updateMaskArray[UNIT_FIELD_AURA + i])
                     {
                         // JimsProxy (Rupture-DoT-Lingering-Icon): log every aura-slot touch on units
                         // so we can see the exact packet timing of aura apply/remove vs SPELL_PERIODIC ticks.
@@ -2804,8 +2814,12 @@ public partial class WorldClient
                             if (castUnit == default)
                                 aura.AuraData.Flags |= AuraFlagsModern.NoCaster;
                         }
-                        else if (updateMaskArray[UNIT_FIELD_AURA + i])
+                        else
                         {
+                            // Slot cleared (UNIT_FIELD_AURA + i is in the mask with spellId == 0).
+                            // Forward the empty AuraInfo so the client removes the icon, and drop
+                            // the cached per-slot state so a later refresh doesn't inherit stale
+                            // duration / caster from the previous occupant.
                             GetSession().GameState.ClearAuraDuration(guid, i);
                             GetSession().GameState.ClearAuraCaster(guid, i);
                             Framework.Logging.Log.Event("aura.slot.cleared", new
@@ -2819,22 +2833,7 @@ public partial class WorldClient
                                 is_player_target = guid == GetSession().GameState.CurrentPlayerGuid,
                             });
                         }
-                        else
-                        {
-                            // levels or apps mask without UNIT_FIELD_AURA mask — slot likely already
-                            // empty server-side. Modern client never gets a clear for this case.
-                            Framework.Logging.Log.Event("aura.slot.skipped", new
-                            {
-                                target_low = guid.GetCounter(),
-                                slot = i,
-                                mask_aura = _maskAura,
-                                mask_levels = _maskLevels,
-                                mask_apps = _maskApps,
-                                is_player_target = guid == GetSession().GameState.CurrentPlayerGuid,
-                            });
-                        }
-                        if (aura.AuraData != null || updateMaskArray[UNIT_FIELD_AURA + i])
-                            auraUpdate.Auras.Add(aura);
+                        auraUpdate.Auras.Add(aura);
 
                         // JimsProxy (vanilla synthesized spell stats): mirror active aura spell
                         // ids for the player so the synthesis pass can walk them alongside
