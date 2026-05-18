@@ -72,6 +72,18 @@ public sealed class GameSessionData
 {
     public bool HasWsgHordeFlagCarrier;
     public bool HasWsgAllyFlagCarrier;
+
+    // JimsProxy (pvp-log-data-throttle 2026-05-17): tick of the most recent
+    // CMSG_PVP_LOG_DATA we forwarded to the legacy server. Used by
+    // BattlegroundHandler.HandlePvPLogData to drop requests inside the throttle
+    // window (10s). Kronos / vanilla-emu servers treat sustained
+    // CMSG_PVP_LOG_DATA above ~10/min as a spam-bot signal and silently queue
+    // a kick — addons like BattlegroundEnemies (2s ticker) and enemyFrames
+    // (every-frame OnUpdate) can blow past that threshold per-addon. The
+    // proxy throttle is the universal defense: covers any current or future
+    // misbehaving PvP-scoreboard addon with zero per-addon work. 0 means we
+    // haven't forwarded one yet this session — first request always passes.
+    public long LastForwardedPvpLogDataTickMs;
     public bool JimsPlusSideband;
     public bool ChannelDisplayList;
     public bool ShowPlayedTime;

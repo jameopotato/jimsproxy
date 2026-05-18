@@ -56,6 +56,33 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_PVP_LOG_DATA)]
     void HandlePvPLogData(PVPLogDataRequest log)
     {
+        // JimsProxy (pvp-log-data-throttle 2026-05-17): forward at most once
+        // per 10 seconds per session. Kronos / vanilla-emu servers treat
+        // sustained CMSG_PVP_LOG_DATA above ~10/min as a spam-bot signal and
+        // silently queue a kick (observed BG-exit DC, log
+        // jimsproxy-20260516-...-BGDC.jsonl). Common BG-addons hammer this:
+        // BattlegroundEnemies' default 2s OnUpdate ticker = ~30/min;
+        // enemyFrames calls RequestBattlefieldScoreData() every frame from
+        // OnUpdate = ~3600/min at 60fps. Throttling proxy-side covers every
+        // current and future misbehaving addon. Side effect for dropped
+        // requests: the client won't fire UPDATE_BATTLEFIELD_SCORE for THIS
+        // drop, but the last forwarded request's response still populated
+        // the cache — 10s staleness is fine for BG scoreboards.
+        const long ThrottleWindowMs = 10_000;
+        long now = Environment.TickCount64;
+        long last = GetSession().GameState.LastForwardedPvpLogDataTickMs;
+        long deltaMs = last == 0 ? long.MaxValue : now - last;
+        if (deltaMs < ThrottleWindowMs)
+        {
+            Log.Event("battleground.pvp_log_data.throttle_dropped", new
+            {
+                ms_since_last_forward = deltaMs,
+                throttle_window_ms = ThrottleWindowMs,
+            });
+            return;
+        }
+
+        GetSession().GameState.LastForwardedPvpLogDataTickMs = now;
         WorldPacket packet = new WorldPacket(Opcode.MSG_PVP_LOG_DATA);
         SendPacketToServer(packet);
     }
