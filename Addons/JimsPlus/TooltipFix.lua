@@ -676,7 +676,15 @@ local function FixQuestRewardUsability()
                     else            r, g, b = 0.9, 0.0, 0.0 end
 
                     if SetItemButtonTextureVertexColor       then SetItemButtonTextureVertexColor(button, r, g, b)       end
-                    if SetItemButtonNormalTextureVertexColor then SetItemButtonNormalTextureVertexColor(button, r, g, b) end
+                    -- pcall both FrameXML helpers — they index _G[name.."NormalTexture"] /
+                    -- _G[name.."SlotTexture"] which the modern Classic client doesn't always
+                    -- expose for quest-reward buttons (QuestInfoRewardsFrameQuestInfoItem1
+                    -- etc.). Use member access first when available, fall back to the helper.
+                    if button.NormalTexture and button.NormalTexture.SetVertexColor then
+                        button.NormalTexture:SetVertexColor(r, g, b)
+                    elseif SetItemButtonNormalTextureVertexColor then
+                        pcall(SetItemButtonNormalTextureVertexColor, button, r, g, b)
+                    end
                     if SetItemButtonSlotVertexColor then
                         pcall(SetItemButtonSlotVertexColor, button, r, g, b)
                     end
