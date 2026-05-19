@@ -4001,10 +4001,14 @@ public static partial class GameData
     // working behaviour where right-click consume goes to the legacy server
     // for handling.
     //
-    //   Mana gems — removed in retail, vanilla "Restore Mana" rank spells
-    //   (5405/10052-54) absent from the modern SpellDB. Items 5513/5514 have
-    //   ItemEffect CSV records (97663/97664) that trip the slot-mismatch path;
-    //   Citrine (5515) / Ruby (5516) have none but are included defensively.
+    //   Mana gems — vanilla "Restore Mana" spell IDs were reshuffled in the
+    //   modern client. Vanilla 10053/10054 ("Restore Mana" R3/R4) map to
+    //   "Conjure Mana Citrine/Ruby" in 1.14; the modern equivalents are
+    //   10057/10058. Items 5513/5514 have ItemEffect CSV records
+    //   (97663/97664) that trip the slot-mismatch path; Citrine (8007) /
+    //   Ruby (8008) have modern DB2 records (98334/98355) with the correct
+    //   spells (10057/10058) that the hotfix would overwrite with the wrong
+    //   vanilla IDs.
     //
     //   Warlock Spellstone — base rank (5522) has both a slot-0 vanilla record
     //   (97949) and a slot-1 retail record (97950) carrying spell 32793, a
@@ -4014,8 +4018,8 @@ public static partial class GameData
     //   variance.
     internal static readonly HashSet<uint> ItemEffectSlotMismatchExclusions = new()
     {
-        // Mage mana gems
-        5513u, 5514u, 5515u, 5516u,
+        // Mage mana gems (Agate=5514, Jade=5513, Citrine=8007, Ruby=8008)
+        5513u, 5514u, 8007u, 8008u,
         // Warlock spellstones
         5522u, 13456u, 13457u,
         // Orb of Soran'ruk — hypothesis-A local-only test for PTR. Item has 3
