@@ -1055,8 +1055,11 @@ public static class ModernVersion
     public static byte ConvertResponseCodesValue(byte legacyValue)
     {
         string legacyName = Enum.ToObject(LegacyVersion.GetResponseCodesEnum()!, legacyValue).ToString()!;
-        byte modernValue = (byte)Enum.Parse(GetResponseCodesEnum()!, legacyName);
-        return modernValue;
+        if (Enum.TryParse(GetResponseCodesEnum()!, legacyName, out object? modern))
+            return (byte)(int)modern;
+        Framework.Logging.Log.Print(Framework.Logging.LogType.Error,
+            $"Unmapped ResponseCode: legacy byte {legacyValue} name '{legacyName}'");
+        return legacyValue;
     }
 
     public static byte ConvertSocketColor(byte legacyValue)
