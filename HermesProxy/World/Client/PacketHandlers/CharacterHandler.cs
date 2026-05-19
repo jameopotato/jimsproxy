@@ -147,7 +147,14 @@ public partial class WorldClient
 
         CreateChar createChar = new CreateChar();
         createChar.Guid = new WowGuid128();
-        createChar.Code = ModernVersion.ConvertResponseCodesValue(result);
+        try
+        {
+            createChar.Code = ModernVersion.ConvertResponseCodesValue(result);
+        }
+        catch
+        {
+            createChar.Code = (byte)V1_14_1_40688.ResponseCodes.CharCreateError;
+        }
         SendPacketToClient(createChar);
     }
 
@@ -157,7 +164,14 @@ public partial class WorldClient
         byte result = packet.ReadUInt8();
 
         DeleteChar deleteChar = new DeleteChar();
-        deleteChar.Code = ModernVersion.ConvertResponseCodesValue(result);
+        try
+        {
+            deleteChar.Code = ModernVersion.ConvertResponseCodesValue(result);
+        }
+        catch
+        {
+            deleteChar.Code = (byte)V1_14_1_40688.ResponseCodes.CharDeleteFailed;
+        }
         SendPacketToClient(deleteChar);
     }
 
