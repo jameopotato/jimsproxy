@@ -153,7 +153,7 @@ public partial class WorldClient
         }
         catch
         {
-            createChar.Code = (byte)V1_14_1_40688.ResponseCodes.CharCreateError;
+            createChar.Code = (byte)Enums.V1_14_1_40688.ResponseCodes.CharCreateError;
         }
         SendPacketToClient(createChar);
     }
@@ -170,7 +170,7 @@ public partial class WorldClient
         }
         catch
         {
-            deleteChar.Code = (byte)V1_14_1_40688.ResponseCodes.CharDeleteFailed;
+            deleteChar.Code = (byte)Enums.V1_14_1_40688.ResponseCodes.CharDeleteFailed;
         }
         SendPacketToClient(deleteChar);
     }
