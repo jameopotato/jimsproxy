@@ -3992,19 +3992,19 @@ public static partial class GameData
         (99320u, 9421),
     };
 
-    // Mage mana gems were removed in retail; the modern client's SpellDB no longer
-    // recognizes vanilla "Restore Mana" rank spells (5405, 10052, 10053, 10054).
-    // Pre-#196 the client rendered the Use: line via its untouched retail ItemEffect
-    // record (whatever Blizzard left behind), and right-click consume worked because
-    // the legacy server handles the cast. PR #196's slot-mismatch hotfix overwrites
-    // those records with the vanilla SpellID, which the client can't resolve →
-    // Use: line vanishes and the item becomes inert.
+    // Mage mana gems: vanilla "Restore Mana" spell IDs were reshuffled in the
+    // modern client. Vanilla 10053/10054 ("Restore Mana" R3/R4) became "Conjure
+    // Mana Citrine/Ruby" in 1.14; the modern equivalents are 10057/10058.
+    // PR #196's slot-mismatch hotfix overwrites the client's retail ItemEffect
+    // records with the vanilla SpellID, which the client resolves as a conjure
+    // spell → Use: line vanishes and the item becomes inert. Excluding these
+    // items leaves the client's cached retail records untouched.
     //
-    // Items 5513/5514 are the only mana gems present in our ItemEffect CSVs (record
-    // ids 97663 / 97664). Citrine (5515) / Ruby (5516) have no CSV record so the
-    // slot-mismatch path never fires for them. Excluding 5513/5514 from the override
-    // restores the working pre-#196 behavior without affecting healthstones.
-    internal static readonly HashSet<uint> ManaGemItemEntries = new() { 5513u, 5514u, 5515u, 5516u };
+    // Agate (5514) and Jade (5513) have CSV records (97663/97664).
+    // Citrine (8007) and Ruby (8008) have modern DB2 records (98334/98355)
+    // with spells 10057/10058 that the hotfix would overwrite with the wrong
+    // vanilla IDs (10053/10054).
+    internal static readonly HashSet<uint> ManaGemItemEntries = new() { 5513u, 5514u, 8007u, 8008u };
 
     public static List<Server.Packets.HotFixMessage> PushKnownItemEffectFixes()
     {
