@@ -402,6 +402,17 @@ public partial class WorldClient
                     spell_id = pendingCast.SpellId,
                     client_cast_id = pendingCast.ClientGUID.ToString(),
                 });
+                // DIAGNOSTIC (stuck-spell investigation): remove when closed
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("cast.movement_resolved", new
+                    {
+                        spell_id = pendingCast.SpellId,
+                        resolved_via = "cast_failed",
+                        ms_from_mark = pendingCast.MarkedAtTickMs > 0
+                            ? Environment.TickCount64 - pendingCast.MarkedAtTickMs
+                            : 0L,
+                        client_cast_id = pendingCast.ClientGUID.ToString(),
+                    });
             }
             else if (!pendingCast.HasStarted)
             {
@@ -1015,6 +1026,20 @@ public partial class WorldClient
             else
                 castId = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, spellId, spellId + casterUnit.GetCounter());
             spellVisual = GameData.GetSpellVisual(spellId);
+
+            // DIAGNOSTIC (stuck-spell investigation): remove when closed
+            // Local-player SPELL_FAILURE that found no matching pending cast — the proxy
+            // is about to forward a SpellFailure with a deterministic CastID that the
+            // 1.14 client has no live cast to match against. Captured here so we can
+            // measure how often Cascade B (lag flood / preemptive sweep) produces these.
+            if (casterIsLocalPlayer && !foundActiveCastId && Framework.Settings.DebugOutput)
+                Log.Event("cast.unmatched_failure_forwarded", new
+                {
+                    packet_type = "spell_failure",
+                    spell_id = spellId,
+                    reason,
+                    pending_queue_depth = GetSession().GameState.PendingNormalCasts.Count,
+                });
         }
 
         byte broadcastReason = overrideReasonForLocalBroadcast ? (byte)SpellCastResultClassic.DontReport : reason;
@@ -1211,8 +1236,21 @@ public partial class WorldClient
             // Clear non-started casts and send failures for them
             // (keeps the started cast so SPELL_GO can dequeue it)
             var failedCasts = GetSession().GameState.ClearNonStartedNormalCasts();
+            // DIAGNOSTIC (stuck-spell investigation): hoist toggle read; remove with diagnostics
+            bool debugEventsNormal = Framework.Settings.DebugOutput;
             foreach (var failed in failedCasts)
+            {
                 GetSession().InstanceSocket.SendCastRequestFailed(failed, false);
+                // DIAGNOSTIC (stuck-spell investigation): remove when closed
+                if (debugEventsNormal)
+                    Log.Event("cast.non_started_swept", new
+                    {
+                        queue = "normal",
+                        spell_id = failed.SpellId,
+                        triggering_spell_id = (uint)spell.Cast.SpellID,
+                        client_cast_id = failed.ClientGUID.ToString(),
+                    });
+            }
         }
         bool petCastWasPlayerPressed = false;
         if (casterIsLocalPet &&
@@ -1231,8 +1269,21 @@ public partial class WorldClient
 
             // Clear non-started pet casts and send failures for them
             var failedPetCasts = GetSession().GameState.ClearNonStartedPetCasts();
+            // DIAGNOSTIC (stuck-spell investigation): hoist toggle read; remove with diagnostics
+            bool debugEventsPet = Framework.Settings.DebugOutput;
             foreach (var failed in failedPetCasts)
+            {
                 GetSession().InstanceSocket.SendCastRequestFailed(failed, true);
+                // DIAGNOSTIC (stuck-spell investigation): remove when closed
+                if (debugEventsPet)
+                    Log.Event("cast.non_started_swept", new
+                    {
+                        queue = "pet",
+                        spell_id = failed.SpellId,
+                        triggering_spell_id = (uint)spell.Cast.SpellID,
+                        client_cast_id = failed.ClientGUID.ToString(),
+                    });
+            }
         }
 
         // JimsProxy: suppress SMSG_SPELL_START forward for the LOCAL player/pet's INSTANT

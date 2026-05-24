@@ -301,6 +301,15 @@ public partial class WorldSocket
                 // for players with very low RTT.
                 if (Settings.LowLatencyMode)
                 {
+                    // DIAGNOSTIC (stuck-spell investigation): remove when closed
+                    if (Framework.Settings.DebugOutput)
+                        Log.Event("cast.forwarded", new
+                        {
+                            spell_id = cast.Cast.SpellID,
+                            client_cast_id = castRequest.ClientGUID.ToString(),
+                            queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
+                            source = "low_latency",
+                        });
                     lock (GetSession().GameState.PendingCastsLock)
                     {
                         GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
@@ -459,12 +468,30 @@ public partial class WorldSocket
                 }
 
                 // Enqueue the cast - responses will be matched by SpellId in FIFO order
+                // DIAGNOSTIC (stuck-spell investigation): remove when closed
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("cast.forwarded", new
+                    {
+                        spell_id = cast.Cast.SpellID,
+                        client_cast_id = castRequest.ClientGUID.ToString(),
+                        queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
+                        source = "immediate",
+                    });
                 GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
             }
             else
             {
                 // Off-GCD path: still enqueue so SMSG_SPELL_GO can match back to the ClientGUID,
                 // but skip the cast-bar gate and the GCD hold.
+                // DIAGNOSTIC (stuck-spell investigation): remove when closed
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("cast.forwarded", new
+                    {
+                        spell_id = cast.Cast.SpellID,
+                        client_cast_id = castRequest.ClientGUID.ToString(),
+                        queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
+                        source = "off_gcd",
+                    });
                 GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
 
                 // Off-GCD spells bypass the hold system, so SpellPrepare must be sent now
@@ -624,6 +651,15 @@ public partial class WorldSocket
             return;
 
         var gameState = GetSession().GameState;
+        // DIAGNOSTIC (stuck-spell investigation): remove when closed
+        if (Framework.Settings.DebugOutput)
+            Log.Event("cast.forwarded", new
+            {
+                spell_id = cast.SpellId,
+                client_cast_id = cast.ClientGUID.ToString(),
+                queue_depth_before = gameState.PendingNormalCasts.Count,
+                source = "held_gcd_release",
+            });
         lock (gameState.PendingCastsLock)
         {
             gameState.PendingNormalCasts.Enqueue(cast);
@@ -658,6 +694,15 @@ public partial class WorldSocket
         }
 
         // Enqueue the cast - responses will be matched by SpellId in FIFO order
+        // DIAGNOSTIC (stuck-spell investigation): remove when closed
+        if (Framework.Settings.DebugOutput)
+            Log.Event("cast.forwarded", new
+            {
+                spell_id = cast.Cast.SpellID,
+                client_cast_id = castRequest.ClientGUID.ToString(),
+                queue_depth_before = GetSession().GameState.PendingPetCasts.Count,
+                source = "pet",
+            });
         GetSession().GameState.PendingPetCasts.Enqueue(castRequest);
 
         SpellCastTargetFlags targetFlags = ConvertSpellTargetFlags(cast.Cast.Target);
@@ -710,6 +755,15 @@ public partial class WorldSocket
             castRequest.LegacySpellId = legacySpellId;
 
         // Enqueue the cast - responses will be matched by SpellId (or LegacySpellId) in FIFO order
+        // DIAGNOSTIC (stuck-spell investigation): remove when closed
+        if (Framework.Settings.DebugOutput)
+            Log.Event("cast.forwarded", new
+            {
+                spell_id = use.Cast.SpellID,
+                client_cast_id = castRequest.ClientGUID.ToString(),
+                queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
+                source = "item",
+            });
         GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
 
         // MIRASU (cast-while-moving-out-of-range 2026-05-23): sync server position
