@@ -389,7 +389,13 @@ public partial class WorldSocket
                 // displaced previously-held cast; don't ack-fail the new one. The eventual
                 // SpellPrepare at SPELL_START time keeps the button lit smoothly across the
                 // hold.
-                if (GetSession().GameState.HasStartedNormalCast())
+                //
+                // JimsProxy (1.14 SpellQueueWindow alignment): gate is the LAST 400 ms of the
+                // active cast bar, not the entire cast. Presses earlier than that are forwarded
+                // to the server, which returns SpellInProgress; the client renders that as the
+                // standard "Spell is already in progress" feedback. Matches what a real 1.14
+                // server does with default SpellQueueWindow=400.
+                if (GetSession().GameState.HasStartedCastInQueueWindow())
                 {
                     WorldPacket heldPacket = BuildCastSpellPacket(cast);
                     castRequest.HeldPacketForReplay = heldPacket;
@@ -414,7 +420,13 @@ public partial class WorldSocket
                 // packet now but don't forward it — store it as the pending held cast. The Timer
                 // set up in SMSG_SPELL_GO will release it at (estimated GCD expiry - early offset).
                 // Mashing during GCD overwrites the held slot so only the most recent press fires.
-                if (GetSession().GameState.IsGcdHoldActive())
+                //
+                // JimsProxy (1.14 SpellQueueWindow alignment): gate is the LAST 400 ms of the
+                // GCD, not the entire 1500 ms. Presses earlier than that are forwarded to the
+                // server, which returns NOT_READY; the client renders that as the standard
+                // "Spell is not ready yet" feedback. Matches what a real 1.14 server does with
+                // default SpellQueueWindow=400.
+                if (GetSession().GameState.IsInGcdQueueWindow())
                 {
                     WorldPacket heldPacket = BuildCastSpellPacket(cast);
                     castRequest.HeldPacketForReplay = heldPacket;
