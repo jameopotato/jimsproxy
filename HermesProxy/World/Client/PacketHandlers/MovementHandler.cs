@@ -314,6 +314,24 @@ public partial class WorldClient
 
         SendPacketToClient(transfer);
         GetSession().GameState.IsWaitingForNewWorld = false;
+
+        var clearedCounts = GetSession().GameState.ResetInFlightCastState();
+        var droppedGcdHold = GetSession().GameState.CancelGcdHold();
+        var droppedCastTimeHold = GetSession().GameState.ClearHeldCastTimeCast();
+        if (clearedCounts.normalCasts > 0 || clearedCounts.petCasts > 0 ||
+            droppedGcdHold != null || droppedCastTimeHold != null)
+        {
+            Log.Event("session.transfer_aborted.cast_state_cleared", new
+            {
+                aborted_map_id = transfer.MapID,
+                reason = transfer.Reason.ToString(),
+                normal_casts_cleared = clearedCounts.normalCasts,
+                pet_casts_cleared = clearedCounts.petCasts,
+                other_caster_ids_cleared = clearedCounts.otherCasterIds,
+                gcd_hold_dropped_spell_id = droppedGcdHold?.SpellId ?? 0,
+                cast_time_hold_dropped_spell_id = droppedCastTimeHold?.SpellId ?? 0,
+            });
+        }
     }
 
     [PacketHandler(Opcode.SMSG_NEW_WORLD)]
