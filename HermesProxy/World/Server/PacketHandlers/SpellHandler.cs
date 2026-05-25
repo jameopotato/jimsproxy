@@ -535,25 +535,15 @@ public partial class WorldSocket
     /// </summary>
     private void SyncLegacyServerPositionBeforeCast(SpellCastRequest castRequest, string source)
     {
-        // Gate as tightly as possible — only run for the exact case this fix targets:
-        // reticle (ground-targeted) casts at long range while the player is moving.
-        // Everything else (unit-targeted, self-cast, short-range reticle, standing-
-        // still, no MoveUpdate on the wire) goes through the proxy's existing,
-        // unchanged forwarding path. This avoids touching the normal cast pipeline
-        // and minimizes the surface for any regression on standard player casting.
         if (castRequest.MoveUpdate == null)
             return;
-        if (castRequest.Target.DstLocation == null)
-            return;
 
-        var player = castRequest.MoveUpdate.Position;
-        var dest = castRequest.Target.DstLocation.Location;
-        float dx = dest.X - player.X;
-        float dy = dest.Y - player.Y;
-        float dz = dest.Z - player.Z;
-        float distance = MathF.Sqrt(dx * dx + dy * dy + dz * dz);
-        if (distance <= 15f)
-            return; // close-range reticle casts (Goblin Sapper at 5 yds, etc.) don't need the fix
+        bool hasUnitTarget = !castRequest.Target.Unit.IsEmpty()
+            && castRequest.Target.Unit != GetSession().GameState.CurrentPlayerGuid;
+        bool hasDstLocation = castRequest.Target.DstLocation != null;
+
+        if (!hasUnitTarget && !hasDstLocation)
+            return;
 
         try
         {
@@ -567,39 +557,52 @@ public partial class WorldSocket
                 SendPacketToServer(hb);
             }
 
-            // MIRASU (cast-while-moving-out-of-range 2026-05-23 — phase 2):
-            // The heartbeat sync alone isn't enough at literal max range — vmangos's
-            // movement anticheat (HandleFlagTests / HandlePositionTests) sometimes
-            // rejects our synthesized heartbeat as a suspicious position update, in
-            // which case the cast's range check runs against the older position and
-            // fails. For 1.12 parity (where moving casts at max range Just Work),
-            // pull the dest 1.5 yds toward the player as a safety margin. Sacrifices
-            // ~1.5 yds of effective range — invisible for AoE spells (radius >> 1.5),
-            // small and predictable for precise bombs at long range.
-            const float nudge = 1.5f;
-            float scale = (distance - nudge) / distance;
-            var nudgedDest = new Vector3(
-                player.X + dx * scale,
-                player.Y + dy * scale,
-                player.Z + dz * scale);
-            castRequest.Target.DstLocation.Location = nudgedDest;
-
-            Log.Event("cast.move_sync_for_reticle", new
+            if (hasDstLocation)
             {
-                source,
-                spell_id = (uint)castRequest.SpellID,
-                original_dist = distance,
-                nudge_yards = nudge,
-                player_x = player.X,
-                player_y = player.Y,
-                player_z = player.Z,
-                original_dest_x = dest.X,
-                original_dest_y = dest.Y,
-                original_dest_z = dest.Z,
-                nudged_dest_x = nudgedDest.X,
-                nudged_dest_y = nudgedDest.Y,
-                nudged_dest_z = nudgedDest.Z,
-            });
+                var player = castRequest.MoveUpdate.Position;
+                var dest = castRequest.Target.DstLocation!.Location;
+                float dx = dest.X - player.X;
+                float dy = dest.Y - player.Y;
+                float dz = dest.Z - player.Z;
+                float distance = MathF.Sqrt(dx * dx + dy * dy + dz * dz);
+
+                if (distance > 15f)
+                {
+                    const float nudge = 1.5f;
+                    float scale = (distance - nudge) / distance;
+                    var nudgedDest = new Vector3(
+                        player.X + dx * scale,
+                        player.Y + dy * scale,
+                        player.Z + dz * scale);
+                    castRequest.Target.DstLocation.Location = nudgedDest;
+
+                    Log.Event("cast.move_sync_for_reticle", new
+                    {
+                        source,
+                        spell_id = (uint)castRequest.SpellID,
+                        original_dist = distance,
+                        nudge_yards = nudge,
+                        player_x = player.X,
+                        player_y = player.Y,
+                        player_z = player.Z,
+                        original_dest_x = dest.X,
+                        original_dest_y = dest.Y,
+                        original_dest_z = dest.Z,
+                        nudged_dest_x = nudgedDest.X,
+                        nudged_dest_y = nudgedDest.Y,
+                        nudged_dest_z = nudgedDest.Z,
+                    });
+                }
+            }
+            else
+            {
+                Log.Event("cast.move_sync_for_unit_target", new
+                {
+                    source,
+                    spell_id = (uint)castRequest.SpellID,
+                    target = castRequest.Target.Unit.GetCounter(),
+                });
+            }
         }
         catch
         {
