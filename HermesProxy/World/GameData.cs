@@ -2410,6 +2410,7 @@ public static partial class GameData
     // on top of the universal hotfix at startup when Settings.ServerType names
     // a known emulator. Distinct ID range so it doesn't collide with the
     // universal HotfixItemSparseBegin block.
+    public const uint HotfixEmotesTextDataBegin = 310000;
     public const uint HotfixItemSparseEmulatorBegin = 300000;
     public static Dictionary<uint, HotfixRecord> Hotfixes = [];
     public static void LoadHotfixes()
@@ -2438,6 +2439,7 @@ public static partial class GameData
         LoadCreatureDisplayInfoHotfixes();
         LoadCreatureDisplayInfoExtraHotfixes();
         LoadCreatureDisplayInfoOptionHotfixes();
+        LoadEmotesTextDataHotfixes();
     }
 
     public static void LoadAreaTriggerHotfixes()
@@ -5070,6 +5072,34 @@ public static partial class GameData
             Hotfixes.Add(record.HotfixId, record);
         }
     }
+    public static void LoadEmotesTextDataHotfixes()
+    {
+        // Blizzard changed /spit in the modern client (post-2019) to always
+        // display "spits on the ground" even when targeting a player. Restore
+        // the original vanilla targeted text so proxy players see it properly.
+        ReadOnlySpan<(uint id, string text)> spitFixes =
+        [
+            (458, "%s spits on %s."),
+            (459, "%s spits on you."),
+            (460, "You spit on %s."),
+        ];
+        uint counter = 0;
+        foreach (var (id, text) in spitFixes)
+        {
+            counter++;
+            HotfixRecord record = new()
+            {
+                TableHash = DB2Hash.EmotesTextData,
+                HotfixId = HotfixEmotesTextDataBegin + counter,
+                Status = HotfixStatus.Valid,
+                RecordId = id,
+            };
+            record.UniqueId = record.HotfixId;
+            record.HotfixContent.WriteCString(text);
+            Hotfixes.Add(record.HotfixId, record);
+        }
+    }
+
     public static void LoadItemEffectHotfixes()
     {
         var path = Path.Combine("CSV", "Hotfix", $"ItemEffect{ModernVersion.ExpansionVersion}.csv");
