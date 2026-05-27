@@ -383,6 +383,7 @@ public sealed class GameSessionData
     private bool _gcdTimerHasFired;                     // true after OnGcdTimerElapsed runs; prevents orphaned holds
     private uint _lastFiredSpellId;                     // spell ID forwarded by the timer; used to drop same-spell late presses
     public Action<ClientCastRequest>? OnGcdHeldCastFire; // set by WorldSocket at attach time; invoked on a ThreadPool thread at GCD expiry
+    public Action<ClientCastRequest>? OnAutoRepeatRetry; // set by WorldSocket; refires Shoot/Auto Shot after retryable legacy failures
 
     // JimsProxy: cast-time spell queue. While a cast-time spell is in progress
     // (HasStartedNormalCast), presses are held here instead of dropped. Fired
@@ -1700,6 +1701,7 @@ public sealed class GameSessionData
         // path that normally nulls it.
         CurrentClientNextMeleeCast = null;
         CurrentClientAutoRepeatCast = null;
+        OnAutoRepeatRetry = null;
         return (normalCount, petCount, otherCount);
     }
 
