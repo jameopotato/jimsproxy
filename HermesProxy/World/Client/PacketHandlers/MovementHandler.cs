@@ -192,6 +192,24 @@ public partial class WorldClient
         //    "log in mounted, walk at unmounted speed until I remount."
         bool isLocalPlayer = control.Guid == GetSession().GameState.CurrentPlayerGuid;
         bool justRegainedControl = control.HasControl && !GetSession().GameState.LastObservedHasControl;
+
+        // JimsProxy (diag): SMSG_CONTROL_UPDATE body is one PackGUID + one byte
+        // HasControl bool, neither captured by the existing packet.in event (size +
+        // opcode only). Without HasControl in the log, post-incident triage of
+        // movement-wedge bugs has to guess whether the proxy saw a freeze (false)
+        // or a restore (true) — including for the BG-exit lockout family where the
+        // entire question is "did the server send the restore packet or not." Emit
+        // the parsed values + the transition signal so future logs answer that
+        // directly. Zero behavior impact; one structured event per inbound packet.
+        Framework.Logging.Log.Event("movement.control_update.observed", new
+        {
+            guid_low = control.Guid.GetCounter(),
+            has_control = control.HasControl,
+            is_local_player = isLocalPlayer,
+            last_observed_before = GetSession().GameState.LastObservedHasControl,
+            just_regained_control = justRegainedControl,
+        });
+
         if (isLocalPlayer)
             GetSession().GameState.LastObservedHasControl = control.HasControl;
 
