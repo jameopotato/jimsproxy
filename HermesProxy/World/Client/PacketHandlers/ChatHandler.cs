@@ -563,7 +563,7 @@ public partial class WorldClient
                 packet.WriteCString(msg);
                 break;
             case ChatMessageTypeVanilla.Whisper:
-                packet.WriteCString(to);
+                packet.WriteCString(NormalizeLegacyWhisperTarget(to));
                 packet.WriteCString(msg);
                 break;
             case ChatMessageTypeVanilla.Say:
@@ -639,7 +639,7 @@ public partial class WorldClient
                 packet.WriteCString(msg);
                 break;
             case ChatMessageTypeWotLK.Whisper:
-                packet.WriteCString(to);
+                packet.WriteCString(NormalizeLegacyWhisperTarget(to));
                 packet.WriteCString(msg);
                 break;
             case ChatMessageTypeWotLK.Say:
@@ -661,6 +661,16 @@ public partial class WorldClient
         }
 
         SendPacket(packet);
+    }
+
+    private static string NormalizeLegacyWhisperTarget(string target)
+    {
+        if (string.IsNullOrWhiteSpace(target))
+            return target;
+
+        target = target.Trim();
+        int realmSeparator = target.IndexOf('-');
+        return realmSeparator >= 0 ? target.Substring(0, realmSeparator) : target;
     }
 
     [PacketHandler(Opcode.SMSG_EMOTE)]
