@@ -114,11 +114,14 @@ local function RefreshCheckboxes()
     end
 end
 panel:SetScript("OnShow", RefreshCheckboxes)
+panel.refresh = RefreshCheckboxes
 
 local initFrame = CreateFrame("Frame")
 initFrame:RegisterEvent("PLAYER_LOGIN")
 initFrame:SetScript("OnEvent", function()
-    RefreshCheckboxes()
+    -- Defer to next frame so CastBars.lua's PLAYER_LOGIN handler runs first
+    -- and populates JimsPlusCastbars.db before we read it.
+    C_Timer.After(0, RefreshCheckboxes)
     initFrame:UnregisterAllEvents()
 end)
 
