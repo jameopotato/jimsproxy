@@ -257,6 +257,8 @@ public partial class WorldSocket
         // in GameSessionData can forward held casts via this socket.
         if (isVanillaServer && GetSession().GameState.OnGcdHeldCastFire == null)
             GetSession().GameState.OnGcdHeldCastFire = ForwardHeldGcdCast;
+        if (isVanillaServer)
+            GetSession().GameState.OnAutoRepeatRetry = ForwardAutoRepeatRetry;
 
         if (isNextMelee || isAutoRepeat)
         {
@@ -268,6 +270,8 @@ public partial class WorldSocket
             castRequest.SpellXSpellVisualId = cast.Cast.SpellXSpellVisualID;
             castRequest.ClientGUID = cast.Cast.CastID;
             castRequest.TargetGuid = cast.Cast.Target.Unit;
+            if (isAutoRepeat)
+                castRequest.HeldPacketForReplay = BuildCastSpellPacket(cast);
 
             // Get the appropriate tracking variable based on spell type
             ref ClientCastRequest? currentCast = ref (isAutoRepeat
@@ -777,6 +781,16 @@ public partial class WorldSocket
         });
         SendPacketToServer(cast.HeldPacketForReplay);
     }
+
+    internal void ForwardAutoRepeatRetry(ClientCastRequest cast)
+    {
+        if (cast.HeldPacketForReplay == null)
+            return;
+
+        cast.Timestamp = Environment.TickCount;
+        SendPacketToServer(cast.HeldPacketForReplay);
+    }
+
     [PacketHandler(Opcode.CMSG_PET_CAST_SPELL)]
     void HandlePetCastSpell(PetCastSpell cast)
     {
@@ -956,6 +970,7 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CANCEL_AUTO_REPEAT_SPELL)]
     void HandleCancelAutoRepeatSpell(CancelAutoRepeatSpell spell)
     {
+        GetSession().GameState.CurrentClientAutoRepeatCast = null;
         WorldPacket packet = new WorldPacket(Opcode.CMSG_CANCEL_AUTO_REPEAT_SPELL);
         SendPacketToServer(packet);
     }

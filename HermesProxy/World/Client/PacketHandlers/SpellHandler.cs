@@ -20,6 +20,9 @@ public partial class WorldClient
     // and shorter than feels-laggy to the user when the pathological Kronos
     // case kicks in (target-dies-mid-cast, no trailing CAST_FAILED).
     private const long WatchdogWindowMs = 2500;
+    private const int AutoRepeatRetryFallbackDelayMs = 1500;
+    private const int AutoRepeatRetryMinDelayMs = 500;
+    private const int AutoRepeatRetryMaxDelayMs = 3500;
 
     // JimsProxy (Spell Success Kit Reset): defer (ms) before re-firing the cast-finish, so it lands
     // in a clean client frame past the coalesced START+GO burst. A couple of frames at 60fps.
@@ -425,8 +428,14 @@ public partial class WorldClient
             failed.FailedArg2 = arg2;
             SendPacketToClient(failed);
 
-            if (isAutoRepeat)
+            if (isAutoRepeat && IsRetryableAutoRepeatFailure(reason))
+            {
+                ScheduleAutoRepeatRetry(specialCast);
+            }
+            else if (isAutoRepeat)
+            {
                 GetSession().GameState.CurrentClientAutoRepeatCast = null;
+            }
             else
                 GetSession().GameState.CurrentClientNextMeleeCast = null;
         }
@@ -715,6 +724,52 @@ public partial class WorldClient
     // JimsProxy (warlock-pet-gcd-on-failure): true if a CMSG_PET_CAST_SPELL for this spell is still queued — those get their own trailing SMSG_PET_CAST_FAILED, so the synthesized GCD release is gated to unqueued CMSG_PET_ACTION presses to avoid a double-fail.
     bool HasQueuedPetCast(uint spellId) =>
         GetSession().GameState.PendingPetCasts.Any(c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId));
+
+    private static bool IsRetryableAutoRepeatFailure(uint reason)
+    {
+        uint classicReason = LegacyVersion.ConvertSpellCastResult(reason);
+        return classicReason == (uint)SpellCastResultClassic.LineOfSight ||
+               classicReason == (uint)SpellCastResultClassic.OutOfRange;
+    }
+
+    private void ScheduleAutoRepeatRetry(ClientCastRequest cast)
+    {
+        int delayMs = GetAutoRepeatRetryDelayMs(cast);
+        // Legacy servers stop ranged auto-repeat after pre-shot LoS/range failures.
+        // Keep the user's Shoot/Auto Shot intent alive at the natural ranged swing cadence.
+        System.Threading.Tasks.Task.Delay(delayMs).ContinueWith(_ =>
+        {
+            try
+            {
+                var current = GetSession().GameState.CurrentClientAutoRepeatCast;
+                if (!ReferenceEquals(current, cast))
+                    return;
+
+                GetSession().GameState.OnAutoRepeatRetry?.Invoke(cast);
+            }
+            catch
+            {
+                // Best-effort retry: a stale callback should never tear down the world session.
+            }
+        });
+    }
+
+    private int GetAutoRepeatRetryDelayMs(ClientCastRequest cast)
+    {
+        uint rangedAttackTime = GetSession().GameState.GetLegacyFieldValueUInt32(
+            GetSession().GameState.CurrentPlayerGuid,
+            UnitField.UNIT_FIELD_RANGEDATTACKTIME);
+        int attackTimeMs = rangedAttackTime > 0
+            ? (int)rangedAttackTime
+            : AutoRepeatRetryFallbackDelayMs;
+        attackTimeMs = Math.Clamp(attackTimeMs, AutoRepeatRetryMinDelayMs, AutoRepeatRetryMaxDelayMs);
+
+        int elapsedSinceAttemptMs = (int)Math.Max(0, Environment.TickCount - cast.Timestamp);
+        return Math.Clamp(
+            attackTimeMs - elapsedSinceAttemptMs,
+            AutoRepeatRetryMinDelayMs,
+            AutoRepeatRetryMaxDelayMs);
+    }
 
     [PacketHandler(Opcode.SMSG_SPELL_FAILED_OTHER)]
     void HandleSpellFailedOther(WorldPacket packet)
@@ -1857,8 +1912,9 @@ public partial class WorldClient
             GetSession().GameState.CurrentClientAutoRepeatCast != null &&
             GetSession().GameState.CurrentClientAutoRepeatCast!.SpellId == spell.Cast.SpellID)
         {
-            spell.Cast.CastID = GetSession().GameState.CurrentClientAutoRepeatCast!.ServerGUID;
-            spell.Cast.SpellXSpellVisualID = GetSession().GameState.CurrentClientAutoRepeatCast!.SpellXSpellVisualId;
+            var current = GetSession().GameState.CurrentClientAutoRepeatCast!;
+            spell.Cast.CastID = current.ServerGUID;
+            spell.Cast.SpellXSpellVisualID = current.SpellXSpellVisualId;
             // Note: Don't clear auto-repeat cast here - it stays active until cancelled
         }
         else if (GetSession().GameState.CurrentPetGuid == spell.Cast.CasterUnit &&
