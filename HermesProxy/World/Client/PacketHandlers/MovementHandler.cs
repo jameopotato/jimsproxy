@@ -319,6 +319,7 @@ public partial class WorldClient
         {
             GetSession().GameState.IsWaitingForNewWorld = false;
             GetSession().GameState.IsWaitingForWorldPortAck = true;
+            GetSession().GameState.WorldTransferTimestampMs = Environment.TickCount64;
 
             // JimsProxy (zone-transfer cast-state cleanup): the source map's server
             // state is torn down on transition (BG entry, instance change, zep arrival,
@@ -601,6 +602,39 @@ public partial class WorldClient
         flag.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
         flag.MoveCounter = packet.ReadUInt32();
         SendPacketToClient(flag);
+
+        // JimsProxy (bg-exit-control-stuck): when SMSG_MOVE_UNROOT arrives for
+        // the local player within 5s of a world transfer and the server never
+        // sent CONTROL_UPDATE(HasControl=true), synthesize one. Without this,
+        // a missing server restore leaves the player permanently locked out
+        // (black action bars, can't move). PTR-verified: flight paths and
+        // death do not use CONTROL_UPDATE, so this only triggers on BG-exit
+        // or instance-exit control restores. A redundant HasControl=true is
+        // a no-op if the server already restored control normally.
+        if (packet.GetUniversalOpcode(false) == Opcode.SMSG_MOVE_UNROOT
+            && flag.MoverGUID == GetSession().GameState.CurrentPlayerGuid
+            && !GetSession().GameState.LastObservedHasControl
+            && (Environment.TickCount64 - GetSession().GameState.WorldTransferTimestampMs) < 5000)
+        {
+            ControlUpdate controlFix = new ControlUpdate();
+            controlFix.Guid = flag.MoverGUID;
+            controlFix.HasControl = true;
+            SendPacketToClient(controlFix);
+            GetSession().GameState.LastObservedHasControl = true;
+
+            MoveSetSpeed runFix = new MoveSetSpeed(Opcode.SMSG_MOVE_SET_RUN_SPEED);
+            runFix.MoverGUID = flag.MoverGUID;
+            runFix.MoveCounter = 0;
+            runFix.Speed = GetSession().GameState.LastKnownPlayerRunSpeed;
+            SendPacketToClient(runFix);
+
+            Log.Event("movement.control_restore.synthesized", new
+            {
+                player_low = flag.MoverGUID.GetCounter(),
+                ms_since_world_transfer = Environment.TickCount64 - GetSession().GameState.WorldTransferTimestampMs,
+                map_id = GetSession().GameState.CurrentMapId,
+            });
+        }
     }
 
     [PacketHandler(Opcode.SMSG_COMPRESSED_MOVES)]

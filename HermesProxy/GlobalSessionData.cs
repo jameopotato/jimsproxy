@@ -103,6 +103,10 @@ public sealed class GameSessionData
     // by hardcoding 7.0f. Default true: a player who has never been CC'd is
     // always in control, so the natural login state is "has control already."
     public bool LastObservedHasControl = true;
+    // JimsProxy (bg-exit-control-stuck): TickCount64 of the most recent
+    // HandleNewWorld inside the IsWaitingForNewWorld path. Gates the
+    // defensive ControlUpdate synth to a narrow post-transfer window.
+    public long WorldTransferTimestampMs;
     // JimsProxy (speed-stuck-after-fear-while-mounted): cached for reassert; see memory.
     public float LastKnownPlayerRunSpeed = 7.0f;
     // JimsProxy (speed-stuck-after-bg-end-while-mounted): deferred reassert flag; see memory.
