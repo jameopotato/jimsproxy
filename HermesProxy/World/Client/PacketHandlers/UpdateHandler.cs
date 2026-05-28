@@ -1275,6 +1275,16 @@ public partial class WorldClient
                 monsterMove.SplineTime = packet.ReadUInt32();
                 monsterMove.SplineTimeFull = packet.ReadUInt32();
                 monsterMove.SplineId = packet.ReadUInt32();
+
+                // JimsProxy (taxi-resume-control-stuck #330): a taxi resumed across login arrives only as this CREATE-block flight spline (no per-leg SMSG_ON_MONSTER_MOVE reaches the player, so HandleMonsterMove's dismount never schedules) and the vanilla server sends no flag-clear/teleport/control-update at flight end; schedule the dismount from the spline's own remaining duration, the only reliable landing signal. Create only (updateData != null), local player, vanilla. See memory.
+                if (updateData != null && hasTaxiFlightFlags && guid.IsPlayer() && flags.HasAnyFlag(UpdateFlag.Self) &&
+                    LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+                {
+                    uint remainingMs = monsterMove.SplineTimeFull > monsterMove.SplineTime
+                        ? monsterMove.SplineTimeFull - monsterMove.SplineTime
+                        : monsterMove.SplineTimeFull;
+                    ScheduleTaxiResumeDismount(guid, remainingMs);
+                }
                 
                 if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_1_0_9767))
                 {

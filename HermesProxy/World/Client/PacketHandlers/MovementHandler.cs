@@ -224,6 +224,62 @@ public partial class WorldClient
         }
     }
 
+    // JimsProxy (taxi-resume-control-stuck #330): packets the 1.14 client needs to leave the taxi/passenger state — control restore + gravity + clear-fly + unroot. Mirrors the dismount Task; used by the resumed-taxi SPLINE_ENABLED-clear path in ReadMovementUpdateBlock which never reaches HandleMonsterMove. See memory.
+    public void SendTaxiDismountRestore(WowGuid128 guid)
+    {
+        ControlUpdate control = new ControlUpdate();
+        control.Guid = guid;
+        control.HasControl = true;
+        SendPacketToClient(control);
+
+        MoveSetFlag enableGravity = new MoveSetFlag(Opcode.SMSG_MOVE_ENABLE_GRAVITY);
+        enableGravity.MoverGUID = guid;
+        SendPacketToClient(enableGravity);
+
+        MoveSetFlag unsetFly = new MoveSetFlag(Opcode.SMSG_MOVE_UNSET_CAN_FLY);
+        unsetFly.MoverGUID = guid;
+        SendPacketToClient(unsetFly);
+
+        MoveSetFlag unroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
+        unroot.MoverGUID = guid;
+        SendPacketToClient(unroot);
+    }
+
+    // JimsProxy (taxi-resume-control-stuck #330): a resumed taxi's flight spline arrives only in the player's CREATE block (UpdateHandler), bypassing HandleMonsterMove's dismount scheduling; schedule the same dismount off the create-spline's remaining duration so control/gravity restore fires at landing. Mirrors the HandleMonsterMove dismount Task (CTS + atomic claim + cancel-on-disconnect via TaxiDismountCts). See memory.
+    public void ScheduleTaxiResumeDismount(WowGuid128 guid, uint remainingMs)
+    {
+        var gameState = GetSession().GameState;
+        System.Threading.Volatile.Write(ref gameState.IsInTaxiFlight, true);
+        gameState.CancelTaxiDismount("taxi_resume_reschedule");
+
+        const uint TAXI_FLIGHT_MAX_MS = 600_000;
+        int delayMs = (int)Math.Min(remainingMs, TAXI_FLIGHT_MAX_MS) + 250;
+        var cts = new System.Threading.CancellationTokenSource();
+        gameState.TaxiDismountCts = cts;
+        gameState.TaxiDismountFiresAtTickMs = Environment.TickCount64 + delayMs;
+
+        var capturedSession = GetSession();
+        var capturedClient = this;
+        var token = cts.Token;
+        WowGuid128 playerGuid = guid;
+        _ = System.Threading.Tasks.Task.Run(async () =>
+        {
+            try { await System.Threading.Tasks.Task.Delay(delayMs, token).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+
+            var prior = System.Threading.Interlocked.CompareExchange(ref capturedSession.GameState.TaxiDismountCts, null, cts);
+            if (!ReferenceEquals(prior, cts))
+                return;
+            if (!System.Threading.Volatile.Read(ref capturedSession.GameState.IsInTaxiFlight))
+                return;
+            if (capturedSession.InstanceSocket == null)
+                return;
+
+            capturedClient.SendTaxiDismountRestore(playerGuid);
+            System.Threading.Volatile.Write(ref capturedSession.GameState.IsInTaxiFlight, false);
+        });
+    }
+
     [PacketHandler(Opcode.MSG_MOVE_TELEPORT_ACK)]
     void HandleMoveTeleportAck(WorldPacket packet)
     {
