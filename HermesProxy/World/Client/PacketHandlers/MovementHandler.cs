@@ -503,6 +503,13 @@ public partial class WorldClient
         speed.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
         speed.Speed = packet.ReadFloat();
         SendPacketToClient(speed);
+
+        // JimsProxy (speed-stuck-cc-spline): when CC ends mid-spline the server restores run speed via the spline opcode, not FORCE; mirror the FORCE cache so the regain-control reassert restores the buffed speed. See memory.
+        if (packet.GetUniversalOpcode(false) == Opcode.SMSG_MOVE_SPLINE_SET_RUN_SPEED &&
+            speed.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            GetSession().GameState.LastKnownPlayerRunSpeed = speed.Speed;
+        }
     }
 
     // for own player
