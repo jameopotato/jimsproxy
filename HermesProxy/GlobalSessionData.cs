@@ -1293,6 +1293,29 @@ public sealed class GameSessionData
     }
 
     /// <summary>
+    /// JimsProxy (issue #334): returns true if a started normal cast targets the
+    /// given GameObject. Used to drop chain CMSG_CAST_SPELL on the same GO without
+    /// holding-and-releasing it 1ms after SPELL_GO. Releasing a held same-GO cast
+    /// preempts the legacy server's loot-creating script subspell (cast FROM the
+    /// player at SPELL_GO + ~440ms — e.g. spell 15343 "Create Whipper Root
+    /// Tubers"), and the loot is silently lost.
+    /// Returns false if the argument is empty or not a GameObject GUID.
+    /// </summary>
+    public bool HasStartedCastOnGameObject(WowGuid128 gameObjectGuid)
+    {
+        if (gameObjectGuid.IsEmpty())
+            return false;
+        if (gameObjectGuid.GetHighType() != HighGuidType.GameObject)
+            return false;
+        foreach (var item in PendingNormalCasts)
+        {
+            if (item.HasStarted && item.TargetGuid == gameObjectGuid)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
     /// JimsProxy (PR #161 follow-up): walks PendingNormalCasts and PendingPetCasts,
     /// dequeues any entry whose WatchdogDeadlineMs has expired, and returns the
     /// evicted entries via the out parameters. Caller (GlobalSessionData

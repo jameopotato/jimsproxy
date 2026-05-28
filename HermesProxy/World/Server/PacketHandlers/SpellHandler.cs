@@ -338,6 +338,30 @@ public partial class WorldSocket
                     return;
                 }
 
+                // JimsProxy (issue #334): GameObject-Opening chain-cast race. If the player
+                // spam-clicks the same GO at the end of a cast, the held cast is released 1ms
+                // after SPELL_GO and lands at the server before its OnUse script can fire the
+                // loot-creating subspell FROM the player (e.g. spell 15343 "Create Whipper Root
+                // Tubers", ~440ms after SPELL_GO). The chain cast occupies the player's slot,
+                // the subspell fails, and the item is silently lost while the GO is consumed.
+                // GOs are one-shot interactions — a second cast on the same GO never delivers
+                // a second item even on a clean run. Drop the chain press silently here so it
+                // never enters the hold-and-replay path. Different-GO chains and mining/herb
+                // chain casts (loot delivered directly via SMSG_LOOT_RESPONSE, no script
+                // subspell) are unaffected.
+                WowGuid128 newPressTarget = cast.Cast.Target.Unit;
+                if (GetSession().GameState.HasStartedCastOnGameObject(newPressTarget))
+                {
+                    Log.Event("cast.dropped.go_in_flight", new
+                    {
+                        spell_id = cast.Cast.SpellID,
+                        target_low = newPressTarget.GetCounter(),
+                        client_cast_id = castRequest.ClientGUID.ToString(),
+                    });
+                    SendCastFailedWithoutPrepare(castRequest);
+                    return;
+                }
+
                 // Guard: cast-time spell in progress — hold (most-recent-wins, hidden queue).
                 // JimsProxy (GCD-sweep-during-cast-time-spam 2026-05-07): keep the held press
                 // hidden from the modern client. Previously this path sent SendCastFailedWithoutPrepare
