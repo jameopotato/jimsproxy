@@ -156,6 +156,20 @@ public partial class WorldSocket
         // a fast-clicker at login could otherwise be blocked from legitimate casts.
         var knownSpellsForCastGuard = GetSession().GameState.CurrentPlayerKnownSpells;
         uint guardSpellId = (uint)cast.Cast.SpellID;
+
+        // DIAGNOSTIC (stuck-checked-button investigation): log every CMSG_CAST_SPELL the
+        // moment it's received, before any gate. Presses are otherwise only logged once
+        // they're forwarded / held / dropped, so a press the client sends that gets
+        // suppressed or swallowed earlier leaves no spell_id trace — which blocked the
+        // Retaliation stuck-lit investigation (no 20230 anywhere in the session despite a
+        // reported press). Gated behind DebugOutput. Remove when that investigation closes.
+        if (Framework.Settings.DebugOutput)
+            Log.Event("cast.received", new
+            {
+                spell_id = guardSpellId,
+                client_cast_id = cast.Cast.CastID.ToString(),
+            });
+
         if (knownSpellsForCastGuard.Count > 0 && !knownSpellsForCastGuard.Contains(guardSpellId))
         {
             Log.Event("spell.cast.blocked_unknown_spell", new
