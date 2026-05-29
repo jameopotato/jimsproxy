@@ -289,6 +289,9 @@ public partial class WorldSocket
             castRequest.ClientGUID = cast.Cast.CastID;
             castRequest.TargetGuid = cast.Cast.Target.Unit;
             castRequest.ServerGUID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, cast.Cast.SpellID, 10000 + cast.Cast.CastID.GetCounter());
+            // Tag for the non-started-cast sweep: off-GCD casts must survive an unrelated
+            // normal cast's SPELL_START (see ClearNonStartedNormalCasts / IsOffGcd).
+            castRequest.IsOffGcd = isOffGcd;
 
             // JimsProxy (issue #43): off-GCD spells (Sprint, Evasion, Trinket, racials, etc)
             // bypass both the HasStartedNormalCast cast-bar gate and the GCD hold path. A real

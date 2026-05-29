@@ -1622,6 +1622,10 @@ public sealed class GameSessionData
     /// <summary>
     /// Clear only pending normal casts that haven't started yet.
     /// Keeps started casts so SPELL_GO can dequeue them later.
+    /// Also keeps off-GCD casts (Bloodrage, Sprint, racials, trinkets): they coexist
+    /// with a normal GCD cast and the server processes them independently, so a normal
+    /// cast's SMSG_SPELL_START must not fail them — they resolve via their own
+    /// SPELL_GO / CAST_FAILED. See ClientCastRequest.IsOffGcd for the stuck-lit rationale.
     /// Returns the cleared casts so they can be failed.
     /// </summary>
     public List<ClientCastRequest> ClearNonStartedNormalCasts()
@@ -1633,7 +1637,7 @@ public sealed class GameSessionData
         {
             while (PendingNormalCasts.TryDequeue(out var current))
             {
-                if (current.HasStarted)
+                if (current.HasStarted || current.IsOffGcd)
                     keep.Add(current);
                 else
                     cleared.Add(current);
@@ -2257,6 +2261,15 @@ public class ClientCastRequest
     // The GCD hold gate in HandleSpellGo uses this instead of HasStarted so Kronos-flavored
     // instants still trigger BeginGcd. See JimsProxy issue #43 follow-up.
     public uint StartedCastTimeMs;
+
+    // JimsProxy (stuck-Bloodrage fix): true for off-GCD spells (Sprint, Evasion,
+    // Bloodrage, racials, trinkets). Off-GCD casts coexist with a normal GCD cast,
+    // so when a normal cast's SMSG_SPELL_START arrives, ClearNonStartedNormalCasts
+    // must NOT sweep these out of the queue. The server casts them independently and
+    // their own SPELL_GO / CAST_FAILED resolves the button. Without this exemption the
+    // off-GCD cast gets a premature CAST_FAILED while its real SPELL_GO still arrives
+    // unmatched, leaving the action-bar highlight stuck-lit until relog.
+    public bool IsOffGcd;
 
     // JimsProxy (PR #161 follow-up): when HandleSpellFailure peeks this entry
     // (instead of dequeuing) so the trailing SMSG_CAST_FAILED can deliver the
