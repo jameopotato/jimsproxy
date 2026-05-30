@@ -369,6 +369,7 @@ public sealed class GameSessionData
     public long AuctionOwnerWalkLastFinalizedTickMs;
     public uint LastWhoRequestId;
     public WowGuid128 CurrentPetGuid;
+    public WowGuid128 CurrentSelection;
     public WowGuid64 CurrentAttackTarget;        // active CMSG_ATTACK_SWING victim, cleared on ATTACK_STOP/CANCEL_COMBAT
     public bool WaitingForAttackStart;           // true between CMSG_ATTACK_SWING and SMSG_ATTACK_START
     public bool DeferredAttackStop;              // CMSG_ATTACK_STOP received while waiting for SMSG_ATTACK_START

@@ -2410,6 +2410,7 @@ public static partial class GameData
     // on top of the universal hotfix at startup when Settings.ServerType names
     // a known emulator. Distinct ID range so it doesn't collide with the
     // universal HotfixItemSparseBegin block.
+    public const uint HotfixEmotesTextDataBegin = 310000;
     public const uint HotfixItemSparseEmulatorBegin = 300000;
     public static Dictionary<uint, HotfixRecord> Hotfixes = [];
     public static void LoadHotfixes()
@@ -2438,6 +2439,7 @@ public static partial class GameData
         LoadCreatureDisplayInfoHotfixes();
         LoadCreatureDisplayInfoExtraHotfixes();
         LoadCreatureDisplayInfoOptionHotfixes();
+        LoadEmotesTextDataHotfixes();
     }
 
     public static void LoadAreaTriggerHotfixes()
@@ -5070,6 +5072,39 @@ public static partial class GameData
             Hotfixes.Add(record.HotfixId, record);
         }
     }
+    public static void LoadEmotesTextDataHotfixes()
+    {
+        // Blizzard changed /spit in the modern client (post-2019) to always
+        // display "spits on the ground" even when targeting a player. Restore
+        // the original vanilla targeted text so proxy players see it properly.
+        // Inline payload is Text_lang (CString) + RelationshipFlags (u8). EmotesTextID
+        // is a non-inline relation field and is NOT written to the hotfix record.
+        // RelationshipFlags selects the perspective: 0 = third party, 1 = you are the
+        // target, 2 = you are the source.
+        ReadOnlySpan<(uint id, string text, byte relationshipFlags)> spitFixes =
+        [
+            (458, "%s spits on %s.", 0),
+            (459, "%s spits on you.", 1),
+            (460, "You spit on %s.", 2),
+        ];
+        uint counter = 0;
+        foreach (var (id, text, relationshipFlags) in spitFixes)
+        {
+            counter++;
+            HotfixRecord record = new()
+            {
+                TableHash = DB2Hash.EmotesTextData,
+                HotfixId = HotfixEmotesTextDataBegin + counter,
+                Status = HotfixStatus.Valid,
+                RecordId = id,
+            };
+            record.UniqueId = record.HotfixId;
+            record.HotfixContent.WriteCString(text);
+            record.HotfixContent.WriteUInt8(relationshipFlags);
+            Hotfixes.Add(record.HotfixId, record);
+        }
+    }
+
     public static void LoadItemEffectHotfixes()
     {
         var path = Path.Combine("CSV", "Hotfix", $"ItemEffect{ModernVersion.ExpansionVersion}.csv");
