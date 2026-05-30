@@ -292,6 +292,11 @@ public partial class WorldSocket
             // Tag for the non-started-cast sweep: off-GCD casts must survive an unrelated
             // normal cast's SPELL_START (see ClearNonStartedNormalCasts / IsOffGcd).
             castRequest.IsOffGcd = isOffGcd;
+            // #344 follow-up: sweep-exempt off-GCD casts never become HasStarted, so they get
+            // no watchdog deadline from the failure/movement paths. Arm one at enqueue so a
+            // lost SPELL_GO can't leave the cast lingering in PendingNormalCasts forever.
+            if (isOffGcd)
+                castRequest.WatchdogDeadlineMs = Environment.TickCount64 + ClientCastRequest.WatchdogWindowMs;
 
             // JimsProxy (issue #43): off-GCD spells (Sprint, Evasion, Trinket, racials, etc)
             // bypass both the HasStartedNormalCast cast-bar gate and the GCD hold path. A real
