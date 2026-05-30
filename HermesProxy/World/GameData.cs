@@ -5077,10 +5077,14 @@ public static partial class GameData
         // Blizzard changed /spit in the modern client (post-2019) to always
         // display "spits on the ground" even when targeting a player. Restore
         // the original vanilla targeted text so proxy players see it properly.
-        // Inline payload is Text_lang (CString) + RelationshipFlags (u8). EmotesTextID
-        // is a non-inline relation field and is NOT written to the hotfix record.
+        // 1.14.2 EmotesTextData record (DBD layout 93E6D146): Text_lang (CString),
+        // RelationshipFlags (u8), then EmotesTextID (u32 — the relation FK to
+        // EmotesText.ID, 89 for /spit). The relation field IS appended to the hotfix
+        // payload; omitting it leaves the record 4 bytes short of the client's meta, so
+        // the client silently drops the hotfix and the override never applies.
         // RelationshipFlags selects the perspective: 0 = third party, 1 = you are the
         // target, 2 = you are the source.
+        const uint SpitEmotesTextId = 89;
         ReadOnlySpan<(uint id, string text, byte relationshipFlags)> spitFixes =
         [
             (458, "%s spits on %s.", 0),
@@ -5101,6 +5105,7 @@ public static partial class GameData
             record.UniqueId = record.HotfixId;
             record.HotfixContent.WriteCString(text);
             record.HotfixContent.WriteUInt8(relationshipFlags);
+            record.HotfixContent.WriteUInt32(SpitEmotesTextId);
             Hotfixes.Add(record.HotfixId, record);
         }
     }
