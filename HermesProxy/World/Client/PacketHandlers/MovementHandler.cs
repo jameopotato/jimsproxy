@@ -270,13 +270,24 @@ public partial class WorldClient
             var prior = System.Threading.Interlocked.CompareExchange(ref capturedSession.GameState.TaxiDismountCts, null, cts);
             if (!ReferenceEquals(prior, cts))
                 return;
-            if (!System.Threading.Volatile.Read(ref capturedSession.GameState.IsInTaxiFlight))
-                return;
-            if (capturedSession.InstanceSocket == null)
-                return;
 
-            capturedClient.SendTaxiDismountRestore(playerGuid);
-            System.Threading.Volatile.Write(ref capturedSession.GameState.IsInTaxiFlight, false);
+            // We own the dismount; cts + bookkeeping cleanup is now our responsibility
+            // (mirrors the HandleMonsterMove dismount Task's finally).
+            try
+            {
+                if (!System.Threading.Volatile.Read(ref capturedSession.GameState.IsInTaxiFlight))
+                    return;
+                if (capturedSession.InstanceSocket == null)
+                    return;
+
+                capturedClient.SendTaxiDismountRestore(playerGuid);
+                System.Threading.Volatile.Write(ref capturedSession.GameState.IsInTaxiFlight, false);
+            }
+            finally
+            {
+                capturedSession.GameState.TaxiDismountFiresAtTickMs = 0;
+                cts.Dispose();
+            }
         });
     }
 
