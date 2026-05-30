@@ -1181,6 +1181,9 @@ public partial class WorldClient
         });
     }
 
+    // JimsProxy (observed-bow): forwarding an observed ranged auto-repeat SPELL_START (Auto Shot/Shoot) latches the 1.14 client's intrinsic auto-repeat aim (spell 75 = SPELL_ATTR2_AUTO_REPEAT, no client SpellVisual) and nothing retracts it for observers (SPELL_GO / SPELL_FAILURE / SPELL_FAILED_OTHER / CANCEL_AUTO_REPEAT / a SheatheState push were all verified non-working in-client — SheatheState only stows the weapon, leaving the arms locked in the aim). So we hold each observed auto-repeat START here and replay it paired with its SPELL_GO (HandleSpellGo) only when the shot fires — the draw shows for shots that fire, and a shot that aborts (no GO) is never forwarded, so it can't stick. Held per caster; touched only on the WorldClient ReceiveLoop (HandleSpellStart/Go), so no lock needed.
+    private readonly Dictionary<WowGuid128, SpellStart> _pendingObservedAutoRepeatStart = new();
+
     [PacketHandler(Opcode.SMSG_SPELL_START)]
     void HandleSpellStart(WorldPacket packet)
     {
@@ -1388,7 +1391,16 @@ public partial class WorldClient
             return;
         }
 
-        SendPacketToClient(spell);
+        // JimsProxy (observed-bow): hold the observed Auto Shot/Shoot SPELL_START; HandleSpellGo replays it paired with the GO so the draw shows only for shots that fire. Forwarding it standalone latches the client's auto-repeat aim with no way to retract it.
+        if (!casterIsLocalPlayer && !casterIsLocalPet && isRangedAutoAttack)
+        {
+            _pendingObservedAutoRepeatStart[spell.Cast.CasterUnit] = spell;
+            Log.Event("ranged.auto_repeat.start_held", new { caster_low = spell.Cast.CasterUnit.GetCounter(), spell_id = spell.Cast.SpellID });
+        }
+        else
+        {
+            SendPacketToClient(spell);
+        }
 
         // JimsProxy HealComm bridge: when local player begins a resurrection
         // cast, synthesize HC-1.0 "Resurrection/{name}/start/" addon outbound
@@ -1700,6 +1712,17 @@ public partial class WorldClient
             });
             spell.Cast.CasterGUID = stunTarget;
             spell.Cast.CasterUnit = stunTarget;
+        }
+
+        // JimsProxy (observed-bow): replay this observed caster's held auto-repeat START now, paired to this GO (CastID-matched) so the client renders a complete draw+fire. A held START whose GO never arrives is never forwarded, so it can't latch the aim.
+        if (spell.Cast.CasterUnit != GetSession().GameState.CurrentPlayerGuid
+            && spell.Cast.CasterUnit != GetSession().GameState.CurrentPetGuid
+            && GameData.AutoRepeatSpells.Contains((uint)spell.Cast.SpellID)
+            && _pendingObservedAutoRepeatStart.Remove(spell.Cast.CasterUnit, out var heldStart))
+        {
+            heldStart.Cast.CastID = spell.Cast.CastID;
+            SendPacketToClient(heldStart);
+            Log.Event("ranged.auto_repeat.start_replayed", new { caster_low = spell.Cast.CasterUnit.GetCounter(), spell_id = spell.Cast.SpellID });
         }
 
         SendPacketToClient(spell);
