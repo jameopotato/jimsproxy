@@ -14,6 +14,7 @@ TooltipFix.lua
 ZoneSync.lua
 MoonkinSound.lua
 AuctionsPaginationFix.lua
+MailNameFix.lua
 castbars/PoolManager.lua
 castbars/AnchorManager.lua
 castbars/Data.lua
