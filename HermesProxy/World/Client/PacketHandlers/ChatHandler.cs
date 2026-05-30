@@ -730,6 +730,16 @@ public partial class WorldClient
         uint nameLength = packet.ReadUInt32();
         string targetName = packet.ReadString(nameLength);
         emote.TargetGUID = GetSession().GameState.GetPlayerGuidByName(targetName);
+        // JimsProxy (spit-npc-target): the legacy server sends the emote target as a name,
+        // and GetPlayerGuidByName only resolves players. For the local player's own targeted
+        // emote at an NPC (e.g. /spit), fall back to the current selection so the modern client
+        // renders the targeted text instead of the untargeted "on the ground" row.
+        if (emote.TargetGUID.IsEmpty()
+            && !string.IsNullOrEmpty(targetName)
+            && emote.SourceGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            emote.TargetGUID = GetSession().GameState.CurrentSelection;
+        }
         SendPacketToClient(emote);
     }
 
