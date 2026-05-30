@@ -5077,14 +5077,18 @@ public static partial class GameData
         // Blizzard changed /spit in the modern client (post-2019) to always
         // display "spits on the ground" even when targeting a player. Restore
         // the original vanilla targeted text so proxy players see it properly.
-        ReadOnlySpan<(uint id, string text)> spitFixes =
+        // Inline payload is Text_lang (CString) + RelationshipFlags (u8). EmotesTextID
+        // is a non-inline relation field and is NOT written to the hotfix record.
+        // RelationshipFlags selects the perspective: 0 = third party, 1 = you are the
+        // target, 2 = you are the source.
+        ReadOnlySpan<(uint id, string text, byte relationshipFlags)> spitFixes =
         [
-            (458, "%s spits on %s."),
-            (459, "%s spits on you."),
-            (460, "You spit on %s."),
+            (458, "%s spits on %s.", 0),
+            (459, "%s spits on you.", 1),
+            (460, "You spit on %s.", 2),
         ];
         uint counter = 0;
-        foreach (var (id, text) in spitFixes)
+        foreach (var (id, text, relationshipFlags) in spitFixes)
         {
             counter++;
             HotfixRecord record = new()
@@ -5096,6 +5100,7 @@ public static partial class GameData
             };
             record.UniqueId = record.HotfixId;
             record.HotfixContent.WriteCString(text);
+            record.HotfixContent.WriteUInt8(relationshipFlags);
             Hotfixes.Add(record.HotfixId, record);
         }
     }
