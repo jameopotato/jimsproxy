@@ -142,15 +142,5 @@ internal static class ThreatNPCModules
                 tracker.MultiplyTargetThreat(npcGuid, victimGuid, 0.75);
                 break;
         }
-
-        Framework.Logging.Log.Event("threat.npc_module_fired", new
-        {
-            npc_low = npcGuid.GetCounter(),
-            npc_entry = npcEntry,
-            spell_id = spellId,
-            victim_low = victimGuid.GetCounter(),
-            action = action.ToString(),
-            trigger,
-        });
     }
 }

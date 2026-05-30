@@ -445,13 +445,6 @@ public partial class WorldSocket
 
         WowGuid128 targetGuid128 = targetGuid64.To128(gameState);
 
-        Framework.Logging.Log.Event("threat.smoke_test", new
-        {
-            mode = clear ? "clear" : "update",
-            player_guid = playerGuid.ToString(),
-            target_guid = targetGuid128.ToString(),
-        });
-
         if (clear)
         {
             var pkt = new ThreatClearPkt

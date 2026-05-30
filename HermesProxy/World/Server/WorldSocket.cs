@@ -283,15 +283,16 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
                                 opcode == Opcode.CMSG_ENTER_ENCRYPTED_MODE_ACK ||
                                 opcode == Opcode.CMSG_SERVER_TIME_OFFSET_REQUEST ||
                                 opcode == Opcode.CMSG_QUERY_REALM_NAME;
-        Log.Event("packet.in", new
-        {
-            direction = "c2s",
-            opcode_universal = opcode.ToString(),
-            opcode_raw = packet.GetOpcode(),
-            size = packet.GetSize(),
-            has_handler = _jpInlineHandled || _clientPacketTable.ContainsKey(opcode),
-            path = _jpInlineHandled ? "inline" : "dispatch",
-        });
+        if (Framework.Settings.DebugOutput)
+            Log.Event("packet.in", new
+            {
+                direction = "c2s",
+                opcode_universal = opcode.ToString(),
+                opcode_raw = packet.GetOpcode(),
+                size = packet.GetSize(),
+                has_handler = _jpInlineHandled || _clientPacketTable.ContainsKey(opcode),
+                path = _jpInlineHandled ? "inline" : "dispatch",
+            });
 
         switch (opcode)
         {
@@ -399,13 +400,14 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
                 if (HermesProxy.Server.MetricsEnabled)
                     HermesProxy.Server.Metrics.RecordClientToServerLatency(universalOpcode, elapsedTicks);
 
-                Log.Event("packet.translated", new
-                {
-                    direction = "c2s",
-                    opcode_universal = universalOpcode.ToString(),
-                    opcode_raw = rawOpcode,
-                    duration_us = elapsedTicks / (TimeSpan.TicksPerMillisecond / 1000),
-                });
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("packet.translated", new
+                    {
+                        direction = "c2s",
+                        opcode_universal = universalOpcode.ToString(),
+                        opcode_raw = rawOpcode,
+                        duration_us = elapsedTicks / (TimeSpan.TicksPerMillisecond / 1000),
+                    });
             }
             catch (Exception exJP)
             {

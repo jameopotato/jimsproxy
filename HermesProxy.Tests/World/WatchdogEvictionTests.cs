@@ -174,26 +174,26 @@ public class WatchdogEvictionTests
     }
 
     [Fact]
-    public void DrainPendingCastsForDestroyedTarget_Match_EvictsAllExceptStartedChannels()
+    public void DrainPendingCastsForDestroyedTarget_Match_EvictsOnlyNotStarted()
     {
-        // Started NON-channeled casts (Frostbolt-style) are still evicted so the
-        // proxy keeps emitting instant BadTargets feedback on combat-on-dying-mob.
-        // Only started CHANNELS are kept for the server's real resolution.
+        // Per PR #310: only !HasStarted matching casts are drained. Started casts
+        // (channel AND cast-time) stay in the queue so the server's real
+        // SPELL_GO / SPELL_FAILURE resolves them — prevents the mining-stuck
+        // animation where an evicted started cast left the trailing failure
+        // orphaned and the CancelSpellVisual gate was missed.
         var session = NewSession();
-        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(100, Creature(1), hasStarted: true)); // started, non-channeled — evicted
+        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(100, Creature(1), hasStarted: true)); // started, matches — kept
         session.PendingNormalCasts.Enqueue(MakeCastWithTarget(200, Creature(2)));                   // other target — kept
         session.PendingNormalCasts.Enqueue(MakeCastWithTarget(300, Creature(1)));                   // not started, matches — evicted
 
         session.DrainPendingCastsForDestroyedTarget(Creature(1),
             out var normal, out var pet);
 
-        // Both casts aimed at the destroyed target are evicted; the started one
-        // because it's not a channel, the not-started one as before.
-        Assert.Equal(2, normal.Count);
-        Assert.Contains(normal, c => c.SpellId == 100);
+        Assert.Single(normal);
         Assert.Contains(normal, c => c.SpellId == 300);
         Assert.Empty(pet);
-        Assert.Single(session.PendingNormalCasts);
+        Assert.Equal(2, session.PendingNormalCasts.Count);
+        Assert.Contains(session.PendingNormalCasts, c => c.SpellId == 100);
         Assert.Contains(session.PendingNormalCasts, c => c.SpellId == 200);
     }
 

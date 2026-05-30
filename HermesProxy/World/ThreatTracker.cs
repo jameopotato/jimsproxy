@@ -60,14 +60,6 @@ public sealed class ThreatTracker
 
     private readonly GlobalSessionData _session;
 
-    // Passive threat multiplier cache, keyed by threater GUID. Recomputed
-    // on every threat operation (cheap) but the threat.passive_modifier
-    // event only emits on change, so testers can spot stance / form
-    // transitions without spamming logs. Phase 6.0 widened from a single
-    // pair (local player only) to a per-threater dict so groupmates'
-    // stance / form changes are also tracked.
-    private readonly Dictionary<WowGuid128, (uint stanceForm, double modifier)> _passiveCache = new();
-
     public ThreatTracker(GlobalSessionData session)
     {
         _session = session;
@@ -175,11 +167,6 @@ public sealed class ThreatTracker
         list.Clear();
         _lastHighest.Remove(mob);
         _dirty.Add(mob);
-
-        Framework.Logging.Log.Event("threat.npc_raid_wipe", new
-        {
-            mob_low = mob.GetCounter(),
-        });
     }
 
     // Bring threater up to the current top of mob's list (taunt semantics).
@@ -245,11 +232,6 @@ public sealed class ThreatTracker
 
         var pkt = new ThreatClearPkt { UnitGUID = mob };
         SendToClient(pkt);
-
-        Log.Event("threat.mob_cleared", new
-        {
-            mob_guid = mob.ToString(),
-        });
     }
 
     // A single threater (e.g. a player who left the group, died) drops off a
@@ -328,7 +310,6 @@ public sealed class ThreatTracker
             _lastHighest.TryGetValue(mob, out var prevHighest);
             WowGuid128 newHighest;
             double highestValue;
-            bool aggroFlipHeld = false;
             if (prevHighest == default || !list.TryGetValue(prevHighest, out var prevValue))
             {
                 // No prior top, or prior top has dropped off the list (left
@@ -360,7 +341,6 @@ public sealed class ThreatTracker
                     // band — vanilla server would still target prev. Hold.
                     newHighest = prevHighest;
                     highestValue = prevValue;
-                    aggroFlipHeld = true;
                 }
             }
 
@@ -373,23 +353,11 @@ public sealed class ThreatTracker
             // Snap to actual server target so TinyThreat / ThreatPlates show
             // who the mob is REALLY hitting instead of who LTC2 predicts.
             WowGuid128 serverTarget = ReadMobCurrentTarget(mob);
-            bool snappedToServerTarget = false;
             if (serverTarget != default && serverTarget != newHighest &&
                 list.TryGetValue(serverTarget, out var serverTargetValue))
             {
-                Log.Event("threat.snap_to_server_target", new
-                {
-                    mob_low = mob.GetCounter(),
-                    predicted_top_low = newHighest.GetCounter(),
-                    predicted_top_value = (long)highestValue,
-                    server_target_low = serverTarget.GetCounter(),
-                    server_target_value = (long)serverTargetValue,
-                    predicted_was_local = newHighest == _session.GameState.CurrentPlayerGuid,
-                    server_target_is_local = serverTarget == _session.GameState.CurrentPlayerGuid,
-                });
                 newHighest = serverTarget;
                 highestValue = serverTargetValue;
-                snappedToServerTarget = true;
             }
 
             var update = new ThreatUpdatePkt { UnitGUID = mob };
@@ -403,36 +371,9 @@ public sealed class ThreatTracker
             }
             SendToClient(update);
 
-            bool highestChanged = prevHighest != newHighest;
-
-            if (aggroFlipHeld)
-            {
-                Log.Event("threat.aggro_flip_held", new
-                {
-                    mob_low = mob.GetCounter(),
-                    held_threater_low = prevHighest.GetCounter(),
-                    held_value = (long)highestValue,
-                    challenger_low = rawTop.GetCounter(),
-                    challenger_value = (long)rawTopValue,
-                    margin_required = GetAggroFlipMargin(rawTop),
-                });
-            }
-
-            Log.Event("threat.emit_update", new
-            {
-                mob_low = mob.GetCounter(),
-                threater_count = list.Count,
-                highest_low = newHighest.GetCounter(),
-                highest_value = (long)highestValue,
-                highest_is_local = newHighest == _session.GameState.CurrentPlayerGuid,
-                highest_changed = highestChanged,
-                snapped_to_server_target = snappedToServerTarget,
-                threaters = ThreaterSnapshot(list),
-            });
-
             // Emit HIGHEST only when the top changes — saves churn but keeps
             // tank-aggro indicators (red border, nameplate color) snappy.
-            if (highestChanged)
+            if (prevHighest != newHighest)
             {
                 _lastHighest[mob] = newHighest;
                 var highest = new HighestThreatUpdatePkt
@@ -449,33 +390,8 @@ public sealed class ThreatTracker
                     });
                 }
                 SendToClient(highest);
-
-                Log.Event("threat.highest_changed", new
-                {
-                    mob_low = mob.GetCounter(),
-                    prev_highest_low = prevHighest.GetCounter(),
-                    new_highest_low = newHighest.GetCounter(),
-                    new_highest_is_local = newHighest == _session.GameState.CurrentPlayerGuid,
-                    new_highest_value = (long)highestValue,
-                });
             }
         }
-    }
-
-    // Compact one-line representation of a mob's threater list for the JSONL
-    // bundle. Keeps the snapshot small — counter + value pairs — so it's
-    // readable in a diagnostic without flooding context.
-    private static string ThreaterSnapshot(Dictionary<WowGuid128, double> list)
-    {
-        var sb = new System.Text.StringBuilder();
-        bool first = true;
-        foreach (var (threater, value) in list)
-        {
-            if (!first) sb.Append(',');
-            first = false;
-            sb.Append(threater.GetCounter()).Append('=').Append((long)value);
-        }
-        return sb.ToString();
     }
 
     // Wipe everything — used on session disconnect / character switch. Doesn't
@@ -485,7 +401,6 @@ public sealed class ThreatTracker
         _threatLists.Clear();
         _lastHighest.Clear();
         _dirty.Clear();
-        _passiveCache.Clear();
     }
 
     // Called from SMSG_CANCEL_COMBAT — the legacy server told the local player
@@ -503,15 +418,9 @@ public sealed class ThreatTracker
     {
         if (_threatLists.Count == 0) return;
 
-        var mobsCleared = _threatLists.Count;
         var mobsToClear = new List<WowGuid128>(_threatLists.Keys);
         foreach (var mob in mobsToClear)
             ClearMob(mob);
-
-        Log.Event("threat.local_player_left_combat", new
-        {
-            mobs_cleared = mobsCleared,
-        });
     }
 
     // Called from the SMSG_DESTROY_OBJECT handler. Two cases to clean up:
@@ -584,23 +493,19 @@ public sealed class ThreatTracker
                 }
             }
 
-            // Tester bundles will show this when a damage event fires but
-            // we filtered the attacker out of the group / pet / self set —
-            // e.g. a stranger's pet hitting our shared mob, or a groupmate
-            // who hasn't been seen in CurrentGroups yet (login race).
-            Log.Event("threat.drop_irrelevant_attacker", new
-            {
-                attacker_low = attacker.GetCounter(),
-                attacker_high = attacker.GetHighType().ToString(),
-                victim_low = victim.GetCounter(),
-                spell_id = spellId,
-                damage = (long)rawDamage,
-            });
             return;
         }
         if (victim == default) return;
 
-        SnapshotTalentStateIfChanged();
+        // JimsProxy: vanilla threat is creature-only. If the victim isn't a creature
+        // (e.g., an ally Mind-Controlled by an enemy mob, an enemy player in PvP, a
+        // friendly hunter pet caught in AoE), don't register them as a fake "mob"
+        // — doing so emits an SMSG_THREAT_UPDATE per damage event for a unit that
+        // can't actually hold threat, which cascades to every group member's proxy
+        // and addon (Plater, Details, TinyThreat) and shows up as a damage-tick-
+        // synchronized lag spike. Reported repeatedly against MC scenarios in BGs.
+        if (victim.GetHighType() != HighGuidType.Creature) return;
+
         double abilityMultiplier = ThreatModules.GetDamageMultiplier(spellId);
         double passiveModifier = GetPassiveModifier(attacker);
         double talentMultiplier = GetSpellTalentMultiplier(attacker, spellId);
@@ -628,25 +533,6 @@ public sealed class ThreatTracker
         double scaledThreat = (rawDamage * abilityMultiplier * gearMultiplier + gearFlat) * passiveModifier * talentMultiplier * auraMultiplier;
         if (scaledThreat < 0) scaledThreat = 0;
         AddThreat(victim, attacker, scaledThreat);
-
-        if (_threatLists.TryGetValue(victim, out var list) &&
-            list.TryGetValue(attacker, out double newTotal))
-        {
-            Log.Event("threat.damage_added", new
-            {
-                attacker_low = attacker.GetCounter(),
-                attacker_is_player = attacker == _session.GameState.CurrentPlayerGuid,
-                victim_low = victim.GetCounter(),
-                spell_id = spellId,
-                damage = (long)rawDamage,
-                ability_mult = abilityMultiplier,
-                passive_mod = passiveModifier,
-                talent_mult = talentMultiplier,
-                threat_added = (long)scaledThreat,
-                new_total = (long)newTotal,
-                threater_count = list.Count,
-            });
-        }
 
         EmitDirty();
     }
@@ -700,7 +586,6 @@ public sealed class ThreatTracker
             return;
         }
 
-        SnapshotTalentStateIfChanged();
         double passiveModifier = GetPassiveModifier(healer);
         // School-gated talent on heals: paladin Imp Righteous Fury boosts holy
         // heal threat when RF aura is active. Other classes' heals are no-op.
@@ -728,19 +613,6 @@ public sealed class ThreatTracker
 
         foreach (var mob in mobsThreateningHealer)
             AddThreat(mob, healer, threatPerMob);
-
-        Log.Event("threat.heal_added", new
-        {
-            healer_low = healer.GetCounter(),
-            heal_target_low = healTarget.GetCounter(),
-            spell_id = spellId,
-            effective_heal = (long)effectiveHeal,
-            passive_mod = passiveModifier,
-            talent_mult = talentMultiplier,
-            mobs_split = mobsThreateningHealer.Count,
-            threat_per_mob = (long)threatPerMob,
-            total_threat = (long)totalThreat,
-        });
 
         EmitDirty();
     }
@@ -801,17 +673,6 @@ public sealed class ThreatTracker
         // skips mobs the caster isn't already on (no aggro pull from
         // off-combat energize — matches lib semantics).
         AddThreatToAllMobs(caster, rawThreat);
-
-        Framework.Logging.Log.Event("threat.energize", new
-        {
-            caster_low = caster.GetCounter(),
-            recipient_low = recipient.GetCounter(),
-            spell_id = spellId,
-            power_type = powerType.ToString(),
-            amount = (long)amount,
-            multiplier,
-            raw_threat = (long)rawThreat,
-        });
 
         EmitDirty();
     }
@@ -1077,49 +938,6 @@ public sealed class ThreatTracker
         return highest;
     }
 
-    // Cached snapshot of detected talent ranks so the diagnostic event below
-    // only fires when the rank set actually changes (login, learn, respec).
-    // Initialized to all -1 sentinels so the first call after construction
-    // always emits a baseline snapshot for tester observability.
-    private (int defiance, int feralInstinct, int silentResolve,
-             int shadowAffinity, int druidSubtlety, int impRighteousFury,
-             int impPws) _lastTalentSnapshot = (-1, -1, -1, -1, -1, -1, -1);
-
-    // Emits a `threat.talent_snapshot` JSONL event whenever the detected
-    // talent-rank set differs from the last observation. Lets a solo tester
-    // run the proxy, log in on any character, attack any mob once, and grep
-    // the bundle for the snapshot line to confirm the talent injection +
-    // detection pipeline is working — even for characters that are too low
-    // level to have any of these talents (all ranks would log as 0).
-    private void SnapshotTalentStateIfChanged()
-    {
-        var playerClass = (Class)_session.GameState.CurrentPlayerClass;
-        int defiance       = playerClass == Class.Warrior ? GetTalentRank(DefianceRanks)         : 0;
-        int feralInstinct  = playerClass == Class.Druid   ? GetTalentRank(FeralInstinctRanks)    : 0;
-        int silentResolve  = playerClass == Class.Priest  ? GetTalentRank(SilentResolveRanks)    : 0;
-        int shadowAffinity = playerClass == Class.Priest  ? GetTalentRank(ShadowAffinityRanks)   : 0;
-        int druidSubtlety  = playerClass == Class.Druid   ? GetTalentRank(DruidSubtletyRanks)    : 0;
-        int irf            = playerClass == Class.Paladin ? GetTalentRank(ImpRighteousFuryRanks) : 0;
-        int impPws         = playerClass == Class.Priest  ? GetTalentRank(ImpPwsRanks)           : 0;
-        var current = (defiance, feralInstinct, silentResolve, shadowAffinity, druidSubtlety, irf, impPws);
-        if (current == _lastTalentSnapshot)
-            return;
-        _lastTalentSnapshot = current;
-        Log.Event("threat.talent_snapshot", new
-        {
-            player_class = (byte)playerClass,
-            defiance_rank = defiance,
-            feral_instinct_rank = feralInstinct,
-            silent_resolve_rank = silentResolve,
-            shadow_affinity_rank = shadowAffinity,
-            druid_subtlety_rank = druidSubtlety,
-            imp_righteous_fury_rank = irf,
-            imp_pws_rank = impPws,
-            real_known_count = _session.GameState.CurrentPlayerKnownSpells.Count,
-            synthesized_count = _session.GameState.SynthesizedTalentRanks.Count,
-        });
-    }
-
     // Returns the Imp PW:S multiplier (1.0 + 0.05 × rank). Called from the
     // PW:S cast handler in ThreatModules. Public so the cast handler can
     // pre-multiply the table amount before adding threat.
@@ -1154,7 +972,6 @@ public sealed class ThreatTracker
         if (mobsInCombat == null || mobsInCombat.Count == 0)
             return;
 
-        SnapshotTalentStateIfChanged();
         double passive = GetPassiveModifier(caster);
         double impPwsMult = GetImpPwsMultiplier();
         double totalThreat = baseAmount * impPwsMult * passive;
@@ -1162,18 +979,6 @@ public sealed class ThreatTracker
 
         foreach (var mob in mobsInCombat)
             AddThreat(mob, caster, threatPerMob);
-
-        Log.Event("threat.spell.power_word_shield", new
-        {
-            spell_id = spellId,
-            shield_target_low = shieldTarget.GetCounter(),
-            base_amount = baseAmount,
-            imp_pws_mult = impPwsMult,
-            passive_mod = passive,
-            mobs_split = mobsInCombat.Count,
-            threat_per_mob = (long)threatPerMob,
-            total_threat = (long)totalThreat,
-        });
 
         EmitDirty();
     }
@@ -1184,9 +989,6 @@ public sealed class ThreatTracker
     // threater's own UNIT_FIELD_AURA cache. Pets / charms / unknown class
     // fall through to 1.0 since vanilla pets carry no stance / form /
     // class modifier.
-    //
-    // Side effect: emits threat.passive_modifier on every value change so
-    // testers can correlate stance switches with threat shifts in the JSONL.
     private double GetPassiveModifier(WowGuid128 threater)
     {
         var threaterClass = GetThreaterClass(threater);
@@ -1200,22 +1002,6 @@ public sealed class ThreatTracker
         // session's CurrentPlayerKnownSpells / SynthesizedTalentRanks.
         if (threater == _session.GameState.CurrentPlayerGuid)
             modifier *= GetTalentMultiplier(threaterClass, formAura);
-
-        _passiveCache.TryGetValue(threater, out var cached);
-        if (cached.stanceForm != formAura || cached.modifier != modifier)
-        {
-            Log.Event("threat.passive_modifier", new
-            {
-                threater_low = threater.GetCounter(),
-                is_local_player = threater == _session.GameState.CurrentPlayerGuid,
-                player_class = (byte)threaterClass,
-                stance_form_spell = formAura,
-                modifier,
-                previous_modifier = cached.modifier,
-                previous_stance_form_spell = cached.stanceForm,
-            });
-            _passiveCache[threater] = (formAura, modifier);
-        }
 
         return modifier;
     }

@@ -67,6 +67,35 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_AUCTION_LIST_OWNED_ITEMS)]
     void HandleAuctionListOwnerItems(AuctionListOwnerItems auction)
     {
+        // JimsProxy (issue #305-ah): on vanilla, walk all pages on Offset==0 and combine into
+        // one SMSG. The 1.14 client UI doesn't have Auctions-tab Next/Prev page buttons
+        // (Blizzard regression — Blizzard_AuctionUI XML only defines Browse pagination), so
+        // pagination from the client never fires. Walk only when Offset==0 so any future
+        // addon doing per-page fetches still works (the request passes through unchanged).
+        if (LegacyVersion.ExpansionVersion <= 1 && auction.Offset == 0)
+        {
+            var gameState = GetSession().GameState;
+            bool startWalk = false;
+            lock (gameState.AuctionOwnerWalkLock)
+            {
+                if (!gameState.AuctionOwnerWalkInProgress)
+                {
+                    gameState.AuctionOwnerWalkInProgress = true;
+                    gameState.AuctionOwnerWalkAuctioneer = auction.Auctioneer;
+                    gameState.AuctionOwnerWalkAccumulator.Clear();
+                    startWalk = true;
+                }
+            }
+            if (startWalk)
+            {
+                Log.Event("auction.owner_walk.started", new { auctioneer = auction.Auctioneer.ToString() });
+                WorldPacket startPkt = new WorldPacket(Opcode.CMSG_AUCTION_LIST_OWNED_ITEMS);
+                startPkt.WriteGuid(auction.Auctioneer.To64());
+                startPkt.WriteUInt32(0);
+                SendPacketToServer(startPkt);
+            }
+            return;
+        }
         WorldPacket packet = new WorldPacket(Opcode.CMSG_AUCTION_LIST_OWNED_ITEMS);
         packet.WriteGuid(auction.Auctioneer.To64());
         packet.WriteUInt32(auction.Offset);

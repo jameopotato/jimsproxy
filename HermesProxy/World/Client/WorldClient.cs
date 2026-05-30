@@ -589,14 +589,15 @@ public partial class WorldClient
             universalOpcode == Opcode.SMSG_AUTH_RESPONSE ||
             universalOpcode == Opcode.SMSG_ADDON_INFO ||
             _packetHandlers.ContainsKey(universalOpcode);
-        Log.Event("packet.in", new
-        {
-            direction = "s2c",
-            opcode_universal = universalOpcode.ToString(),
-            opcode_raw = rawOpcodeJP,
-            size = packetSizeJP,
-            has_handler = hasHandlerJP,
-        });
+        if (Settings.DebugOutput)
+            Log.Event("packet.in", new
+            {
+                direction = "s2c",
+                opcode_universal = universalOpcode.ToString(),
+                opcode_raw = rawOpcodeJP,
+                size = packetSizeJP,
+                has_handler = hasHandlerJP,
+            });
 
         long startTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         try
@@ -654,7 +655,7 @@ public partial class WorldClient
             if (HermesProxy.Server.MetricsEnabled)
                 HermesProxy.Server.Metrics.RecordServerToClientLatency(universalOpcode, elapsedTicks);
 
-            if (hasHandlerJP)
+            if (hasHandlerJP && Settings.DebugOutput)
             {
                 Log.Event("packet.translated", new
                 {

@@ -191,22 +191,7 @@ public sealed class HealCommBridge
         };
 
         if (translated == null)
-        {
-            Log.Event("healcomm.outbound.skipped", new
-            {
-                reason = "unsupported_lhc40_type",
-                comm_type = commType,
-            });
             return false;
-        }
-
-        Log.Event("healcomm.outbound.translated", new
-        {
-            comm_type = commType,
-            from_prefix = prefix,
-            to_prefix = HcPrefix,
-            payload = translated,
-        });
 
         prefix = HcPrefix;
         text = translated;
@@ -366,12 +351,6 @@ public sealed class HealCommBridge
         // server's real SMSG_SPELL_START for the local player's cast.
         if (senderGuid == _session.GameState.CurrentPlayerGuid)
         {
-            Log.Event("healcomm.inbound.skipped", new
-            {
-                reason = "echo_self",
-                head,
-                payload = text,
-            });
             DropInbound(ref prefix, ref text);
             return true;
         }
@@ -407,31 +386,11 @@ public sealed class HealCommBridge
 
         if (lhc40Body != null)
         {
-            Log.Event("healcomm.inbound.translated", new
-            {
-                head,
-                sender = senderName,
-                from_prefix = prefix,
-                to_prefix = LhcPrefix,
-                payload = lhc40Body,
-            });
             prefix = LhcPrefix;
             text = lhc40Body;
             return true;
         }
 
-        // Distinguish "head was known and handled via synth side-effects"
-        // (Healstop / Healdelay routed through DismissSynth / SpellDelayed
-        // packets) from genuinely unsupported types (Renew/Reju/Regr/Resurrection
-        // dropped by design, or unknown heads).
-        bool isKnownSynthHandled = head is "Healstop" or "GrpHealstop" or "Healdelay" or "GrpHealdelay";
-        Log.Event("healcomm.inbound.skipped", new
-        {
-            head,
-            sender = senderName,
-            payload = text,
-            reason = isKnownSynthHandled ? "synth_handled_no_forward" : "unrecognized_or_unsupported",
-        });
         DropInbound(ref prefix, ref text);
         return true;
     }
@@ -602,16 +561,6 @@ public sealed class HealCommBridge
         // If a Healstop or supersede DOES arrive first, the cleanup becomes a
         // no-op (the synth's CastId won't match — we check before dismissing).
         ScheduleNaturalCleanup(senderGuid, castId, castTimeMs);
-
-        Log.Event("healcomm.synth.spell_start", new
-        {
-            caster = senderGuid.ToString(),
-            target = targetGuid.ToString(),
-            spell_id = spellId,
-            cast_time_ms = castTimeMs,
-            predicted_amount = predictedAmount,
-            cast_id_counter = castId.GetCounter(),
-        });
     }
 
     private void ScheduleNaturalCleanup(WowGuid128 senderGuid, WowGuid128 castId, int castTimeMs)
@@ -622,19 +571,16 @@ public sealed class HealCommBridge
         int delayMs = castTimeMs + (int)NaturalCompletionTolerance.TotalMilliseconds;
         Task.Delay(delayMs).ContinueWith(_ =>
         {
+            // Swallow: fire-and-forget timer; DismissSynth can throw if the
+            // world connection dropped between the lookup and SendPacketToClient.
+            // Without the catch, the exception becomes an unobserved task
+            // exception on the timer thread.
             try
             {
                 if (_synthCastsByCaster.TryGetValue(senderGuid, out var synth) && synth.CastId == castId)
                     DismissSynth(senderGuid, "natural_completion_timeout");
             }
-            catch (Exception ex)
-            {
-                Log.Event("healcomm.synth.cleanup_error", new
-                {
-                    caster = senderGuid.ToString(),
-                    error = ex.Message,
-                });
-            }
+            catch { }
         }, TaskScheduler.Default);
     }
 
@@ -651,13 +597,6 @@ public sealed class HealCommBridge
         worldClient.SendPacketToClient(delayed);
 
         synth.ExpectedEndUtc = synth.ExpectedEndUtc.AddMilliseconds(delayMs);
-
-        Log.Event("healcomm.synth.delayed", new
-        {
-            caster = senderGuid.ToString(),
-            delay_ms = delayMs,
-            spell_id = synth.SpellId,
-        });
     }
 
     private void DismissSynth(WowGuid128 senderGuid, string reasonTag)
@@ -690,15 +629,6 @@ public sealed class HealCommBridge
         // completions and shouldn't show interrupt UI.
         bool isInterruptVisual = reasonTag == "interrupted";
         EmitLhc40StopToClient(senderGuid, synth.SpellId, isInterruptVisual);
-
-        Log.Event("healcomm.synth.dismissed", new
-        {
-            caster = senderGuid.ToString(),
-            spell_id = synth.SpellId,
-            cast_id_counter = synth.CastId.GetCounter(),
-            reason = reasonTag,
-            lhc40_interrupt_flag = isInterruptVisual,
-        });
     }
 
     // Synthesize an inbound CHAT_MSG_ADDON to the modern client. Used to feed
@@ -757,29 +687,13 @@ public sealed class HealCommBridge
     {
         string targetName = _session.GameState.GetPlayerName(targetGuid);
         if (string.IsNullOrEmpty(targetName))
-        {
-            Log.Event("healcomm.rez.start.no_target_name", new
-            {
-                spell_id = spellId,
-                target_guid = targetGuid.ToString(),
-            });
             return null;
-        }
 
-        Log.Event("healcomm.rez.start.synthesized", new
-        {
-            spell_id = spellId,
-            target_name = targetName,
-        });
         return $"Resurrection/{targetName}/start/";
     }
 
     public string BuildResurrectionStopPayload(uint spellId)
     {
-        Log.Event("healcomm.rez.stop.synthesized", new
-        {
-            spell_id = spellId,
-        });
         return "Resurrection/stop/";
     }
 
@@ -885,13 +799,6 @@ public sealed class HealCommBridge
             ChatMessageTypeVanilla chatType = IsInRaid() ? ChatMessageTypeVanilla.Raid : ChatMessageTypeVanilla.Party;
             worldClient.SendMessageChatVanilla(chatType, addonLanguage, text, "", "");
         }
-
-        Log.Event("healcomm.emit", new
-        {
-            prefix,
-            body,
-            in_raid = IsInRaid(),
-        });
     }
 
     // Detect raid vs party from cached group state. CurrentGroups is a

@@ -369,15 +369,6 @@ internal static class ThreatModules
 
             var target = hitTargets[0];
             tracker.AddModifiedThreat(target, caster, finalAmount);
-
-            Log.Event("threat.spell." + eventTag, new
-            {
-                spell_id = spellId,
-                target_low = target.GetCounter(),
-                amount = finalAmount,
-                base_amount = amount,
-                gear_mult = gearMult,
-            });
         };
 
     // For abilities that apply the same flat threat to every mob they hit
@@ -394,13 +385,6 @@ internal static class ThreatModules
 
             foreach (var target in hitTargets)
                 tracker.AddModifiedThreat(target, caster, amount);
-
-            Log.Event("threat.spell." + eventTag, new
-            {
-                spell_id = spellId,
-                target_count = hitTargets.Count,
-                amount,
-            });
         };
 
     private static ThreatHandler PetSingleTargetFlat(string eventTag, Dictionary<int, double> amounts)
@@ -412,13 +396,6 @@ internal static class ThreatModules
 
             var target = hitTargets[0];
             tracker.AddModifiedThreat(target, caster, amount);
-
-            Log.Event("threat.spell." + eventTag, new
-            {
-                spell_id = spellId,
-                target_low = target.GetCounter(),
-                amount,
-            });
         };
 
     // JimsProxy (pet-ap-scaling 2026-05-17): LibThreatClassic2 Pet.lua applies
@@ -502,21 +479,6 @@ internal static class ThreatModules
                 var target = hitTargets[i];
                 tracker.AddModifiedThreat(target, caster, amount);
             }
-
-            Log.Event("threat.spell." + eventTag, new
-            {
-                spell_id = spellId,
-                target_low = hitTargets[0].GetCounter(),
-                target_count = targetCount,
-                amount,
-                rank_flat = rankFlat,
-                ap_bonus = apBonus,
-                pet_level = petLevel,
-                pet_ap = petAP,
-                pet_base_ap = petBaseAP,
-                pet_ap_mod_pos = petApModPos,
-                pet_ap_mod_neg = petApModNeg,
-            });
         };
 
     private static ThreatHandler PlayerSetToTop(string eventTag)
@@ -527,12 +489,6 @@ internal static class ThreatModules
 
             var target = hitTargets[0];
             tracker.SetToTop(target, caster);
-
-            Log.Event("threat.spell." + eventTag, new
-            {
-                spell_id = spellId,
-                target_low = target.GetCounter(),
-            });
         };
 
     private static ThreatHandler PlayerZeroAllMobs(string eventTag)
@@ -541,12 +497,6 @@ internal static class ThreatModules
             if (caster != session.GameState.CurrentPlayerGuid) return;
 
             tracker.MultiplyThreat(caster, 0.0);
-
-            Log.Event("threat.spell." + eventTag, new
-            {
-                spell_id = spellId,
-                caster_low = caster.GetCounter(),
-            });
         };
 
     private static ThreatHandler PlayerAddToAllMobs(string eventTag, double amount)
@@ -555,13 +505,6 @@ internal static class ThreatModules
             if (caster != session.GameState.CurrentPlayerGuid) return;
 
             tracker.AddThreatToAllMobs(caster, amount);
-
-            Log.Event("threat.spell." + eventTag, new
-            {
-                spell_id = spellId,
-                caster_low = caster.GetCounter(),
-                amount,
-            });
         };
 
     // Per-rank variant for shouts and blessings — adds the rank's flat amount
@@ -573,13 +516,6 @@ internal static class ThreatModules
             if (!amounts.TryGetValue(spellId, out double amount)) return;
 
             tracker.AddThreatToAllMobs(caster, amount);
-
-            Log.Event("threat.spell." + eventTag, new
-            {
-                spell_id = spellId,
-                caster_low = caster.GetCounter(),
-                amount,
-            });
         };
 
     // -----------------------------------------------------------------------
