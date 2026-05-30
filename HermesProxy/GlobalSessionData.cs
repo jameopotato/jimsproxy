@@ -2284,11 +2284,6 @@ public class ClientCastRequest
     // permanently blocks HasStartedNormalCast(). 0 = no watchdog active.
     public long WatchdogDeadlineMs;
 
-    // Watchdog window (ms) after which an unresolved cast is force-evicted. Single
-    // source of truth for the failure-peek path (HandleSpellFailure) and the off-GCD
-    // enqueue arming (#344 follow-up).
-    public const long WatchdogWindowMs = 2500;
-
     // JimsProxy (PR #161 follow-up — destroy-hook fast path): captured from
     // CastSpell.Cast.Target.Unit at enqueue time. When HandleDestroyObject
     // sees this GUID, the proxy can immediately evict any pending casts that

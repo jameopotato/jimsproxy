@@ -18,7 +18,7 @@ public partial class WorldClient
     // any observed CAST_FAILED arrival on vmangos/Twinstar (~1ms after FAILURE)
     // and shorter than feels-laggy to the user when the pathological Kronos
     // case kicks in (target-dies-mid-cast, no trailing CAST_FAILED).
-    private const long WatchdogWindowMs = ClientCastRequest.WatchdogWindowMs;
+    private const long WatchdogWindowMs = 2500;
 
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_SEND_KNOWN_SPELLS)]

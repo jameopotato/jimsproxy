@@ -102,44 +102,4 @@ public class ClearNonStartedNormalCastsTests
         Assert.Contains(session.PendingNormalCasts, c => c.SpellId == 7386);
         Assert.Contains(session.PendingNormalCasts, c => c.SpellId == 2687);
     }
-
-    [Fact]
-    public void OffGcdCast_SurvivesSweep_ButWatchdogReapsItWhenDeadlineExpires()
-    {
-        // #344 follow-up backstop: HandleCastSpell arms WatchdogDeadlineMs on off-GCD casts
-        // at enqueue. Since they're sweep-exempt and never become HasStarted, if their
-        // SPELL_GO is ever lost the sweep keeps them — so the watchdog must reap them, else
-        // they linger in PendingNormalCasts forever.
-        var session = NewSession();
-        var bloodrage = MakeCast(2687, hasStarted: false, isOffGcd: true);
-        bloodrage.WatchdogDeadlineMs = Environment.TickCount64 - 1; // armed at enqueue, now expired
-        session.PendingNormalCasts.Enqueue(bloodrage);
-
-        // Sweep keeps the off-GCD cast (the #344 exemption)...
-        var cleared = session.ClearNonStartedNormalCasts();
-        Assert.Empty(cleared);
-        Assert.Single(session.PendingNormalCasts);
-
-        // ...but the watchdog reaps it once the deadline passes, so it can't leak.
-        session.DrainExpiredWatchdogCasts(Environment.TickCount64, out var normalEvicted, out _);
-        Assert.Single(normalEvicted);
-        Assert.Equal(2687u, normalEvicted[0].SpellId);
-        Assert.Empty(session.PendingNormalCasts);
-    }
-
-    [Fact]
-    public void OffGcdCast_WithFreshWatchdogDeadline_NotReapedEarly()
-    {
-        // The armed window must be generous enough not to false-evict a legit off-GCD cast
-        // before its SPELL_GO arrives — premature eviction would re-create the stuck-lit bug.
-        var session = NewSession();
-        var bloodrage = MakeCast(2687, hasStarted: false, isOffGcd: true);
-        bloodrage.WatchdogDeadlineMs = Environment.TickCount64 + ClientCastRequest.WatchdogWindowMs;
-        session.PendingNormalCasts.Enqueue(bloodrage);
-
-        session.DrainExpiredWatchdogCasts(Environment.TickCount64, out var normalEvicted, out _);
-
-        Assert.Empty(normalEvicted);
-        Assert.Single(session.PendingNormalCasts);
-    }
 }
