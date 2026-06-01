@@ -26,6 +26,92 @@ local function CreateDescription(parent, text, yOffset)
     return fs
 end
 
+local function CreateButton(parent, yOffset, label, width, tooltip)
+    local btn = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
+    btn:SetPoint("TOPLEFT", parent, "TOPLEFT", 16, yOffset)
+    btn:SetSize(width or 160, 24)
+    btn:SetText(label)
+    if tooltip then
+        btn:HookScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText(tooltip, 1, 1, 1, 1, true)
+            GameTooltip:Show()
+        end)
+        btn:HookScript("OnLeave", function() GameTooltip:Hide() end)
+    end
+    return btn
+end
+
+---------------------------------------------------------------------------
+-- Keyring cleanup: move non-key items out of the keyring into free bag slots.
+-- Older characters can have non-keys stuck in the keyring from a past client bug;
+-- the proxy now blocks new ones, this button clears existing ones. Keys (item
+-- class 13) are left in place. One move per timer tick so each settles server-side.
+---------------------------------------------------------------------------
+local KEYRING = (type(KEYRING_CONTAINER) == "number") and KEYRING_CONTAINER or -2
+
+local function KR_NumSlots(bag)
+    if C_Container and C_Container.GetContainerNumSlots then return C_Container.GetContainerNumSlots(bag) or 0 end
+    return (GetContainerNumSlots and GetContainerNumSlots(bag)) or 0
+end
+local function KR_ItemID(bag, slot)
+    if C_Container and C_Container.GetContainerItemID then return C_Container.GetContainerItemID(bag, slot) end
+    return GetContainerItemID and GetContainerItemID(bag, slot)
+end
+local function KR_Pickup(bag, slot)
+    if C_Container and C_Container.PickupContainerItem then return C_Container.PickupContainerItem(bag, slot) end
+    if PickupContainerItem then return PickupContainerItem(bag, slot) end
+end
+
+local function KR_IsNonKey(id)
+    if not id then return false end
+    local classID = select(6, GetItemInfoInstant(id))
+    if classID == nil then return false end -- unknown item: leave it alone
+    return classID ~= 13 -- 13 = Key
+end
+
+local function KR_FirstFreeBagSlot()
+    for bag = 0, 4 do
+        for slot = 1, KR_NumSlots(bag) do
+            if not KR_ItemID(bag, slot) then return bag, slot end
+        end
+    end
+end
+
+local KR_cleaning, KR_steps = false, 0
+local function KR_Step()
+    KR_steps = KR_steps + 1
+    if KR_steps > 40 then KR_cleaning = false; return end
+    for slot = 1, KR_NumSlots(KEYRING) do
+        if KR_IsNonKey(KR_ItemID(KEYRING, slot)) then
+            local bag, bslot = KR_FirstFreeBagSlot()
+            if not bag then
+                print("|cFF00FF00[JimsPlus]|r Keyring cleanup: bags are full - free a slot and click again.")
+                KR_cleaning = false
+                return
+            end
+            ClearCursor()
+            KR_Pickup(KEYRING, slot)
+            KR_Pickup(bag, bslot)
+            ClearCursor()
+            C_Timer.After(0.2, KR_Step)
+            return
+        end
+    end
+    if KR_cleaning then print("|cFF00FF00[JimsPlus]|r Keyring cleanup complete.") end
+    KR_cleaning = false
+end
+
+local function KR_StartCleanup()
+    if InCombatLockdown() then
+        print("|cFF00FF00[JimsPlus]|r Can't clean the keyring in combat.")
+        return
+    end
+    if KR_cleaning then return end
+    KR_cleaning, KR_steps = true, 0
+    KR_Step()
+end
+
 ---------------------------------------------------------------------------
 -- Panel
 ---------------------------------------------------------------------------
@@ -96,6 +182,18 @@ for _, info in ipairs(castbarUnits) do
     castbarCBs[info.key] = CreateCheckbox(panel, y, info.label, info.tooltip)
     y = y - 28
 end
+
+---------------------------------------------------------------------------
+-- Tools
+---------------------------------------------------------------------------
+y = y - 12
+CreateHeader(panel, "Tools", y)
+y = y - 26
+local btnBagAudit = CreateButton(panel, y, "Bag Audit", 150,
+    "Moves non-key items out of your keyring and into your bags.\nUse it if a character has items stuck in the keyring from a past\nbug. Keys are left in place.")
+btnBagAudit:SetScript("OnClick", KR_StartCleanup)
+y = y - 30
+-- More tool buttons can be added below (decrement y per button).
 
 ---------------------------------------------------------------------------
 -- Sync checkboxes from saved state

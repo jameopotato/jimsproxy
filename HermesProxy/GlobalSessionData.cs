@@ -802,6 +802,16 @@ public sealed class GameSessionData
 
         return bagFields.GetGuidValue(containerSlotField + slot * 2);
     }
+
+    // JimsProxy: the items in the last inventory move, remembered so we can repair an
+    // InventoryChangeFailure the server sends with empty item GUIDs (it does this for
+    // invalid-slot rejections — e.g. the modern client's phantom keyring slots 13-32 that
+    // Kronos lacks). Without the GUIDs the client can't unlock the source item, so it
+    // stays stuck until relog. Set in the item-move handlers, consumed in the failure handler.
+    public WowGuid128 LastMoveItem0;
+    public WowGuid128 LastMoveItem1;
+    public int LastMoveItemsTickMs;
+
     public uint GetItemStackCount(WowGuid128 itemGuid)
     {
         uint count = GetLegacyFieldValueUInt32(itemGuid, ItemField.ITEM_FIELD_STACK_COUNT);
