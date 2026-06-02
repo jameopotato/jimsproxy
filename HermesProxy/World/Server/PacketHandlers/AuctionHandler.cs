@@ -252,8 +252,20 @@ public partial class WorldSocket
             }
 
             // Send outside the lock (no I/O under the lock, matching the replicate path).
-            // SendPacketToServer safe-drops if the WorldClient is gone, so a teardown race
-            // just no-ops instead of throwing.
+            // Skip cleanly if the session is tearing down — parity with
+            // ScheduleNextReplicatePage rather than relying on SendPacketToServer's
+            // safe-drop. Pending state was already cleared above, so dropping the search
+            // here is fine (reopening the AH resets the client's query flag anyway).
+            var worldClient = GetSession().WorldClient;
+            if (worldClient == null || !worldClient.IsConnected())
+            {
+                Framework.Logging.Log.Event("auction.list.flush_aborted", new
+                {
+                    reason = "world_client_disconnected",
+                });
+                return;
+            }
+
             SendPacketToServer(toSend);
             Framework.Logging.Log.Event("auction.list.forwarded_pending", new
             {
