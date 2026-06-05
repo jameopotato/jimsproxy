@@ -15,6 +15,7 @@ ZoneSync.lua
 MoonkinSound.lua
 AuctionsPaginationFix.lua
 MailNameFix.lua
+NameDashFix.lua
 KeyringClamp.lua
 castbars/PoolManager.lua
 castbars/AnchorManager.lua
