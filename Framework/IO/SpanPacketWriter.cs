@@ -200,13 +200,13 @@ public ref struct SpanPacketWriter
         WriteUInt8(0);
     }
 
-    public void WriteString(string value)
+    public void WriteString(string value, Encoding? encoding = null)
     {
         if (string.IsNullOrEmpty(value))
             return;
 
         FlushBits();
-        int bytesWritten = Encoding.UTF8.GetBytes(value, _buffer.Slice(_position));
+        int bytesWritten = (encoding ?? Encoding.UTF8).GetBytes(value, _buffer.Slice(_position));
         _position += bytesWritten;
     }
 

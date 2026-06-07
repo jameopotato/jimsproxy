@@ -6,6 +6,7 @@ using HermesProxy.World.Server;
 using HermesProxy.World.Server.Packets;
 using System;
 using System.Globalization;
+using System.Text;
 using Framework.Logging;
 using static HermesProxy.World.Server.Packets.ChannelListResponse;
 
@@ -209,7 +210,8 @@ public partial class WorldClient
         }
 
         uint textLength = packet.ReadUInt32();
-        string text = packet.ReadString(textLength);
+        // Addon bodies are binary (DEFLATE etc.); read 1:1 (Latin1) so bytes >= 0x80 survive.
+        string text = packet.ReadString(textLength, language == (uint)Language.Addon ? Encoding.Latin1 : null);
         var chatTag = (ChatTag)packet.ReadUInt8();
         var chatFlags = chatTag.CastEnum<ChatFlags>();
 
@@ -410,7 +412,8 @@ public partial class WorldClient
         }
 
         uint textLength = packet.ReadUInt32();
-        string text = packet.ReadString(textLength);
+        // Addon bodies are binary (DEFLATE etc.); read 1:1 (Latin1) so bytes >= 0x80 survive.
+        string text = packet.ReadString(textLength, language == (uint)Language.Addon ? Encoding.Latin1 : null);
         var chatFlags = (ChatFlags)packet.ReadUInt8();
 
         if (LegacyVersion.InVersion(ClientVersionBuild.V2_0_1_6180, ClientVersionBuild.V3_0_2_9056) &&
@@ -492,7 +495,11 @@ public partial class WorldClient
 
     public void SendMessageChatVanilla(ChatMessageTypeVanilla type, uint lang, string msg, string channel, string to)
     {
-        if (HandleHermesInternalChatCommand(msg))
+        // Addon-language bodies are binary (DEFLATE): skip the text transforms below and write
+        // the body 1:1 (Latin1) so bytes >= 0x80 survive. Normal chat keeps UTF-8 + transforms.
+        bool isAddon = lang == (uint)Language.Addon;
+        Encoding? msgEnc = isAddon ? Encoding.Latin1 : null;
+        if (!isAddon && HandleHermesInternalChatCommand(msg))
         {
             return; // was handled by us
         }
@@ -508,7 +515,7 @@ public partial class WorldClient
         //   [0] enchantID, [1-4] gem1-4, [5] suffixID, [6] uniqueID, [7] linkLevel, ...
         // Vanilla 1.12 itemString fields after itemID:
         //   [0] enchantID, [1] randomProperty (signed; matches modern suffixID), [2] creator
-        msg = System.Text.RegularExpressions.Regex.Replace(msg, @"\|Hitem:(\d+)([^|]*)\|h(\[[^\]]*\])?", match =>
+        if (!isAddon) msg = System.Text.RegularExpressions.Regex.Replace(msg, @"\|Hitem:(\d+)([^|]*)\|h(\[[^\]]*\])?", match =>
         {
             string itemId = match.Groups[1].Value;
             string raw = match.Groups[2].Value;
@@ -560,11 +567,11 @@ public partial class WorldClient
         {
             case ChatMessageTypeVanilla.Channel:
                 packet.WriteCString(channel);
-                packet.WriteCString(msg);
+                packet.WriteCString(msg, msgEnc);
                 break;
             case ChatMessageTypeVanilla.Whisper:
                 packet.WriteCString(NormalizeLegacyWhisperTarget(to));
-                packet.WriteCString(msg);
+                packet.WriteCString(msg, msgEnc);
                 break;
             case ChatMessageTypeVanilla.Say:
             case ChatMessageTypeVanilla.Emote:
@@ -579,7 +586,7 @@ public partial class WorldClient
             case ChatMessageTypeVanilla.BattlegroundLeader:
             case ChatMessageTypeVanilla.Afk:
             case ChatMessageTypeVanilla.Dnd:
-                packet.WriteCString(msg);
+                packet.WriteCString(msg, msgEnc);
                 break;
         }
 
@@ -623,7 +630,9 @@ public partial class WorldClient
 
     public void SendMessageChatWotLK(ChatMessageTypeWotLK type, uint lang, string msg, string channel, string to)
     {
-        if (HandleHermesInternalChatCommand(msg))
+        bool isAddon = lang == (uint)Language.Addon;
+        Encoding? msgEnc = isAddon ? Encoding.Latin1 : null;
+        if (!isAddon && HandleHermesInternalChatCommand(msg))
         {
             return; // was handled by us
         }
@@ -636,11 +645,11 @@ public partial class WorldClient
         {
             case ChatMessageTypeWotLK.Channel:
                 packet.WriteCString(channel);
-                packet.WriteCString(msg);
+                packet.WriteCString(msg, msgEnc);
                 break;
             case ChatMessageTypeWotLK.Whisper:
                 packet.WriteCString(NormalizeLegacyWhisperTarget(to));
-                packet.WriteCString(msg);
+                packet.WriteCString(msg, msgEnc);
                 break;
             case ChatMessageTypeWotLK.Say:
             case ChatMessageTypeWotLK.Emote:
@@ -656,7 +665,7 @@ public partial class WorldClient
             case ChatMessageTypeWotLK.BattlegroundLeader:
             case ChatMessageTypeWotLK.Afk:
             case ChatMessageTypeWotLK.Dnd:
-                packet.WriteCString(msg);
+                packet.WriteCString(msg, msgEnc);
                 break;
         }
 
