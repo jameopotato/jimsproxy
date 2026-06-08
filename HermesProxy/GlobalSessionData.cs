@@ -475,6 +475,18 @@ public sealed class GameSessionData
     // overridden with ServerGUID downstream → the auto-cast map entry is a harmless
     // orphan in that case.
     public ConcurrentDictionary<(WowGuid128 caster, uint spellId), WowGuid128> PetAutoCastActiveCastIds = new();
+    // JimsProxy (cast-go-castid-recovery): client-facing CastID forwarded for the LOCAL
+    // PLAYER's SMSG_SPELL_START, keyed by spellId. HandleSpellGo recalls it when no
+    // PendingNormalCast / melee / auto-repeat entry matches at SPELL_GO, so START and GO
+    // ship the SAME CastID. The 1.14 client pairs START↔GO by CastID; a mismatch leaves
+    // the cast un-terminated → stuck casting animation + looping cast sound. Covers
+    // server-initiated player casts with no CMSG (GO loot subspells e.g. Whipper Root
+    // "Create Whipper Root Tubers" 15343, weapon/trinket procs) and casts whose pending
+    // entry was consumed by an interleaved duplicate CAST_FAILED before the GO (Blade
+    // Flurry, re-clicked gathers). Fallback ONLY — never consulted when a real pending
+    // cast is dequeued at GO, so normal casts are wire-identical. Cleared on world
+    // transfer alongside the pet/other-caster cast-id maps.
+    public ConcurrentDictionary<uint, WowGuid128> PlayerForwardedCastIds = new();
     // Tracks last-seen UNIT_CHANNEL_SPELL per unit so we can synthesize
     // SMSG_SPELL_CHANNEL_START/UPDATE for observers (vanilla only sends
     // MSG_CHANNEL_START to the caster, not to nearby players).
@@ -1746,6 +1758,7 @@ public sealed class GameSessionData
         int otherCount = OtherCasterActiveCastIds.Count;
         OtherCasterActiveCastIds.Clear();
         PetAutoCastActiveCastIds.Clear();
+        PlayerForwardedCastIds.Clear();
         // Single-slot trackers for melee + auto-repeat (Auto Shot, Shoot Wand)
         // — same lifecycle as PendingNormalCasts; if a tracker was set when
         // the DC fired, it never gets cleared by the SPELL_GO/CAST_FAILED

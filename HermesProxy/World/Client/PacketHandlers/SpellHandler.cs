@@ -1399,6 +1399,13 @@ public partial class WorldClient
         }
         else
         {
+            // JimsProxy (cast-go-castid-recovery): record the CastID we forward for the
+            // local player's SPELL_START so HandleSpellGo can recover it if the pending
+            // entry is gone by GO time (server-initiated casts with no CMSG, or a
+            // duplicate's CAST_FAILED having consumed the entry). See PlayerForwardedCastIds.
+            // Fallback only — normal casts override with ServerGUID at GO and never read it.
+            if (casterIsLocalPlayer)
+                GetSession().GameState.PlayerForwardedCastIds[(uint)spell.Cast.SpellID] = spell.Cast.CastID;
             SendPacketToClient(spell);
         }
 
@@ -1656,6 +1663,27 @@ public partial class WorldClient
                 prepare.ServerCastID = spell.Cast.CastID;
                 SendPacketToClient(prepare);
             }
+        }
+        // JimsProxy (cast-go-castid-recovery): FALLBACK — reached only when none of the
+        // branches above matched, i.e. the local player's SPELL_GO has no PendingNormalCast,
+        // melee, or auto-repeat entry. HandleSpellStartOrGo therefore left a freshly-minted
+        // sequence-unique CastID that won't match the CastID we forwarded at SPELL_START.
+        // The 1.14 client pairs START↔GO by CastID, so the mismatch leaves the player's cast
+        // un-terminated → stuck casting animation + looping cast sound. Re-stamp the GO with
+        // the START's forwarded CastID so the pair matches and the client closes the cast.
+        // Hits server-initiated player casts with no CMSG (GO loot subspells e.g. Whipper
+        // Root 15343, weapon/trinket procs) and casts whose pending entry was consumed by a
+        // duplicate's CAST_FAILED before the GO (Blade Flurry, re-clicked gathers).
+        else if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
+                 GetSession().GameState.PlayerForwardedCastIds.TryRemove((uint)spell.Cast.SpellID, out var forwardedStartCastId))
+        {
+            spell.Cast.CastID = forwardedStartCastId;
+            Log.Event("cast.go.castid_recovered", new
+            {
+                spell_id = spell.Cast.SpellID,
+                caster_low = spell.Cast.CasterUnit.GetCounter(),
+                recovered_cast_id = forwardedStartCastId.ToString(),
+            });
         }
 
         if (!spell.Cast.CasterUnit.IsEmpty() && GameData.AuraSpells.Contains((uint)spell.Cast.SpellID))
