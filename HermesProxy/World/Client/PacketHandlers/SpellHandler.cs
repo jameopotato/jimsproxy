@@ -312,7 +312,20 @@ public partial class WorldClient
         {
             var status = packet.ReadUInt8();
             if (status != 2)
+            {
+                // JimsProxy (engineering-malfunction jam): a discarded CAST_FAILED can be a
+                // server-side substitute (e.g. Goblin Mortar -> Malfunction Explosion 13261) that
+                // preempted a forwarded item-use cast (13237). The item-use then never starts and
+                // never fails on its own, so it sits forwarded-unstarted and HasForwardedPendingCast()
+                // jams every later press ("can't cast" until relog). Clear that orphan now — instant,
+                // no timeout, item-use-only — and release its button state silently.
+                if (GetSession().GameState.TryEvictForwardedItemUseCast(spellId, out var orphan) && orphan != null)
+                {
+                    GetSession().InstanceSocket.SendCastRequestFailed(orphan, false, SpellCastResultClassic.DontReport);
+                    Log.Event("cast.item_use_orphan_evicted", new { evicted_spell_id = orphan.SpellId, trigger_spell_id = spellId });
+                }
                 return;
+            }
         }
 
         uint reason = packet.ReadUInt8();

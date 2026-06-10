@@ -1665,6 +1665,36 @@ public sealed class GameSessionData
     }
 
     /// <summary>
+    /// Evict the first forwarded-but-unstarted ITEM-use cast (ItemGUID set) preempted by a
+    /// server-side substitute spell. An engineering device (e.g. Goblin Mortar 13237) can
+    /// malfunction into a different spell (Malfunction Explosion 13261) whose CAST_FAILED arrives
+    /// with status != 2 and is discarded; the original item-use then never gets a SPELL_START or
+    /// its own failure, so it sits forwarded-unstarted forever and HasForwardedPendingCast() jams
+    /// every later press. Gated to item-use casts (ItemGUID non-empty) so normal spell casts are
+    /// never touched, and to SpellId != the discarded CAST_FAILED so an item's own status-0 ack
+    /// can't self-evict. Returns the evicted request so the caller can release its button state.
+    /// </summary>
+    public bool TryEvictForwardedItemUseCast(uint triggerSpellId, out ClientCastRequest? evicted)
+    {
+        evicted = null;
+        var keep = new List<ClientCastRequest>();
+        lock (PendingCastsLock)
+        {
+            while (PendingNormalCasts.TryDequeue(out var current))
+            {
+                if (evicted == null && !current.HasStarted && !current.ItemGUID.IsEmpty()
+                    && current.SpellId != triggerSpellId)
+                    evicted = current;
+                else
+                    keep.Add(current);
+            }
+            foreach (var item in keep)
+                PendingNormalCasts.Enqueue(item);
+        }
+        return evicted != null;
+    }
+
+    /// <summary>
     /// Try to find and dequeue a pending pet cast by SpellId.
     /// </summary>
     public bool TryDequeuePendingPetCast(uint spellId, out ClientCastRequest? cast)
