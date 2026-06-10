@@ -258,6 +258,20 @@ public partial class WorldClient
         failure.Item[1] = packet.ReadGuid().To128(GetSession().GameState);
         failure.ContainerBSlot = packet.ReadUInt8();
 
+        // JimsProxy: Kronos sends invalid-slot rejections (e.g. the modern client's phantom
+        // keyring slots 13-32 that the server lacks) with empty item GUIDs, so the client
+        // can't unlock the item the player picked up and it stays stuck until relog. Backfill
+        // the GUIDs from the move we just forwarded so the client releases the item.
+        if (failure.Item[0].IsEmpty() && failure.Item[1].IsEmpty())
+        {
+            var state = GetSession().GameState;
+            if (Environment.TickCount - state.LastMoveItemsTickMs < 2000)
+            {
+                failure.Item[0] = state.LastMoveItem0;
+                failure.Item[1] = state.LastMoveItem1;
+            }
+        }
+
         SendPacketToClient(failure);
 
         // Check if item use cast failed (queue-based)

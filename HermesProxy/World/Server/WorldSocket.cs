@@ -281,16 +281,18 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
                                 opcode == Opcode.CMSG_ENABLE_NAGLE ||
                                 opcode == Opcode.CMSG_CONNECT_TO_FAILED ||
                                 opcode == Opcode.CMSG_ENTER_ENCRYPTED_MODE_ACK ||
-                                opcode == Opcode.CMSG_SERVER_TIME_OFFSET_REQUEST;
-        Log.Event("packet.in", new
-        {
-            direction = "c2s",
-            opcode_universal = opcode.ToString(),
-            opcode_raw = packet.GetOpcode(),
-            size = packet.GetSize(),
-            has_handler = _jpInlineHandled || _clientPacketTable.ContainsKey(opcode),
-            path = _jpInlineHandled ? "inline" : "dispatch",
-        });
+                                opcode == Opcode.CMSG_SERVER_TIME_OFFSET_REQUEST ||
+                                opcode == Opcode.CMSG_QUERY_REALM_NAME;
+        if (Framework.Settings.DebugOutput)
+            Log.Event("packet.in", new
+            {
+                direction = "c2s",
+                opcode_universal = opcode.ToString(),
+                opcode_raw = packet.GetOpcode(),
+                size = packet.GetSize(),
+                has_handler = _jpInlineHandled || _clientPacketTable.ContainsKey(opcode),
+                path = _jpInlineHandled ? "inline" : "dispatch",
+            });
 
         switch (opcode)
         {
@@ -363,6 +365,9 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             case Opcode.CMSG_SERVER_TIME_OFFSET_REQUEST:
                 SendServerTimeOffset();
                 break;
+            case Opcode.CMSG_QUERY_REALM_NAME:
+                HandleQueryRealmName(packet);
+                break;
             default:
                 HandlePacket(packet);
                 break;
@@ -395,13 +400,14 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
                 if (HermesProxy.Server.MetricsEnabled)
                     HermesProxy.Server.Metrics.RecordClientToServerLatency(universalOpcode, elapsedTicks);
 
-                Log.Event("packet.translated", new
-                {
-                    direction = "c2s",
-                    opcode_universal = universalOpcode.ToString(),
-                    opcode_raw = rawOpcode,
-                    duration_us = elapsedTicks / (TimeSpan.TicksPerMillisecond / 1000),
-                });
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("packet.translated", new
+                    {
+                        direction = "c2s",
+                        opcode_universal = universalOpcode.ToString(),
+                        opcode_raw = rawOpcode,
+                        duration_us = elapsedTicks / (TimeSpan.TicksPerMillisecond / 1000),
+                    });
             }
             catch (Exception exJP)
             {
@@ -1265,6 +1271,30 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
     {
         ServerTimeOffset response = new();
         response.Time = Time.UnixTime;
+        SendPacket(response);
+    }
+
+    void HandleQueryRealmName(WorldPacket packet)
+    {
+        uint realmAddress = packet.ReadUInt32();
+        var realm = GetSession().RealmManager.GetRealm(new Framework.Realm.RealmId(realmAddress));
+
+        RealmQueryResponse response = new();
+        response.VirtualRealmAddress = realmAddress;
+        if (realm != null)
+        {
+            response.LookupState = 0; // success
+            response.NameInfo = new VirtualRealmNameInfo(
+                realmAddress == GetSession().RealmId.GetAddress(),
+                false,
+                realm.Name,
+                realm.NormalizedName);
+        }
+        else
+        {
+            response.LookupState = 1; // failure
+            response.NameInfo = new VirtualRealmNameInfo(false, false, "", "");
+        }
         SendPacket(response);
     }
 

@@ -492,7 +492,7 @@ public class AuthWaitInfo
     public bool HasFCM; // true if the account has a forced character migration pending. @todo implement
 }
 
-struct VirtualRealmNameInfo
+public struct VirtualRealmNameInfo
 {
     public VirtualRealmNameInfo(bool isHomeRealm, bool isInternalRealm, string realmNameActual, string realmNameNormalized)
     {
@@ -537,4 +537,21 @@ struct VirtualRealmInfo
 
     public uint RealmAddress;             // the virtual address of this realm, constructed as RealmHandle::Region << 24 | RealmHandle::Battlegroup << 16 | RealmHandle::Index
     public VirtualRealmNameInfo RealmNameInfo;
+}
+
+public class RealmQueryResponse : ServerPacket
+{
+    public RealmQueryResponse() : base(Opcode.SMSG_REALM_QUERY_RESPONSE) { }
+
+    public override void Write()
+    {
+        _worldPacket.WriteUInt32(VirtualRealmAddress);
+        _worldPacket.WriteUInt8(LookupState);
+        if (LookupState == 0)
+            NameInfo.Write(_worldPacket);
+    }
+
+    public uint VirtualRealmAddress;
+    public byte LookupState;
+    public VirtualRealmNameInfo NameInfo;
 }

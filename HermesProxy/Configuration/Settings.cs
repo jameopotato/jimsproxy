@@ -11,6 +11,8 @@ using HermesProxy.Configuration;
 
 namespace Framework;
 
+public enum ServerFork { Kronos, Generic }
+
 public static class Settings
 {
     public static byte[] ClientSeed = null!;
@@ -60,6 +62,24 @@ public static class Settings
     // the client doesn't show red error text during rapid spam. Independent of
     // LowLatencyMode — useful as a companion setting but not required.
     public static bool SuppressSpellCastErrors;
+    // JimsProxy (PR #228 follow-up): synthesize SMSG_THREAT_UPDATE / HIGHEST /
+    // CLEAR so the modern client's native threat APIs (UnitDetailedThreatSituation,
+    // UNIT_THREAT_LIST_UPDATE) populate. Default on. Disable for players who
+    // don't use threat meters or who want to rule the engine out as the cause
+    // of an issue without swapping proxy versions.
+    //
+    // Gate placement: only blocks ThreatTracker per-event work (damage/heal/
+    // energize/spell-cast intake, set-bonus counting, hysteresis, SMSG emission).
+    // The talent synthesizer in SpellHandler.cs (SynthesizedTalentRanks reconcile)
+    // runs unconditionally — other systems consume that data.
+    //
+    // Default-init to true so tests / paths that bypass LoadAndVerifyFrom get
+    // the safe default; LoadAndVerifyFrom still overrides from config below.
+    public static bool ThreatEngine = false;
+    // JimsProxy: server fork detection. Different vanilla 1.12 forks (Kronos,
+    // vmangos, Twinstar) have subtly different wire formats for some CMSGs.
+    // Default Kronos since this launcher is built for Kronos.
+    public static ServerFork ServerType = ServerFork.Kronos;
 
     public static bool LoadAndVerifyFrom(ConfigurationParser config)
     {
@@ -91,6 +111,10 @@ public static class Settings
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);
         LowLatencyMode = config.GetBoolean("LowLatencyMode", false);
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);
+        ThreatEngine = config.GetBoolean("ThreatEngine", false);
+        var serverTypeStr = config.GetString("ServerType", "Kronos");
+        ServerType = serverTypeStr.Equals("Generic", StringComparison.OrdinalIgnoreCase)
+            ? ServerFork.Generic : ServerFork.Kronos;
         Log.StructuredLogEnabled = StructuredLog;
         Log.VerboseLogEnabled = VerboseLog;
         // Open the JSONL file now so session.start's payload can include the full path.

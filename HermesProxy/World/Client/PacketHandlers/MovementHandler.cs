@@ -20,6 +20,13 @@ public partial class WorldClient
         return GetSession().GameState.GetLegacyFieldValueFloat(guid, UnitField.UNIT_FIELD_HOVERHEIGHT) > 0.0f;
     }
 
+    // MIRASU (swim-mob basketball-bounce 2026-05-23): true if we've seen this mob
+    // with MovementFlag.Swimming. Seeded in UpdateHandler.ReadMovementUpdateBlock.
+    private bool IsSwimmingMob(WowGuid128 guid)
+    {
+        return GetSession().GameState.KnownSwimmingMobs.Contains(guid);
+    }
+
     // Strips Falling/FallingFar and forces DisableGravity on a hovering mob's movement
     // flags. Call BEFORE casting WotLK flags to Modern. Vanilla servers don't have
     // AnimTier/HoverHeight in their movement protocol, so hovering mobs bleed Falling
@@ -31,6 +38,38 @@ public partial class WorldClient
             return false;
 
         moveInfo.Flags &= ~(uint)(MovementFlagWotLK.Falling | MovementFlagWotLK.FallingFar);
+        moveInfo.Flags |= (uint)MovementFlagWotLK.DisableGravity;
+        moveInfo.FallTime = 0;
+        moveInfo.JumpVerticalSpeed = 0.0f;
+        moveInfo.JumpHorizontalSpeed = 0.0f;
+        return true;
+    }
+
+    // MIRASU (swim-mob basketball-bounce 2026-05-23): the flag bit positions differ
+    // between WotLK (the proxy's internal storage format after Vanilla→WotLK cast)
+    // and Modern. Specifically:
+    //   WotLK.Swimming      = 0x200000  (bit 21)
+    //   Modern.Swimming     = 0x100000  (bit 20)
+    //   Modern bit 21       = Ascending
+    // The proxy writes info.Flags raw to the modern wire (no name-based conversion),
+    // so a swimming NPC ends up with the modern Ascending flag set — the 1.14 client
+    // then renders it as continuously ascending = visible up/down bouncing on the
+    // water surface with walk anim. This mirrors the workaround the hover override
+    // uses: explicitly strip the wrong bits and set the right modern ones.
+    // Also strip Falling/FallingFar so the client doesn't try to ground-snap.
+    private bool ApplySwimOverrideIfNeeded(WowGuid128 guid, MovementInfo moveInfo)
+    {
+        if (!IsSwimmingMob(guid))
+            return false;
+
+        // Clear WotLK's Swimming bit position (which would show up as Ascending on modern)
+        // and clear falling flags. Set modern Swimming bit (0x100000) directly.
+        moveInfo.Flags &= ~(uint)(MovementFlagWotLK.Swimming | MovementFlagWotLK.Falling | MovementFlagWotLK.FallingFar);
+        moveInfo.Flags |= (uint)MovementFlagModern.Swimming;
+        // MIRASU (swim moving anim 2026-05-23): DisableGravity is the anti-gravity bit
+        // that doesn't force a flight anim (unlike SplineFlagModern.Flying). Pairs with
+        // UnitFlags.CanSwim on UNIT_FIELD_FLAGS so the client renders swim moving anim
+        // instead of bouncing the unit on the water surface.
         moveInfo.Flags |= (uint)MovementFlagWotLK.DisableGravity;
         moveInfo.FallTime = 0;
         moveInfo.JumpVerticalSpeed = 0.0f;
@@ -153,6 +192,24 @@ public partial class WorldClient
         //    "log in mounted, walk at unmounted speed until I remount."
         bool isLocalPlayer = control.Guid == GetSession().GameState.CurrentPlayerGuid;
         bool justRegainedControl = control.HasControl && !GetSession().GameState.LastObservedHasControl;
+
+        // JimsProxy (diag): SMSG_CONTROL_UPDATE body is one PackGUID + one byte
+        // HasControl bool, neither captured by the existing packet.in event (size +
+        // opcode only). Without HasControl in the log, post-incident triage of
+        // movement-wedge bugs has to guess whether the proxy saw a freeze (false)
+        // or a restore (true) — including for the BG-exit lockout family where the
+        // entire question is "did the server send the restore packet or not." Emit
+        // the parsed values + the transition signal so future logs answer that
+        // directly. Zero behavior impact; one structured event per inbound packet.
+        Framework.Logging.Log.Event("movement.control_update.observed", new
+        {
+            guid_low = control.Guid.GetCounter(),
+            has_control = control.HasControl,
+            is_local_player = isLocalPlayer,
+            last_observed_before = GetSession().GameState.LastObservedHasControl,
+            just_regained_control = justRegainedControl,
+        });
+
         if (isLocalPlayer)
             GetSession().GameState.LastObservedHasControl = control.HasControl;
 
@@ -165,6 +222,73 @@ public partial class WorldClient
             runFix.Speed = GetSession().GameState.LastKnownPlayerRunSpeed;
             SendPacketToClient(runFix);
         }
+    }
+
+    // JimsProxy (taxi-resume-control-stuck #330): packets the 1.14 client needs to leave the taxi/passenger state — control restore + gravity + clear-fly + unroot. Mirrors the dismount Task; used by the resumed-taxi SPLINE_ENABLED-clear path in ReadMovementUpdateBlock which never reaches HandleMonsterMove. See memory.
+    public void SendTaxiDismountRestore(WowGuid128 guid)
+    {
+        ControlUpdate control = new ControlUpdate();
+        control.Guid = guid;
+        control.HasControl = true;
+        SendPacketToClient(control);
+
+        MoveSetFlag enableGravity = new MoveSetFlag(Opcode.SMSG_MOVE_ENABLE_GRAVITY);
+        enableGravity.MoverGUID = guid;
+        SendPacketToClient(enableGravity);
+
+        MoveSetFlag unsetFly = new MoveSetFlag(Opcode.SMSG_MOVE_UNSET_CAN_FLY);
+        unsetFly.MoverGUID = guid;
+        SendPacketToClient(unsetFly);
+
+        MoveSetFlag unroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
+        unroot.MoverGUID = guid;
+        SendPacketToClient(unroot);
+    }
+
+    // JimsProxy (taxi-resume-control-stuck #330): a resumed taxi's flight spline arrives only in the player's CREATE block (UpdateHandler), bypassing HandleMonsterMove's dismount scheduling; schedule the same dismount off the create-spline's remaining duration so control/gravity restore fires at landing. Mirrors the HandleMonsterMove dismount Task (CTS + atomic claim + cancel-on-disconnect via TaxiDismountCts). See memory.
+    public void ScheduleTaxiResumeDismount(WowGuid128 guid, uint remainingMs)
+    {
+        var gameState = GetSession().GameState;
+        System.Threading.Volatile.Write(ref gameState.IsInTaxiFlight, true);
+        gameState.CancelTaxiDismount("taxi_resume_reschedule");
+
+        const uint TAXI_FLIGHT_MAX_MS = 600_000;
+        int delayMs = (int)Math.Min(remainingMs, TAXI_FLIGHT_MAX_MS) + 250;
+        var cts = new System.Threading.CancellationTokenSource();
+        gameState.TaxiDismountCts = cts;
+        gameState.TaxiDismountFiresAtTickMs = Environment.TickCount64 + delayMs;
+
+        var capturedSession = GetSession();
+        var capturedClient = this;
+        var token = cts.Token;
+        WowGuid128 playerGuid = guid;
+        _ = System.Threading.Tasks.Task.Run(async () =>
+        {
+            try { await System.Threading.Tasks.Task.Delay(delayMs, token).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+
+            var prior = System.Threading.Interlocked.CompareExchange(ref capturedSession.GameState.TaxiDismountCts, null, cts);
+            if (!ReferenceEquals(prior, cts))
+                return;
+
+            // We own the dismount; cts + bookkeeping cleanup is now our responsibility
+            // (mirrors the HandleMonsterMove dismount Task's finally).
+            try
+            {
+                if (!System.Threading.Volatile.Read(ref capturedSession.GameState.IsInTaxiFlight))
+                    return;
+                if (capturedSession.InstanceSocket == null)
+                    return;
+
+                capturedClient.SendTaxiDismountRestore(playerGuid);
+                System.Threading.Volatile.Write(ref capturedSession.GameState.IsInTaxiFlight, false);
+            }
+            finally
+            {
+                capturedSession.GameState.TaxiDismountFiresAtTickMs = 0;
+                cts.Dispose();
+            }
+        });
     }
 
     [PacketHandler(Opcode.MSG_MOVE_TELEPORT_ACK)]
@@ -257,6 +381,24 @@ public partial class WorldClient
 
         SendPacketToClient(transfer);
         GetSession().GameState.IsWaitingForNewWorld = false;
+
+        var clearedCounts = GetSession().GameState.ResetInFlightCastState();
+        var droppedGcdHold = GetSession().GameState.CancelGcdHold();
+        var droppedCastTimeHold = GetSession().GameState.ClearHeldCastTimeCast();
+        if (clearedCounts.normalCasts > 0 || clearedCounts.petCasts > 0 ||
+            droppedGcdHold != null || droppedCastTimeHold != null)
+        {
+            Log.Event("session.transfer_aborted.cast_state_cleared", new
+            {
+                aborted_map_id = transfer.MapID,
+                reason = transfer.Reason.ToString(),
+                normal_casts_cleared = clearedCounts.normalCasts,
+                pet_casts_cleared = clearedCounts.petCasts,
+                other_caster_ids_cleared = clearedCounts.otherCasterIds,
+                gcd_hold_dropped_spell_id = droppedGcdHold?.SpellId ?? 0,
+                cast_time_hold_dropped_spell_id = droppedCastTimeHold?.SpellId ?? 0,
+            });
+        }
     }
 
     [PacketHandler(Opcode.SMSG_NEW_WORLD)]
@@ -428,6 +570,13 @@ public partial class WorldClient
         speed.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
         speed.Speed = packet.ReadFloat();
         SendPacketToClient(speed);
+
+        // JimsProxy (speed-stuck-cc-spline): when CC ends mid-spline the server restores run speed via the spline opcode, not FORCE; mirror the FORCE cache so the regain-control reassert restores the buffed speed. See memory.
+        if (packet.GetUniversalOpcode(false) == Opcode.SMSG_MOVE_SPLINE_SET_RUN_SPEED &&
+            speed.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            GetSession().GameState.LastKnownPlayerRunSpeed = speed.Speed;
+        }
     }
 
     // for own player
@@ -638,6 +787,19 @@ public partial class WorldClient
                         guid = guid.ToString(),
                     });
                 }
+                // MIRASU (swim-mob basketball-bounce 2026-05-23): same pattern as hover
+                // but for swimming mobs. Without AnimTierSwim on stop, the modern client
+                // reverts to ground anim and ground-snaps Z, causing big up-down hops on
+                // swimming bosses (Rotgrip) and patrolling water mobs.
+                else if (IsSwimmingMob(guid))
+                {
+                    moveSpline.SplineFlags &= ~SplineFlagModern.Flying;
+                    moveSpline.SplineFlags |= SplineFlagModern.AnimTierSwim | SplineFlagModern.CanSwim;
+                    Framework.Logging.Log.Event("swim.spline_stop_override", new
+                    {
+                        guid = guid.ToString(),
+                    });
+                }
                 MonsterMove moveStop = new MonsterMove(guid, moveSpline);
                 SendPacketToClient(moveStop);
                 return;
@@ -694,6 +856,27 @@ public partial class WorldClient
                 moveSpline.SplineFlags &= ~(SplineFlagModern.Unknown5 | SplineFlagModern.Falling | SplineFlagModern.FallingSlow | SplineFlagModern.SmoothGroundPath | SplineFlagModern.CatmullRom);
                 moveSpline.SplineFlags |= SplineFlagModern.Flying | SplineFlagModern.AnimTierHover;
                 Framework.Logging.Log.Event("hover.spline_override", new
+                {
+                    guid = guid.ToString(),
+                    spline_type = moveSpline.SplineType.ToString(),
+                });
+            }
+            // MIRASU (swim-mob basketball-bounce 2026-05-23): same shape as hover override
+            // but for swimming mobs. Strip ground-snapping / falling flags so the modern
+            // client doesn't yank the mob's Z to ground level each spline tick. Add Flying
+            // (means "moves freely in 3D, don't ground-follow") + AnimTierSwim. Without
+            // Flying, the client still ground-snaps and warps between waypoints because
+            // the smooth-3D path mode isn't enabled.
+            else if (IsSwimmingMob(guid))
+            {
+                moveSpline.SplineFlags &= ~(SplineFlagModern.Unknown5 | SplineFlagModern.Falling | SplineFlagModern.FallingSlow | SplineFlagModern.SmoothGroundPath | SplineFlagModern.Flying);
+                // MIRASU (swim moving anim 2026-05-23): Flying spline flag forced the
+                // client to play flight glide. With UnitFlags.CanSwim now on
+                // UNIT_FIELD_FLAGS (synthesized in UpdateHandler), the client treats
+                // the unit as a swimmer for both physics and anim selection — Flying
+                // is no longer needed and was actually preventing the swim moving anim.
+                moveSpline.SplineFlags |= SplineFlagModern.AnimTierSwim | SplineFlagModern.CanSwim;
+                Framework.Logging.Log.Event("swim.spline_override", new
                 {
                     guid = guid.ToString(),
                     spline_type = moveSpline.SplineType.ToString(),

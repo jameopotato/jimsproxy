@@ -117,6 +117,8 @@ partial class Server
             reported_os = Settings.ReportedOS,
             reported_platform = Settings.ReportedPlatform,
             structured_log_path = Log.StructuredLogPath,
+            threat_engine = Settings.ThreatEngine,
+            server_type = Settings.ServerType.ToString(),
         });
 
         GameData.LoadEverything();

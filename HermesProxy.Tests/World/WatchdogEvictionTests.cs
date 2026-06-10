@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Frozen;
 using HermesProxy;
 using HermesProxy.Enums;
 using HermesProxy.World;
@@ -173,21 +174,27 @@ public class WatchdogEvictionTests
     }
 
     [Fact]
-    public void DrainPendingCastsForDestroyedTarget_Match_EvictsOnly()
+    public void DrainPendingCastsForDestroyedTarget_Match_EvictsOnlyNotStarted()
     {
+        // Per PR #310: only !HasStarted matching casts are drained. Started casts
+        // (channel AND cast-time) stay in the queue so the server's real
+        // SPELL_GO / SPELL_FAILURE resolves them — prevents the mining-stuck
+        // animation where an evicted started cast left the trailing failure
+        // orphaned and the CancelSpellVisual gate was missed.
         var session = NewSession();
-        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(100, Creature(1), hasStarted: true));
-        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(200, Creature(2)));
-        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(300, Creature(1))); // also targets evicted unit
+        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(100, Creature(1), hasStarted: true)); // started, matches — kept
+        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(200, Creature(2)));                   // other target — kept
+        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(300, Creature(1)));                   // not started, matches — evicted
 
         session.DrainPendingCastsForDestroyedTarget(Creature(1),
             out var normal, out var pet);
 
-        Assert.Equal(2, normal.Count);
-        Assert.Contains(normal, c => c.SpellId == 100);
+        Assert.Single(normal);
         Assert.Contains(normal, c => c.SpellId == 300);
-        Assert.Single(session.PendingNormalCasts);
         Assert.Empty(pet);
+        Assert.Equal(2, session.PendingNormalCasts.Count);
+        Assert.Contains(session.PendingNormalCasts, c => c.SpellId == 100);
+        Assert.Contains(session.PendingNormalCasts, c => c.SpellId == 200);
     }
 
     [Fact]
@@ -224,21 +231,44 @@ public class WatchdogEvictionTests
     }
 
     [Fact]
-    public void DrainPendingCastsForDestroyedTarget_HasStartedNormalCast_FalseAfterEviction()
+    public void DrainPendingCastsForDestroyedTarget_StartedChannel_KeptForServerResolution()
     {
-        // The end-to-end symptom: cast-time spell on a target, target dies, server
-        // sends only SMSG_SPELL_FAILURE (no trailing CAST_FAILED on Kronos). Without
-        // the destroy hook the entry leaks. With the hook, SMSG_DESTROY_OBJECT for
-        // the target evicts it immediately and HasStartedNormalCast returns false.
-        var session = NewSession();
-        var dyingMob = Creature(1);
-        session.PendingNormalCasts.Enqueue(MakeCastWithTarget(100, dyingMob, hasStarted: true));
+        // Regression guard (gather "node does nothing after the first tick"):
+        // a CHANNELED cast the legacy server has already started must NOT be
+        // evicted when its target is destroyed. The server owns it and sends a
+        // real SMSG_SPELL_FAILURE; HandleSpellFailure arms the watchdog as the
+        // leak backstop. Evicting it here raced that resolution and emitted
+        // SMSG_CAST_FAILED, which cannot tear down an already-started channel
+        // bar — stranding the modern client until it moved away.
+        //
+        // Non-channeled started casts (e.g. Frostbolt) DO still get evicted —
+        // that's covered by DrainPendingCastsForDestroyedTarget_Match_*. The
+        // narrowing here matches Jim's review feedback: scope the kept-cast
+        // exemption to channels specifically so combat instant-feedback isn't
+        // regressed.
+        var prevChanneled = GameData.ChanneledSpells;
+        try
+        {
+            const uint channeledSpellId = 2575; // Mining (vanilla 1.12, real channel)
+            GameData.ChanneledSpells = new System.Collections.Generic.HashSet<uint> { channeledSpellId }
+                .ToFrozenSet();
+            Assert.True(GameData.IsChanneledSpell(channeledSpellId));
 
-        Assert.True(session.HasStartedNormalCast());
+            var session = NewSession();
+            var dyingMob = Creature(1);
+            session.PendingNormalCasts.Enqueue(MakeCastWithTarget(channeledSpellId, dyingMob, hasStarted: true));
 
-        session.DrainPendingCastsForDestroyedTarget(dyingMob, out var _, out var _);
+            session.DrainPendingCastsForDestroyedTarget(dyingMob, out var normal, out var pet);
 
-        Assert.False(session.HasStartedNormalCast());
+            Assert.Empty(normal);
+            Assert.Empty(pet);
+            Assert.Single(session.PendingNormalCasts);
+            Assert.True(session.HasStartedNormalCast());
+        }
+        finally
+        {
+            GameData.ChanneledSpells = prevChanneled;
+        }
     }
 
     // ---- Movement preemption tests ----

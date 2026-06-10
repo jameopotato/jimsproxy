@@ -195,13 +195,30 @@ public partial class WorldClient
             spell.SpellID = spellId;
             TrainerSpellStateLegacy stateOld = (TrainerSpellStateLegacy)packet.ReadUInt8();
             TrainerSpellStateModern stateNew = stateOld.CastEnum<TrainerSpellStateModern>();
-            spell.Usable = stateNew;
             spell.MoneyCost = packet.ReadUInt32();
             packet.ReadInt32(); // Profession Dialog
             packet.ReadInt32(); // Profession Button
             spell.ReqLevel = packet.ReadUInt8();
             spell.ReqSkillLine = packet.ReadUInt32();
             spell.ReqSkillRank = packet.ReadUInt32();
+            // JimsProxy (issue #305): override Available→Unavailable when player skill rank < ReqSkillRank; see memory.
+            if (stateNew == TrainerSpellStateModern.Available && spell.ReqSkillLine != 0 && spell.ReqSkillRank > 0)
+            {
+                var gs = GetSession().GameState;
+                if (gs.HasPopulatedSkillBlock() && gs.GetPlayerSkillRank(spell.ReqSkillLine) < spell.ReqSkillRank)
+                {
+                    stateNew = TrainerSpellStateModern.Unavailable;
+                    Log.Event("spell.trainer_list.skill_gated_override", new
+                    {
+                        trainer_id = trainer.TrainerID,
+                        spell_id = spellId,
+                        req_skill_line = spell.ReqSkillLine,
+                        req_skill_rank = spell.ReqSkillRank,
+                        player_skill_rank = gs.GetPlayerSkillRank(spell.ReqSkillLine),
+                    });
+                }
+            }
+            spell.Usable = stateNew;
             spell.ReqAbility[0] = packet.ReadUInt32();
             spell.ReqAbility[1] = packet.ReadUInt32();
             spell.ReqAbility[2] = packet.ReadUInt32();

@@ -1,6 +1,6 @@
 local ADDON_NAME, namespace = ...
 
-namespace.BUILD = 19
+namespace.BUILD = 20
 
 print("|cFF00FF00[JimsPlus]|r Core loaded (build " .. namespace.BUILD .. ")")
 

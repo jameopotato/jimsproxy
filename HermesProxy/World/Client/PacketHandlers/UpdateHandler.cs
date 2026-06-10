@@ -39,6 +39,7 @@ public partial class WorldClient
     internal static readonly FrozenDictionary<int, float> M2NativeRatio = new Dictionary<int, float>
     {
         { 411, 2.33f },  // FelBat — 1.12 intrinsic ≈ 2.33× modern's (Ressan-validated)
+        { 1531, 4.0f },  // Mini Diablo (entry 11326, display 10992) — 1.14 mesh shrunk vs 1.12; calibrate from in-game test
     }.ToFrozenDictionary();
 
     // Per-ModelId render-time compensation for divergences invisible to DBC/M2 files.
@@ -181,25 +182,12 @@ public partial class WorldClient
         // on the riders but separate Pet-high-GUID creature spawns (entry 4196). Without
         // this event, we can't tell whether the legacy server ever sends a destroy for
         // those mount GUIDs around aggro/death time.
-        int cachedEntry = GetSession().GameState.GetLegacyFieldValueInt32(guid, ObjectField.OBJECT_FIELD_ENTRY);
-        int cachedDisplayId = GetSession().GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
-
         // JimsProxy (target-buffs-stuck-after-render-roundtrip): drop the
         // four per-target aura tables for this guid. Without this, the
         // modern client surfaces stale buffs when the unit re-enters
         // render distance — fresh OBJECT_UPDATE deltas don't reliably
         // overwrite the old slot data before the addon's first read.
-        int aurasEvicted = GetSession().GameState.EvictUnitAuraState(guid);
-
-        Log.Event("object.destroy", new
-        {
-            guid = guid.ToString(),
-            high_type = guid.GetHighType().ToString(),
-            guid_entry = guid.GetEntry(),
-            cached_entry = cachedEntry,
-            cached_display_id = cachedDisplayId,
-            auras_evicted = aurasEvicted,
-        });
+        GetSession().GameState.EvictUnitAuraState(guid);
 
         lock (GetSession().GameState.ObjectCacheLock)
         {
@@ -517,23 +505,6 @@ public partial class WorldClient
             if (guid == GetSession().GameState.CurrentPlayerGuid)
                 continue;
             PrintString($"Guid = {objCount}", index, j);
-
-            // JimsProxy (mount-and-quest-diagnostics): per-GUID structured log for far/
-            // out-of-range removals, captured BEFORE cache eviction so cached entry and
-            // displayId survive into the bundle. Pairs with object.destroy to give a
-            // complete picture of how the legacy server removes objects from the client's
-            // view — needed to triage the Outrunner cat-mount persistence bug where the
-            // mount cats are independent creature spawns (entry 4196), not MOUNTDISPLAYID.
-            int cachedEntry = GetSession().GameState.GetLegacyFieldValueInt32(guid, ObjectField.OBJECT_FIELD_ENTRY);
-            int cachedDisplayId = GetSession().GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
-            Log.Event("object.far_object", new
-            {
-                guid = guid.ToString(),
-                high_type = guid.GetHighType().ToString(),
-                guid_entry = guid.GetEntry(),
-                cached_entry = cachedEntry,
-                cached_display_id = cachedDisplayId,
-            });
 
             lock (GetSession().GameState.ObjectCacheLock)
             {
@@ -1066,7 +1037,38 @@ public partial class WorldClient
                 }
             }
 
+            // MIRASU (swim-mob basketball-bounce 2026-05-23): vanilla NPCs in water
+            // carry MovementFlagVanilla.Swimming on their MovementInfo. Modern 1.14 client
+            // wants UNIT_BYTES_1.AnimTier=Swim, spline flags without SmoothGroundPath, and
+            // the modern Swimming bit (0x100000) instead of WotLK's Swimming bit (0x200000)
+            // — otherwise it ground-snaps to the water surface, plays walk anim, and
+            // basketball-bounces (Rotgrip in Maraudon, naga in Desolace). Seed the swim
+            // registry from this flag — same shape as the hover seed above. The actual
+            // flag-bit fixup is in ApplySwimOverrideIfNeeded called below. The detection
+            // checks the WotLK-format flag (post-CastFlags) since info.Flags has already
+            // been normalized to WotLK by ReadMovementInfoLegacy.
+            // MIRASU (swim debug 2026-05-23): restrict to creatures only so that
+            // other players, pets, and tamed mobs aren't permanently flagged as
+            // swimming after a single observation. Hunter pets and other players
+            // legitimately transition between water and land — applying persistent
+            // swim overrides to them would make them visually float on land.
+            // Stationary aquatic creatures (Rotgrip, naga) remain in water so the
+            // one-shot Add is still correct for them.
+            if (((MovementFlagWotLK)moveInfo.Flags).HasAnyFlag(MovementFlagWotLK.Swimming) &&
+                guid.GetHighType() == HighGuidType.Creature)
+            {
+                if (GetSession().GameState.KnownSwimmingMobs.Add(guid))
+                {
+                    Framework.Logging.Log.Event("swim.detect_swimming_flag", new
+                    {
+                        guid = guid.ToString(),
+                        z = moveInfo.Position.Z,
+                    });
+                }
+            }
+
             ApplyHoverOverrideIfNeeded(guid, moveInfo);
+            ApplySwimOverrideIfNeeded(guid, moveInfo);
 
             // JimsProxy (zep-relog-diag 2026-05-15): emit a diagnostic on the
             // player's own UpdateObject only when transport state transitions
@@ -1273,6 +1275,16 @@ public partial class WorldClient
                 monsterMove.SplineTime = packet.ReadUInt32();
                 monsterMove.SplineTimeFull = packet.ReadUInt32();
                 monsterMove.SplineId = packet.ReadUInt32();
+
+                // JimsProxy (taxi-resume-control-stuck #330): a taxi resumed across login arrives only as this CREATE-block flight spline (no per-leg SMSG_ON_MONSTER_MOVE reaches the player, so HandleMonsterMove's dismount never schedules) and the vanilla server sends no flag-clear/teleport/control-update at flight end; schedule the dismount from the spline's own remaining duration, the only reliable landing signal. Create only (updateData != null), local player, vanilla. See memory.
+                if (updateData != null && hasTaxiFlightFlags && guid.IsPlayer() && flags.HasAnyFlag(UpdateFlag.Self) &&
+                    LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+                {
+                    uint remainingMs = monsterMove.SplineTimeFull > monsterMove.SplineTime
+                        ? monsterMove.SplineTimeFull - monsterMove.SplineTime
+                        : monsterMove.SplineTimeFull;
+                    ScheduleTaxiResumeDismount(guid, remainingMs);
+                }
                 
                 if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_1_0_9767))
                 {
@@ -1532,6 +1544,36 @@ public partial class WorldClient
         return questLog;
     }
 
+    // MIRASU (stack-aura-decrement): build a fresh AuraDataInfo for a stack-only
+    // change. Vanilla servers transmit Lightning Shield charges / Sunder Armor
+    // stacks / Devouring Plague ticks via UNIT_FIELD_AURAAPPLICATIONS only — the
+    // spell ID and flags stay constant. We mirror the cached AuraDataInfo and
+    // recompute Applications via the same offset ReadAuraSlot applies on a full
+    // update so the modern client sees a consistent value.
+    private static AuraDataInfo CloneAuraDataForStackChange(AuraDataInfo src, byte wireApps)
+    {
+        byte appsAdjusted = wireApps;
+        if (GameData.StackableAuras.Contains(src.SpellID))
+            appsAdjusted++;
+        if (appsAdjusted == 0)
+            appsAdjusted = 1;
+
+        return new AuraDataInfo
+        {
+            CastID = src.CastID,
+            SpellID = src.SpellID,
+            SpellXSpellVisualID = src.SpellXSpellVisualID,
+            Flags = src.Flags,
+            ActiveFlags = src.ActiveFlags,
+            CastLevel = src.CastLevel,
+            Applications = appsAdjusted,
+            ContentTuningID = src.ContentTuningID,
+            CastUnit = src.CastUnit,
+            Duration = src.Duration,
+            Remaining = src.Remaining,
+        };
+    }
+
     public AuraDataInfo? ReadAuraSlot(byte i, WowGuid128 guid, Dictionary<int, UpdateField> updates)
     {
         int UNIT_FIELD_AURA = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
@@ -1606,7 +1648,8 @@ public partial class WorldClient
 
         if (GameData.SpellEffectPoints.TryGetValue(spellId, out var basePoints))
             data.Points = basePoints;
-        int duration = GameData.GetAuraSpellDuration(spellId);
+        int? talentDuration = GameData.TryGetTalentDuration(spellId, GetSession().GameState.CurrentPlayerKnownSpells);
+        int duration = talentDuration ?? GameData.GetAuraSpellDuration(spellId);
         if (duration > 0)
         {
             data.Duration = duration;
@@ -2305,6 +2348,18 @@ public partial class WorldClient
                     updateData.UnitData.Flags = updates[UNIT_FIELD_FLAGS].UInt32Value;
                 }
 
+                // MIRASU (swim animation 2026-05-23): vmangos source confirms
+                // UNIT_FLAG_USE_SWIM_ANIMATION (0x00008000, = UnitFlags.CanSwim)
+                // is THE bit that tells the client to play swim anim — the comment
+                // reads "Without it units walk on the sea floor instead of swimming."
+                // Twinstar / some vanilla servers don't set CREATURE_STATIC_FLAG_CAN_SWIM
+                // on aquatic creatures (Rotgrip, Desolace naga), so this bit never
+                // reaches the modern client and the mob ground-walks underwater.
+                // When we've registered the mob as swimming via MovementFlag.Swimming,
+                // force the bit on so the client picks the swim animation.
+                if (Session.GameState.KnownSwimmingMobs.Contains(guid))
+                    updateData.UnitData.Flags |= (uint)UnitFlags.CanSwim;
+
                 // Here because of this bullshit in cmangos:
                 // https://github.com/cmangos/mangos-tbc/blob/fd093b33071b546545cc5973608304bccc5a041b/src/game/Entities/Object.cpp#L544
                 if (updateData.UnitData.Flags.HasAnyFlag(UnitFlags.ServerControlled) && isCreate &&
@@ -2328,10 +2383,53 @@ public partial class WorldClient
             int UNIT_FIELD_BASEATTACKTIME = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_BASEATTACKTIME);
             if (UNIT_FIELD_BASEATTACKTIME >= 0)
             {
+                bool isLocalPlayer = guid == GetSession().GameState.CurrentPlayerGuid;
                 for (int i = 0; i < 2; i++)
                 {
-                    if (updateMaskArray[UNIT_FIELD_BASEATTACKTIME + i])
-                        updateData.UnitData.AttackRoundBaseTime[i] = updates[UNIT_FIELD_BASEATTACKTIME + i].UInt32Value;
+                    if (!updateMaskArray[UNIT_FIELD_BASEATTACKTIME + i])
+                        continue;
+
+                    uint raw = updates[UNIT_FIELD_BASEATTACKTIME + i].UInt32Value;
+
+                    // JimsProxy (#320): for the local player, defer mid-swing speed changes
+                    // until the next SMSG_ATTACKER_STATE_UPDATE flushes them. See the comment
+                    // on LastSentBaseAttackTime in GlobalSessionData for full rationale — the
+                    // vanilla server doesn't recalculate m_attackTimer mid-swing, so the
+                    // BASEATTACKTIME field changing immediately while the in-flight swing
+                    // finishes at the OLD cadence breaks swing-timer addons' rescale math.
+                    bool deferred = false;
+                    if (isLocalPlayer && raw > 0)
+                    {
+                        var state = GetSession().GameState;
+                        uint lastSent = state.LastSentBaseAttackTime[i];
+                        long lastSwingMs = state.LastAttackerStateUpdateMs[i];
+                        long nowMs = Environment.TickCount64;
+                        // Defer only when the player is actively in an attack cycle. If they
+                        // /stopattacked mid-swing then cast SnD before combat times out, we
+                        // want the haste change to surface immediately rather than hang
+                        // until SMSG_CANCEL_COMBAT — they're not visibly swinging, so the
+                        // addon's "rescale on speed change" math can't go wrong.
+                        bool isAttacking = state.CurrentAttackTarget != default;
+                        bool inFlight = isAttacking &&
+                                        lastSent > 0 && lastSwingMs > 0 &&
+                                        (nowMs - lastSwingMs) < lastSent;
+
+                        if (inFlight && raw != lastSent)
+                        {
+                            state.PendingBaseAttackTime[i] = raw;
+                            state.HasPendingBaseAttackTime[i] = true;
+                            updateData.UnitData.AttackRoundBaseTime[i] = lastSent;
+                            deferred = true;
+                        }
+                        else
+                        {
+                            state.LastSentBaseAttackTime[i] = raw;
+                            state.HasPendingBaseAttackTime[i] = false;
+                        }
+                    }
+
+                    if (!deferred)
+                        updateData.UnitData.AttackRoundBaseTime[i] = raw;
                 }
             }
             int UNIT_FIELD_RANGEDATTACKTIME = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_RANGEDATTACKTIME);
@@ -2488,6 +2586,14 @@ public partial class WorldClient
                     updateData.UnitData.AnimTier = 2;
                     if (hoverHeight > 0.0f)
                         updateData.UnitData.HoverHeight = hoverHeight;
+                }
+                // MIRASU (swim-mob basketball-bounce 2026-05-23): mirror the hover synth —
+                // when we've registered this mob as swimming (MovementFlag.Swimming on
+                // its MovementInfo), set AnimTier=Swim so the modern client plays the
+                // swim animation and stops ground-snapping the unit.
+                else if (Session.GameState.KnownSwimmingMobs.Contains(guid))
+                {
+                    updateData.UnitData.AnimTier = 1; // AnimTier.Swim
                 }
             }
             int UNIT_FIELD_PETNUMBER = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_PETNUMBER);
@@ -2828,31 +2934,78 @@ public partial class WorldClient
                 int aurasCount = LegacyVersion.GetAuraSlotsCount();
                 for (byte i = 0; i < aurasCount; i++)
                 {
-                    // Only process slot i when its specific spell ID changed
-                    // (UNIT_FIELD_AURA is per-slot, one uint32 per aura slot).
-                    // UNIT_FIELD_AURALEVELS and UNIT_FIELD_AURAAPPLICATIONS pack
-                    // 4 slots into one uint32, so their mask fires when ANY of
-                    // the 4 slots in the quad change. Triggering on them caused
-                    // the "warlock recasts one DoT and all 4 visible DoTs refresh
-                    // simultaneously" bug — adjacent slots that didn't actually
-                    // change still got their aura data re-emitted, firing UNIT_AURA
-                    // on the modern client and confusing LibClassicDurations.
-                    // Legitimate per-slot refreshes (recasts) propagate via
-                    // SpellHandler.SendAuraRefreshUpdate from SMSG_SPELL_GO, which
-                    // resolves the slot by SpellID lookup and is slot-targeted.
-                    if (updateMaskArray[UNIT_FIELD_AURA + i])
+                    // Process slot i when EITHER:
+                    //  (a) UNIT_FIELD_AURA + i fires — the slot's spell ID itself changed
+                    //      (apply / refresh / clear). This is per-slot so it's unambiguous.
+                    //  (b) UNIT_FIELD_AURAAPPLICATIONS + i/4 fires AND the per-slot byte
+                    //      within that quad differs from what we last emitted for slot i —
+                    //      a stack count change with no spell-ID change (Lightning Shield
+                    //      charge consumed, Sunder Armor stack added, Devouring Plague tick
+                    //      stacked, etc.).
+                    // The quad mask alone can't gate processing because UNIT_FIELD_AURALEVELS
+                    // and UNIT_FIELD_AURAAPPLICATIONS pack 4 slots into one uint32 — its mask
+                    // fires whenever ANY of those 4 slots in the quad changes. Triggering on
+                    // the quad without per-byte diffing caused the "warlock recasts one DoT
+                    // and all 4 visible DoTs refresh simultaneously" bug — adjacent slots
+                    // that didn't actually change still got re-emitted. We compare against
+                    // the cached AuraDataInfo for this slot so only the slot whose byte
+                    // actually changed re-emits.
+                    bool _maskAura = updateMaskArray[UNIT_FIELD_AURA + i];
+                    bool _maskLevels = updateMaskArray[UNIT_FIELD_AURALEVELS + i / 4];
+                    bool _maskApps = updateMaskArray[UNIT_FIELD_AURAAPPLICATIONS + i / 4];
+
+                    AuraDataInfo? cachedAuraForApps = null;
+                    byte newWireApps = 0;
+                    bool appsOnlyChanged = false;
+                    if (!_maskAura && _maskApps && updates.TryGetValue(UNIT_FIELD_AURAAPPLICATIONS + i / 4, out var _appsQuad))
+                    {
+                        newWireApps = (byte)((_appsQuad.UInt32Value >> ((i % 4) * 8)) & 0xFF);
+                        cachedAuraForApps = GetSession().GameState.GetLastEmittedAura(guid, i);
+                        if (cachedAuraForApps != null)
+                        {
+                            // The cached Applications is post-ReadAuraSlot adjustment:
+                            //   wire + (1 if StackableAuras), then clamped to >=1.
+                            // Reverse both adjustments to recover the actual wire byte the server
+                            // would have written for THIS slot. Without the clamp reversal, every
+                            // non-stackable aura at wire-byte=0 (e.g. Kidney Shot, Cheap Shot, any
+                            // single-application debuff) gets a phantom re-emit whenever a *different*
+                            // slot in the same UNIT_FIELD_AURAAPPLICATIONS quad changes — because
+                            // the quad's mask fires for all 4 slots and the byte-diff check sees
+                            // cached=1 vs wire=0. Symptom: Hemorrhage cast on a target with Kidney
+                            // Shot in an adjacent slot triggered a Flicker refresh of the Kidney
+                            // Shot timer on every Hemorrhage proc.
+                            byte expectedWire = cachedAuraForApps.Applications;
+                            bool isStackable = GameData.StackableAuras.Contains(cachedAuraForApps.SpellID);
+                            if (isStackable && expectedWire > 0)
+                                expectedWire = (byte)(expectedWire - 1);
+                            else if (!isStackable && expectedWire == 1)
+                                expectedWire = 0;
+                            if (newWireApps != expectedWire)
+                                appsOnlyChanged = true;
+                        }
+                    }
+
+                    if (_maskAura || appsOnlyChanged)
                     {
                         // JimsProxy (Rupture-DoT-Lingering-Icon): log every aura-slot touch on units
                         // so we can see the exact packet timing of aura apply/remove vs SPELL_PERIODIC ticks.
                         // Targeting Rupture-on-enemy lingering bug. Remove once root cause is confirmed.
-                        bool _maskAura = updateMaskArray[UNIT_FIELD_AURA + i];
-                        bool _maskLevels = updateMaskArray[UNIT_FIELD_AURALEVELS + i / 4];
-                        bool _maskApps = updateMaskArray[UNIT_FIELD_AURAAPPLICATIONS + i / 4];
                         uint _slotSpellId = (_maskAura && updates.TryGetValue(UNIT_FIELD_AURA + i, out var _auraField)) ? _auraField.UInt32Value : 0;
 
                         AuraInfo aura = new AuraInfo();
                         aura.Slot = i;
-                        aura.AuraData = ReadAuraSlot(i, guid, updates)!;
+                        if (appsOnlyChanged && cachedAuraForApps != null)
+                        {
+                            // Stack count changed without a spell-ID restate — synthesize the
+                            // aura update from the cached AuraDataInfo so flags / CastID / level /
+                            // CastUnit stay intact. Recompute Applications via the same offset
+                            // ReadAuraSlot would apply.
+                            aura.AuraData = CloneAuraDataForStackChange(cachedAuraForApps, newWireApps);
+                        }
+                        else
+                        {
+                            aura.AuraData = ReadAuraSlot(i, guid, updates)!;
+                        }
                         if (aura.AuraData != null)
                         {
                             int durationLeft;
@@ -2886,7 +3039,11 @@ public partial class WorldClient
                                 // (Cheap Shot, flat 4 s) is the primary case; any other spell with
                                 // an AuraDurations CSV row also benefits.
                                 if (durationFull <= 0)
-                                    durationFull = GameData.GetAuraSpellDuration((uint)aura.AuraData.SpellID);
+                                {
+                                    uint auraSpellId = (uint)aura.AuraData.SpellID;
+                                    int? talentDur = GameData.TryGetTalentDuration(auraSpellId, GetSession().GameState.CurrentPlayerKnownSpells);
+                                    durationFull = talentDur ?? GameData.GetAuraSpellDuration(auraSpellId);
+                                }
                             }
 
                             if (durationLeft > 0 && durationFull > 0)
@@ -2937,6 +3094,7 @@ public partial class WorldClient
                             // duration / caster from the previous occupant.
                             GetSession().GameState.ClearAuraDuration(guid, i);
                             GetSession().GameState.ClearAuraCaster(guid, i);
+                            GetSession().GameState.ClearLastEmittedAura(guid, i);
                             Framework.Logging.Log.Event("aura.slot.cleared", new
                             {
                                 target_low = guid.GetCounter(),
@@ -2963,6 +3121,13 @@ public partial class WorldClient
                         {
                             auraUpdate.Auras.Add(aura);
                         }
+
+                        // MIRASU (stack-aura-decrement): remember what we just emitted so the
+                        // next AURAAPPLICATIONS-quad-only update can detect a per-slot byte
+                        // change and re-emit without spuriously refreshing the other three
+                        // slots packed into the same uint32.
+                        if (aura.AuraData != null)
+                            GetSession().GameState.StoreLastEmittedAura(guid, i, aura.AuraData);
 
                         // JimsProxy (vanilla synthesized spell stats): mirror active aura spell
                         // ids for the player so the synthesis pass can walk them alongside
@@ -3462,17 +3627,13 @@ public partial class WorldClient
                     }
                 }
             }
-            bool spellStatsDirty = false;
             int PLAYER_FIELD_MOD_DAMAGE_DONE_POS = LegacyVersion.GetUpdateField(PlayerField.PLAYER_FIELD_MOD_DAMAGE_DONE_POS);
             if (PLAYER_FIELD_MOD_DAMAGE_DONE_POS >= 0)
             {
                 for (int i = 0; i < 7; i++)
                 {
                     if (updateMaskArray[PLAYER_FIELD_MOD_DAMAGE_DONE_POS + i])
-                    {
                         updateData.ActivePlayerData.ModDamageDonePos[i] = updates[PLAYER_FIELD_MOD_DAMAGE_DONE_POS + i].Int32Value;
-                        spellStatsDirty = true;
-                    }
                 }
             }
             int PLAYER_FIELD_MOD_DAMAGE_DONE_NEG = LegacyVersion.GetUpdateField(PlayerField.PLAYER_FIELD_MOD_DAMAGE_DONE_NEG);
@@ -3481,10 +3642,7 @@ public partial class WorldClient
                 for (int i = 0; i < 7; i++)
                 {
                     if (updateMaskArray[PLAYER_FIELD_MOD_DAMAGE_DONE_NEG + i])
-                    {
                         updateData.ActivePlayerData.ModDamageDoneNeg[i] = updates[PLAYER_FIELD_MOD_DAMAGE_DONE_NEG + i].Int32Value;
-                        spellStatsDirty = true;
-                    }
                 }
             }
             int PLAYER_FIELD_MOD_DAMAGE_DONE_PCT = LegacyVersion.GetUpdateField(PlayerField.PLAYER_FIELD_MOD_DAMAGE_DONE_PCT);
@@ -3493,37 +3651,12 @@ public partial class WorldClient
                 for (int i = 0; i < 7; i++)
                 {
                     if (updateMaskArray[PLAYER_FIELD_MOD_DAMAGE_DONE_PCT + i])
-                    {
                         updateData.ActivePlayerData.ModDamageDonePercent[i] = updates[PLAYER_FIELD_MOD_DAMAGE_DONE_PCT + i].FloatValue;
-                        spellStatsDirty = true;
-                    }
                 }
             }
             int PLAYER_FIELD_MOD_HEALING_DONE_POS = LegacyVersion.GetUpdateField(PlayerField.PLAYER_FIELD_MOD_HEALING_DONE_POS);
             if (PLAYER_FIELD_MOD_HEALING_DONE_POS >= 0 && updateMaskArray[PLAYER_FIELD_MOD_HEALING_DONE_POS])
-            {
                 updateData.ActivePlayerData.ModHealingDonePos = updates[PLAYER_FIELD_MOD_HEALING_DONE_POS].Int32Value;
-                spellStatsDirty = true;
-            }
-            // JimsProxy diagnostic: snapshot the spell-power/healing fields whenever the legacy
-            // server pushes any of them. Lets us see what Kronos is actually sending — vanilla
-            // 1.12 protocol has no PLAYER_FIELD_MOD_HEALING_DONE_POS field at all (the field
-            // jumps from MOD_DAMAGE_DONE_PCT[6] straight to PLAYER_FIELD_BYTES), so Spell Healing
-            // on the modern client will always show 0 unless the proxy synthesizes it. The
-            // ModDamageDonePos values are present in vanilla but may or may not be pushed by
-            // Kronos at login. School order: 0=Physical, 1=Holy, 2=Fire, 3=Nature, 4=Frost,
-            // 5=Shadow, 6=Arcane.
-            if (spellStatsDirty)
-            {
-                Log.Event("stats.spell_power.update", new
-                {
-                    pos = updateData.ActivePlayerData.ModDamageDonePos,
-                    neg = updateData.ActivePlayerData.ModDamageDoneNeg,
-                    pct = updateData.ActivePlayerData.ModDamageDonePercent,
-                    healing_pos = updateData.ActivePlayerData.ModHealingDonePos,
-                    has_healing_field = PLAYER_FIELD_MOD_HEALING_DONE_POS >= 0,
-                });
-            }
 
             // JimsProxy: synthesize Spell Healing and per-school Spell Damage from equipment-
             // triggered passive auras for vanilla. The vanilla 1.12 protocol has no
@@ -3553,13 +3686,6 @@ public partial class WorldClient
                         updateData.ActivePlayerData.ModDamageDonePos[i] = damageDone[i];
                 }
 
-                Log.Event("stats.spell_power.synthesized", new
-                {
-                    healing_done = healingDone,
-                    damage_done = damageDone,
-                    equipped_item_count = GetSession().GameState.CurrentEquippedItemIds.Count(id => id > 0),
-                });
-
                 // JimsProxy (vanilla synthesized spell crit): vanilla 1.12 has no
                 // PLAYER_SPELL_CRIT_PERCENTAGE1 field. Compute base + INT/rate + aura
                 // contributions per school and override the modern client's per-school
@@ -3575,61 +3701,6 @@ public partial class WorldClient
                     GetSession().GameState.CurrentPlayerKnownSpells);
                 for (int i = 0; i < 7; i++)
                     updateData.ActivePlayerData.SpellCritPercentage[i] = critByschool[i];
-
-                // Drill-down: which specific spells contributed crit, so we can see
-                // whether the gap to vanilla's reference is a missing input vs a
-                // formula bug. Filter SpellAuraEffects to crit-only entries (auras
-                // 57/71) and report any such spell we found in equipment, auras, or
-                // spellbook with its base points and (for school-masked) the schools
-                // it touches.
-                var critContribs = new System.Collections.Generic.List<object>();
-                void AddIfCrit(uint sid, string source)
-                {
-                    if (!GameData.SpellAuraEffects.TryGetValue(sid, out var effects))
-                        return;
-                    foreach (var eff in effects)
-                    {
-                        if (eff.AuraType == 57 || eff.AuraType == 71)
-                        {
-                            critContribs.Add(new
-                            {
-                                spell_id = sid,
-                                source,
-                                aura = (int)eff.AuraType,
-                                base_points = eff.BasePoints,
-                                misc_value = eff.MiscValue,
-                            });
-                        }
-                    }
-                }
-                foreach (var sid in GetSession().GameState.CurrentPlayerKnownSpells)
-                    AddIfCrit(sid, "spellbook");
-                foreach (var sid in GetSession().GameState.CurrentPlayerAuraSpellIds)
-                {
-                    if (sid != 0)
-                        AddIfCrit(sid, "active_aura");
-                }
-                foreach (int itemId in GetSession().GameState.CurrentEquippedItemIds)
-                {
-                    if (itemId <= 0) continue;
-                    var tmpl = GameData.GetItemTemplate((uint)itemId);
-                    if (tmpl == null) continue;
-                    for (int t = 0; t < tmpl.TriggeredSpellIds.Length; t++)
-                    {
-                        if (tmpl.TriggeredSpellIds[t] > 0 && tmpl.TriggeredSpellTypes[t] == 1)
-                            AddIfCrit((uint)tmpl.TriggeredSpellIds[t], $"item:{itemId}");
-                    }
-                }
-
-                Log.Event("stats.spell_crit.synthesized", new
-                {
-                    player_class = GetSession().GameState.CurrentPlayerClass,
-                    player_level = GetSession().GameState.CurrentPlayerLevel,
-                    player_intellect = GetSession().GameState.CurrentPlayerIntellect,
-                    crit_per_school = critByschool,
-                    known_spell_count = GetSession().GameState.CurrentPlayerKnownSpells.Count,
-                    crit_contributions = critContribs,
-                });
 
                 // JimsProxy: synthesize melee/ranged Hit Chance. Vanilla 1.12 has no
                 // UiHitModifier-equivalent field — Kronos can't push a value the modern
@@ -3654,71 +3725,6 @@ public partial class WorldClient
                 // and stays a flat %.
                 const float SPELL_HIT_RATING_PER_PCT_L60 = 7.0f;
                 updateData.ActivePlayerData.UiSpellHitModifier = spellHitMod * SPELL_HIT_RATING_PER_PCT_L60;
-
-                // Drill-down: which spells contributed (aura 54 melee/ranged hit, 55 spell
-                // hit). Also surface every aura *effect* on the player's spell IDs so we can
-                // see whether a talent uses aura 107 SPELLMOD (client computes itself, not
-                // here) or some other type we haven't wired up.
-                var hitContribs = new System.Collections.Generic.List<object>();
-                var spellHitContribs = new System.Collections.Generic.List<object>();
-                var unmappedAuras = new System.Collections.Generic.List<object>();
-                void AddContribsForSpell(uint sid, string source)
-                {
-                    if (!GameData.SpellAuraEffects.TryGetValue(sid, out var effects))
-                        return;
-                    foreach (var eff in effects)
-                    {
-                        if (eff.AuraType == 54)
-                        {
-                            hitContribs.Add(new { spell_id = sid, source, base_points = eff.BasePoints });
-                        }
-                        else if (eff.AuraType == 55)
-                        {
-                            spellHitContribs.Add(new { spell_id = sid, source, base_points = eff.BasePoints });
-                        }
-                        else if (eff.AuraType == 107 && (eff.MiscValue == 16 || eff.MiscValue == 24))
-                        {
-                            // SPELLMOD with miscValue 16 (HIT_CHANCE) or 24 (RESIST_MISS_CHANCE)
-                            // — these are talent spell-hit modifiers (Mage Elemental Precision,
-                            // Lightning Mastery etc.). Modern client computes them itself.
-                            unmappedAuras.Add(new { spell_id = sid, source, aura = (int)eff.AuraType, base_points = eff.BasePoints, misc_value = eff.MiscValue });
-                        }
-                    }
-                }
-                foreach (var sid in GetSession().GameState.CurrentPlayerKnownSpells)
-                    AddContribsForSpell(sid, "spellbook");
-                foreach (var sid in GetSession().GameState.CurrentPlayerAuraSpellIds)
-                {
-                    if (sid != 0)
-                        AddContribsForSpell(sid, "active_aura");
-                }
-                foreach (int itemId in GetSession().GameState.CurrentEquippedItemIds)
-                {
-                    if (itemId <= 0) continue;
-                    var tmpl = GameData.GetItemTemplate((uint)itemId);
-                    if (tmpl == null) continue;
-                    for (int t = 0; t < tmpl.TriggeredSpellIds.Length; t++)
-                    {
-                        if (tmpl.TriggeredSpellIds[t] > 0 && tmpl.TriggeredSpellTypes[t] == 1)
-                            AddContribsForSpell((uint)tmpl.TriggeredSpellIds[t], $"item:{itemId}");
-                    }
-                }
-
-                int rangedItemId = 0;
-                if (GetSession().GameState.CurrentEquippedItemIds.Length > 18)
-                    rangedItemId = GetSession().GameState.CurrentEquippedItemIds[18];
-                Log.Event("stats.ranged.snapshot", new
-                {
-                    player_class = GetSession().GameState.CurrentPlayerClass,
-                    ranged_crit_percentage = updateData.ActivePlayerData.RangedCritPercentage,
-                    ui_hit_modifier_synth = hitMod,
-                    ui_spell_hit_modifier_synth = spellHitMod,
-                    hit_contributions = hitContribs,
-                    spell_hit_contributions = spellHitContribs,
-                    spellmod_hit_auras = unmappedAuras,
-                    ranged_attack_power = updateData.UnitData.RangedAttackPower,
-                    ranged_slot_item_id = rangedItemId,
-                });
             }
             int PLAYER_FIELD_MOD_TARGET_RESISTANCE = LegacyVersion.GetUpdateField(PlayerField.PLAYER_FIELD_MOD_TARGET_RESISTANCE);
             if (PLAYER_FIELD_MOD_TARGET_RESISTANCE >= 0 && updateMaskArray[PLAYER_FIELD_MOD_TARGET_RESISTANCE])

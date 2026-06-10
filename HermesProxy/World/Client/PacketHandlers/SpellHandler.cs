@@ -402,6 +402,17 @@ public partial class WorldClient
                     spell_id = pendingCast.SpellId,
                     client_cast_id = pendingCast.ClientGUID.ToString(),
                 });
+                // DIAGNOSTIC (stuck-spell investigation): remove when closed
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("cast.movement_resolved", new
+                    {
+                        spell_id = pendingCast.SpellId,
+                        resolved_via = "cast_failed",
+                        ms_from_mark = pendingCast.MarkedAtTickMs > 0
+                            ? Environment.TickCount64 - pendingCast.MarkedAtTickMs
+                            : 0L,
+                        client_cast_id = pendingCast.ClientGUID.ToString(),
+                    });
             }
             else if (!pendingCast.HasStarted)
             {
@@ -1015,6 +1026,20 @@ public partial class WorldClient
             else
                 castId = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, spellId, spellId + casterUnit.GetCounter());
             spellVisual = GameData.GetSpellVisual(spellId);
+
+            // DIAGNOSTIC (stuck-spell investigation): remove when closed
+            // Local-player SPELL_FAILURE that found no matching pending cast — the proxy
+            // is about to forward a SpellFailure with a deterministic CastID that the
+            // 1.14 client has no live cast to match against. Captured here so we can
+            // measure how often Cascade B (lag flood / preemptive sweep) produces these.
+            if (casterIsLocalPlayer && !foundActiveCastId && Framework.Settings.DebugOutput)
+                Log.Event("cast.unmatched_failure_forwarded", new
+                {
+                    packet_type = "spell_failure",
+                    spell_id = spellId,
+                    reason,
+                    pending_queue_depth = GetSession().GameState.PendingNormalCasts.Count,
+                });
         }
 
         byte broadcastReason = overrideReasonForLocalBroadcast ? (byte)SpellCastResultClassic.DontReport : reason;
@@ -1156,6 +1181,9 @@ public partial class WorldClient
         });
     }
 
+    // JimsProxy (observed-bow): forwarding an observed ranged auto-repeat SPELL_START (Auto Shot/Shoot) latches the 1.14 client's intrinsic auto-repeat aim (spell 75 = SPELL_ATTR2_AUTO_REPEAT, no client SpellVisual) and nothing retracts it for observers (SPELL_GO / SPELL_FAILURE / SPELL_FAILED_OTHER / CANCEL_AUTO_REPEAT / a SheatheState push were all verified non-working in-client — SheatheState only stows the weapon, leaving the arms locked in the aim). So we hold each observed auto-repeat START here and replay it paired with its SPELL_GO (HandleSpellGo) only when the shot fires — the draw shows for shots that fire, and a shot that aborts (no GO) is never forwarded, so it can't stick. Held per caster; touched only on the WorldClient ReceiveLoop (HandleSpellStart/Go), so no lock needed.
+    private readonly Dictionary<WowGuid128, SpellStart> _pendingObservedAutoRepeatStart = new();
+
     [PacketHandler(Opcode.SMSG_SPELL_START)]
     void HandleSpellStart(WorldPacket packet)
     {
@@ -1211,8 +1239,21 @@ public partial class WorldClient
             // Clear non-started casts and send failures for them
             // (keeps the started cast so SPELL_GO can dequeue it)
             var failedCasts = GetSession().GameState.ClearNonStartedNormalCasts();
+            // DIAGNOSTIC (stuck-spell investigation): hoist toggle read; remove with diagnostics
+            bool debugEventsNormal = Framework.Settings.DebugOutput;
             foreach (var failed in failedCasts)
+            {
                 GetSession().InstanceSocket.SendCastRequestFailed(failed, false);
+                // DIAGNOSTIC (stuck-spell investigation): remove when closed
+                if (debugEventsNormal)
+                    Log.Event("cast.non_started_swept", new
+                    {
+                        queue = "normal",
+                        spell_id = failed.SpellId,
+                        triggering_spell_id = (uint)spell.Cast.SpellID,
+                        client_cast_id = failed.ClientGUID.ToString(),
+                    });
+            }
         }
         bool petCastWasPlayerPressed = false;
         if (casterIsLocalPet &&
@@ -1231,8 +1272,21 @@ public partial class WorldClient
 
             // Clear non-started pet casts and send failures for them
             var failedPetCasts = GetSession().GameState.ClearNonStartedPetCasts();
+            // DIAGNOSTIC (stuck-spell investigation): hoist toggle read; remove with diagnostics
+            bool debugEventsPet = Framework.Settings.DebugOutput;
             foreach (var failed in failedPetCasts)
+            {
                 GetSession().InstanceSocket.SendCastRequestFailed(failed, true);
+                // DIAGNOSTIC (stuck-spell investigation): remove when closed
+                if (debugEventsPet)
+                    Log.Event("cast.non_started_swept", new
+                    {
+                        queue = "pet",
+                        spell_id = failed.SpellId,
+                        triggering_spell_id = (uint)spell.Cast.SpellID,
+                        client_cast_id = failed.ClientGUID.ToString(),
+                    });
+            }
         }
 
         // JimsProxy: suppress SMSG_SPELL_START forward for the LOCAL player/pet's INSTANT
@@ -1320,7 +1374,33 @@ public partial class WorldClient
             return;
         }
 
-        SendPacketToClient(spell);
+        // Cannibalize channel (20578): the 1.12 server triggers this as a
+        // sub-spell of wrapper 20577. No CMSG_CAST_SPELL was sent for 20578,
+        // so the pending-cast queue has no entry — SPELL_START arrives at the
+        // client with an unmapped CastID (no SpellPrepare), corrupting the
+        // animation dispatcher for all subsequent cast-time spells.
+        // Channel functionality is preserved via MSG_CHANNEL_START +
+        // UNIT_CHANNEL_SPELL; SPELL_GO 20577 still drives the GCD synth.
+        if (spell.Cast.SpellID == 20578 && (casterIsLocalPlayer || casterIsLocalPet))
+        {
+            Log.Event("spell.start.suppressed_cannibalize_channel", new
+            {
+                spell_id = spell.Cast.SpellID,
+                spell_visual_id = spell.Cast.SpellXSpellVisualID,
+            });
+            return;
+        }
+
+        // JimsProxy (observed-bow): hold the observed Auto Shot/Shoot SPELL_START; HandleSpellGo replays it paired with the GO so the draw shows only for shots that fire. Forwarding it standalone latches the client's auto-repeat aim with no way to retract it.
+        if (!casterIsLocalPlayer && !casterIsLocalPet && isRangedAutoAttack)
+        {
+            _pendingObservedAutoRepeatStart[spell.Cast.CasterUnit] = spell;
+            Log.Event("ranged.auto_repeat.start_held", new { caster_low = spell.Cast.CasterUnit.GetCounter(), spell_id = spell.Cast.SpellID });
+        }
+        else
+        {
+            SendPacketToClient(spell);
+        }
 
         // JimsProxy HealComm bridge: when local player begins a resurrection
         // cast, synthesize HC-1.0 "Resurrection/{name}/start/" addon outbound
@@ -1369,6 +1449,20 @@ public partial class WorldClient
             // contents so the next hit gives us bytes to fix the parser.
             LogSpellStartGoParseFailure(packet, e, isSpellGo: true);
             DrainOrphanedStartedNormalCastsOnParseFailure(isSpellGo: true);
+            return;
+        }
+
+        // Cannibalize channel (20578): matching the SPELL_START suppression.
+        // No pending-cast entry exists for 20578, so all dequeue/GCD paths
+        // below are no-ops. GCD is driven by SPELL_GO 20577 (the wrapper).
+        if (spell.Cast.SpellID == 20578 &&
+            (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit ||
+             GetSession().GameState.CurrentPetGuid == spell.Cast.CasterUnit))
+        {
+            Log.Event("spell.go.suppressed_cannibalize_channel", new
+            {
+                spell_id = spell.Cast.SpellID,
+            });
             return;
         }
 
@@ -1618,6 +1712,17 @@ public partial class WorldClient
             });
             spell.Cast.CasterGUID = stunTarget;
             spell.Cast.CasterUnit = stunTarget;
+        }
+
+        // JimsProxy (observed-bow): replay this observed caster's held auto-repeat START now, paired to this GO (CastID-matched) so the client renders a complete draw+fire. A held START whose GO never arrives is never forwarded, so it can't latch the aim.
+        if (spell.Cast.CasterUnit != GetSession().GameState.CurrentPlayerGuid
+            && spell.Cast.CasterUnit != GetSession().GameState.CurrentPetGuid
+            && GameData.AutoRepeatSpells.Contains((uint)spell.Cast.SpellID)
+            && _pendingObservedAutoRepeatStart.Remove(spell.Cast.CasterUnit, out var heldStart))
+        {
+            heldStart.Cast.CastID = spell.Cast.CastID;
+            SendPacketToClient(heldStart);
+            Log.Event("ranged.auto_repeat.start_replayed", new { caster_low = spell.Cast.CasterUnit.GetCounter(), spell_id = spell.Cast.SpellID });
         }
 
         SendPacketToClient(spell);
@@ -2365,33 +2470,16 @@ public partial class WorldClient
             }
         }
 
-        ComputeOverHealFromCache(spell.TargetGUID, spell.HealAmount, wireHasOverheal,
-            out uint computedOverHeal, out bool cacheHit, out int cachedHp, out int cachedMaxHp);
+        uint computedOverHeal = ComputeOverHealFromCache(spell.TargetGUID, spell.HealAmount, wireHasOverheal);
         if (!wireHasOverheal)
             spell.OverHeal = computedOverHeal;
-
-        Log.Event("combat.heal.log", new
-        {
-            spell_id = spell.SpellID,
-            target = spell.TargetGUID.ToString(),
-            caster = spell.CasterGUID.ToString(),
-            heal_amount = spell.HealAmount,
-            over_heal_sent = spell.OverHeal,
-            absorbed_sent = spell.Absorbed,
-            crit = spell.Crit,
-            wire_has_overheal = wireHasOverheal,
-            wire_has_absorbed = wireHasAbsorbed,
-            cache_hit = cacheHit,
-            cached_hp = cachedHp,
-            cached_max_hp = cachedMaxHp,
-        });
 
         SendPacketToClient(spell);
 
         // Threat translation: heal threat = 0.5 x effective heal, distributed
-        // across every mob in combat with the heal target. Overheal generates
-        // no threat — feed only the effective amount.
-        long effectiveHeal = (long)spell.HealAmount - (long)spell.OverHeal;
+        // across every mob in combat with the heal target. Overheal AND absorbed
+        // generate no threat — feed only the amount that actually landed on hp.
+        long effectiveHeal = (long)spell.HealAmount - (long)spell.OverHeal - (long)spell.Absorbed;
         if (effectiveHeal > 0)
         {
             GetSession().ThreatTracker.OnHeal(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, effectiveHeal);
@@ -2405,35 +2493,25 @@ public partial class WorldClient
     // back-to-back heals (faster than UPDATE_OBJECT can resync) compute accurately.
     // If the cache has no entry for the target (e.g., never received a UPDATE_OBJECT
     // for them), we leave overheal at 0 and don't touch the cache.
-    private void ComputeOverHealFromCache(
-        WowGuid128 target, int healAmount, bool wireHadOverheal,
-        out uint computedOverHeal, out bool cacheHit, out int cachedHp, out int cachedMaxHp)
+    private uint ComputeOverHealFromCache(WowGuid128 target, int healAmount, bool wireHadOverheal)
     {
-        computedOverHeal = 0;
-        cacheHit = false;
-        cachedHp = 0;
-        cachedMaxHp = 0;
-
         if (wireHadOverheal || healAmount <= 0)
-            return;
+            return 0;
 
         var cache = GetSession().GameState.UnitHealthCache;
         if (!cache.TryGetValue(target, out var state) || state.MaxHp <= 0)
-            return;
-
-        cacheHit = true;
-        cachedHp = state.Hp;
-        cachedMaxHp = state.MaxHp;
+            return 0;
 
         int missing = state.MaxHp - state.Hp;
         if (missing < 0) missing = 0;
         int effective = Math.Min(healAmount, missing);
         int overheal = healAmount - effective;
-        computedOverHeal = (uint)overheal;
 
         int newHp = state.Hp + effective;
         if (newHp > state.MaxHp) newHp = state.MaxHp;
         cache[target] = (newHp, state.MaxHp);
+
+        return (uint)overheal;
     }
 
     [PacketHandler(Opcode.SMSG_SPELL_PERIODIC_AURA_LOG)]
@@ -2506,25 +2584,9 @@ public partial class WorldClient
                         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_1_2_9901))
                             effect.Crit = packet.ReadBool();
 
-                        ComputeOverHealFromCache(spell.TargetGUID, effect.Amount, wireHasOverhealHot,
-                            out uint computedOverHealHot, out bool cacheHitHot, out int cachedHpHot, out int cachedMaxHotHp);
+                        uint computedOverHealHot = ComputeOverHealFromCache(spell.TargetGUID, effect.Amount, wireHasOverhealHot);
                         if (!wireHasOverhealHot)
                             effect.OverHealOrKill = computedOverHealHot;
-
-                        Log.Event("combat.heal.periodic", new
-                        {
-                            spell_id = spell.SpellID,
-                            target = spell.TargetGUID.ToString(),
-                            caster = spell.CasterGUID.ToString(),
-                            aura = aura.ToString(),
-                            amount = effect.Amount,
-                            over_heal_sent = effect.OverHealOrKill,
-                            crit = effect.Crit,
-                            wire_has_overheal = wireHasOverhealHot,
-                            cache_hit = cacheHitHot,
-                            cached_hp = cachedHpHot,
-                            cached_max_hp = cachedMaxHotHp,
-                        });
 
                         spell.Effects.Add(effect);
                         break;
@@ -2576,10 +2638,26 @@ public partial class WorldClient
         }
         if (hotHeal > 0)
         {
-            // HoT ticks don't carry overheal info on the wire, so we feed
-            // the raw amount. Slight overcount when the target is at max hp;
-            // acceptable at this stage.
-            GetSession().ThreatTracker.OnHeal(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, hotHeal);
+            // HoT ticks don't carry overheal on the wire; compute it from the
+            // unit HP cache so a Rejuv tick on a topped-off target produces
+            // 0 threat instead of full-tick threat (resto-druid raid healing).
+            uint hotOverheal = ComputeOverHealFromCache(spell.TargetGUID, (int)hotHeal, wireHadOverheal: false);
+            double effectiveHotHeal = hotHeal - hotOverheal;
+            if (effectiveHotHeal > 0)
+                GetSession().ThreatTracker.OnHeal(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, effectiveHotHeal);
+        }
+
+        // Periodic energize threat (Spirit Tap, Innervate, Mana Tide ticks,
+        // Vampiric Embrace mana-return). Each effect can carry its own
+        // power type via SchoolMaskOrPower — process per-effect rather than
+        // summing.
+        foreach (var effect in spell.Effects)
+        {
+            if (effect.Effect == (uint)AuraType.PeriodicEnergize && effect.Amount > 0)
+            {
+                var powerType = (PowerType)effect.SchoolMaskOrPower;
+                GetSession().ThreatTracker.OnEnergize(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, powerType, effect.Amount);
+            }
         }
     }
 
@@ -2593,6 +2671,11 @@ public partial class WorldClient
         spell.Type = (PowerType)packet.ReadUInt32();
         spell.Amount = packet.ReadInt32();
         SendPacketToClient(spell);
+
+        // Threat translation: energize generates caster-side threat per LTC2
+        // (mana ×0.5, others ×5). Server pre-caps amount to actual gain so
+        // zero-gain energizes don't reach us.
+        GetSession().ThreatTracker.OnEnergize(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, spell.Type, spell.Amount);
     }
 
     [PacketHandler(Opcode.SMSG_SPELL_DELAYED)]
@@ -2997,7 +3080,10 @@ public partial class WorldClient
             {
                 GetSession().GameState.GetAuraDuration(target, slot, out durationLeft, out durationFull);
                 if (durationFull <= 0)
-                    durationFull = GameData.GetAuraSpellDuration(spellId);
+                {
+                    int? talentDur = GameData.TryGetTalentDuration(spellId, GetSession().GameState.CurrentPlayerKnownSpells);
+                    durationFull = talentDur ?? GameData.GetAuraSpellDuration(spellId);
+                }
             }
 
             if (durationFull > 0)

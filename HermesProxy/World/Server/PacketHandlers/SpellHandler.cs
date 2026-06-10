@@ -156,6 +156,20 @@ public partial class WorldSocket
         // a fast-clicker at login could otherwise be blocked from legitimate casts.
         var knownSpellsForCastGuard = GetSession().GameState.CurrentPlayerKnownSpells;
         uint guardSpellId = (uint)cast.Cast.SpellID;
+
+        // DIAGNOSTIC (stuck-checked-button investigation): log every CMSG_CAST_SPELL the
+        // moment it's received, before any gate. Presses are otherwise only logged once
+        // they're forwarded / held / dropped, so a press the client sends that gets
+        // suppressed or swallowed earlier leaves no spell_id trace — which blocked the
+        // Retaliation stuck-lit investigation (no 20230 anywhere in the session despite a
+        // reported press). Gated behind DebugOutput. Remove when that investigation closes.
+        if (Framework.Settings.DebugOutput)
+            Log.Event("cast.received", new
+            {
+                spell_id = guardSpellId,
+                client_cast_id = cast.Cast.CastID.ToString(),
+            });
+
         if (knownSpellsForCastGuard.Count > 0 && !knownSpellsForCastGuard.Contains(guardSpellId))
         {
             Log.Event("spell.cast.blocked_unknown_spell", new
@@ -180,6 +194,8 @@ public partial class WorldSocket
         // leak would block every subsequent cast until the user happened to retrigger
         // the same spell that's leaked, which is unintuitive and looks like a freeze.
         GetSession().RunWatchdogEviction();
+
+        SyncLegacyServerPositionBeforeCast(cast.Cast, source: "spell_cast");
 
         if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
             GetSession().GameState.LastDispellSpellId = (uint)cast.Cast.SpellID;
@@ -287,6 +303,9 @@ public partial class WorldSocket
             castRequest.ClientGUID = cast.Cast.CastID;
             castRequest.TargetGuid = cast.Cast.Target.Unit;
             castRequest.ServerGUID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, cast.Cast.SpellID, 10000 + cast.Cast.CastID.GetCounter());
+            // Tag for the non-started-cast sweep: off-GCD casts must survive an unrelated
+            // normal cast's SPELL_START (see ClearNonStartedNormalCasts / IsOffGcd).
+            castRequest.IsOffGcd = isOffGcd;
 
             // JimsProxy (issue #43): off-GCD spells (Sprint, Evasion, Trinket, racials, etc)
             // bypass both the HasStartedNormalCast cast-bar gate and the GCD hold path. A real
@@ -299,6 +318,15 @@ public partial class WorldSocket
                 // for players with very low RTT.
                 if (Settings.LowLatencyMode)
                 {
+                    // DIAGNOSTIC (stuck-spell investigation): remove when closed
+                    if (Framework.Settings.DebugOutput)
+                        Log.Event("cast.forwarded", new
+                        {
+                            spell_id = cast.Cast.SpellID,
+                            client_cast_id = castRequest.ClientGUID.ToString(),
+                            queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
+                            source = "low_latency",
+                        });
                     lock (GetSession().GameState.PendingCastsLock)
                     {
                         GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
@@ -322,6 +350,30 @@ public partial class WorldSocket
                         reason = "in_flight_same_spell",
                         client_cast_id = cast.Cast.CastID.ToString(),
                         queue_depth = GetSession().GameState.PendingNormalCasts.Count,
+                    });
+                    SendCastFailedWithoutPrepare(castRequest);
+                    return;
+                }
+
+                // JimsProxy (issue #334): GameObject-Opening chain-cast race. If the player
+                // spam-clicks the same GO at the end of a cast, the held cast is released 1ms
+                // after SPELL_GO and lands at the server before its OnUse script can fire the
+                // loot-creating subspell FROM the player (e.g. spell 15343 "Create Whipper Root
+                // Tubers", ~440ms after SPELL_GO). The chain cast occupies the player's slot,
+                // the subspell fails, and the item is silently lost while the GO is consumed.
+                // GOs are one-shot interactions — a second cast on the same GO never delivers
+                // a second item even on a clean run. Drop the chain press silently here so it
+                // never enters the hold-and-replay path. Different-GO chains and mining/herb
+                // chain casts (loot delivered directly via SMSG_LOOT_RESPONSE, no script
+                // subspell) are unaffected.
+                WowGuid128 newPressTarget = cast.Cast.Target.Unit;
+                if (GetSession().GameState.HasStartedCastOnGameObject(newPressTarget))
+                {
+                    Log.Event("cast.dropped.go_in_flight", new
+                    {
+                        spell_id = cast.Cast.SpellID,
+                        target_low = newPressTarget.GetCounter(),
+                        client_cast_id = castRequest.ClientGUID.ToString(),
                     });
                     SendCastFailedWithoutPrepare(castRequest);
                     return;
@@ -457,12 +509,30 @@ public partial class WorldSocket
                 }
 
                 // Enqueue the cast - responses will be matched by SpellId in FIFO order
+                // DIAGNOSTIC (stuck-spell investigation): remove when closed
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("cast.forwarded", new
+                    {
+                        spell_id = cast.Cast.SpellID,
+                        client_cast_id = castRequest.ClientGUID.ToString(),
+                        queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
+                        source = "immediate",
+                    });
                 GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
             }
             else
             {
                 // Off-GCD path: still enqueue so SMSG_SPELL_GO can match back to the ClientGUID,
                 // but skip the cast-bar gate and the GCD hold.
+                // DIAGNOSTIC (stuck-spell investigation): remove when closed
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("cast.forwarded", new
+                    {
+                        spell_id = cast.Cast.SpellID,
+                        client_cast_id = castRequest.ClientGUID.ToString(),
+                        queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
+                        source = "off_gcd",
+                    });
                 GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
 
                 // Off-GCD spells bypass the hold system, so SpellPrepare must be sent now
@@ -483,6 +553,104 @@ public partial class WorldSocket
     }
 
     /// <summary>
+    /// MIRASU (cast-while-moving-out-of-range 2026-05-23): reticle-targeted spells
+    /// (Distract, Goblin Sapper Charge, Iron Grenade, Flare, etc.) fail with
+    /// SpellCastResult.OutOfRange when cast at max range while the player is moving.
+    /// The modern 1.14 CMSG_CAST_SPELL / CMSG_USE_ITEM packets carry a MoveUpdate with
+    /// the client's current position; the legacy 1.12 protocol's CMSG_CAST_SPELL has
+    /// no movement info, so the server uses its last-known position for the
+    /// caster-to-dest range check. Because periodic movement heartbeats run on
+    /// ~500 ms intervals, the legacy server's view of the player position can lag
+    /// ~hundreds of ms behind the client when the cast lands — at max range that's
+    /// enough to fail the range check by a few yards. Native 1.12 clients don't hit
+    /// this because they compute the dest position from the same lagged server-side
+    /// position the engine uses for everything.
+    ///
+    /// Fix: when MoveUpdate is present, fan it out to the legacy server as
+    /// MSG_MOVE_HEARTBEAT first so the server's position view is in sync with
+    /// whatever position the client used to pick the dest. The heartbeat is the
+    /// cheapest movement opcode (no flag transitions, no state-machine effects) so
+    /// it's safe to inject ad-hoc. Channeled spells still get correctly interrupted
+    /// by ongoing movement because the heartbeat carries the moving MovementFlags;
+    /// only the range check benefits.
+    /// </summary>
+    private void SyncLegacyServerPositionBeforeCast(SpellCastRequest castRequest, string source)
+    {
+        if (castRequest.MoveUpdate == null)
+            return;
+
+        bool hasUnitTarget = !castRequest.Target.Unit.IsEmpty()
+            && castRequest.Target.Unit != GetSession().GameState.CurrentPlayerGuid;
+        bool hasDstLocation = castRequest.Target.DstLocation != null;
+
+        if (!hasUnitTarget && !hasDstLocation)
+            return;
+
+        try
+        {
+            uint heartbeatOpcode = Opcodes.GetOpcodeValueForVersion("MSG_MOVE_HEARTBEAT", Framework.Settings.ServerBuild);
+            if (heartbeatOpcode != 0)
+            {
+                WorldPacket hb = new WorldPacket(heartbeatOpcode);
+                if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_2_0_10192))
+                    hb.WritePackedGuid(castRequest.MoverGUID.To64());
+                castRequest.MoveUpdate.WriteMovementInfoLegacy(hb);
+                SendPacketToServer(hb);
+            }
+
+            if (hasDstLocation)
+            {
+                var player = castRequest.MoveUpdate.Position;
+                var dest = castRequest.Target.DstLocation!.Location;
+                float dx = dest.X - player.X;
+                float dy = dest.Y - player.Y;
+                float dz = dest.Z - player.Z;
+                float distance = MathF.Sqrt(dx * dx + dy * dy + dz * dz);
+
+                if (distance > 15f)
+                {
+                    const float nudge = 1.5f;
+                    float scale = (distance - nudge) / distance;
+                    var nudgedDest = new Vector3(
+                        player.X + dx * scale,
+                        player.Y + dy * scale,
+                        player.Z + dz * scale);
+                    castRequest.Target.DstLocation.Location = nudgedDest;
+
+                    Log.Event("cast.move_sync_for_reticle", new
+                    {
+                        source,
+                        spell_id = (uint)castRequest.SpellID,
+                        original_dist = distance,
+                        nudge_yards = nudge,
+                        player_x = player.X,
+                        player_y = player.Y,
+                        player_z = player.Z,
+                        original_dest_x = dest.X,
+                        original_dest_y = dest.Y,
+                        original_dest_z = dest.Z,
+                        nudged_dest_x = nudgedDest.X,
+                        nudged_dest_y = nudgedDest.Y,
+                        nudged_dest_z = nudgedDest.Z,
+                    });
+                }
+            }
+            else
+            {
+                Log.Event("cast.move_sync_for_unit_target", new
+                {
+                    source,
+                    spell_id = (uint)castRequest.SpellID,
+                    target = castRequest.Target.Unit.GetCounter(),
+                });
+            }
+        }
+        catch
+        {
+            // Best-effort sync; never block a legitimate cast over a position-sync failure.
+        }
+    }
+
     /// JimsProxy (issue #43): build the outbound CMSG_CAST_SPELL wire packet from a CastSpell.
     /// Extracted so the GCD hold path can construct the packet up front and the timer callback
     /// can send it verbatim when the GCD expires.
@@ -527,6 +695,15 @@ public partial class WorldSocket
             return;
 
         var gameState = GetSession().GameState;
+        // DIAGNOSTIC (stuck-spell investigation): remove when closed
+        if (Framework.Settings.DebugOutput)
+            Log.Event("cast.forwarded", new
+            {
+                spell_id = cast.SpellId,
+                client_cast_id = cast.ClientGUID.ToString(),
+                queue_depth_before = gameState.PendingNormalCasts.Count,
+                source = "held_gcd_release",
+            });
         lock (gameState.PendingCastsLock)
         {
             gameState.PendingNormalCasts.Enqueue(cast);
@@ -561,6 +738,15 @@ public partial class WorldSocket
         }
 
         // Enqueue the cast - responses will be matched by SpellId in FIFO order
+        // DIAGNOSTIC (stuck-spell investigation): remove when closed
+        if (Framework.Settings.DebugOutput)
+            Log.Event("cast.forwarded", new
+            {
+                spell_id = cast.Cast.SpellID,
+                client_cast_id = castRequest.ClientGUID.ToString(),
+                queue_depth_before = GetSession().GameState.PendingPetCasts.Count,
+                source = "pet",
+            });
         GetSession().GameState.PendingPetCasts.Enqueue(castRequest);
 
         SpellCastTargetFlags targetFlags = ConvertSpellTargetFlags(cast.Cast.Target);
@@ -613,7 +799,21 @@ public partial class WorldSocket
             castRequest.LegacySpellId = legacySpellId;
 
         // Enqueue the cast - responses will be matched by SpellId (or LegacySpellId) in FIFO order
+        // DIAGNOSTIC (stuck-spell investigation): remove when closed
+        if (Framework.Settings.DebugOutput)
+            Log.Event("cast.forwarded", new
+            {
+                spell_id = use.Cast.SpellID,
+                client_cast_id = castRequest.ClientGUID.ToString(),
+                queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
+                source = "item",
+            });
         GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
+
+        // MIRASU (cast-while-moving-out-of-range 2026-05-23): sync server position
+        // for reticle-targeted item uses (bombs, sapper charge, grenades). See
+        // SyncLegacyServerPositionBeforeCast docs for the full explanation.
+        SyncLegacyServerPositionBeforeCast(use.Cast, source: "use_item");
 
         WorldPacket packet = new WorldPacket(Opcode.CMSG_USE_ITEM);
         byte containerSlot = use.PackSlot != Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(use.PackSlot) : use.PackSlot;

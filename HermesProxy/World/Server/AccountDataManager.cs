@@ -297,35 +297,42 @@ public class AccountDataManager
 
     public AccountData? LoadData(WowGuid128 guid, uint type)
     {
-        AccountData? data = null;
         string fileName = GetFullFileName(guid, type);
+        if (!File.Exists(fileName))
+            return null;
 
-        if (File.Exists(fileName))
+        try
         {
-            using (FileStream file = File.OpenRead(GetFullFileName(guid, type)))
+            using BinaryReader reader = new BinaryReader(File.OpenRead(fileName));
+            AccountData data = new();
+            ulong guidLow = reader.ReadUInt64();
+            ulong guidHigh = reader.ReadUInt64();
+            data.Guid = new WowGuid128(guidLow, guidHigh);
+
+            if (!IsGlobalDataType(type) && guid != data.Guid)
             {
-                using (BinaryReader reader = new BinaryReader(File.OpenRead(GetFullFileName(guid, type))))
-                {
-                    data = new();
-                    ulong guidLow = reader.ReadUInt64();
-                    ulong guidHigh = reader.ReadUInt64();
-                    data.Guid = new WowGuid128(guidLow, guidHigh);
-
-                    if (!IsGlobalDataType(type))
-                        System.Diagnostics.Trace.Assert(guid == data.Guid);
-
-                    data.Timestamp = reader.ReadInt64();
-                    data.Type = reader.ReadUInt32();
-                    System.Diagnostics.Trace.Assert(type == data.Type);
-                    data.UncompressedSize = reader.ReadUInt32();
-
-                    int compressedSize = reader.ReadInt32();
-                    data.CompressedData = reader.ReadBytes(compressedSize);
-                }
+                Log.Print(LogType.Warn, $"AccountData cache '{fileName}' has wrong GUID ({data.Guid} vs expected {guid}); discarding.");
+                return null;
             }
+
+            data.Timestamp = reader.ReadInt64();
+            data.Type = reader.ReadUInt32();
+            if (type != data.Type)
+            {
+                Log.Print(LogType.Warn, $"AccountData cache '{fileName}' has wrong type ({data.Type} vs expected {type}); discarding.");
+                return null;
+            }
+            data.UncompressedSize = reader.ReadUInt32();
+
+            int compressedSize = reader.ReadInt32();
+            data.CompressedData = reader.ReadBytes(compressedSize);
+            return data;
         }
-        
-        return data;
+        catch (Exception ex)
+        {
+            Log.Print(LogType.Warn, $"AccountData cache '{fileName}' is corrupt or unreadable ({ex.GetType().Name}: {ex.Message}); discarding. A fresh file will be written on next save.");
+            return null;
+        }
     }
 
     public void SaveData(WowGuid128 guid, long timestamp, uint type, uint uncompressedSize, byte[] compressedData)
@@ -341,7 +348,10 @@ public class AccountDataManager
         Data[type].UncompressedSize = uncompressedSize;
         Data[type].CompressedData = compressedData;
 
-        using (BinaryWriter writer = new BinaryWriter(File.Open(GetFullFileName(guid, type), FileMode.Create)))
+        string finalPath = GetFullFileName(guid, type);
+        string tempPath = finalPath + ".tmp";
+
+        using (BinaryWriter writer = new BinaryWriter(File.Open(tempPath, FileMode.Create)))
         {
             writer.Write(guid.GetLowValue());
             writer.Write(guid.GetHighValue());
@@ -351,6 +361,7 @@ public class AccountDataManager
             writer.Write(compressedData.Length);
             writer.Write(compressedData);
         }
+        File.Move(tempPath, finalPath, overwrite: true);
     }
 
     public byte[] LoadCUFProfiles()

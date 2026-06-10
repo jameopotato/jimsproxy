@@ -26,6 +26,92 @@ local function CreateDescription(parent, text, yOffset)
     return fs
 end
 
+local function CreateButton(parent, yOffset, label, width, tooltip)
+    local btn = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
+    btn:SetPoint("TOPLEFT", parent, "TOPLEFT", 16, yOffset)
+    btn:SetSize(width or 160, 24)
+    btn:SetText(label)
+    if tooltip then
+        btn:HookScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText(tooltip, 1, 1, 1, 1, true)
+            GameTooltip:Show()
+        end)
+        btn:HookScript("OnLeave", function() GameTooltip:Hide() end)
+    end
+    return btn
+end
+
+---------------------------------------------------------------------------
+-- Keyring cleanup: move non-key items out of the keyring into free bag slots.
+-- Older characters can have non-keys stuck in the keyring from a past client bug;
+-- the proxy now blocks new ones, this button clears existing ones. Keys (item
+-- class 13) are left in place. One move per timer tick so each settles server-side.
+---------------------------------------------------------------------------
+local KEYRING = (type(KEYRING_CONTAINER) == "number") and KEYRING_CONTAINER or -2
+
+local function KR_NumSlots(bag)
+    if C_Container and C_Container.GetContainerNumSlots then return C_Container.GetContainerNumSlots(bag) or 0 end
+    return (GetContainerNumSlots and GetContainerNumSlots(bag)) or 0
+end
+local function KR_ItemID(bag, slot)
+    if C_Container and C_Container.GetContainerItemID then return C_Container.GetContainerItemID(bag, slot) end
+    return GetContainerItemID and GetContainerItemID(bag, slot)
+end
+local function KR_Pickup(bag, slot)
+    if C_Container and C_Container.PickupContainerItem then return C_Container.PickupContainerItem(bag, slot) end
+    if PickupContainerItem then return PickupContainerItem(bag, slot) end
+end
+
+local function KR_IsNonKey(id)
+    if not id then return false end
+    local classID = select(6, GetItemInfoInstant(id))
+    if classID == nil then return false end -- unknown item: leave it alone
+    return classID ~= 13 -- 13 = Key
+end
+
+local function KR_FirstFreeBagSlot()
+    for bag = 0, 4 do
+        for slot = 1, KR_NumSlots(bag) do
+            if not KR_ItemID(bag, slot) then return bag, slot end
+        end
+    end
+end
+
+local KR_cleaning, KR_steps = false, 0
+local function KR_Step()
+    KR_steps = KR_steps + 1
+    if KR_steps > 40 then KR_cleaning = false; return end
+    for slot = 1, KR_NumSlots(KEYRING) do
+        if KR_IsNonKey(KR_ItemID(KEYRING, slot)) then
+            local bag, bslot = KR_FirstFreeBagSlot()
+            if not bag then
+                print("|cFF00FF00[JimsPlus]|r Keyring cleanup: bags are full - free a slot and click again.")
+                KR_cleaning = false
+                return
+            end
+            ClearCursor()
+            KR_Pickup(KEYRING, slot)
+            KR_Pickup(bag, bslot)
+            ClearCursor()
+            C_Timer.After(0.2, KR_Step)
+            return
+        end
+    end
+    if KR_cleaning then print("|cFF00FF00[JimsPlus]|r Keyring cleanup complete.") end
+    KR_cleaning = false
+end
+
+local function KR_StartCleanup()
+    if InCombatLockdown() then
+        print("|cFF00FF00[JimsPlus]|r Can't clean the keyring in combat.")
+        return
+    end
+    if KR_cleaning then return end
+    KR_cleaning, KR_steps = true, 0
+    KR_Step()
+end
+
 ---------------------------------------------------------------------------
 -- Panel
 ---------------------------------------------------------------------------
@@ -50,18 +136,29 @@ CreateDescription(panel, "These fix bugs in the 1.14 client when connected to a 
 y = y - 22
 
 local cbPetFix = CreateCheckbox(panel, y,
-    "Pet UI crash fix  |cFFFF6600(reload required)|r",
-    "Prevents Lua errors when opening the pet stats or stable UI.\nHunter pets from vanilla servers don't have a player class,\nwhich crashes the 1.14 client's FrameXML code.\n\nChanges take effect after /reload.")
+    "Pet UI crash fix  |cFF888888(always on)|r",
+    "Prevents Lua errors when opening the pet stats or stable UI.\nHunter pets from vanilla servers don't have a player class,\nwhich crashes the 1.14 client's FrameXML code.\n\nThis fix cannot be disabled — without it the pet UI is broken.")
+cbPetFix:SetChecked(true)
+cbPetFix:Disable()
+cbPetFix.Text:SetTextColor(0.5, 0.5, 0.5)
 y = y - 28
 
 local cbTaxiFix = CreateCheckbox(panel, y,
-    "Hide early-landing button",
-    "Hides the \"Stop at next flight path\" button during flights.\nVanilla servers don't support early landing — clicking it\ndoes nothing. This removes the misleading button.")
+    "Hide early-landing button  |cFF888888(always on)|r",
+    "Hides the \"Stop at next flight path\" button during flights.\nVanilla servers don't support early landing — clicking it\ndoes nothing.\n\nThis fix cannot be disabled — the button has no function on vanilla servers.")
+cbTaxiFix:SetChecked(true)
+cbTaxiFix:Disable()
+cbTaxiFix.Text:SetTextColor(0.5, 0.5, 0.5)
 y = y - 28
 
 local cbTooltipFix = CreateCheckbox(panel, y,
     "Off-class armor / weapon red text  |cFFFF6600(reload required)|r",
     "Recolors armor type and weapon type to red on item tooltips and vendor\nrows when your class can't use the item (e.g. \"Mail\" on a rogue, \"Plate\"\non a hunter), based on the proficiencies you've actually trained.\n\nThe 1.14 Classic Era client gets this signal from a hardcoded table\nthe proxy can't reach over the wire — this addon does the recolor\nclient-side.\n\nChanges take effect after /reload.")
+y = y - 28
+
+local cbMoonkinSound = CreateCheckbox(panel, y,
+    "Moonkin Form sound  |cFF888888(Druid only)|r",
+    "Gives Moonkin Form a distinct transformation sound instead\nof reusing the Bear Form sound.\n\nOnly affects Druid characters.")
 y = y - 40
 
 ---------------------------------------------------------------------------
@@ -76,7 +173,7 @@ local castbarUnits = {
     { key = "target",    label = "Target",     tooltip = "Shows what your current target is casting.\nEssential for interrupting enemy spells." },
     { key = "nameplate", label = "Nameplates",  tooltip = "Shows cast bars on nameplates above characters' heads.\nUseful in dungeons and PvP to see multiple casts at once." },
     { key = "focus",     label = "Focus",       tooltip = "Shows what your focus target is casting.\nUseful for watching a specific mob while targeting another." },
-    { key = "player",    label = "Player  |cFF888888(reskins Blizzard bar)|r", tooltip = "Replaces the default Blizzard cast bar with the JimsPlus style.\nPurely cosmetic — disable if you prefer the default look\nor use another cast bar addon." },
+    { key = "player",    label = "Player  |cFF888888(reskins Blizzard bar)|r", tooltip = "Replaces the default Blizzard cast bar with the JimsPlus style.\nAlso fixes incorrect icons on tradeskill craft bars.\n\nDisable if you prefer the default look or use another cast bar addon." },
     { key = "party",     label = "Party members", tooltip = "Shows cast bars on party member frames.\nUseful for seeing when your healer is casting." },
 }
 
@@ -87,13 +184,24 @@ for _, info in ipairs(castbarUnits) do
 end
 
 ---------------------------------------------------------------------------
+-- Tools
+---------------------------------------------------------------------------
+y = y - 12
+CreateHeader(panel, "Tools", y)
+y = y - 26
+local btnBagAudit = CreateButton(panel, y, "Bag Audit", 150,
+    "Moves non-key items out of your keyring and into your bags.\nUse it if a character has items stuck in the keyring from a past\nbug. Keys are left in place.")
+btnBagAudit:SetScript("OnClick", KR_StartCleanup)
+y = y - 30
+-- More tool buttons can be added below (decrement y per button).
+
+---------------------------------------------------------------------------
 -- Sync checkboxes from saved state
 ---------------------------------------------------------------------------
 local function RefreshCheckboxes()
     local db = namespace.db or JimsPlusDB or {}
-    cbPetFix:SetChecked(db.petFix == true)
-    cbTaxiFix:SetChecked(db.taxiFix == true)
     cbTooltipFix:SetChecked(db.tooltipFix == true)
+    cbMoonkinSound:SetChecked(db.moonkinSound ~= false)
 
     local cdb = JimsPlusCastbars and JimsPlusCastbars.db
     if cdb then
@@ -104,39 +212,34 @@ local function RefreshCheckboxes()
     end
 end
 panel:SetScript("OnShow", RefreshCheckboxes)
+panel.refresh = RefreshCheckboxes
 
 local initFrame = CreateFrame("Frame")
 initFrame:RegisterEvent("PLAYER_LOGIN")
 initFrame:SetScript("OnEvent", function()
-    RefreshCheckboxes()
+    -- Defer to next frame so CastBars.lua's PLAYER_LOGIN handler runs first
+    -- and populates JimsPlusCastbars.db before we read it.
+    C_Timer.After(0, RefreshCheckboxes)
     initFrame:UnregisterAllEvents()
 end)
 
 ---------------------------------------------------------------------------
 -- OnClick handlers
 ---------------------------------------------------------------------------
-cbPetFix:SetScript("OnClick", function(self)
-    local enabled = self:GetChecked() and true or false
-    if namespace.db then
-        namespace.db.petFix = enabled
-    end
-    print("|cFF00FF00[JimsPlus]|r Pet UI fix " .. (enabled and "enabled" or "disabled") .. ". Type /reload to apply.")
-end)
-
-cbTaxiFix:SetScript("OnClick", function(self)
-    local enabled = self:GetChecked() and true or false
-    if namespace.db then
-        namespace.db.taxiFix = enabled
-    end
-    print("|cFF00FF00[JimsPlus]|r Early-landing button " .. (enabled and "hidden" or "shown") .. ". Type /reload to apply.")
-end)
-
 cbTooltipFix:SetScript("OnClick", function(self)
     local enabled = self:GetChecked() and true or false
     if namespace.db then
         namespace.db.tooltipFix = enabled
     end
     print("|cFF00FF00[JimsPlus]|r Off-class armor red text " .. (enabled and "enabled" or "disabled") .. ". Type /reload to apply.")
+end)
+
+cbMoonkinSound:SetScript("OnClick", function(self)
+    local enabled = self:GetChecked() and true or false
+    if namespace.db then
+        namespace.db.moonkinSound = enabled
+    end
+    print("|cFF00FF00[JimsPlus]|r Moonkin Form sound " .. (enabled and "enabled" or "disabled") .. ". Type /reload to apply.")
 end)
 
 for _, info in ipairs(castbarUnits) do

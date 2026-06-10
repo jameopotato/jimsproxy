@@ -101,7 +101,127 @@ public partial class WorldClient
         auction.TotalItemsCount = packet.ReadInt32();
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_3_0_7561))
             auction.DesiredDelay = packet.ReadUInt32();
+
+        // JimsProxy (issue #305-ah): walk all owner pages and combine into one SMSG.
+        if (auction.GetUniversalOpcode() == Opcode.SMSG_AUCTION_LIST_OWNED_ITEMS_RESULT
+            && LegacyVersion.ExpansionVersion <= 1)
+        {
+            var gs = GetSession().GameState;
+            const int PageSize = 50;
+            lock (gs.AuctionOwnerWalkLock)
+            {
+                if (!gs.AuctionOwnerWalkInProgress)
+                {
+                    // Out-of-walk responses arriving within the suppression window are dropped
+                    // (these are late server responses to walk-issued CMSGs whose results would
+                    // overwrite the modern client's display with a partial page since the client
+                    // REPLACES rather than appends on each SMSG). Otherwise pass through so
+                    // post-cancel/post-buy refreshes from the server still reach the client.
+                    const long PostWalkSuppressMs = 2000;
+                    long sinceFinalize = Environment.TickCount64 - gs.AuctionOwnerWalkLastFinalizedTickMs;
+                    if (gs.AuctionOwnerWalkLastFinalizedTickMs > 0 && sinceFinalize < PostWalkSuppressMs)
+                    {
+                        Log.Event("auction.owner_walk.suppressed_post_walk_refresh", new
+                        {
+                            ms_since_finalize = sinceFinalize,
+                            items_in_packet = auction.Items.Count,
+                            server_total = auction.TotalItemsCount,
+                        });
+                        return;
+                    }
+                    Log.Event("auction.owner_walk.passthrough_outside_walk", new
+                    {
+                        items = auction.Items.Count,
+                        server_total = auction.TotalItemsCount,
+                    });
+                    SendPacketToClient(auction);
+                    SendJpAhTotalSideband(auction.TotalItemsCount, auction.Items.Count);
+                    return;
+                }
+                // Walk in progress — accumulate this page, dedupe by AuctionID. Kronos sometimes
+                // sends a duplicate of the first page as a second SMSG (auto-pagination quirk);
+                // without dedupe we'd absorb the dupes and ship N copies of the first-page items.
+                int serverTotal = auction.TotalItemsCount;
+                int alreadyHave = gs.AuctionOwnerWalkAccumulator.Count;
+                var existingIds = new HashSet<uint>();
+                foreach (var existing in gs.AuctionOwnerWalkAccumulator)
+                    existingIds.Add(existing.AuctionID);
+                int duplicatesSkipped = 0;
+                int needed = serverTotal > 0 ? Math.Max(0, serverTotal - alreadyHave) : int.MaxValue;
+                foreach (var item in auction.Items)
+                {
+                    if (needed <= 0) break;
+                    if (existingIds.Contains(item.AuctionID))
+                    {
+                        duplicatesSkipped++;
+                        continue;
+                    }
+                    gs.AuctionOwnerWalkAccumulator.Add(item);
+                    existingIds.Add(item.AuctionID);
+                    needed--;
+                }
+                int totalSoFar = gs.AuctionOwnerWalkAccumulator.Count;
+                if (duplicatesSkipped > 0)
+                {
+                    Log.Event("auction.owner_walk.duplicates_skipped", new
+                    {
+                        skipped = duplicatesSkipped,
+                        in_page = auction.Items.Count,
+                        accumulator = totalSoFar,
+                    });
+                }
+                bool isShortPage = auction.Items.Count < PageSize;
+                bool reachedTotal = serverTotal > 0 && totalSoFar >= serverTotal;
+                const int MaxWalkItems = 1000;
+                bool atCap = totalSoFar >= MaxWalkItems;
+                if (isShortPage || reachedTotal || atCap)
+                {
+                    gs.AuctionOwnerWalkInProgress = false;
+                    gs.AuctionOwnerWalkLastFinalizedTickMs = Environment.TickCount64;
+                    auction.Items = new List<AuctionItem>(gs.AuctionOwnerWalkAccumulator);
+                    auction.TotalItemsCount = auction.Items.Count;
+                    gs.AuctionOwnerWalkAccumulator.Clear();
+                    Log.Event("auction.owner_walk.finalized", new
+                    {
+                        items_total = auction.TotalItemsCount,
+                        capped = atCap,
+                    });
+                    SendPacketToClient(auction);
+                    SendJpAhTotalSideband(auction.TotalItemsCount, auction.TotalItemsCount);
+                    return;
+                }
+                else
+                {
+                    Log.Event("auction.owner_walk.page_received", new
+                    {
+                        items_in_page = auction.Items.Count,
+                        items_total = totalSoFar,
+                        server_total = serverTotal,
+                    });
+                    WorldPacket nextPage = new WorldPacket(Opcode.CMSG_AUCTION_LIST_OWNED_ITEMS);
+                    nextPage.WriteGuid(gs.AuctionOwnerWalkAuctioneer.To64());
+                    nextPage.WriteUInt32((uint)totalSoFar);
+                    SendPacketToServer(nextPage);
+                    return; // don't forward intermediate page
+                }
+            }
+        }
+
         SendPacketToClient(auction);
+    }
+
+    // JimsProxy (issue #305-ah): inform the JimsPlus addon of the real owner-auctions total
+    // via JP CHAT_MSG_ADDON sideband. The 1.14 client's GetNumAuctionItems("owner") surfaces
+    // only batch (not the wire totalcount), and the modern UI removed the Auctions-tab Next/Prev
+    // buttons; addons that want to display the true total can subscribe to this sideband.
+    private void SendJpAhTotalSideband(int total, int batch)
+    {
+        var playerGuid = GetSession().GameState.CurrentPlayerGuid;
+        if (playerGuid.IsEmpty()) return;
+        var chat = new ChatPkt(GetSession(), ChatMessageTypeModern.Whisper,
+            $"AH_TOTAL\t{total}\t{batch}", (uint)Language.AddonBfA,
+            playerGuid, "", playerGuid, "", "", ChatFlags.None, "JP");
+        SendPacketToClient(chat);
     }
 
     [PacketHandler(Opcode.SMSG_AUCTION_LIST_ITEMS_RESULT)]
@@ -331,6 +451,27 @@ public partial class WorldClient
             WowGuid128 auctioneer = GetSession().GameState.CurrentInteractedWithNPC;
             if (!auctioneer.IsEmpty())
             {
+                // JimsProxy (issue #305-ah): arm the walk before refreshing so the response
+                // produces a combined SMSG (with all pages) instead of just the first 50.
+                // Without this, the 2s post-walk suppression would drop the refresh entirely.
+                if (LegacyVersion.ExpansionVersion <= 1)
+                {
+                    var gs = GetSession().GameState;
+                    lock (gs.AuctionOwnerWalkLock)
+                    {
+                        if (!gs.AuctionOwnerWalkInProgress)
+                        {
+                            gs.AuctionOwnerWalkInProgress = true;
+                            gs.AuctionOwnerWalkAuctioneer = auctioneer;
+                            gs.AuctionOwnerWalkAccumulator.Clear();
+                        }
+                    }
+                    Log.Event("auction.owner_walk.started", new
+                    {
+                        auctioneer = auctioneer.ToString(),
+                        trigger = "post_" + auction.Command.ToString().ToLower(),
+                    });
+                }
                 WorldPacket refreshOwned = new WorldPacket(Opcode.CMSG_AUCTION_LIST_OWNED_ITEMS);
                 refreshOwned.WriteGuid(auctioneer.To64());
                 refreshOwned.WriteUInt32(0);

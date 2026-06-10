@@ -332,13 +332,24 @@ public partial class WorldSocket
         }
     }
 
+    const int TEXTEMOTE_SPIT = 89;
+
     [PacketHandler(Opcode.CMSG_SEND_TEXT_EMOTE)]
     void HandleSendTextEmote(CTextEmote emote)
     {
+        var target = emote.Target;
+
+        if (emote.EmoteID == TEXTEMOTE_SPIT && target.IsEmpty())
+        {
+            var selection = GetSession().GameState.CurrentSelection;
+            if (!selection.IsEmpty())
+                target = selection;
+        }
+
         WorldPacket packet = new WorldPacket(Opcode.CMSG_SEND_TEXT_EMOTE);
         packet.WriteInt32(emote.EmoteID);
         packet.WriteInt32(emote.SoundIndex);
-        packet.WriteGuid(emote.Target.To64());
+        packet.WriteGuid(target.To64());
         SendPacketToServer(packet);
     }
 
@@ -433,13 +444,6 @@ public partial class WorldSocket
         }
 
         WowGuid128 targetGuid128 = targetGuid64.To128(gameState);
-
-        Framework.Logging.Log.Event("threat.smoke_test", new
-        {
-            mode = clear ? "clear" : "update",
-            player_guid = playerGuid.ToString(),
-            target_guid = targetGuid128.ToString(),
-        });
 
         if (clear)
         {

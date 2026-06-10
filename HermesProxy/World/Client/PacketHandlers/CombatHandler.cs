@@ -27,13 +27,13 @@ public partial class WorldClient
     {
         SAttackStop attack = new();
         attack.Attacker = packet.ReadPackedGuid().To128(GetSession().GameState);
-        attack.Victim = packet.ReadPackedGuid().To128(GetSession().GameState);
+        var rawVictim = packet.ReadPackedGuid();
+        attack.Victim = rawVictim.To128(GetSession().GameState);
         attack.NowDead = packet.ReadUInt32() != 0;
 
         var state = GetSession().GameState;
         if (attack.Attacker == state.CurrentPlayerGuid)
         {
-            // If the client wanted to stop and we deferred it, now flush it
             if (state.DeferredAttackStop)
             {
                 state.DeferredAttackStop = false;
@@ -41,26 +41,23 @@ public partial class WorldClient
                 WorldPacket stopPacket = new WorldPacket(Opcode.CMSG_ATTACK_STOP);
                 SendPacketToServer(stopPacket, Opcode.MSG_NULL_ACTION);
             }
-            //MIRASU: Server-initiated SMSG_ATTACK_STOP — Gouge, Cheap Shot, Blind, Feign Death,
-            //MIRASU: stealth, Vanish, and similar incapacitate/stealth effects all cause Kronos/TC-1.12
-            //MIRASU: to push SMSG_ATTACK_STOP (attacker=self) without a prior CMSG_ATTACK_STOP from the
-            //MIRASU: client. WaitingForAttackStart is false (our prior SWING was already ack'd by
-            //MIRASU: SMSG_ATTACK_START long ago) and DeferredAttackStop is false (client never asked).
-            //MIRASU: We MUST clear CurrentAttackTarget here: otherwise the modern client's next
-            //MIRASU: CMSG_ATTACK_SWING (issued when the debuff wears off / stealth breaks / target is
-            //MIRASU: right-clicked / /startattack macro fires) hits the (target == CurrentAttackTarget)
-            //MIRASU: de-dupe guard in the server-side CMSG_ATTACK_SWING handler and gets swallowed —
-            //MIRASU: server never learns the player wants to resume, so no white-swings, no animation,
-            //MIRASU: until the user clicks the action-bar Attack button which bypasses the guard.
-            //MIRASU: The WaitingForAttackStart==true case below remains untouched: that's the
-            //MIRASU: client-driven target-switch sequence (CMSG_SWING(new) → SMSG_STOP(old) → SMSG_START(new))
-            //MIRASU: where the new CurrentAttackTarget is already set and must be preserved.
             else if (!state.WaitingForAttackStart)
             {
+                // Server-initiated stop without our SWING: Gouge / Cheap Shot / Blind /
+                // Feign Death / stealth / Vanish. Must clear CurrentAttackTarget here or
+                // the next CMSG_ATTACK_SWING gets eaten by the dedupe guard at Server/CombatHandler.cs:16.
                 state.CurrentAttackTarget = default;
             }
-            // If WaitingForAttackStart is true with no deferred stop, we're switching targets —
-            // don't clear the attack target, the new SWING already set it
+            else if (rawVictim == state.CurrentAttackTarget)
+            {
+                // Server rejected our SWING with ATTACK_STOP (no prior ATTACK_START):
+                // target died or became invalid between our SWING and server processing.
+                // Clear the state so the de-dupe guard doesn't eat future attacks.
+                state.WaitingForAttackStart = false;
+                state.CurrentAttackTarget = default;
+            }
+            // else: WaitingForAttackStart is true but victim != CurrentAttackTarget —
+            // target-switch sequence, the new SWING already set CurrentAttackTarget.
         }
 
         SendPacketToClient(attack);
@@ -141,9 +138,43 @@ public partial class WorldClient
 
         SendPacketToClient(attack);
 
+        // JimsProxy (#320): on a real swing for the local player, record the swing time
+        // and flush any deferred BASEATTACKTIME so the speed change reaches the addon at
+        // the moment the new server-side cadence becomes effective. The HitInfo.OffHand
+        // bit picks the right slot.
+        if (attack.AttackerGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            int slot = (hitInfo & (uint)HitInfo.OffHand) != 0 ? 1 : 0;
+            FlushDeferredBaseAttackTime(slot);
+        }
+
         // Threat translation: feed melee swing damage into the threat tracker.
         // Vanilla damage threat is 1.0 × raw damage, no school weighting.
         GetSession().ThreatTracker.OnDamage(attack.AttackerGUID, attack.VictimGUID, attack.Damage);
+    }
+
+    // JimsProxy (#320): record the swing timestamp and, if a BASEATTACKTIME change was
+    // deferred while the in-flight swing was running, synthesize a values-update carrying
+    // just the new AttackRoundBaseTime so addons re-poll UnitAttackSpeed with the correct
+    // post-swing value. Called from HandleAttackerStateUpdate (slot per HitInfo.OffHand)
+    // and from the combat-exit / attack-stop paths (both slots) so a pending value never
+    // outlives the swing window.
+    void FlushDeferredBaseAttackTime(int slot)
+    {
+        var state = GetSession().GameState;
+        state.LastAttackerStateUpdateMs[slot] = Environment.TickCount64;
+        if (!state.HasPendingBaseAttackTime[slot])
+            return;
+
+        uint pending = state.PendingBaseAttackTime[slot];
+        UpdateObject updateObject = new UpdateObject(state);
+        ObjectUpdate update = new ObjectUpdate(state.CurrentPlayerGuid, UpdateTypeModern.Values, GetSession());
+        update.UnitData.AttackRoundBaseTime[slot] = pending;
+        updateObject.ObjectUpdates.Add(update);
+        SendPacketToClient(updateObject);
+
+        state.LastSentBaseAttackTime[slot] = pending;
+        state.HasPendingBaseAttackTime[slot] = false;
     }
     [PacketHandler(Opcode.SMSG_ATTACKSWING_NOTINRANGE)]
     void HandleAttackSwingNotInRange(WorldPacket packet)
@@ -181,6 +212,17 @@ public partial class WorldClient
         GetSession().GameState.DeferredAttackStop = false;
         CancelCombat combat = new();
         SendPacketToClient(combat);
+
+        // JimsProxy (#320): combat ended — flush any deferred BASEATTACKTIME for both slots
+        // so a SnD/buff applied just before combat exit doesn't sit pending forever.
+        FlushDeferredBaseAttackTime(0);
+        FlushDeferredBaseAttackTime(1);
+
+        // Drop every mob's threat list — vanilla 1.12 doesn't emit a
+        // "threat ended" signal, so without this the modern client retains
+        // every mob we ever fought and Luna / ThreatPlates leave red
+        // indicators lit on stale nameplates.
+        GetSession().ThreatTracker.OnLocalPlayerLeftCombat();
     }
     [PacketHandler(Opcode.SMSG_AI_REACTION)]
     void HandleAIReaction(WorldPacket packet)

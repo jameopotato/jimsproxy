@@ -73,6 +73,7 @@ frame:RegisterEvent("UNIT_SPELLCAST_SENT")
 frame:SetScript("OnEvent", function(_, event, unit, _, _, spellID)
     if unit ~= "player" then return end
     if spellID ~= MOONKIN_FORM_SPELL_ID then return end
+    if namespace.db and namespace.db.moonkinSound == false then return end
     MuteBears()
     PlayReplacementSound()
     C_Timer.After(MUTE_WINDOW_SECONDS, UnmuteBears)

@@ -589,14 +589,15 @@ public partial class WorldClient
             universalOpcode == Opcode.SMSG_AUTH_RESPONSE ||
             universalOpcode == Opcode.SMSG_ADDON_INFO ||
             _packetHandlers.ContainsKey(universalOpcode);
-        Log.Event("packet.in", new
-        {
-            direction = "s2c",
-            opcode_universal = universalOpcode.ToString(),
-            opcode_raw = rawOpcodeJP,
-            size = packetSizeJP,
-            has_handler = hasHandlerJP,
-        });
+        if (Settings.DebugOutput)
+            Log.Event("packet.in", new
+            {
+                direction = "s2c",
+                opcode_universal = universalOpcode.ToString(),
+                opcode_raw = rawOpcodeJP,
+                size = packetSizeJP,
+                has_handler = hasHandlerJP,
+            });
 
         long startTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         try
@@ -654,7 +655,7 @@ public partial class WorldClient
             if (HermesProxy.Server.MetricsEnabled)
                 HermesProxy.Server.Metrics.RecordServerToClientLatency(universalOpcode, elapsedTicks);
 
-            if (hasHandlerJP)
+            if (hasHandlerJP && Settings.DebugOutput)
             {
                 Log.Event("packet.translated", new
                 {
@@ -803,6 +804,17 @@ public partial class WorldClient
         byte[] flagBytes = AuthSessionAddons.Derive();
         byte[] addonBytes = AuthSessionAddons.BuildAddonAuthSection(flagBytes);
         packet.WriteBytes(addonBytes);
+
+        // MIRASU (Kronos parser 2026-05-23): Kronos's _HandleAuthSession reads
+        // one byte past the addon section (locale or similar trailing field).
+        // Without it, every login produces a server-side ByteBufferException
+        // "pos N size N value with size: 1" — non-fatal (auth still succeeds)
+        // but spams the server log. vmangos's parser stops at the digest read
+        // and never touches the addon section in WorldSocket, so the extra
+        // trailing byte is unread leftover and ignored. Vanilla-path only;
+        // TBC+ already writes its own trailing fields.
+        if (Settings.ServerBuild < ClientVersionBuild.V2_0_1_6180)
+            packet.WriteUInt8(0);
 
         Log.Event("auth.addon_section.sent", new
         {

@@ -38,11 +38,27 @@ public partial class WorldSocket
 
         if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
         {
-            packet.WriteUInt8(2); // GMTICKET_BEHAVIOR_HARASSMENT
-            packet.WriteUInt32(complaint.Header.SelfPlayerMapId);
-            packet.WriteVector3(complaint.Header.SelfPlayerPos);
-            packet.WriteCString(ticketText);
-            packet.WriteCString(""); // Not used
+            if (Framework.Settings.ServerType == Framework.ServerFork.Kronos)
+            {
+                // Kronos format (from server dev parser snippet): no category
+                // byte, three trailing uint32s after the ticket text.
+                packet.WriteUInt32(complaint.Header.SelfPlayerMapId);
+                packet.WriteVector3(complaint.Header.SelfPlayerPos);
+                packet.WriteCString(ticketText);
+                packet.WriteUInt32(0);
+                packet.WriteUInt32(1);
+                packet.WriteUInt32(0);
+            }
+            else
+            {
+                // Generic mangos-zero / vmangos format: leading category byte,
+                // single trailing uint32.
+                packet.WriteUInt8(2); // GMTICKET_BEHAVIOR_HARASSMENT
+                packet.WriteUInt32(complaint.Header.SelfPlayerMapId);
+                packet.WriteVector3(complaint.Header.SelfPlayerPos);
+                packet.WriteCString(ticketText);
+                packet.WriteUInt32(0);
+            }
         }
         else
         {
