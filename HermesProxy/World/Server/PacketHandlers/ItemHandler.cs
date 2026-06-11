@@ -1,4 +1,5 @@
 ﻿using Framework.Constants;
+using Framework.Logging;
 using System;
 using HermesProxy.Enums;
 using HermesProxy.World;
@@ -45,9 +46,10 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_SPLIT_ITEM)]
     void HandleSplitItem(SplitItem item)
     {
-        RememberMoveItems(item.FromPackSlot, item.FromSlot, item.ToPackSlot, item.ToSlot);
-        if (BlockNonKeySplitIntoKeyring(item.ToPackSlot, item.ToSlot))
+        var (moveItem0, moveItem1) = ResolveMoveItems(item.FromPackSlot, item.FromSlot, item.ToPackSlot, item.ToSlot);
+        if (BlockNonKeySplitIntoKeyring(item.ToPackSlot, item.ToSlot, moveItem0, moveItem1))
             return;
+        RememberMoveItems(moveItem0, moveItem1);
         WorldPacket packet = new WorldPacket(Opcode.CMSG_SPLIT_ITEM);
         byte containerSlot1 = item.FromPackSlot != Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(item.FromPackSlot) : item.FromPackSlot;
         byte slot1 = item.FromPackSlot == Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(item.FromSlot) : item.FromSlot;
@@ -67,9 +69,10 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_SWAP_INV_ITEM)]
     void HandleSwapInvItem(SwapInvItem item)
     {
-        RememberMoveItems(Enums.Classic.InventorySlots.Bag0, item.Slot1, Enums.Classic.InventorySlots.Bag0, item.Slot2);
-        if (BlockNonKeyIntoKeyring(Enums.Classic.InventorySlots.Bag0, item.Slot1, Enums.Classic.InventorySlots.Bag0, item.Slot2))
+        var (moveItem0, moveItem1) = ResolveMoveItems(Enums.Classic.InventorySlots.Bag0, item.Slot1, Enums.Classic.InventorySlots.Bag0, item.Slot2);
+        if (BlockNonKeyIntoKeyring(Enums.Classic.InventorySlots.Bag0, item.Slot1, Enums.Classic.InventorySlots.Bag0, item.Slot2, moveItem0, moveItem1))
             return;
+        RememberMoveItems(moveItem0, moveItem1);
         WorldPacket packet = new WorldPacket(Opcode.CMSG_SWAP_INV_ITEM);
         byte slot1 = ModernVersion.AdjustInventorySlot(item.Slot1);
         byte slot2 = ModernVersion.AdjustInventorySlot(item.Slot2);
@@ -81,9 +84,10 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_SWAP_ITEM)]
     void HandleSwapItem(SwapItem item)
     {
-        RememberMoveItems(item.ContainerSlotA, item.SlotA, item.ContainerSlotB, item.SlotB);
-        if (BlockNonKeyIntoKeyring(item.ContainerSlotA, item.SlotA, item.ContainerSlotB, item.SlotB))
+        var (moveItem0, moveItem1) = ResolveMoveItems(item.ContainerSlotA, item.SlotA, item.ContainerSlotB, item.SlotB);
+        if (BlockNonKeyIntoKeyring(item.ContainerSlotA, item.SlotA, item.ContainerSlotB, item.SlotB, moveItem0, moveItem1))
             return;
+        RememberMoveItems(moveItem0, moveItem1);
         WorldPacket packet = new WorldPacket(Opcode.CMSG_SWAP_ITEM);
         byte containerSlotB = item.ContainerSlotB != Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(item.ContainerSlotB) : item.ContainerSlotB;
         byte slotB = item.ContainerSlotB == Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(item.SlotB) : item.SlotB;
@@ -222,21 +226,29 @@ public partial class WorldSocket
         SendPacketToServer(packet);
     }
 
-    // JimsProxy: remember the items at both endpoints of an item move (looked up from the
-    // cached player inventory at the legacy slots we're about to forward), so the failure
-    // handler can repair an empty-GUID InventoryChangeFailure and unlock the source item.
-    // Kronos sends empty item GUIDs for invalid-slot rejections (e.g. the modern client's
-    // phantom keyring slots 13-32 that the server lacks), which otherwise leaves the picked-
-    // up item locked until relog.
-    void RememberMoveItems(byte containerA, byte slotA, byte containerB, byte slotB)
+    // JimsProxy: resolve the items currently sitting at both endpoints of an item move (looked
+    // up from the cached player inventory at the legacy slots we're about to forward).
+    (WowGuid128, WowGuid128) ResolveMoveItems(byte containerA, byte slotA, byte containerB, byte slotB)
     {
         var state = GetSession().GameState;
         byte lcA = containerA != Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(containerA) : containerA;
         byte lsA = containerA == Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(slotA) : slotA;
         byte lcB = containerB != Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(containerB) : containerB;
         byte lsB = containerB == Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(slotB) : slotB;
-        state.LastMoveItem0 = state.GetInventorySlotItem(lcA, lsA).To128(state);
-        state.LastMoveItem1 = state.GetInventorySlotItem(lcB, lsB).To128(state);
+        return (state.GetInventorySlotItem(lcA, lsA).To128(state), state.GetInventorySlotItem(lcB, lsB).To128(state));
+    }
+
+    // JimsProxy: remember a forwarded move's endpoint items so the failure handler can repair an
+    // empty-GUID InventoryChangeFailure and unlock the source item. Kronos sends empty item GUIDs
+    // for invalid-slot rejections (e.g. the modern client's phantom keyring slots 13-32 that the
+    // server lacks), which otherwise leaves the picked-up item locked until relog. Only called for
+    // moves that are actually forwarded — a blocked move can't produce a server failure, and letting
+    // it clobber this state would mis-attribute the backfill of an in-flight earlier move.
+    void RememberMoveItems(WowGuid128 item0, WowGuid128 item1)
+    {
+        var state = GetSession().GameState;
+        state.LastMoveItem0 = item0;
+        state.LastMoveItem1 = item1;
         state.LastMoveItemsTickMs = Environment.TickCount;
     }
 
@@ -252,51 +264,86 @@ public partial class WorldSocket
            && slot >= Enums.Classic.InventorySlots.KeyringStart
            && slot < Enums.Classic.InventorySlots.KeyringEnd;
 
-    bool IsKnownNonKey(WowGuid128 item)
+    uint ResolveItemId(WowGuid128 item)
+        => item.IsEmpty() ? 0 : GetSession().GameState.GetItemId(item);
+
+    // Keyring-eligible means legacy class Key (13) OR the keyring bag-family bit — the same rule
+    // the vanilla server's CanStoreItem enforces, and the same data our own ItemSparse hotfixes
+    // advertise to the client (ItemTemplate.ReadFromLegacyPacket translates the vanilla keyring
+    // bag-family bit 0x8 to the modern 0x100). Kronos marks some non-Key-class items keyring-able
+    // (e.g. 18645 Alarm-O-Bot: class 7 + keyring family); judging by class alone made the proxy
+    // bounce the very move its own hotfix told Bagnon to make, and Bagnon retries a rejected sort
+    // move every 50ms forever.
+    static bool IsKnownNonKey(uint itemId)
     {
-        if (item.IsEmpty())
-            return false;
-        uint itemId = GetSession().GameState.GetItemId(item);
         if (itemId == 0)
             return false;
         var template = GameData.GetItemTemplate(itemId);
-        return template != null && template.Class != 13; // 13 = ItemClass.Key
+        return template != null && template.Class != 13 && (template.BagFamily & 0x100) == 0;
     }
 
     // Bounce a blocked keyring move with a clean WrongBagType. Unlocks BOTH move endpoints so a
     // swap never leaves the dragged item OR the swapped item locked (stuck).
-    void SendKeyringBounce()
+    void SendKeyringBounce(WowGuid128 item0, WowGuid128 item1)
     {
-        var state = GetSession().GameState;
         InventoryChangeFailure failure = new();
         failure.BagResult = InventoryResult.WrongBagType;
-        failure.Item[0] = state.LastMoveItem0;
-        failure.Item[1] = state.LastMoveItem1;
+        failure.Item[0] = item0;
+        failure.Item[1] = item1;
         SendPacket(failure);
     }
 
-    // Swap/move: the item from A lands in B (LastMoveItem0) and the item from B lands in A
-    // (LastMoveItem1). Block if either lands a known non-key in a client keyring slot.
-    bool BlockNonKeyIntoKeyring(byte containerA, byte slotA, byte containerB, byte slotB)
+    // Swap/move: the item from A lands in B (item0) and the item from B lands in A (item1).
+    // Block if either lands a known non-key in a client keyring slot.
+    bool BlockNonKeyIntoKeyring(byte containerA, byte slotA, byte containerB, byte slotB, WowGuid128 item0, WowGuid128 item1)
     {
-        var state = GetSession().GameState;
-        if ((IsKeyringSlot(containerB, slotB) && IsKnownNonKey(state.LastMoveItem0))
-            || (IsKeyringSlot(containerA, slotA) && IsKnownNonKey(state.LastMoveItem1)))
+        bool keyringA = IsKeyringSlot(containerA, slotA);
+        bool keyringB = IsKeyringSlot(containerB, slotB);
+        if (!keyringA && !keyringB)
+            return false;
+        uint itemId0 = ResolveItemId(item0);
+        uint itemId1 = ResolveItemId(item1);
+        if (!(keyringB && IsKnownNonKey(itemId0)) && !(keyringA && IsKnownNonKey(itemId1)))
+            return false;
+        // Same item at both endpoints: the server merges the stacks (nothing lands back in the
+        // source slot), so the keyring contents can't get worse — and blocking it would make an
+        // orphaned stack impossible to merge out of the keyring onto an existing bag stack.
+        if (itemId0 != 0 && itemId0 == itemId1)
+            return false;
+        Log.Event("item.keyring_bounce", new
         {
-            SendKeyringBounce();
-            return true;
-        }
-        return false;
+            container_a = containerA,
+            slot_a = slotA,
+            container_b = containerB,
+            slot_b = slotB,
+            item_id_a = itemId0,
+            item_id_b = itemId1,
+        });
+        SendKeyringBounce(item0, item1);
+        return true;
     }
 
     // Split: only the destination receives the split portion (no swap-back), so check the dest only.
-    bool BlockNonKeySplitIntoKeyring(byte toContainer, byte toSlot)
+    bool BlockNonKeySplitIntoKeyring(byte toContainer, byte toSlot, WowGuid128 item0, WowGuid128 item1)
     {
-        if (IsKeyringSlot(toContainer, toSlot) && IsKnownNonKey(GetSession().GameState.LastMoveItem0))
+        if (!IsKeyringSlot(toContainer, toSlot))
+            return false;
+        uint itemId0 = ResolveItemId(item0);
+        if (!IsKnownNonKey(itemId0))
+            return false;
+        // Splitting onto the item's own stack in the keyring is a merge — nothing new enters.
+        uint itemId1 = ResolveItemId(item1);
+        if (itemId0 == itemId1)
+            return false;
+        Log.Event("item.keyring_bounce", new
         {
-            SendKeyringBounce();
-            return true;
-        }
-        return false;
+            split = true,
+            container_b = toContainer,
+            slot_b = toSlot,
+            item_id_a = itemId0,
+            item_id_b = itemId1,
+        });
+        SendKeyringBounce(item0, item1);
+        return true;
     }
 }
