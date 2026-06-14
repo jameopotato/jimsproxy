@@ -470,6 +470,44 @@ The native model dominates both. **The improvement over sugarproxy is to reconst
 
 **Revised Phase 2:** *"Upgrade Low-Latency mode into the parallel-identity-pinned model with local double-send collapse,"* not *"globally delete Hold-and-Fire."* Same destination, far safer path, and the endpoint is *better* than sugarproxy rather than merely matching it.
 
+### 7.7.8 Phase 1.5: off-GCD double-send collapse — IMPLEMENTED in PR [#372](https://github.com/jameopotato/jimsproxy/pull/372)
+
+**Status:** shipped — the off-GCD `else` branch now collapses the still-unstarted same-spell duplicate (`Server SpellHandler.cs`), emitting `cast.dropped.duplicate{reason:"off_gcd_double_send"}`. Build clean, 544 tests pass (3 added pinning the predicate semantics). Verified end-to-end via the diagnostic in the tester's capture (the handler needs a live socket, so it's field-verified rather than unit-tested). Spec below for the record.
+
+**Goal.** When the 1.14 client emits two `CMSG_CAST_SPELL` for one off-GCD keypress, forward only the first and silently ack-fail the second, so the server casts once and there is no second pending entry to mis-pair. Server-kindness + removes the H7 ambiguity at the source; the §7.7 caller-aware dequeue stays as the deterministic backstop.
+
+**Key realization — this already exists for on-GCD spells; off-GCD just skips it.** The on-GCD dup guard (`Server SpellHandler.cs:345`) does exactly this: `if (HasNonStartedPendingCastForSpell(spellId)) { SendCastFailedWithoutPrepare(castRequest); return; }`. It lives inside `if (!isOffGcd)`, so off-GCD casts (the ones that actually double-send and hit H7) never get it. **The fix is to add the same two-line guard to the off-GCD `else` branch (`:523`)**, before the enqueue at `:536`.
+
+**Why it's safe and complementary (not a new risk class):**
+- `HasNonStartedPendingCastForSpell` returns true only while the first press is *un-started* — i.e. the brief window before the server responds. The double-send's second CMSG (microseconds later, same WorldSocket receive thread, processed after the first is already enqueued) lands inside that window → collapsed. A deliberate re-cast spaced beyond the round-trip finds the first already started/gone → **not** collapsed.
+- For the off-GCD class (self-buffs / cooldowns: Blade Flurry, Sprint, Evasion, trinkets), a second cast within a round-trip is *redundant* (a buff refresh microseconds after applying it is a no-op), so collapsing it is harmless even on a genuine fast double-tap. This is the **same assumption the on-GCD guard already makes for every spell** — not a new one.
+- `SendCastFailedWithoutPrepare` acks the dup with `DontReport` (silent) on the client's own `ClientGUID`, releasing its second pending press with no error feedback and no SpellPrepare (no GCD-sweep interference).
+- **Complements #372, doesn't replace it.** Collapse handles *press2-before-START* (one entry, trivially correct). The dequeue fix handles *press2-after-START* (two entries — the first already marked started, so the guard's `HasNonStarted…` is false and press2 enqueues). Together they cover both orderings.
+
+**Exact change (off-GCD `else`, before the enqueue):**
+```csharp
+// JimsProxy (off-GCD double-send collapse): the 1.14 client emits two CMSG_CAST_SPELL per
+// off-GCD keypress. Collapse the still-unstarted same-spell duplicate so the server casts
+// once and there's no second pending entry to mis-pair at SPELL_GO (H7 at the source).
+// Mirrors the on-GCD dup guard (:345) that off-GCD casts skip by design. Silent ack
+// releases the client's second pending press.
+if (GetSession().GameState.HasNonStartedPendingCastForSpell((uint)cast.Cast.SpellID))
+{
+    Log.Event("cast.dropped.duplicate", new { spell_id = cast.Cast.SpellID,
+        reason = "off_gcd_double_send", client_cast_id = castRequest.ClientGUID.ToString() });
+    SendCastFailedWithoutPrepare(castRequest);
+    return;
+}
+```
+
+**Diagnostic value.** `cast.dropped.duplicate{reason:"off_gcd_double_send"}` in the tester's JSONL both confirms the collapse fires AND quantifies how often the off-GCD double-send actually occurs — useful evidence about H7's frequency.
+
+**Tests (extend `CastGoPreferStartedTests` or a new file):** two unstarted off-GCD same-spell entries → the guard reports the dup (second press collapsed, one entry remains); a started + a new press → not collapsed (the started one already left the unstarted window); a single press → not collapsed.
+
+**Scope:** off-GCD normal casts only (the `else` at `:523`). Not pet/melee/auto-repeat (separate paths, separate quirks). Always-on (mode-independent, since off-GCD bypasses the dup guard in both modes). Ships independently of the Phase-2 parallel rewrite.
+
+**One open question worth a capture (not a blocker):** do the double-send's two CMSGs share a CastID or carry different ones? The `cast.received` event already logs `client_cast_id` per CMSG, so a single capture answers it. The guard above works regardless (it keys on spell-id + unstarted-ness, not CastID), but if they share a CastID that's an even more precise signal we could use later.
+
 ## 8. External parallels (Q4) — fuel, condensed (full cites in §10)
 
 - **The mechanism, named by other devs.** vmangos maintainers on stuck *channel* visuals: "suspected there is some sort of cleanup packet that the client is expecting but is not receiving" ([vmangos#3227]). The classic **"glowing hands"** bug: a missing stop packet → "the target never stops playing the visual hands-glowing and waving cast animation," **server-side and visible to everyone** (= O3). AzerothCore #19102 *proves* the shape: re-adding a dropped `SMSG_CAST_FAILED` for `SPELL_STATE_PREPARING` un-sticks casts — "send the stop packet again."
