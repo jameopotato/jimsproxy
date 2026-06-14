@@ -2,9 +2,13 @@
 
 **Status:** v1.4 (2026-06-13). Living document — updated each log-driven iteration.
 
-> ### ✎ v1.4 — H7 PATCH APPLIED (quick patch, doubles as the test)
-> Shipped the surgical fix for H7 in `GlobalSessionData.cs` `TryDequeuePendingNormalCast`: **`SMSG_SPELL_GO` now resolves to the STARTED same-spell entry** (the one `SMSG_SPELL_START` opened and whose CastID the client is showing), falling back to the oldest unstarted entry only when no started entry exists (preserving the skip-START instant path). Previously it *preferred unstarted*, so an off-GCD double-send's GO grabbed the duplicate entry → START/GO CastID mismatch → stuck cast visual. Added 4 regression tests (`CastGoPreferStartedTests`); build clean, all 535 existing tests pass. A `DebugOutput`-gated diagnostic `cast.go.prefer_started` fires exactly when the H7 ambiguity (started + unstarted same-spell both queued) is resolved — so the tester's JSONL will *show the condition was occurring*.
-> **This is patch-as-test, not a declared fix** (see §1.5 — 0-for-10): confirmation = the tester's stuck Blade Flurry stops AND `cast.go.prefer_started` events appear. If it persists, H7 was not their funnel entry → fall to E0/H1. Not yet committed/PR'd; targets `beta` when it is.
+> ### ✎ v1.4 — H7 FIX (Phase 1) — PR [#372](https://github.com/jameopotato/jimsproxy/pull/372) (base `beta`)
+> **Mechanism, now verified against the CMSG side:** the double-send only produces two same-spell entries in **Low-Latency mode**, where `HandleCastSpell` bypasses the CMSG dup guard (`HasNonStartedPendingCastForSpell`, Server `SpellHandler.cs:345`) and forwards every press immediately. In *normal* mode the dup guard drops the second press, so H7 can't occur. **The tester is low-latency → in Low-Latency mode → unprotected by the dup guard → hits H7.** That's a real config-specific confirmation.
+> **The fix is caller-aware** (`TryDequeuePendingNormalCast(spellId, out cast, preferStarted)`):
+> - `SMSG_SPELL_GO` and real failures pass `preferStarted: true` → resolve the **started** entry (START/GO pair); fall back to oldest unstarted (skip-START instants).
+> - a duplicate's `NOT_READY`/`SpellInProgress` rejection passes `preferStarted: false` → consume the **unstarted** dup and **spare the started entry** for its in-flight GO.
+> This pairs the double-send correctly in **both** packet orderings (GO-before-fail *and* fail-before-fail). My first one-liner only handled GO→started and would have let a dup's failure steal the started entry in the fail-before-GO ordering — a latent hole the caller-aware version closes. `DebugOutput`-gated diagnostics `cast.go.prefer_started` / `cast.fail.spared_started` fire exactly when each direction resolves the ambiguity. Build clean, **541 tests pass** (6 in `CastGoPreferStartedTests`).
+> **Still patch-as-test, not a declared fix** (§1.5 — 0-for-10): confirmation = the tester's stuck Blade Flurry stops AND those diagnostics appear. If it persists, H7 wasn't their funnel entry → fall to E0/H1.
 
 > ### ★ v1.3 REFRAME (tester correction — supersedes the aura framing as the lead)
 > The tester clarified the looping thing is **the CAST animation/sound** (the short one you get *on press*), **not** an aura/buff sound — there may be no sound while the aura is active. It is **intermittent** ("only sometimes"), and the tester's strong prior is that **a jimsproxy change introduced it** (not the Xian55/HermesProxy base, not sugarproxy — the leading competitor, see §7.6). This reframes the investigation from "missing aura-stop edge" to a **REGRESSION HUNT in our cast-CastID machinery**, and promotes a new leading hypothesis **H7** (§5):
@@ -401,6 +405,41 @@ The leading competitor (Chinese-language; English-only searches missed it — it
 2. **The decisive realization: a parallel cast model is ONLY safe with identity-based correspondence.** Firing many casts without waiting puts *more* same-spell casts in flight at once — which would make jimsproxy's FIFO-prefer-unstarted heuristic mis-match *more* often, not less. For Tangtang to fire in parallel AND not have "卡技能," its server-event→press correspondence **cannot** be the fragile heuristic ours is — it must be identity/order-pinned. So the competitor's success is concrete evidence that **§7.5's identity-pinned correspondence is both the race fix and the prerequisite for the latency fix.** One change unlocks both.
 3. **Our GCD-hold/serialize choice (issue #43) is the likely shared root of BOTH complaints.** jimsproxy *holds and serializes* casts to tame mid-GCD mashing (the NOT_READY failure storm); that holding both adds the latency players feel AND manufactures the multiple same-spell pending entries H7 mis-routes. But jimsproxy **already has the other half of Tangtang's answer** — `SuppressSpellCastErrors` silently eats NOT_READY/SpellInProgress (`SpellHandler.cs:345`). So the path is visible: **go parallel + suppress the failure storm client-side (like Tangtang) instead of hold-and-serialize**, on top of identity-pinned matching. That plausibly removes the race *and* closes the 30–40 ms gap.
 4. **Caveat:** the doc lists *卡技能/卡潜行* (stuck skills/stealth) but not specifically a looping *cast sound*, and it's behavior-not-source — so it's a validated **direction**, not a drop-in spec. We're inferring "identity-based correspondence" from "parallel + no stuck skills," which is strong but not stated.
+
+## 7.7 Architecture rework — design & phased migration (the spell-casting arch change)
+
+The §7.5 verdict, made concrete against the code, plus the explicit **Hold-and-Fire cleanup**. This is a design to approve before implementing — it touches the most-patched code in the repo, so it is **phased**, each phase independently shippable and testable.
+
+### 7.7.1 Target model — identity-pinned, parallel cast correspondence
+- **Immutable identity.** Each cast gets one client-facing CastID, fixed at `CMSG_CAST_SPELL` time (reuse the client's own `ClientGUID`, or mint once). **Every** forwarded server event for that cast (`SPELL_START`/`SPELL_GO`/`FAILED`) is stamped with it. START/GO pair by construction — no re-matching, no prefer-started/unstarted heuristic, no #362 fallback.
+- **Parallel forward.** Casts go to the server **immediately**, without waiting for the prior result (sugarproxy's "并行" model, §7.6) — i.e. the current **Low-Latency path becomes the only path**; the GCD hold-and-fire is deleted.
+- **Failure suppression absorbs the flood.** Firing in parallel re-introduces the mid-GCD `NOT_READY` storm the hold was added (issue #43) to prevent. We already have the antidote: `SuppressSpellCastErrors` eats `NOT_READY`/`SpellInProgress` client-side (`SpellHandler.cs:345`). Make it always-on for the parallel path so the client never sees the storm.
+- **GCD shown, not enforced.** The client still needs the action-bar GCD swirl: keep the `SpellCooldownPkt` synth on a successful GO (`SpellHandler.cs:1639`), but **stop holding casts** — the swirl is cosmetic; the server is the GCD authority.
+
+### 7.7.2 Phased migration (each phase = one PR to `beta`, each independently verifiable)
+- **Phase 0 — DONE (#372).** H7 prefer-started dequeue. Stops the immediate stuck-cast for the double-send; buys breathing room. Doesn't change architecture.
+- **Phase 1 — identity-pinning (lower risk, additive).** Make "the terminating event's CastID = the START's recorded CastID for that cast" **the rule**, not #362's last-ditch `else if`. Keep the queue and the hold for now. This deterministically kills the entire START/GO/FAILED **mis-pair class** (H7 and its cousins) without changing cast *timing/feel*. Mostly additive; easy to test (extend `CastGoPreferStartedTests` / `PlayerForwardedCastIdsTests`). **Recommended regardless of the latency decision.**
+- **Phase 2 — go parallel + Hold-and-Fire cleanup (higher risk, changes feel).** Delete the GCD hold-and-fire; forward all casts immediately; make failure-suppression always-on; keep GCD-cooldown synth + watchdog. This is what closes the 30–40 ms gap and matches sugarproxy. **This is the phase that needs the cleanup step below and the most testing.**
+
+### 7.7.3 Cleanup — the Hold-and-Fire code to REMOVE (Phase 2)
+Located; precise file:line inventory being compiled by recon. The removal set (GlobalSessionData.cs unless noted):
+- `BeginGcd` (`:1967`) + the `_gcdExpiryTimer` `System.Threading.Timer`, `OnGcdTimerElapsed` (`:2052`), `_gcdGeneration`/`_gcdTimerHasFired` staleness guards.
+- `OnGcdHeldCastFire` (`:401`) + `WorldSocket.ForwardHeldGcdCast`, `TakeHeldCastIfReady` (`:1607`), `PeekHeldGcdCast` (`:2044`), `CancelGcdHold` (`:1993`).
+- Cast-time holds: `HoldCastDuringCastTime` (`:408`), `TakeHeldCastTimeCast` (`:418`), `ClearHeldCastTimeCast` (`:431`), `ForceHoldCast` (`:1592`).
+- The hold gate: `TryHoldCastDuringGcd` (`:1932`), `IsGcdHoldActive` (`:1902`), and the `if (!isOffGcd)` hold branch in `HandleCastSpell` (Server SpellHandler).
+- `GetAdaptiveFireOffsetMs` (`:1651`) + RTT smoothing **iff** only used for the fire offset (verify — RTT may feed other features).
+- **Simplifies away:** the `IsOffGcd` sweep *exemption* (#344/#366) — once every cast forwards in parallel, "off-GCD doesn't get held" is the default, so the special case largely dissolves.
+
+### 7.7.4 KEEP / REWIRE (do NOT delete)
+`SuppressSpellCastErrors` (becomes load-bearing), the watchdog (`DrainExpiredWatchdogCasts`/`RunWatchdogEviction` — still need to evict orphaned started casts), the `CancelSpellVisual` failure-synth family (#189/#213/#367), the GCD `SpellCooldownPkt` synth (cosmetic swirl), the threat/HealComm/finisher-snapshot hooks, `ClearNonStartedNormalCasts` (still useful for button-lit cleanup), and the aura/visual closure rules from §7 (separate lifecycle).
+
+### 7.7.5 The real risk to validate before Phase 2
+**The parallel `NOT_READY` flood.** Issue #43's history (4 `NOT_READY` failures per Arcane-Explosion GCD on Kronos) is the reason the hold exists. Going parallel re-creates that flood; suppression hides it from the *client*, but we must verify it causes no **server-side** problem — Kronos has a *tuned anticheat* (`RESEARCH.md` §5) that could flag rapid cast spam, and the failures must not desync any other state. **Phase 2 needs a Kronos capture of a parallel cast-spam burst** (cast Arcane Explosion through its GCD repeatedly) watching for: anticheat kick, `packet.error`, or any state the suppressed failures leave dangling. Sugarproxy ships parallel on these same servers, so it's almost certainly safe — but "almost certainly" is exactly what's burned us before.
+
+### 7.7.6 The decision for the user
+- **Phase 1 only** — deterministically fixes the desync *class*; keeps current latency/feel; low risk. 
+- **Phase 1 + 2** — also closes the latency gap and matches the competitor; deletes a large, concurrency-tricky machinery (net simplification); higher risk, needs the §7.7.5 Kronos validation.
+Recommendation: **do Phase 1 now** (it's the right fix and low-risk), and treat **Phase 2 as a deliberate follow-up** gated on the parallel-flood capture — not because it's wrong, but because it's the kind of timing change that deserves its own validation cycle rather than riding along with the correctness fix.
 
 ## 8. External parallels (Q4) — fuel, condensed (full cites in §10)
 
