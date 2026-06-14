@@ -1227,23 +1227,41 @@ public sealed class GameSessionData
     {
         var pending = new List<ClientCastRequest>();
         cast = null;
-        ClientCastRequest? startedFallback = null;
-        int startedFallbackIndex = -1;
+        ClientCastRequest? unstartedFallback = null;
+        int unstartedFallbackIndex = -1;
+        // JimsProxy (H7 cast-go-mispair fix): SMSG_SPELL_GO completes the cast that
+        // SMSG_SPELL_START opened, so when BOTH a started and an unstarted same-spell entry
+        // are queued, the GO must resolve to the STARTED entry — the one whose CastID we
+        // forwarded at START and whose cast visual the client is actually showing. This is the
+        // off-GCD double-send shape (e.g. Blade Flurry): the first press's START marked entry A
+        // (started); the duplicate press left entry B (unstarted) in the queue. The previous
+        // "prefer unstarted" rule grabbed B and stamped the GO with B.ServerGUID — a CastID the
+        // client never saw at START — so the client's cast visual for A never received a
+        // matching GO and looped (stuck cast animation + sound). #362's GO-side CastID recovery
+        // could NOT catch it because the normal dequeue "succeeded" on the wrong entry, skipping
+        // the recovery else-if entirely. Falling back to the oldest unstarted entry preserves the
+        // skip-START instant path (server emits GO with no preceding START → no started entry
+        // exists, so we still dequeue the unstarted one and send its SpellPrepare).
+        bool sawUnstartedMatch = false;
 
         lock (PendingCastsLock)
         {
             while (PendingNormalCasts.TryDequeue(out var current))
             {
-                if (cast == null && CastMatchesSpellId(current, spellId))
+                bool matches = CastMatchesSpellId(current, spellId);
+                if (matches && !current.HasStarted)
+                    sawUnstartedMatch = true;
+
+                if (cast == null && matches)
                 {
-                    if (!current.HasStarted)
+                    if (current.HasStarted)
                     {
                         cast = current;
                     }
-                    else if (startedFallback == null)
+                    else if (unstartedFallback == null)
                     {
-                        startedFallback = current;
-                        startedFallbackIndex = pending.Count;
+                        unstartedFallback = current;
+                        unstartedFallbackIndex = pending.Count;
                         pending.Add(current);
                     }
                     else
@@ -1257,17 +1275,34 @@ public sealed class GameSessionData
                 }
             }
 
-            // No non-started match found — fall back to the first started entry
-            if (cast == null && startedFallback != null)
+            // No started match found — fall back to the oldest unstarted entry (an instant
+            // whose SMSG_SPELL_START the server skipped). FIFO order among same-spell entries
+            // is preserved: started entries are always older than unstarted ones, because
+            // TryMarkPendingNormalCastStarted marks the oldest unstarted entry first.
+            if (cast == null && unstartedFallback != null)
             {
-                cast = startedFallback;
-                pending.RemoveAt(startedFallbackIndex);
+                cast = unstartedFallback;
+                pending.RemoveAt(unstartedFallbackIndex);
             }
 
             foreach (var item in pending)
             {
                 PendingNormalCasts.Enqueue(item);
             }
+        }
+
+        // DIAGNOSTIC (H7 stuck-cast investigation): fires only when the GO resolved to a
+        // STARTED entry while an unstarted same-spell entry was ALSO queued — i.e. the exact
+        // double-send ambiguity H7 describes, now resolved to the correct (started) entry.
+        // Its presence in the tester's JSONL confirms the mis-pair condition was occurring
+        // (and that this fix is the one taking effect). Remove when the investigation closes.
+        if (cast != null && cast.HasStarted && sawUnstartedMatch && Framework.Settings.DebugOutput)
+        {
+            Log.Event("cast.go.prefer_started", new
+            {
+                spell_id = spellId,
+                started_cast_id = cast.ServerGUID.ToString(),
+            });
         }
 
         return cast != null;
