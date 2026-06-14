@@ -3,7 +3,8 @@
 **Status:** v1.4 (2026-06-13). Living document — updated each log-driven iteration.
 
 > ### ✎ v1.4 — H7 FIX (Phase 1) — PR [#372](https://github.com/jameopotato/jimsproxy/pull/372) (base `beta`)
-> **Mechanism, now verified against the CMSG side:** the double-send only produces two same-spell entries in **Low-Latency mode**, where `HandleCastSpell` bypasses the CMSG dup guard (`HasNonStartedPendingCastForSpell`, Server `SpellHandler.cs:345`) and forwards every press immediately. In *normal* mode the dup guard drops the second press, so H7 can't occur. **The tester is low-latency → in Low-Latency mode → unprotected by the dup guard → hits H7.** That's a real config-specific confirmation.
+> **Mechanism, verified against the CMSG side — and it's MODE-INDEPENDENT for Blade Flurry.** The CMSG dup guard that would drop a duplicate press (`HasNonStartedPendingCastForSpell`, Server `SpellHandler.cs:345`) lives *inside* the `if (!isOffGcd)` branch. **Blade Flurry is off-GCD, so it skips that branch entirely** — the off-GCD `else` (`:523`) enqueues *every* press with no dup guard → the double-send always creates two entries → H7 applies, in **both** normal and Low-Latency mode. (For *on-GCD* spells the picture differs: the dup guard protects normal mode, and only Low-Latency mode bypasses it. The brief says the repro is *mostly* BF, *sometimes* other casts — so mode may matter for the "other casts," not for BF.)
+> **Correction (do not repeat):** an earlier draft of this box asserted "the tester is low-latency → in Low-Latency mode → hits H7." That was wrong twice — low *RTT* ≠ the Low-Latency *mode* setting (we do NOT know the tester's mode), and for off-GCD BF the mode is irrelevant. #372 applies to the tester's Blade Flurry either way; their mode is still worth capturing (it bears on the *on-GCD* casts and on Phase 2), but it does not gate H7.
 > **The fix is caller-aware** (`TryDequeuePendingNormalCast(spellId, out cast, preferStarted)`):
 > - `SMSG_SPELL_GO` and real failures pass `preferStarted: true` → resolve the **started** entry (START/GO pair); fall back to oldest unstarted (skip-START instants).
 > - a duplicate's `NOT_READY`/`SpellInProgress` rejection passes `preferStarted: false` → consume the **unstarted** dup and **spare the started entry** for its in-flight GO.
@@ -440,6 +441,34 @@ Located; precise file:line inventory being compiled by recon. The removal set (G
 - **Phase 1 only** — deterministically fixes the desync *class*; keeps current latency/feel; low risk. 
 - **Phase 1 + 2** — also closes the latency gap and matches the competitor; deletes a large, concurrency-tricky machinery (net simplification); higher risk, needs the §7.7.5 Kronos validation.
 Recommendation: **do Phase 1 now** (it's the right fix and low-risk), and treat **Phase 2 as a deliberate follow-up** gated on the parallel-flood capture — not because it's wrong, but because it's the kind of timing change that deserves its own validation cycle rather than riding along with the correctness fix.
+
+### 7.7.7 Phase-2 refinements (design review — decided before we build)
+
+Four considerations reshape Phase 2. Net: aim *past* sugarproxy, regain Hold-and-Fire's server-kindness for free, and roll out safely behind a flag.
+
+**(a) Improve UPON sugarproxy — and recover Hold-and-Fire's server-kindness without its latency.** Three ways to treat a press during a GCD:
+| model | speed | server load | notes |
+|---|---|---|---|
+| Hold-and-Fire (ours now) | slow (holds) | kind (coalesces) | adds latency + serializes |
+| sugarproxy (parallel) | fast | **floods** NOT_READY | forwards every doomed press |
+| **native 1.12 client** | fast | kind | blocks doomed presses **locally**, sends viable ones immediately |
+The native model dominates both. **The improvement over sugarproxy is to reconstruct the native client's *local rejection* in the proxy:** forward viable casts immediately (parallel), but locally absorb presses the proxy *knows* are doomed, so the server never sees them. Two high-value, low-risk absorptions:
+  - **Collapse the off-GCD double-send.** The 1.14 client emits two `CMSG_CAST_SPELL` per off-GCD keypress (the H7 root). Detect it (same spell, two presses within a few ms) and forward only the first; ack-fail the second locally. Server-nice AND it removes the second entry H7 mis-pairs — **fixing H7 at the source**, leaving the §7.7 dequeue routing as a deterministic backstop. **Note: off-GCD casts bypass the CMSG dup guard in *both* modes (it's `!isOffGcd`-gated), so this collapse is mode-independent and should be ALWAYS-ON, not gated behind Low-Latency mode like the rest of the parallel rewrite.** It's effectively a Phase-1.5 cleanup that could ship independently.
+  - **Most-recent-wins coalescing** of a mash burst — forward the latest intent, not every key-repeat in a tight window (Hold-and-Fire's "most-recent-wins" without the hold).
+  The broader "absorb every mid-GCD / on-cooldown press" is a *nice-to-have but riskier*: the client already blocks most of these (it has the GCD swirl we send it), so proxy-side absorption there risks fighting the client's own prediction. Keep it conservative (absorb only with a safety margin; forward when uncertain) or skip it at first. The **double-send collapse is the clear win**. Result: **faster than Hold-and-Fire (no delay), kinder than sugarproxy (no flood), more correct than both (identity-pinned).**
+
+**(b) The Hold-and-Fire code's base ASSUMPTION is the real hazard, not the hold itself.** Serialization isn't confined to the timer — a web of gates assume *one cast at a time*: `HasStartedNormalCast()`, the dup guards `HasNonStartedPendingCastForSpell`/`HasInFlightNormalCastForSpell`, `HasForwardedPendingCast()`, the single-slot `_heldGcdCast`/`_heldCastTimeCast`, and — subtly — `ClearNonStartedNormalCasts` (on a SPELL_START it sweeps *other* non-started casts as stale; under parallel forwarding, concurrent presses are *legitimately* non-started and would be wrongly failed). Retrofitting these to "parallel-aware" is exactly where the next ten bugs hide.
+
+**(c) So don't retrofit — build the parallel path CLEAN and SEPARATE.** It gets its own correspondence logic on the *parallel* base assumption (identity-pinned CastIDs, no serial gates, no hold). The serial/hold code is **not reused** by it. The §7.7.3 cleanup (deleting the hold machinery) happens only *after* parallel is proven and promoted — not while building it.
+
+**(d) Gate it behind Low-Latency mode to start — the safe rollout, and it resolves (b)/(c) for free.** Low-Latency mode already IS the immediate-forward path. Build the full parallel-identity-pinned model *as Low-Latency mode's behavior*:
+  - Opt-in → normal mode (the majority) is untouched; zero regression risk for them.
+  - The tester is already low-latency → exercises it immediately.
+  - **Contains the base-assumption conflict**: the parallel path is Low-Latency-only and shares none of the serial gates, so (b) can't reach normal mode.
+  - Field-validates parallel via the low-latency cohort before any "make-default + delete-hold" decision.
+  - It's also where to clear the §7.7.5 flood-vs-anticheat risk — and the double-send collapse + coalescing should push the flood *below* today's level, a point in favor.
+
+**Revised Phase 2:** *"Upgrade Low-Latency mode into the parallel-identity-pinned model with local double-send collapse,"* not *"globally delete Hold-and-Fire."* Same destination, far safer path, and the endpoint is *better* than sugarproxy rather than merely matching it.
 
 ## 8. External parallels (Q4) — fuel, condensed (full cites in §10)
 
