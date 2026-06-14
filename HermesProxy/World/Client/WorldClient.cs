@@ -946,6 +946,16 @@ public partial class WorldClient
         if (!IsConnected() || _isSuccessful == false)
             return;
 
+        // JimsProxy (T1 guaranteed-closure companion): pump the cast watchdog on the keepalive
+        // tick so an orphaned cast (server sent no GO / CAST_FAILED / SPELL_FAILURE) still gets
+        // its synthetic closure when the player goes idle. The existing watchdog otherwise only
+        // runs on the next inbound spell packet, so a truly idle orphan leaks until the next cast.
+        // The 2.5s per-cast deadline and the eviction logic are unchanged — this only adds a pump
+        // cadence (≤ one keepalive interval late). Gated with the T1 bundle so OFF is byte-identical;
+        // RunWatchdogEviction is already invoked cross-thread and no-ops when nothing is overdue.
+        if (Framework.Settings.IdentityPinnedCastIdsActive)
+            GetSession()?.RunWatchdogEviction();
+
         // JimsProxy silent-stall watchdog: before sending the next keepalive
         // ping, check whether the legacy server has gone silent on us. The
         // existing reconnect path (HandleDisconnect / receive-loop catch)

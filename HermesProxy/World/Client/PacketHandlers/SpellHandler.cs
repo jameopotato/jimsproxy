@@ -475,6 +475,13 @@ public partial class WorldClient
             failed.SpellXSpellVisualID = pendingCast.SpellXSpellVisualId;
             failed.Reason = effectiveReason;
             failed.CastID = pendingCast.ServerGUID;
+            // T1 (identity-pinned): a real failure terminates the STARTED cast — stamp it with the
+            // recorded START CastID (popped FIFO) and consume the FIFO entry so a later same-spell
+            // GO can't pop this now-resolved cast's CastID. Transient dup rejections resolve the
+            // UNSTARTED dup (HasStarted=false, no FIFO entry) and leave the started cast's entry.
+            if (Settings.IdentityPinnedCastIdsActive && pendingCast.HasStarted &&
+                GetSession().GameState.TryPopForwardedStartCastId(pendingCast.SpellId, out var pinnedFailCastId))
+                failed.CastID = pinnedFailCastId;
             failed.FailedArg1 = arg1;
             failed.FailedArg2 = arg2;
             SendPacketToClient(failed);
@@ -1045,6 +1052,12 @@ public partial class WorldClient
             GetSession().GameState.PendingNormalCasts.FirstOrDefault(c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId)) is { } pendingNormal)
         {
             castId = pendingNormal.ServerGUID;
+            // T1 (identity-pinned): SPELL_FAILURE only PEEKS the pending cast (the trailing
+            // CAST_FAILED / GO / watchdog pops it), so stamp the forwarded failure's CastID from
+            // the FIFO front WITHOUT consuming it — the later pop stays paired.
+            if (Settings.IdentityPinnedCastIdsActive && pendingNormal.HasStarted &&
+                GetSession().GameState.TryPeekForwardedStartCastId(pendingNormal.SpellId, out var pinnedFailureCastId))
+                castId = pinnedFailureCastId;
             spellVisual = pendingNormal.SpellXSpellVisualId;
             if (pendingNormal.LegacySpellId != 0)
                 spellId = pendingNormal.SpellId;
@@ -1523,7 +1536,14 @@ public partial class WorldClient
             // duplicate's CAST_FAILED having consumed the entry). See PlayerForwardedCastIds.
             // Fallback only — normal casts override with ServerGUID at GO and never read it.
             if (casterIsLocalPlayer)
-                GetSession().GameState.PlayerForwardedCastIds[(uint)spell.Cast.SpellID] = spell.Cast.CastID;
+            {
+                if (Settings.IdentityPinnedCastIdsActive)
+                    // T1: per-spell FIFO supersedes the single-slot recovery so concurrent
+                    // same-spell starts each retain their forwarded CastID in START order.
+                    GetSession().GameState.EnqueueForwardedStartCastId((uint)spell.Cast.SpellID, spell.Cast.CastID);
+                else
+                    GetSession().GameState.PlayerForwardedCastIds[(uint)spell.Cast.SpellID] = spell.Cast.CastID;
+            }
             SendPacketToClient(spell);
         }
 
@@ -1638,6 +1658,15 @@ public partial class WorldClient
             GetSession().GameState.TryDequeuePendingNormalCast((uint)spell.Cast.SpellID, out var pendingCast))
         {
             spell.Cast.CastID = pendingCast!.ServerGUID;
+            // T1 (identity-pinned): for a STARTED cast, stamp GO with the CastID recorded at
+            // SPELL_START (popped from the per-spell FIFO) instead of the dequeued entry's
+            // ServerGUID, so START↔GO pair even if the dequeue resolved a different concurrent
+            // same-spell entry. Skip-START instants (HasStarted=false, no FIFO entry) keep the
+            // dequeued ServerGUID. Belt-and-suspenders over #372's preferStarted dequeue: matches
+            // it in the common case, diverges only under concurrent same-spell starts.
+            if (Settings.IdentityPinnedCastIdsActive && pendingCast.HasStarted &&
+                GetSession().GameState.TryPopForwardedStartCastId(pendingCast.SpellId, out var pinnedGoCastId))
+                spell.Cast.CastID = pinnedGoCastId;
             spell.Cast.SpellXSpellVisualID = pendingCast.SpellXSpellVisualId;
             // SoM-renumbered item: rewrite the legacy spell id back to the modern one the client expects.
             if (pendingCast.LegacySpellId != 0)
@@ -1792,6 +1821,24 @@ public partial class WorldClient
         // Hits server-initiated player casts with no CMSG (GO loot subspells e.g. Whipper
         // Root 15343, weapon/trinket procs) and casts whose pending entry was consumed by a
         // duplicate's CAST_FAILED before the GO (Blade Flurry, re-clicked gathers).
+        // JimsProxy (T1 identity-pinned cast correspondence): FIFO-backed promotion of the
+        // #362 recovery below to the primary path. When the GO has no pending entry (consumed by
+        // a duplicate's CAST_FAILED, or a server-initiated cast with no CMSG), recover the
+        // forwarded START CastID from the per-spell FIFO so START↔GO still pair. Supersedes the
+        // single-slot recovery (next branch) when active; the single-slot isn't populated then.
+        else if (Settings.IdentityPinnedCastIdsActive &&
+                 GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
+                 GetSession().GameState.TryPopForwardedStartCastId((uint)spell.Cast.SpellID, out var pinnedRecoverCastId))
+        {
+            spell.Cast.CastID = pinnedRecoverCastId;
+            Log.Event("cast.go.castid_recovered", new
+            {
+                spell_id = spell.Cast.SpellID,
+                caster_low = spell.Cast.CasterUnit.GetCounter(),
+                recovered_cast_id = pinnedRecoverCastId.ToString(),
+                pinned = true,
+            });
+        }
         else if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
                  GetSession().GameState.PlayerForwardedCastIds.TryRemove((uint)spell.Cast.SpellID, out var forwardedStartCastId))
         {

@@ -488,6 +488,20 @@ public sealed class GameSessionData
     // cast is dequeued at GO, so normal casts are wire-identical. Cleared on world
     // transfer alongside the pet/other-caster cast-id maps.
     public ConcurrentDictionary<uint, WowGuid128> PlayerForwardedCastIds = new();
+    // JimsProxy (T1 identity-pinned cast correspondence): per-spell FIFO of the CastIDs
+    // forwarded to the modern client at the LOCAL PLAYER's SMSG_SPELL_START. Supersedes the
+    // single-slot PlayerForwardedCastIds (above) when Settings.IdentityPinnedCastIdsActive.
+    // A single slot is overwritten when two same-spell casts are in flight at once (the
+    // immediate-forward / Low-Latency path), so a later GO recovers the wrong CastID; the
+    // FIFO preserves START order so each terminating event consumes the matching forwarded
+    // CastID and START↔GO/FAILED pair deterministically, independent of which queue entry
+    // the dequeue heuristic picks. Bounded per spell (oldest dropped past the cap) and
+    // cleared on reconnect so a missed pop can neither leak nor stale-head a future cast.
+    // Lock-guarded plain Dictionary/List (not Concurrent*) so enqueue+bound and the
+    // remove-by-value the watchdog needs are atomic; contention is negligible (cast events).
+    private readonly Dictionary<uint, List<WowGuid128>> _playerForwardedStartCastIds = new();
+    private readonly object _playerForwardedStartCastIdsLock = new();
+    private const int MaxForwardedStartCastIdsPerSpell = 8;
     // Tracks last-seen UNIT_CHANNEL_SPELL per unit so we can synthesize
     // SMSG_SPELL_CHANNEL_START/UPDATE for observers (vanilla only sends
     // MSG_CHANNEL_START to the caster, not to nearby players).
@@ -1329,6 +1343,99 @@ public sealed class GameSessionData
         return false;
     }
 
+    // JimsProxy (T1 identity-pinned cast correspondence) — per-spell forwarded-START CastID
+    // FIFO helpers. Active only when Settings.IdentityPinnedCastIdsActive; OFF path never
+    // calls these. See _playerForwardedStartCastIds.
+
+    /// <summary>
+    /// Record the CastID forwarded to the client at the local player's SMSG_SPELL_START.
+    /// Oldest-first; bounded so a missed pop can't grow without bound.
+    /// </summary>
+    public void EnqueueForwardedStartCastId(uint spellId, WowGuid128 castId)
+    {
+        lock (_playerForwardedStartCastIdsLock)
+        {
+            if (!_playerForwardedStartCastIds.TryGetValue(spellId, out var list))
+            {
+                list = new List<WowGuid128>(2);
+                _playerForwardedStartCastIds[spellId] = list;
+            }
+            list.Add(castId);
+            while (list.Count > MaxForwardedStartCastIdsPerSpell)
+                list.RemoveAt(0);
+        }
+    }
+
+    /// <summary>
+    /// Pop the oldest forwarded-START CastID for a spell — a terminating event (SPELL_GO or a
+    /// real CAST_FAILED) consuming the cast it opened.
+    /// </summary>
+    public bool TryPopForwardedStartCastId(uint spellId, out WowGuid128 castId)
+    {
+        lock (_playerForwardedStartCastIdsLock)
+        {
+            if (_playerForwardedStartCastIds.TryGetValue(spellId, out var list) && list.Count > 0)
+            {
+                castId = list[0];
+                list.RemoveAt(0);
+                if (list.Count == 0)
+                    _playerForwardedStartCastIds.Remove(spellId);
+                return true;
+            }
+        }
+        castId = default;
+        return false;
+    }
+
+    /// <summary>
+    /// Peek the oldest forwarded-START CastID without consuming it. SMSG_SPELL_FAILURE only
+    /// peeks the pending cast (the trailing SMSG_CAST_FAILED / GO / watchdog is what pops),
+    /// so it stamps from the FIFO front without removing it.
+    /// </summary>
+    public bool TryPeekForwardedStartCastId(uint spellId, out WowGuid128 castId)
+    {
+        lock (_playerForwardedStartCastIdsLock)
+        {
+            if (_playerForwardedStartCastIds.TryGetValue(spellId, out var list) && list.Count > 0)
+            {
+                castId = list[0];
+                return true;
+            }
+        }
+        castId = default;
+        return false;
+    }
+
+    /// <summary>
+    /// Remove a specific forwarded-START CastID by value. The watchdog evicts a known cast
+    /// that may not be the oldest, so removing by value (not popping the front) keeps the FIFO
+    /// consistent — a later same-spell cast's GO can't then pop this evicted cast's stale CastID.
+    /// </summary>
+    public bool RemoveForwardedStartCastId(uint spellId, WowGuid128 castId)
+    {
+        lock (_playerForwardedStartCastIdsLock)
+        {
+            if (_playerForwardedStartCastIds.TryGetValue(spellId, out var list) && list.Remove(castId))
+            {
+                if (list.Count == 0)
+                    _playerForwardedStartCastIds.Remove(spellId);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Drop all forwarded-START CastIDs (reconnect / world-transfer state reset).
+    /// </summary>
+    public void ClearForwardedStartCastIds()
+    {
+        lock (_playerForwardedStartCastIdsLock)
+        {
+            _playerForwardedStartCastIds.Clear();
+        }
+    }
+
     /// <summary>
     /// Clear all pending normal casts (used on timeout or disconnect).
     /// </summary>
@@ -1832,6 +1939,7 @@ public sealed class GameSessionData
         OtherCasterActiveCastIds.Clear();
         PetAutoCastActiveCastIds.Clear();
         PlayerForwardedCastIds.Clear();
+        ClearForwardedStartCastIds();
         // Single-slot trackers for melee + auto-repeat (Auto Shot, Shoot Wand)
         // — same lifecycle as PendingNormalCasts; if a tracker was set when
         // the DC fired, it never gets cleared by the SPELL_GO/CAST_FAILED
@@ -2591,6 +2699,12 @@ public class GlobalSessionData
                 had_started = cast.HasStarted,
                 ms_overdue = nowMs - cast.WatchdogDeadlineMs,
             });
+            // T1 (identity-pinned): the started cast is being force-closed without a server
+            // terminating event — release its forwarded-START CastID so a later same-spell cast
+            // can't pop this evicted cast's stale CastID. Remove by value (it may not be the FIFO
+            // head). The synthetic CastFailed below already carries cast.ServerGUID == that CastID.
+            if (Framework.Settings.IdentityPinnedCastIdsActive && cast.HasStarted)
+                GameState.RemoveForwardedStartCastId(cast.SpellId, cast.ServerGUID);
             if (!cast.HasStarted)
             {
                 SpellPrepare prepare = new();
