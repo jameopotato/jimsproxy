@@ -338,14 +338,21 @@ public partial class WorldClient
         if (packet.CanRead())
             arg2 = packet.ReadInt32();
 
+        // JimsProxy (H7): NotReady / SpellInProgress is a duplicate-rejection — the press the
+        // server bounced because another cast of the same spell is already in progress. Its
+        // CAST_FAILED must consume the UNSTARTED dup entry, NOT the started entry whose SPELL_GO
+        // is still in flight (preferStarted=false below). Real failures (OOR, LoS, OOM) fall
+        // through to the main path and resolve the started cast (preferStarted=true).
+        bool isTransientReason = reason == (uint)SpellCastResultVanilla.NotReady ||
+                                 reason == (uint)SpellCastResultVanilla.SpellInProgress;
+
         // JimsProxy: optional suppression of transient cast errors (NotReady = GCD active,
         // SpellInProgress = cast bar active). Useful with Low Latency Mode where mid-GCD
         // presses reach the server and bounce back. The 1.14 client's "Suppress Error Speech"
         // setting covers audio but not the red error text; this covers both.
-        if (Settings.SuppressSpellCastErrors &&
-            (reason == (uint)SpellCastResultVanilla.NotReady || reason == (uint)SpellCastResultVanilla.SpellInProgress))
+        if (Settings.SuppressSpellCastErrors && isTransientReason)
         {
-            GetSession().GameState.TryDequeuePendingNormalCast(spellId, out _);
+            GetSession().GameState.TryDequeuePendingNormalCast(spellId, out _, preferStarted: false);
             Log.Event("cast.error_suppressed", new
             {
                 spell_id = spellId,
@@ -392,8 +399,10 @@ public partial class WorldClient
             else
                 GetSession().GameState.CurrentClientNextMeleeCast = null;
         }
-        // Look up pending normal cast by SpellId (queue-based, FIFO order)
-        else if (GetSession().GameState.TryDequeuePendingNormalCast(spellId, out var pendingCast))
+        // Look up pending normal cast by SpellId (queue-based, FIFO order). A transient
+        // duplicate-rejection (NotReady/SpellInProgress reaching here with suppression off)
+        // fails the unstarted dup; a real failure resolves the started cast. See H7.
+        else if (GetSession().GameState.TryDequeuePendingNormalCast(spellId, out var pendingCast, preferStarted: !isTransientReason))
         {
             // JimsProxy (PR #161 follow-up — movement preemption): if this
             // cast was marked when the user started moving, the modern client

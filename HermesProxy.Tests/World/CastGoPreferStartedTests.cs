@@ -95,4 +95,39 @@ public class CastGoPreferStartedTests
         Assert.Null(cast);
         Assert.Single(session.PendingNormalCasts);   // unrelated entry untouched
     }
+
+    [Fact]
+    public void TryDequeuePendingNormalCast_DupRejectionPrefersUnstarted_SparesStarted()
+    {
+        // The OTHER ordering of the double-send: the duplicate's NOT_READY CAST_FAILED arrives
+        // BEFORE the first press's SPELL_GO. With preferStarted:false it must consume the
+        // unstarted duplicate and SPARE the started entry, so the GO can still pair to it.
+        var session = NewSession();
+        var started = MakeCast(13877, hasStarted: true, isOffGcd: true);
+        var duplicate = MakeCast(13877, hasStarted: false, isOffGcd: true);
+        session.PendingNormalCasts.Enqueue(started);
+        session.PendingNormalCasts.Enqueue(duplicate);
+
+        bool ok = session.TryDequeuePendingNormalCast(13877, out var cast, preferStarted: false);
+
+        Assert.True(ok);
+        Assert.Same(duplicate, cast);                                    // dup-rejection takes the UNSTARTED dup
+        Assert.Single(session.PendingNormalCasts);
+        Assert.Same(started, session.PendingNormalCasts.ToArray()[0]);   // started spared for its GO
+    }
+
+    [Fact]
+    public void TryDequeuePendingNormalCast_DupRejectionNoUnstarted_FallsBackToStarted()
+    {
+        // preferStarted:false with no unstarted entry falls back to the started one (defensive).
+        var session = NewSession();
+        var started = MakeCast(133, hasStarted: true);
+        session.PendingNormalCasts.Enqueue(started);
+
+        bool ok = session.TryDequeuePendingNormalCast(133, out var cast, preferStarted: false);
+
+        Assert.True(ok);
+        Assert.Same(started, cast);
+        Assert.Empty(session.PendingNormalCasts);
+    }
 }
