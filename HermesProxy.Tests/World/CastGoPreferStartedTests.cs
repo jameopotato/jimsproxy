@@ -130,4 +130,40 @@ public class CastGoPreferStartedTests
         Assert.Same(started, cast);
         Assert.Empty(session.PendingNormalCasts);
     }
+
+    // --- Off-GCD double-send collapse (Phase 1.5) ---
+    // The collapse fires in HandleCastSpell's off-GCD branch when this predicate is true,
+    // dropping the duplicate before it becomes a second pending entry. These pin the predicate
+    // semantics the collapse relies on.
+
+    [Fact]
+    public void HasNonStartedPendingCastForSpell_FirstPressUnstarted_True_CollapsesDup()
+    {
+        // press2-before-START: the first off-GCD press is still in flight (unstarted) when the
+        // double-send duplicate arrives → the collapse fires, so the server casts once.
+        var session = NewSession();
+        session.PendingNormalCasts.Enqueue(MakeCast(13877, hasStarted: false, isOffGcd: true));
+
+        Assert.True(session.HasNonStartedPendingCastForSpell(13877));
+    }
+
+    [Fact]
+    public void HasNonStartedPendingCastForSpell_FirstPressStarted_False_DequeueBackstopHandlesIt()
+    {
+        // press2-after-START: the first press already started, so the collapse does NOT fire; the
+        // duplicate enqueues and the caller-aware dequeue (preferStarted) is the backstop.
+        var session = NewSession();
+        session.PendingNormalCasts.Enqueue(MakeCast(13877, hasStarted: true, isOffGcd: true));
+
+        Assert.False(session.HasNonStartedPendingCastForSpell(13877));
+    }
+
+    [Fact]
+    public void HasNonStartedPendingCastForSpell_DifferentSpell_False()
+    {
+        var session = NewSession();
+        session.PendingNormalCasts.Enqueue(MakeCast(133, hasStarted: false));
+
+        Assert.False(session.HasNonStartedPendingCastForSpell(13877));
+    }
 }

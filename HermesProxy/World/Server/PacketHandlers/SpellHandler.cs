@@ -524,6 +524,30 @@ public partial class WorldSocket
             {
                 // Off-GCD path: still enqueue so SMSG_SPELL_GO can match back to the ClientGUID,
                 // but skip the cast-bar gate and the GCD hold.
+
+                // JimsProxy (off-GCD double-send collapse): the 1.14 client emits two
+                // CMSG_CAST_SPELL per off-GCD keypress. Collapse the still-unstarted same-spell
+                // duplicate so the server casts once and there's no second pending entry to
+                // mis-pair at SPELL_GO — fixing H7 at the source (the GO-side caller-aware dequeue
+                // stays as the deterministic backstop). Mirrors the on-GCD dup guard above (which
+                // off-GCD casts skip by design), but collapses only while the first press is still
+                // unstarted — the brief pre-server-response window the double-send's second CMSG
+                // lands in. A deliberate re-cast spaced beyond the round-trip finds the first
+                // already started and is NOT dropped; for off-GCD buffs/cooldowns a second cast
+                // within a round-trip is redundant anyway. The DontReport ack on the client's own
+                // CastID silently releases its second pending press.
+                if (GetSession().GameState.HasNonStartedPendingCastForSpell((uint)cast.Cast.SpellID))
+                {
+                    Log.Event("cast.dropped.duplicate", new
+                    {
+                        spell_id = cast.Cast.SpellID,
+                        reason = "off_gcd_double_send",
+                        client_cast_id = castRequest.ClientGUID.ToString(),
+                    });
+                    SendCastFailedWithoutPrepare(castRequest);
+                    return;
+                }
+
                 // DIAGNOSTIC (stuck-spell investigation): remove when closed
                 if (Framework.Settings.DebugOutput)
                     Log.Event("cast.forwarded", new
