@@ -18,7 +18,14 @@ public partial class WorldClient
     // any observed CAST_FAILED arrival on vmangos/Twinstar (~1ms after FAILURE)
     // and shorter than feels-laggy to the user when the pathological Kronos
     // case kicks in (target-dies-mid-cast, no trailing CAST_FAILED).
-    private const long WatchdogWindowMs = 2500;
+    //
+    // JimsProxy (watchdog-deadline tune): under LowLatencyMode the cohort is low-RTT
+    // (forward-all is for low-ping players), so a dropped reply is evident far sooner —
+    // 1s is a ~5x safety margin over typical RTT and clears an orphaned cast ~1.5s faster
+    // (snappier feel on a legitimately-cancelled mid-cast: movement, mob death, LoS).
+    // Normal / high-RTT players keep 2.5s so a legitimately-slow reply isn't closed early
+    // (which would desync when it finally lands).
+    private static long WatchdogWindowMs => Settings.LowLatencyMode ? 1000 : 2500;
 
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_SEND_KNOWN_SPELLS)]
