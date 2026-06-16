@@ -346,6 +346,21 @@ public partial class WorldClient
         bool isTransientReason = reason == (uint)SpellCastResultVanilla.NotReady ||
                                  reason == (uint)SpellCastResultVanilla.SpellInProgress;
 
+        // JimsProxy (transient-no-dismiss-started): under LowLatencyMode a transient failure
+        // (NOT_READY / SpellInProgress) is the server rejecting a DUPLICATE press, never an
+        // interrupt of the cast already in progress. If no unstarted duplicate is still queued to
+        // consume (the on-START sweep already cleared + acked it), this rejection is stale — drop it
+        // BEFORE the suppression branch and the dequeue below, both of which would otherwise fall
+        // back to the STARTED cast and dismiss its bar (the "interrupted but fired" desync). Normal
+        // mode is unaffected (no dups reach the server); real failures (OOR/LoS/OOM) are non-transient.
+        if (isTransientReason && Settings.LowLatencyMode &&
+            !GetSession().GameState.HasNonStartedPendingCastForSpell(spellId))
+        {
+            if (Framework.Settings.DebugOutput)
+                Log.Event("cast.transient_stale_dropped", new { spell_id = spellId });
+            return;
+        }
+
         // JimsProxy: optional suppression of transient cast errors (NotReady = GCD active,
         // SpellInProgress = cast bar active). Useful with Low Latency Mode where mid-GCD
         // presses reach the server and bounce back. The 1.14 client's "Suppress Error Speech"
@@ -452,6 +467,24 @@ public partial class WorldClient
             failed.FailedArg1 = arg1;
             failed.FailedArg2 = arg2;
             SendPacketToClient(failed);
+
+            // JimsProxy (transient-no-dismiss-started): under LowLatencyMode the SPELL_FAILURE
+            // deferred the caster-side visual-cancel to here so the REAL reason drives it. A real
+            // failure of a STARTED cast still needs its casting-pose / channel visual cancelled (the
+            // 1.14 client doesn't reliably do it from CAST_FAILED alone) — mirror HandleSpellFailure's
+            // cast-failure-stuck-visual cleanup. Transient dup-rejections and movement-cancelled casts
+            // never reach here started, so this is real failures only.
+            if (Settings.LowLatencyMode && pendingCast.HasStarted && !movementSuppressed)
+            {
+                uint resolvedVisual = GameData.GetSpellVisualIdFromXSpellVisual(pendingCast.SpellXSpellVisualId);
+                if (resolvedVisual != 0)
+                {
+                    CancelSpellVisual cancelVisual = new CancelSpellVisual();
+                    cancelVisual.Source = GetSession().GameState.CurrentPlayerGuid;
+                    cancelVisual.SpellVisualID = (int)resolvedVisual;
+                    SendPacketToClient(cancelVisual);
+                }
+            }
 
             var gameState = GetSession().GameState;
             var heldCastTimeDrop = gameState.ClearHeldCastTimeCast();
@@ -969,6 +1002,11 @@ public partial class WorldClient
         // reason and renders the correct popup.
         bool overrideReasonForLocalBroadcast = false;
         bool skipBroadcastFailure = false;
+        // JimsProxy (transient-no-dismiss-started): under LowLatencyMode, defer a STARTED local
+        // cast's bar-dismiss AND visual-cancel to the caller-aware trailing CAST_FAILED (which
+        // knows the real reason — spare a dup-rejection, dismiss a real failure). Set in the
+        // local-player branch; gates the cast-failure visual cleanup below.
+        bool deferLocalDismissToCastFailed = false;
         // 1.14 needs SMSG_SPELL_FAILURE to retract the bow-draw / wand-aim visual
         // for ranged auto-attacks; CastFailed + CANCEL_AUTO_REPEAT alone leaves the
         // bow stuck drawn. Other instants can drop the broadcast entirely -- there's
@@ -1028,6 +1066,16 @@ public partial class WorldClient
             // which clears button-lit state and shows the correct popup.
             else if (!pendingNormal.HasStarted && !isRangedAutoAttack)
                 skipBroadcastFailure = true;
+            // JimsProxy (transient-no-dismiss-started): under LowLatencyMode this SPELL_FAILURE may be
+            // a duplicate-rejection rather than an interrupt of the in-progress cast (the server
+            // hardcodes the reason, so we can't tell here). Defer BOTH the bar-dismiss and the
+            // visual-cancel to the caller-aware trailing CAST_FAILED, which knows the real reason.
+            // Ranged auto-attacks still forward (the bow-draw / wand-aim retract needs it).
+            else if (Settings.LowLatencyMode && !isRangedAutoAttack)
+            {
+                skipBroadcastFailure = true;
+                deferLocalDismissToCastFailed = true;
+            }
             else
                 overrideReasonForLocalBroadcast = true;
         }
@@ -1198,7 +1246,7 @@ public partial class WorldClient
         // #72's instant-suppression was removed once SpellFailure switched to peek),
         // so for auto-repeat ticks the visual is live on the client regardless of
         // whether the pending queue tracked it.
-        if (casterIsLocalPlayer && (wasStarted || isRangedAutoAttack) && !sentCancelVisual)
+        if (casterIsLocalPlayer && (wasStarted || isRangedAutoAttack) && !sentCancelVisual && !deferLocalDismissToCastFailed)
         {
             resolvedSpellVisualId = GameData.GetSpellVisualIdFromXSpellVisual(spellVisual);
             if (resolvedSpellVisualId != 0)
