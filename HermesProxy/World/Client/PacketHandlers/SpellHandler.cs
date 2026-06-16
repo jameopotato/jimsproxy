@@ -352,7 +352,18 @@ public partial class WorldClient
         // setting covers audio but not the red error text; this covers both.
         if (Settings.SuppressSpellCastErrors && isTransientReason)
         {
-            GetSession().GameState.TryDequeuePendingNormalCast(spellId, out _, preferStarted: false);
+            // JimsProxy (suppress-ack-stuck-button): suppress the red error text, but STILL ack
+            // the client so the action-button pending/lit state clears. Under LowLatencyMode the
+            // mid-GCD press was forwarded immediately and bounced back NOT_READY/SpellInProgress;
+            // the SPELL_FAILURE broadcast is already skipped for the local caster, and this dequeue
+            // is the proxy's LAST record of the press — so returning silently strands the button
+            // lit forever (the later ClearNonStartedNormalCasts sweep can't help; the entry is
+            // gone). SendCastRequestFailed emits a SpellPrepare first (only if never started, so
+            // the client can match by CastID) then a CastFailed(DontReport) — clears the button
+            // with no popup / error sound. Mirrors the item-use-orphan eviction ack above.
+            // preferStarted:false (H7, from #372): consume the UNSTARTED dup, leave the started cast for its GO.
+            if (GetSession().GameState.TryDequeuePendingNormalCast(spellId, out var suppressedCast, preferStarted: false) && suppressedCast != null)
+                GetSession().InstanceSocket.SendCastRequestFailed(suppressedCast, false, SpellCastResultClassic.DontReport);
             Log.Event("cast.error_suppressed", new
             {
                 spell_id = spellId,
