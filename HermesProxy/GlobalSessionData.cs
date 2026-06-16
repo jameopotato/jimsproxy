@@ -2604,6 +2604,23 @@ public class GlobalSessionData
             failed.Reason = (byte)SpellCastResultClassic.DontReport;
             failed.CastID = cast.ServerGUID;
             InstanceSocket.SendPacket(failed);
+
+            // JimsProxy (transient-no-dismiss-started): under LowLatencyMode, HandleSpellFailure
+            // deferred a started cast's caster-side visual-cancel to its trailing CAST_FAILED. If
+            // that CAST_FAILED was dropped (e.g. Kronos target-dies-mid-cast) the cast lands here
+            // instead — so cancel the casting-pose / channel visual too, not just dismiss the bar,
+            // or the pose can linger until the next cast. Idempotent on the client.
+            if (Framework.Settings.LowLatencyMode && cast.HasStarted)
+            {
+                uint resolvedVisual = GameData.GetSpellVisualIdFromXSpellVisual(cast.SpellXSpellVisualId);
+                if (resolvedVisual != 0)
+                {
+                    CancelSpellVisual cancelVisual = new();
+                    cancelVisual.Source = GameState.CurrentPlayerGuid;
+                    cancelVisual.SpellVisualID = (int)resolvedVisual;
+                    InstanceSocket.SendPacket(cancelVisual);
+                }
+            }
         }
 
         foreach (var cast in petEvicted)
