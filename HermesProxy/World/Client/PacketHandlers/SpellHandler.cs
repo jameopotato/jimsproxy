@@ -1343,23 +1343,34 @@ public partial class WorldClient
                 pendingCast.HasSentPrepare = true;
             }
 
-            // Clear non-started casts and send failures for them
-            // (keeps the started cast so SPELL_GO can dequeue it)
-            var failedCasts = GetSession().GameState.ClearNonStartedNormalCasts();
-            // DIAGNOSTIC (stuck-spell investigation): hoist toggle read; remove with diagnostics
-            bool debugEventsNormal = Framework.Settings.DebugOutput;
-            foreach (var failed in failedCasts)
+            // JimsProxy (C2 / forward-all): the on-START sweep fails OTHER non-started normal casts
+            // when one starts — correct under hold-and-fire (one cast at a time), but WRONG under
+            // LowLatencyMode forward-all, where concurrent non-started casts are legitimate mashed
+            // presses the server accepts/rejects individually. Sweeping them client-side while the
+            // server is still processing them is the ROOT of the dup-rejection-mis-dismiss class
+            // (the cast "interrupted but fired" desync). Under LowLatency skip it entirely; each cast
+            // resolves via its own SPELL_GO / CAST_FAILED (caller-aware dequeue) or the watchdog.
+            // Normal mode unchanged. (HasStarted / IsOffGcd casts are already exempt in the sweep.)
+            if (!Settings.LowLatencyMode)
             {
-                GetSession().InstanceSocket.SendCastRequestFailed(failed, false);
-                // DIAGNOSTIC (stuck-spell investigation): remove when closed
-                if (debugEventsNormal)
-                    Log.Event("cast.non_started_swept", new
-                    {
-                        queue = "normal",
-                        spell_id = failed.SpellId,
-                        triggering_spell_id = (uint)spell.Cast.SpellID,
-                        client_cast_id = failed.ClientGUID.ToString(),
-                    });
+                // Clear non-started casts and send failures for them
+                // (keeps the started cast so SPELL_GO can dequeue it)
+                var failedCasts = GetSession().GameState.ClearNonStartedNormalCasts();
+                // DIAGNOSTIC (stuck-spell investigation): hoist toggle read; remove with diagnostics
+                bool debugEventsNormal = Framework.Settings.DebugOutput;
+                foreach (var failed in failedCasts)
+                {
+                    GetSession().InstanceSocket.SendCastRequestFailed(failed, false);
+                    // DIAGNOSTIC (stuck-spell investigation): remove when closed
+                    if (debugEventsNormal)
+                        Log.Event("cast.non_started_swept", new
+                        {
+                            queue = "normal",
+                            spell_id = failed.SpellId,
+                            triggering_spell_id = (uint)spell.Cast.SpellID,
+                            client_cast_id = failed.ClientGUID.ToString(),
+                        });
+                }
             }
         }
         bool petCastWasPlayerPressed = false;
