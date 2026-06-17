@@ -124,7 +124,7 @@ title:SetText("|cFF00FF00JimsPlus|r Settings")
 
 local subtitle = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
 subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -4)
-subtitle:SetText("Build " .. namespace.BUILD)
+subtitle:SetText("v" .. (namespace.VERSION or "?"))
 
 ---------------------------------------------------------------------------
 -- Client Fixes (always on by default — these fix real bugs)

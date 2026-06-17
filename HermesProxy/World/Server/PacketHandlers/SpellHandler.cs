@@ -798,6 +798,17 @@ public partial class WorldSocket
         if (legacySpellId != 0)
             castRequest.LegacySpellId = legacySpellId;
 
+        // JimsProxy (#345): mirror HandleCastSpell — flag off-GCD item-use casts (trinkets,
+        // potions, bombs, engineering gadgets) so the ClearNonStartedNormalCasts exemption
+        // from #344 covers them. Without this they default to IsOffGcd=false and get swept
+        // when a concurrent GCD cast's SMSG_SPELL_START arrives: the sweep emits a premature
+        // CAST_FAILED while the server casts the item anyway, leaving the action button
+        // stuck-lit. Key the lookup on the legacy 1.12 id when the on-use spell was
+        // SoM-renumbered (OffGcdSpells is a vanilla Spell.dbc extract), matching the
+        // gcdLookupId pattern in HandleSpellGo.
+        castRequest.IsOffGcd = LegacyVersion.ExpansionVersion == 1 &&
+            GameData.IsOffGcd(castRequest.LegacySpellId != 0 ? castRequest.LegacySpellId : (uint)use.Cast.SpellID);
+
         // Enqueue the cast - responses will be matched by SpellId (or LegacySpellId) in FIFO order
         // DIAGNOSTIC (stuck-spell investigation): remove when closed
         if (Framework.Settings.DebugOutput)

@@ -312,7 +312,20 @@ public partial class WorldClient
         {
             var status = packet.ReadUInt8();
             if (status != 2)
+            {
+                // JimsProxy (engineering-malfunction jam): a discarded CAST_FAILED can be a
+                // server-side substitute (e.g. Goblin Mortar -> Malfunction Explosion 13261) that
+                // preempted a forwarded item-use cast (13237). The item-use then never starts and
+                // never fails on its own, so it sits forwarded-unstarted and HasForwardedPendingCast()
+                // jams every later press ("can't cast" until relog). Clear that orphan now — instant,
+                // no timeout, item-use-only — and release its button state silently.
+                if (GetSession().GameState.TryEvictForwardedItemUseCast(spellId, out var orphan) && orphan != null)
+                {
+                    GetSession().InstanceSocket.SendCastRequestFailed(orphan, false, SpellCastResultClassic.DontReport);
+                    Log.Event("cast.item_use_orphan_evicted", new { evicted_spell_id = orphan.SpellId, trigger_spell_id = spellId });
+                }
                 return;
+            }
         }
 
         uint reason = packet.ReadUInt8();
@@ -624,6 +637,20 @@ public partial class WorldClient
         SendPacketToClient(failed);
     }
 
+    // JimsProxy (warlock-pet-gcd-on-failure): synth SMSG_PET_CAST_FAILED(DontReport) so the modern client releases its predicted pet-button GCD sweep for a failed pet cast. Silent (the fizzle already played); the client matches by SpellID since CMSG_PET_ACTION presses carry no client CastID.
+    void SendPetGcdRelease(uint spellId, WowGuid128 castId)
+    {
+        PetCastFailed petFailed = new PetCastFailed();
+        petFailed.SpellID = spellId;
+        petFailed.Reason = (uint)SpellCastResultClassic.DontReport;
+        petFailed.CastID = castId;
+        SendPacketToClient(petFailed);
+    }
+
+    // JimsProxy (warlock-pet-gcd-on-failure): true if a CMSG_PET_CAST_SPELL for this spell is still queued — those get their own trailing SMSG_PET_CAST_FAILED, so the synthesized GCD release is gated to unqueued CMSG_PET_ACTION presses to avoid a double-fail.
+    bool HasQueuedPetCast(uint spellId) =>
+        GetSession().GameState.PendingPetCasts.Any(c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId));
+
     [PacketHandler(Opcode.SMSG_SPELL_FAILED_OTHER)]
     void HandleSpellFailedOther(WorldPacket packet)
     {
@@ -660,12 +687,17 @@ public partial class WorldClient
         if (GetSession().GameState.RecentlyForwardedSpellFailedOther.TryGetValue(dedupKey, out var lastMs) &&
             nowMs - lastMs < DedupWindowMs)
         {
+            // JimsProxy (warlock-pet-gcd-on-failure): the visual/SpellFailure storm is deduped, but a double-clicked pet-bar press is a distinct failed cast whose predicted GCD sweep must still be released. Gated to unqueued presses (CMSG_PET_ACTION, deterministic seed CastID).
+            bool dedupReleasePetGcd = GetSession().GameState.CurrentPetGuid == casterUnit && !HasQueuedPetCast(spellId);
+            if (dedupReleasePetGcd)
+                SendPetGcdRelease(spellId, WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, spellId, spellId + casterUnit.GetCounter()));
             Log.Event("spell.failed_other.dedup_skipped", new
             {
                 spellId,
                 reason,
                 casterCounter = casterUnit.GetCounter(),
                 ms_since_last = nowMs - lastMs,
+                sentPetCastFailed = dedupReleasePetGcd,
             });
             return;
         }
@@ -797,6 +829,14 @@ public partial class WorldClient
             }
         }
 
+        // JimsProxy (warlock-pet-gcd-on-failure): Kronos reports failed pet-bar casts via FAILED_OTHER only — release the client's predicted pet-button GCD sweep. Gated to unqueued presses (CMSG_PET_ACTION); a queued CMSG_PET_CAST_SPELL gets its own trailing PetCastFailed. The dedup branch above covers double-clicks.
+        bool sentPetCastFailed = false;
+        if (casterIsPet && !HasQueuedPetCast(spellId))
+        {
+            SendPetGcdRelease(spellId, castId);
+            sentPetCastFailed = true;
+        }
+
         Log.Event("spell.failed_other.routed", new
         {
             spellId,
@@ -808,6 +848,7 @@ public partial class WorldClient
             casterIsPet,
             sentInterruptLog,
             sentCancelVisual,
+            sentPetCastFailed,
             resolvedSpellVisualId,
             // Diagnostic: actual content of synthesized cleanup packets
             interruptLogCasterLow,
@@ -1113,6 +1154,14 @@ public partial class WorldClient
             }
         }
 
+        // JimsProxy (warlock-pet-gcd-on-failure): pet failures via SMSG_SPELL_FAILURE (not FAILED_OTHER) also need the predicted pet-button GCD sweep released. Gated to unqueued presses for the same reason as HandleSpellFailedOther.
+        bool sentPetCastFailed = false;
+        if (casterIsPet && !HasQueuedPetCast(spellId))
+        {
+            SendPetGcdRelease(spellId, castId);
+            sentPetCastFailed = true;
+        }
+
         // JimsProxy (cast-failure-stuck-visual 2026-05-10): For local-player cast
         // failures where SPELL_START was forwarded, the modern 1.14 client does not
         // reliably cancel the caster-side visual kit (casting pose, looping channel
@@ -1169,6 +1218,7 @@ public partial class WorldClient
             foundActiveCastId,
             sentInterruptLog,
             sentCancelVisual,
+            sentPetCastFailed,
             spellVisual,
             resolvedSpellVisualId,
             // Diagnostic: actual content of synthesized cleanup packets
@@ -1399,6 +1449,13 @@ public partial class WorldClient
         }
         else
         {
+            // JimsProxy (cast-go-castid-recovery): record the CastID we forward for the
+            // local player's SPELL_START so HandleSpellGo can recover it if the pending
+            // entry is gone by GO time (server-initiated casts with no CMSG, or a
+            // duplicate's CAST_FAILED having consumed the entry). See PlayerForwardedCastIds.
+            // Fallback only — normal casts override with ServerGUID at GO and never read it.
+            if (casterIsLocalPlayer)
+                GetSession().GameState.PlayerForwardedCastIds[(uint)spell.Cast.SpellID] = spell.Cast.CastID;
             SendPacketToClient(spell);
         }
 
@@ -1656,6 +1713,27 @@ public partial class WorldClient
                 prepare.ServerCastID = spell.Cast.CastID;
                 SendPacketToClient(prepare);
             }
+        }
+        // JimsProxy (cast-go-castid-recovery): FALLBACK — reached only when none of the
+        // branches above matched, i.e. the local player's SPELL_GO has no PendingNormalCast,
+        // melee, or auto-repeat entry. HandleSpellStartOrGo therefore left a freshly-minted
+        // sequence-unique CastID that won't match the CastID we forwarded at SPELL_START.
+        // The 1.14 client pairs START↔GO by CastID, so the mismatch leaves the player's cast
+        // un-terminated → stuck casting animation + looping cast sound. Re-stamp the GO with
+        // the START's forwarded CastID so the pair matches and the client closes the cast.
+        // Hits server-initiated player casts with no CMSG (GO loot subspells e.g. Whipper
+        // Root 15343, weapon/trinket procs) and casts whose pending entry was consumed by a
+        // duplicate's CAST_FAILED before the GO (Blade Flurry, re-clicked gathers).
+        else if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
+                 GetSession().GameState.PlayerForwardedCastIds.TryRemove((uint)spell.Cast.SpellID, out var forwardedStartCastId))
+        {
+            spell.Cast.CastID = forwardedStartCastId;
+            Log.Event("cast.go.castid_recovered", new
+            {
+                spell_id = spell.Cast.SpellID,
+                caster_low = spell.Cast.CasterUnit.GetCounter(),
+                recovered_cast_id = forwardedStartCastId.ToString(),
+            });
         }
 
         if (!spell.Cast.CasterUnit.IsEmpty() && GameData.AuraSpells.Contains((uint)spell.Cast.SpellID))

@@ -360,7 +360,8 @@ public class ChatAddonMessageParams
         IsLogged = data.HasBit();
         Type = (ChatMessageTypeModern)data.ReadInt32();
         Prefix = data.ReadString(prefixLen);
-        Text = data.ReadString(textLen);
+        // Addon bodies are binary (DEFLATE etc.); read 1:1 byte<->char so high bytes survive.
+        Text = data.ReadString(textLen, Encoding.Latin1);
     }
 
     public string Prefix = string.Empty;
@@ -408,11 +409,14 @@ public class ChatPkt : ServerPacket, ISpanWritable
         {
             language = (uint)Language.AddonBfA;
             char tab = '\t';
-            if (text.Contains(tab))
+            int tabIdx = text.IndexOf(tab);
+            if (tabIdx >= 0)
             {
-                string[] parts = text.Split(tab);
-                addonPrefix = parts[0];
-                text = string.Join(" ", parts.Skip(1).ToList());
+                // Split on the FIRST tab only: "prefix\tbody". The body is passed through
+                // verbatim — a DEFLATE addon payload can contain raw 0x09 bytes, and the
+                // old Split('\t')+Join(" ") turned every one into a space, corrupting it.
+                addonPrefix = text.Substring(0, tabIdx);
+                text = text.Substring(tabIdx + 1);
 
                 if (!registeredPrefixes.Contains(addonPrefix))
                     return false;
@@ -422,6 +426,12 @@ public class ChatPkt : ServerPacket, ISpanWritable
         }
         return true;
     }
+    // Addon-language chat bodies are binary (DEFLATE); encode 1:1 (Latin1) so bytes >= 0x80
+    // survive. Normal chat stays UTF-8. Applies to the ChatText body field only.
+    private Encoding BodyEncoding =>
+        _Language == (uint)Language.AddonBfA || _Language == (uint)Language.Addon
+            ? Encoding.Latin1 : Encoding.UTF8;
+
     public override void Write()
     {
         _worldPacket.WriteUInt8((byte)SlashCmd);
@@ -439,7 +449,7 @@ public class ChatPkt : ServerPacket, ISpanWritable
         _worldPacket.WriteBits(TargetName.GetByteCount(), 11);
         _worldPacket.WriteBits(Prefix.GetByteCount(), 5);
         _worldPacket.WriteBits(Channel.GetByteCount(), 7);
-        _worldPacket.WriteBits(ChatText.GetByteCount(), 12);
+        _worldPacket.WriteBits(BodyEncoding.GetByteCount(ChatText ?? ""), 12);
         _worldPacket.WriteBits((byte)_ChatFlags, 14);
         _worldPacket.WriteBit(HideChatLog);
         _worldPacket.WriteBit(FakeSenderName);
@@ -451,7 +461,7 @@ public class ChatPkt : ServerPacket, ISpanWritable
         _worldPacket.WriteString(TargetName);
         _worldPacket.WriteString(Prefix);
         _worldPacket.WriteString(Channel);
-        _worldPacket.WriteString(ChatText);
+        _worldPacket.WriteString(ChatText ?? "", BodyEncoding);
 
         if (Unused_801.HasValue)
             _worldPacket.WriteUInt32(Unused_801.Value);
@@ -476,7 +486,7 @@ public class ChatPkt : ServerPacket, ISpanWritable
         int targetNameBytes = Encoding.UTF8.GetByteCount(TargetName ?? "");
         int prefixBytes = Encoding.UTF8.GetByteCount(Prefix ?? "");
         int channelBytes = Encoding.UTF8.GetByteCount(Channel ?? "");
-        int chatTextBytes = Encoding.UTF8.GetByteCount(ChatText ?? "");
+        int chatTextBytes = BodyEncoding.GetByteCount(ChatText ?? "");
 
         // Check against our reduced MaxSize limits - fallback to Write() for oversized messages
         // Protocol limits are larger (2047/4095) but we optimize for typical usage
@@ -512,7 +522,7 @@ public class ChatPkt : ServerPacket, ISpanWritable
         writer.WriteString(TargetName ?? "");
         writer.WriteString(Prefix ?? "");
         writer.WriteString(Channel ?? "");
-        writer.WriteString(ChatText ?? "");
+        writer.WriteString(ChatText ?? "", BodyEncoding);
 
         if (Unused_801.HasValue)
             writer.WriteUInt32(Unused_801.Value);

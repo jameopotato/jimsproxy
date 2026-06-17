@@ -1,8 +1,8 @@
 local ADDON_NAME, namespace = ...
 
-namespace.BUILD = 20
+namespace.VERSION = (GetAddOnMetadata and GetAddOnMetadata(ADDON_NAME, "Version")) or "?"
 
-print("|cFF00FF00[JimsPlus]|r Core loaded (build " .. namespace.BUILD .. ")")
+print("|cFF00FF00[JimsPlus]|r v" .. namespace.VERSION .. " loaded")
 
 C_ChatInfo.RegisterAddonMessagePrefix("JP")
 

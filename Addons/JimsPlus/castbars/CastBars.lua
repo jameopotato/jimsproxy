@@ -351,6 +351,13 @@ end
 function addon:PLAYER_ENTERING_WORLD(isInitialLogin)
     if isInitialLogin then return end
 
+    -- Re-announce the JP sideband handshake. A reconnect (or any loading screen) gives the
+    -- proxy a fresh session with JimsPlusSideband=false, so without re-sending "1" the cast-time
+    -- and channel sidebands silently stop until /reload. Idempotent on same-session zone changes.
+    if C_ChatInfo and C_ChatInfo.SendAddonMessage then
+        C_ChatInfo.SendAddonMessage("JP", "1", "WHISPER", UnitName("player"))
+    end
+
     -- Reset all data on loading screens
     wipe(activeGUIDs)
     wipe(activeTimers)
@@ -411,6 +418,17 @@ function addon:CHAT_MSG_SYSTEM(message)
                 local spellId = tonumber(front:sub(lastColon1 + 1))
                 if guidStr and spellId then
                     proxyCastTimes[guidStr] = castTime
+                    -- JP_CS lands just after SMSG_SPELL_START, so the bar's COMBAT_LOG start
+                    -- usually fires first and reads the PREVIOUS cast's time (one-cast lag, e.g.
+                    -- rank-1 shown for a rank-7 cast). If a player cast for this GUID just started,
+                    -- re-apply the correct duration in place (keep timeStart) and consume it.
+                    local activeCast = activeTimers[guidStr]
+                    if activeCast and activeCast.isPlayer and not activeCast.isChanneled
+                        and (GetTime() - (activeCast.timeStart or 0)) < 0.2 then
+                        activeCast.maxValue = (castTime / 1000) - 0.1
+                        activeCast.endTime = activeCast.timeStart + ((castTime / 1000) - 0.1)
+                        proxyCastTimes[guidStr] = nil
+                    end
                 end
             end
         end

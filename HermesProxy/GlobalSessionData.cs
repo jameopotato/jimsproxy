@@ -5,6 +5,7 @@ using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
 using HermesProxy.World.Server;
 using System.Collections.Concurrent;
+using System.Collections.Frozen;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -475,6 +476,18 @@ public sealed class GameSessionData
     // overridden with ServerGUID downstream → the auto-cast map entry is a harmless
     // orphan in that case.
     public ConcurrentDictionary<(WowGuid128 caster, uint spellId), WowGuid128> PetAutoCastActiveCastIds = new();
+    // JimsProxy (cast-go-castid-recovery): client-facing CastID forwarded for the LOCAL
+    // PLAYER's SMSG_SPELL_START, keyed by spellId. HandleSpellGo recalls it when no
+    // PendingNormalCast / melee / auto-repeat entry matches at SPELL_GO, so START and GO
+    // ship the SAME CastID. The 1.14 client pairs START↔GO by CastID; a mismatch leaves
+    // the cast un-terminated → stuck casting animation + looping cast sound. Covers
+    // server-initiated player casts with no CMSG (GO loot subspells e.g. Whipper Root
+    // "Create Whipper Root Tubers" 15343, weapon/trinket procs) and casts whose pending
+    // entry was consumed by an interleaved duplicate CAST_FAILED before the GO (Blade
+    // Flurry, re-clicked gathers). Fallback ONLY — never consulted when a real pending
+    // cast is dequeued at GO, so normal casts are wire-identical. Cleared on world
+    // transfer alongside the pet/other-caster cast-id maps.
+    public ConcurrentDictionary<uint, WowGuid128> PlayerForwardedCastIds = new();
     // Tracks last-seen UNIT_CHANNEL_SPELL per unit so we can synthesize
     // SMSG_SPELL_CHANNEL_START/UPDATE for observers (vanilla only sends
     // MSG_CHANNEL_START to the caster, not to nearby players).
@@ -1665,6 +1678,54 @@ public sealed class GameSessionData
     }
 
     /// <summary>
+    /// Engineering-malfunction substitute spells mapped to the device whose forwarded item-use cast
+    /// they preempt. When a device malfunctions the server replaces the device's cast with one of
+    /// these substitutes and sends ITS CAST_FAILED (status != 2, discarded), so the device's item-use
+    /// cast never gets a SPELL_START or its own failure and sits forwarded-unstarted forever —
+    /// HasForwardedPendingCast() then jams every later press. Seeded with the only substitution
+    /// confirmed in packet logs: Malfunction Explosion (13261) -> Goblin Mortar (13237). Goblin Rocket
+    /// Boots (8892) and Sapper Charge (13241) are intentionally absent — they pair SPELL_START/GO
+    /// normally and never orphan. Expand as new substitute -> device pairs are confirmed.
+    /// </summary>
+    private static readonly FrozenDictionary<uint, uint> MalfunctionSubstituteToDevice =
+        new Dictionary<uint, uint>
+        {
+            [13261] = 13237, // Malfunction Explosion -> Goblin Mortar
+        }.ToFrozenDictionary();
+
+    /// <summary>
+    /// Evict the forwarded-but-unstarted item-use cast that a server-side malfunction substitute
+    /// preempted. Fires only when <paramref name="triggerSpellId"/> is a known malfunction substitute
+    /// and only evicts that substitute's specific device cast (see <see cref="MalfunctionSubstituteToDevice"/>),
+    /// so an unrelated status-0 CAST_FAILED can't evict a healthy in-flight item and the right victim
+    /// is always picked. Clears the orphan that would otherwise jam HasForwardedPendingCast(); returns
+    /// the evicted request so the caller can release its button state.
+    /// </summary>
+    public bool TryEvictForwardedItemUseCast(uint triggerSpellId, out ClientCastRequest? evicted)
+    {
+        evicted = null;
+
+        if (!MalfunctionSubstituteToDevice.TryGetValue(triggerSpellId, out var deviceSpellId))
+            return false;
+
+        var keep = new List<ClientCastRequest>();
+        lock (PendingCastsLock)
+        {
+            while (PendingNormalCasts.TryDequeue(out var current))
+            {
+                if (evicted == null && !current.HasStarted && !current.ItemGUID.IsEmpty()
+                    && current.SpellId == deviceSpellId)
+                    evicted = current;
+                else
+                    keep.Add(current);
+            }
+            foreach (var item in keep)
+                PendingNormalCasts.Enqueue(item);
+        }
+        return evicted != null;
+    }
+
+    /// <summary>
     /// Try to find and dequeue a pending pet cast by SpellId.
     /// </summary>
     public bool TryDequeuePendingPetCast(uint spellId, out ClientCastRequest? cast)
@@ -1746,6 +1807,7 @@ public sealed class GameSessionData
         int otherCount = OtherCasterActiveCastIds.Count;
         OtherCasterActiveCastIds.Clear();
         PetAutoCastActiveCastIds.Clear();
+        PlayerForwardedCastIds.Clear();
         // Single-slot trackers for melee + auto-repeat (Auto Shot, Shoot Wand)
         // — same lifecycle as PendingNormalCasts; if a tracker was set when
         // the DC fired, it never gets cleared by the SPELL_GO/CAST_FAILED

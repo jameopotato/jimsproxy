@@ -239,13 +239,13 @@ public class ByteBuffer : IDisposable
         return tmpString.ToString();
     }
 
-    public string ReadString(uint length)
+    public string ReadString(uint length, Encoding? encoding = null)
     {
         if (length == 0)
             return "";
 
         ResetBitPos();
-        return Encoding.UTF8.GetString(ReadBytes(length));
+        return (encoding ?? Encoding.UTF8).GetString(ReadBytes(length));
     }
 
     public bool ReadBool()
@@ -473,7 +473,7 @@ public class ByteBuffer : IDisposable
     /// Writes a string to the packet with a null terminated (0)
     /// </summary>
     /// <param name="str"></param>
-    public void WriteCString(string str)
+    public void WriteCString(string str, Encoding? encoding = null)
     {
         if (string.IsNullOrEmpty(str))
         {
@@ -481,16 +481,16 @@ public class ByteBuffer : IDisposable
             return;
         }
 
-        WriteString(str);
+        WriteString(str, encoding);
         WriteUInt8(0);
     }
 
-    public void WriteString(string str)
+    public void WriteString(string str, Encoding? encoding = null)
     {
         if (str.IsEmpty())
             return;
 
-        byte[] sBytes = Encoding.UTF8.GetBytes(str);
+        byte[] sBytes = (encoding ?? Encoding.UTF8).GetBytes(str);
         WriteBytes(sBytes);
     }
 

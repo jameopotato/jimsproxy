@@ -9,6 +9,7 @@ using HermesProxy.World.Server.Packets;
 using System;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace HermesProxy.World.Server;
 
@@ -20,6 +21,24 @@ public partial class WorldSocket
     // window so we never trip Kronos's anti-flood.
     private const double AuctionSearchCooldownSeconds = 6.0;
     private DateTime _lastSearchTime = DateTime.MinValue;
+
+    // JimsProxy (AH search-cooldown hang fix): a CMSG_AUCTION_LIST_ITEMS that arrives
+    // inside the 6s window must NOT be dropped. The modern client already flipped
+    // CanSendAuctionQuery() false on send and will wait forever for an
+    // SMSG_AUCTION_LIST_ITEMS_RESULT that a dropped query never produces — freezing the
+    // AH (and every AH addon / the default UI) until it's closed and reopened. Instead
+    // we stash the latest search (coalesce — latest wins) and forward it once the window
+    // opens via a single-flight Task.Delay continuation (mirrors ScheduleNextReplicatePage),
+    // so every search yields exactly one result. These fields are touched from both the
+    // handler thread and that continuation, so ALL access — including _lastSearchTime —
+    // goes through _auctionSearchLock.
+    private readonly object _auctionSearchLock = new();
+    private WorldPacket? _pendingSearchPacket;
+    private bool _pendingSearchFlushScheduled;
+    // Slack added to the computed wait so the flush never wakes a hair before the window
+    // opens. The under-lock elapsed>=cooldown re-check (which reschedules if woken early)
+    // is the real guard, so this only needs to cover timer granularity — keep it tiny.
+    private const int AuctionSearchFlushSlackMs = 40;
 
     // Minimum gap between forwarded CMSG_AUCTION_SELL_ITEM packets. Aux and similar
     // batch-posting addons can fire sells ~190 ms apart, which is well under the
@@ -134,33 +153,141 @@ public partial class WorldSocket
             return;
         }
 
-        var now = DateTime.UtcNow;
-        var elapsedMs = (now - _lastSearchTime).TotalMilliseconds;
-        var cooldownMs = AuctionSearchCooldownSeconds * 1000.0;
-        if (elapsedMs < cooldownMs)
-        {
-            // JimsProxy (aux-auction-cooldown-investigation): silent-drop diagnostic only.
-            // No behavior change vs. prior code -- still returns without forwarding to the
-            // legacy server. Hypothesis: this drop leaves the modern client's
-            // CanSendAuctionQuery() permanently false (no SMSG_AUCTION_LIST_ITEMS_RESULT
-            // ever arrives), which hangs Aux's pre-post search loop at scan.lua:117. If
-            // this event fires when Aux hangs, theory confirmed and the fix is to queue
-            // the CMSG until cooldown expires instead of dropping.
-            Framework.Logging.Log.Event("auction.list.dropped_cooldown", new
-            {
-                elapsed_ms = (long)elapsedMs,
-                cooldown_ms = (long)cooldownMs,
-                remaining_ms = (long)(cooldownMs - elapsedMs),
-                name = auction.Name,
-                offset = auction.Offset,
-                exact_match = auction.ExactMatch,
-                only_usable = auction.OnlyUsable,
-                quality = auction.Quality,
-            });
-            return;
-        }
-        _lastSearchTime = now;
+        // Translate up front (on the handler thread, while the parsed AuctionListItems is
+        // still alive) so the deferred path only ever holds the built WorldPacket.
+        WorldPacket packet = BuildAuctionListItemsPacket(auction);
 
+        bool sendNow;
+        lock (_auctionSearchLock)
+        {
+            var now = DateTime.UtcNow;
+            var elapsedMs = (now - _lastSearchTime).TotalMilliseconds;
+            var cooldownMs = AuctionSearchCooldownSeconds * 1000.0;
+            if (elapsedMs >= cooldownMs)
+            {
+                // Window open — forward immediately. Null any older pending search so a
+                // still-scheduled flush can't later re-send a now-superseded query as a
+                // duplicate (coalesce on the immediate path too, not only on queue).
+                _lastSearchTime = now;
+                _pendingSearchPacket = null;
+                sendNow = true;
+            }
+            else
+            {
+                // Inside the window. Dropping here is exactly what froze the client (no
+                // SMSG result ever arrives, so CanSendAuctionQuery() sticks false). Stash
+                // the latest search (coalesce — latest wins) and make sure exactly one
+                // flush is scheduled to forward it the moment the window opens.
+                _pendingSearchPacket = packet;
+                sendNow = false;
+                if (!_pendingSearchFlushScheduled)
+                {
+                    _pendingSearchFlushScheduled = true;
+                    ScheduleAuctionSearchFlush(cooldownMs - elapsedMs);
+                }
+                Framework.Logging.Log.Event("auction.list.queued_cooldown", new
+                {
+                    elapsed_ms = (long)elapsedMs,
+                    cooldown_ms = (long)cooldownMs,
+                    remaining_ms = (long)(cooldownMs - elapsedMs),
+                    name = auction.Name,
+                    offset = auction.Offset,
+                    exact_match = auction.ExactMatch,
+                    only_usable = auction.OnlyUsable,
+                    quality = auction.Quality,
+                });
+            }
+        }
+
+        if (sendNow)
+            SendPacketToServer(packet);
+    }
+
+    // Schedule the single-flight flush of the coalesced pending search. The wait is the
+    // remaining cooldown plus a tiny slack; the flush re-checks elapsed>=cooldown under
+    // the lock and reschedules if it somehow wakes early, so the slack only needs to
+    // cover timer granularity.
+    private void ScheduleAuctionSearchFlush(double remainingMs)
+    {
+        int delayMs = (int)Math.Ceiling(Math.Max(0.0, remainingMs)) + AuctionSearchFlushSlackMs;
+        Task.Delay(delayMs).ContinueWith(_ => FlushPendingAuctionSearch());
+    }
+
+    // Forward the coalesced pending search once the 6s window has elapsed. Runs on a
+    // thread-pool continuation (mirrors ScheduleNextReplicatePage): re-check state under
+    // the lock, then send outside it. Guarantees the modern client eventually receives
+    // exactly one SMSG_AUCTION_LIST_ITEMS_RESULT for the search it thinks is in flight,
+    // so CanSendAuctionQuery() always clears.
+    private void FlushPendingAuctionSearch()
+    {
+        try
+        {
+            WorldPacket toSend;
+            long forwardedAfterMs;
+            lock (_auctionSearchLock)
+            {
+                if (_pendingSearchPacket == null)
+                {
+                    // Superseded by an immediate forward, or cleared because a Full Scan
+                    // started. Nothing to send; reopen the single-flight slot.
+                    _pendingSearchFlushScheduled = false;
+                    return;
+                }
+
+                var elapsedMs = (DateTime.UtcNow - _lastSearchTime).TotalMilliseconds;
+                var cooldownMs = AuctionSearchCooldownSeconds * 1000.0;
+                if (elapsedMs < cooldownMs)
+                {
+                    // Woke a touch early, or another forward moved _lastSearchTime — wait
+                    // out the remainder. Stay single-flight (the scheduled flag stays set).
+                    ScheduleAuctionSearchFlush(cooldownMs - elapsedMs);
+                    return;
+                }
+
+                toSend = _pendingSearchPacket;
+                forwardedAfterMs = (long)elapsedMs;
+                _pendingSearchPacket = null;
+                _pendingSearchFlushScheduled = false;
+                _lastSearchTime = DateTime.UtcNow;
+            }
+
+            // Send outside the lock (no I/O under the lock, matching the replicate path).
+            // Skip cleanly if the session is tearing down — parity with
+            // ScheduleNextReplicatePage rather than relying on SendPacketToServer's
+            // safe-drop. Pending state was already cleared above, so dropping the search
+            // here is fine (reopening the AH resets the client's query flag anyway).
+            var worldClient = GetSession().WorldClient;
+            if (worldClient == null || !worldClient.IsConnected())
+            {
+                Framework.Logging.Log.Event("auction.list.flush_aborted", new
+                {
+                    reason = "world_client_disconnected",
+                });
+                return;
+            }
+
+            SendPacketToServer(toSend);
+            Framework.Logging.Log.Event("auction.list.forwarded_pending", new
+            {
+                forwarded_after_ms = forwardedAfterMs,
+            });
+        }
+        catch (Exception ex)
+        {
+            Framework.Logging.Log.Event("auction.list.flush_aborted", new
+            {
+                message = ex.Message,
+            });
+        }
+    }
+
+    // Translate a modern CMSG_AUCTION_LIST_ITEMS into the legacy 1.12 query packet. Pure
+    // build — no send, no cooldown logic — so the immediate path and the deferred flush
+    // share one translation. Emits auction.list.filter once per built query. Runs on the
+    // handler thread (it reads the parsed AuctionListItems, which is disposed when the
+    // handler returns; the deferred path holds the returned WorldPacket, never this object).
+    private WorldPacket BuildAuctionListItemsPacket(AuctionListItems auction)
+    {
         // Kronos has its own per-session search cooldown (canonical vanilla 6s) and
         // silently drops queries that arrive too quickly — kicking the WorldClient if
         // we keep hammering — so we can only ever send ONE CMSG_AUCTION_LIST_ITEMS per
@@ -277,7 +404,7 @@ public partial class WorldSocket
             }
         }
 
-        SendPacketToServer(packet);
+        return packet;
     }
 
     private void SendMergePieceSplit(
@@ -896,8 +1023,16 @@ public partial class WorldSocket
 
         // Stamp our cooldown so the very next user CMSG (if any slips through
         // before the first SMSG result re-asserts the in-progress flag in the
-        // common path) won't double up.
-        _lastSearchTime = DateTime.UtcNow;
+        // common path) won't double up. Also clear any pending user search: a flush
+        // scheduled before this scan started would otherwise fire mid-scan and inject a
+        // query into the Full-Scan's ~6.2s page cadence, grazing Kronos's anti-flood.
+        // Nulling the packet makes that flush a no-op (it bails when pending == null);
+        // both this clear and the flush's check run under _auctionSearchLock.
+        lock (_auctionSearchLock)
+        {
+            _lastSearchTime = DateTime.UtcNow;
+            _pendingSearchPacket = null;
+        }
         SendReplicatePageQuery(req.Auctioneer, page: 0);
     }
 

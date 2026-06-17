@@ -2438,16 +2438,7 @@ public partial class WorldClient
                 uint rangedAttackTime = updates[UNIT_FIELD_RANGEDATTACKTIME].UInt32Value;
                 updateData.UnitData.RangedAttackRoundBaseTime = rangedAttackTime;
 
-                // JimsProxy: vanilla bakes ranged haste straight into RANGEDATTACKTIME, but the
-                // modern client treats RangedAttackRoundBaseTime as the *un-hasted* base and
-                // time-scales the bow draw/release animation by ModRangedHaste. With no haste
-                // multiplier the bow animation can't keep up with hasted Auto Shot (Rapid Fire /
-                // Quick Shots) and freezes in the drawn pose until it catches up. Track the
-                // slowest (resting) RANGEDATTACKTIME seen for this unit as the base and send
-                // ModRangedHaste = resting / current so the client scales the animation. Note:
-                // a mid-session swap to a *faster* ranged weapon leaves the cached resting
-                // stale-high until a slower value is seen again — the failure mode there is a
-                // mildly fast animation, far less jarring than the freeze, so it degrades well.
+                // JimsProxy: keep the hasted base so UnitRangedDamage (paperdoll/swing-timer addons) reads the real speed; Classic Era ignores ModRangedHaste for that API, so send ModRangedHaste = resting/current only to scale the bow-draw animation.
                 if (rangedAttackTime > 0)
                 {
                     WowGuid128 rangedUnitGuid = guid.To128(GetSession().GameState);
@@ -2455,7 +2446,6 @@ public partial class WorldClient
                         rangedUnitGuid, rangedAttackTime,
                         (_, prev) => Math.Max(prev, rangedAttackTime));
                     float modRangedHaste = (float)restingRangedAttackTime / rangedAttackTime;
-                    updateData.UnitData.RangedAttackRoundBaseTime = restingRangedAttackTime;
                     updateData.UnitData.ModRangedHaste = modRangedHaste;
                     if (modRangedHaste > 1.0f)
                         Log.Event("ranged.haste.synth", new
