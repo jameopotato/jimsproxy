@@ -73,6 +73,12 @@ public static class Settings
     public static bool IdentityPinnedCastIds;
     // Effective gate for the T1 mechanism: the sub-toggle is live only under LowLatencyMode.
     public static bool IdentityPinnedCastIdsActive => LowLatencyMode && IdentityPinnedCastIds;
+    // JimsProxy (#313): width (ms) of the spell-queue hold window. A press arriving in the
+    // last SpellQueueWindowMs of an active GCD or cast bar is held and fired at expiry; earlier
+    // presses are forwarded and the server arbitrates (NOT_READY / SpellInProgress). Mirrors the
+    // 1.14 SpellQueueWindow contract. The launcher exposes 400 (retail-accurate) / 1000 / 1300
+    // (smoothest, closest to the old full-hold); lower values are allowed, capped at 1300 ms.
+    public static int SpellQueueWindowMs;
     // JimsProxy (PR #228 follow-up): synthesize SMSG_THREAT_UPDATE / HIGHEST /
     // CLEAR so the modern client's native threat APIs (UnitDetailedThreatSituation,
     // UNIT_THREAT_LIST_UPDATE) populate. Default on. Disable for players who
@@ -123,6 +129,7 @@ public static class Settings
         LowLatencyMode = config.GetBoolean("LowLatencyMode", false);
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);
         IdentityPinnedCastIds = config.GetBoolean("IdentityPinnedCastIds", false);
+        SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 1300), 0, 1300);
         ThreatEngine = config.GetBoolean("ThreatEngine", false);
         var serverTypeStr = config.GetString("ServerType", "Kronos");
         ServerType = serverTypeStr.Equals("Generic", StringComparison.OrdinalIgnoreCase)
