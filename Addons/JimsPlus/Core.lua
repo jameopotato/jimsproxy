@@ -20,6 +20,5 @@ f:SetScript("OnEvent", function(_, _, addon)
     if JimsPlusDB.petFix == nil then JimsPlusDB.petFix = true end
     if JimsPlusDB.taxiFix == nil then JimsPlusDB.taxiFix = true end
     if JimsPlusDB.bagSortOrder == nil then JimsPlusDB.bagSortOrder = false end
-    if JimsPlusDB.bagSortPaceMs == nil then JimsPlusDB.bagSortPaceMs = 75 end
     namespace.db = JimsPlusDB
 end)

@@ -13,11 +13,10 @@
 
 local _, namespace = ...
 
--- Fallback sort-move interval (ms) used until a value is saved. The live value comes
--- from JimsPlusDB.bagSortPaceMs (Options slider, 30-200ms) and is read PER MOVE, so
--- sliding it takes effect on the very next sort with no /reload. Once we've pinned
--- Kronos's actual anti-flood limit, that number becomes this default.
-local DEFAULT_PACE_MS = 75
+-- Sort-move interval (ms), pinned to Kronos's item-move anti-flood limit: one swap per
+-- PACE_MS lands first try instead of being bounced in a burst. 30ms is the measured safe
+-- floor (was a 30-200ms Options slider during tuning; now fixed).
+local PACE_MS = 30
 
 local FIXTURES = {
     [6948] = true, -- Hearthstone
@@ -89,9 +88,8 @@ local function Hook()
     local lastMoveMs = 0
     local origMove = Sorting.Move
     Sorting.Move = function(self, from, to)
-        local pace = (namespace.db and tonumber(namespace.db.bagSortPaceMs)) or DEFAULT_PACE_MS
         local now = GetTime() * 1000
-        if now - lastMoveMs < pace then
+        if now - lastMoveMs < PACE_MS then
             -- Too soon -- skip this swap. Bagnon's Iterate always re-schedules its
             -- Delay(0.05, 'Run'), so the same move is retried on the next pass; we're
             -- only metering how fast swaps actually reach the server. A skipped move

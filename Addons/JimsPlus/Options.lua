@@ -204,30 +204,6 @@ local cbBagSort = CreateCheckbox(panel, y,
     "Changes Bagnon's sort button to a curated layout:\npermanent fixtures (hearthstone) first, then profession and\ngathering tools, quest items, soulbound gear, other gear,\nconsumables, everything else, and junk last.\n\nAlso applies to Bagnon's bank sort. Takes effect on the\nnext sort — no reload needed.")
 y = y - 28
 
--- Bag sort throttle: paces Bagnon's swaps so the server's item-move anti-flood
--- doesn't bounce them (which makes the sort loop). Read live by BagnonSort.lua.
-local paceSlider = CreateFrame("Slider", "JimsPlusSortPaceSlider", panel, "OptionsSliderTemplate")
-paceSlider:SetPoint("TOPLEFT", panel, "TOPLEFT", 20, y - 6)
-paceSlider:SetWidth(220)
-paceSlider:SetMinMaxValues(30, 200)
-paceSlider:SetValueStep(5)
-paceSlider:SetObeyStepOnDrag(true)
-JimsPlusSortPaceSliderLow:SetText("30 ms")
-JimsPlusSortPaceSliderHigh:SetText("200 ms")
-JimsPlusSortPaceSliderText:SetText("Bag sort move interval")
-paceSlider:HookScript("OnEnter", function(self)
-    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-    GameTooltip:SetText("Bag sort speed (Bagnon)\n\nThrottles Bagnon's bag sort so rapid swaps don't trip the server's\nitem-move anti-flood (which bounces them and makes the sort loop).\n\nLower = faster but may stall on big bags; higher = slower but safer.\nTakes effect on the next sort.", 1, 1, 1, 1, true)
-    GameTooltip:Show()
-end)
-paceSlider:HookScript("OnLeave", function() GameTooltip:Hide() end)
-paceSlider:SetScript("OnValueChanged", function(self, value)
-    value = math.floor(value + 0.5)
-    if namespace.db then namespace.db.bagSortPaceMs = value end
-    JimsPlusSortPaceSliderText:SetText("Bag sort move interval: " .. value .. " ms")
-end)
-y = y - 50
-
 -- More tool buttons can be added below (decrement y per button).
 
 ---------------------------------------------------------------------------
@@ -238,7 +214,6 @@ local function RefreshCheckboxes()
     cbTooltipFix:SetChecked(db.tooltipFix == true)
     cbMoonkinSound:SetChecked(db.moonkinSound ~= false)
     cbBagSort:SetChecked(db.bagSortOrder ~= false)
-    paceSlider:SetValue(tonumber(db.bagSortPaceMs) or 75)
 
     local cdb = JimsPlusCastbars and JimsPlusCastbars.db
     if cdb then
