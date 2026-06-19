@@ -118,6 +118,34 @@ local function Hook()
         end
         return origRule(a, b)
     end
+
+    --------------------------------------------------------- keyring exclusion
+    -- Drop the keyring (container -2) from the bag set before every sort. Bagnon's
+    -- GetBagInfo only tags the keyring bag-family 9 (keys-only) when the client's
+    -- KEYRING_CONTAINER constant matches; on 1.14 it falls through to family 0, so the
+    -- sorter sees the keyring as general storage and moves the first non-key (e.g. Gold
+    -- Ore) into keyring slot 1. Kronos rejects a non-key in the keyring (keys-only) and
+    -- Bagnon retries the identical CMSG_SWAP_ITEM every 50ms forever -- the sort never
+    -- finishes. KeyringClamp's family override can't help here: it hooks
+    -- GetContainerNumFreeSlots, which GetBagInfo doesn't read for family. Keys never need
+    -- sorting, so excluding the keyring makes a keyring-slot target impossible. Builds a
+    -- new list (never mutates the frame's self.Bags, which still drives the display).
+    if type(Sorting.Start) == "function" then
+        local KEYRING = (type(KEYRING_CONTAINER) == "number") and KEYRING_CONTAINER or -2
+        local origStart = Sorting.Start
+        Sorting.Start = function(self, owner, bags)
+            if type(bags) == "table" then
+                local filtered = {}
+                for _, bag in pairs(bags) do
+                    if bag ~= KEYRING then
+                        filtered[#filtered + 1] = bag
+                    end
+                end
+                bags = filtered
+            end
+            return origStart(self, owner, bags)
+        end
+    end
 end
 
 -- PLAYER_LOGIN covers the normal case (after non-LoD addons load); ADDON_LOADED
