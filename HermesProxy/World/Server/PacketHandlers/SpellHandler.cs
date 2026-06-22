@@ -318,6 +318,29 @@ public partial class WorldSocket
                 // for players with very low RTT.
                 if (Settings.LowLatencyMode)
                 {
+                    // Guard: in-flight same-spell duplicate. Mirrors the normal-mode guard below.
+                    // Low-Latency mode bypasses the hold/guard paths, which let an on-GCD
+                    // double-send (e.g. Blade Flurry 13877, which the 1.14 client double-sends)
+                    // enqueue TWO entries for one spell: SMSG_SPELL_START marks one started,
+                    // SMSG_SPELL_GO / CAST_FAILED resolve the other, so START and GO carry
+                    // different CastIDs, the client never closes the cast, and we get a stuck
+                    // cast animation + looping sound. Drop the duplicate and ack it via
+                    // SendCastFailedWithoutPrepare (same purpose/reasoning as normal mode) so
+                    // the button doesn't stick lit.
+                    if (GetSession().GameState.HasNonStartedPendingCastForSpell((uint)cast.Cast.SpellID))
+                    {
+                        Log.Event("cast.dropped.duplicate", new
+                        {
+                            spell_id = cast.Cast.SpellID,
+                            reason = "in_flight_same_spell",
+                            client_cast_id = cast.Cast.CastID.ToString(),
+                            queue_depth = GetSession().GameState.PendingNormalCasts.Count,
+                            source = "low_latency",
+                        });
+                        SendCastFailedWithoutPrepare(castRequest);
+                        return;
+                    }
+
                     // DIAGNOSTIC (stuck-spell investigation): remove when closed
                     if (Framework.Settings.DebugOutput)
                         Log.Event("cast.forwarded", new
