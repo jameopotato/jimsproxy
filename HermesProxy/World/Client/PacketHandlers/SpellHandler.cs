@@ -21,9 +21,9 @@ public partial class WorldClient
     // case kicks in (target-dies-mid-cast, no trailing CAST_FAILED).
     private const long WatchdogWindowMs = 2500;
 
-    // JimsProxy (experimental cast-kit-stop): defer (ms) before the synthesized cast-kit stop, so it
-    // lands in a clean client frame past the coalesced START+GO burst. A couple of frames at 60fps.
-    private const int CastKitStopDeferMs = 8;
+    // JimsProxy (Spell Success Kit Reset): defer (ms) before re-firing the cast-finish, so it lands
+    // in a clean client frame past the coalesced START+GO burst. A couple of frames at 60fps.
+    private const int SpellSuccessRefireDeferMs = 8;
 
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_SEND_KNOWN_SPELLS)]
@@ -1757,42 +1757,51 @@ public partial class WorldClient
                 });
             }
 
-            // JimsProxy (Spell Success Kit Reset): an instant cast forwards SPELL_START and SPELL_GO
-            // in the same client frame; the 1.14 client can lose the cast kit's stop-event, leaving
-            // the cast-hold kit (pose + its looping sound, e.g. BF SpellVisual 211 kit 353 "InnerFire")
-            // running until logout. On the cast's SPELL_GO (success), re-fire the stop via
-            // SMSG_CANCEL_SPELL_VISUAL a few ms later in a clean frame, past the coalesced START+GO.
-            // No-op on clean casts (the kit already stopped at the real stop-event). Local-player
-            // instants only; opt-in via SpellSuccessKitReset (works in both latency modes).
+            // JimsProxy (Spell Success Kit Reset — B2 probe): an instant cast forwards SPELL_START and
+            // SPELL_GO in the same client frame; the 1.14 client can drop the cast's teardown, leaving
+            // the casting pose + sound stuck until logout. Re-fire the cast-finish a few ms later in a
+            // clean frame via a DUPLICATE SPELL_GO with the visual suppressed and no targets/log — so
+            // nothing replays (no double explosion/ring), only the UNIT_SPELLCAST_SUCCEEDED that clears
+            // the pose. The real GO forwards first (below, synchronously); this fires after the bounded
+            // delay. Cancels nothing, so it can't blank a spell effect. Local-player instants only;
+            // opt-in via SpellSuccessKitReset, off by default. Probe for the duplicate-GO mechanism.
             if (Settings.SpellSuccessKitReset && pendingCast.StartedCastTimeMs == 0)
             {
-                uint kitVisual = GameData.GetSpellVisualIdFromXSpellVisual(spell.Cast.SpellXSpellVisualID);
-                if (kitVisual != 0)
+                var rfCasterGuid = spell.Cast.CasterGUID;
+                var rfCasterUnit = spell.Cast.CasterUnit;
+                var rfCastId = spell.Cast.CastID;
+                var rfOriginalCastId = spell.Cast.OriginalCastID;
+                int rfSpellId = spell.Cast.SpellID;
+                uint rfCastFlags = spell.Cast.CastFlags;
+                uint rfCastFlagsEx = spell.Cast.CastFlagsEx;
+                _ = Task.Run(async () =>
                 {
-                    WowGuid128 kitCaster = spell.Cast.CasterUnit;
-                    int kitSpellId = spell.Cast.SpellID;
-                    uint kitXVisual = spell.Cast.SpellXSpellVisualID;
-                    _ = Task.Run(async () =>
+                    await Task.Delay(SpellSuccessRefireDeferMs);
+                    try
                     {
-                        await Task.Delay(CastKitStopDeferMs);
-                        try
-                        {
-                            SendPacketToClient(new CancelSpellVisual { Source = kitCaster, SpellVisualID = (int)kitVisual });
-                            if (Framework.Settings.DebugOutput)
-                                Log.Event("cast.kit_stop_synth", new
-                                {
-                                    spell_id = kitSpellId,
-                                    spell_x_spell_visual_id = kitXVisual,
-                                    resolved_visual = kitVisual,
-                                    defer_ms = CastKitStopDeferMs,
-                                });
-                        }
-                        catch
-                        {
-                            // session/socket may have torn down during the defer — best-effort cosmetic cleanup
-                        }
-                    });
-                }
+                        var refire = new SpellGo();
+                        refire.Cast.CasterGUID = rfCasterGuid;
+                        refire.Cast.CasterUnit = rfCasterUnit;
+                        refire.Cast.CastID = rfCastId;
+                        refire.Cast.OriginalCastID = rfOriginalCastId;
+                        refire.Cast.SpellID = rfSpellId;
+                        refire.Cast.SpellXSpellVisualID = 0; // suppress visual so nothing replays
+                        refire.Cast.CastFlags = rfCastFlags;
+                        refire.Cast.CastFlagsEx = rfCastFlagsEx;
+                        // targets + LogData left empty: a pure cast-finish, no effect/CLEU replay
+                        SendPacketToClient(refire);
+                        if (Framework.Settings.DebugOutput)
+                            Log.Event("cast.success_refire", new
+                            {
+                                spell_id = rfSpellId,
+                                defer_ms = SpellSuccessRefireDeferMs,
+                            });
+                    }
+                    catch
+                    {
+                        // session/socket may have torn down during the defer — best-effort
+                    }
+                });
             }
 
             var gameStateAfter = GetSession().GameState;
