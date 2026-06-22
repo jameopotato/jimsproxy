@@ -73,6 +73,13 @@ public static class Settings
     public static bool IdentityPinnedCastIds;
     // Effective gate for the T1 mechanism: the sub-toggle is live only under LowLatencyMode.
     public static bool IdentityPinnedCastIdsActive => LowLatencyMode && IdentityPinnedCastIds;
+    // JimsProxy (Spell Success Kit Reset): an instant cast forwards SPELL_START+SPELL_GO in the same
+    // client frame; the 1.14 client can drop the cast kit's stop (SpellVisualEvent end-event 13),
+    // leaving the cast-hold kit — which carries the cast pose AND its looping sound — stuck on until
+    // logout. When set, on a local instant's SPELL_GO (cast success) re-fire the kit stop
+    // (SMSG_CANCEL_SPELL_VISUAL) a few ms later in a clean frame. No-op on clean casts (the kit
+    // already stopped). Independent of LowLatencyMode — works in both. Default OFF — opt-in.
+    public static bool SpellSuccessKitReset;
     // JimsProxy (#313): width (ms) of the spell-queue hold window. A press arriving in the
     // last SpellQueueWindowMs of an active GCD or cast bar is held and fired at expiry; earlier
     // presses are forwarded and the server arbitrates (NOT_READY / SpellInProgress). Mirrors the
@@ -129,6 +136,7 @@ public static class Settings
         LowLatencyMode = config.GetBoolean("LowLatencyMode", false);
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);
         IdentityPinnedCastIds = config.GetBoolean("IdentityPinnedCastIds", false);
+        SpellSuccessKitReset = config.GetBoolean("SpellSuccessKitReset", false);
         SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 1300), 0, 1300);
         ThreatEngine = config.GetBoolean("ThreatEngine", false);
         var serverTypeStr = config.GetString("ServerType", "Kronos");

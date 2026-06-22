@@ -7,6 +7,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace HermesProxy.World.Client;
 
@@ -19,6 +20,10 @@ public partial class WorldClient
     // and shorter than feels-laggy to the user when the pathological Kronos
     // case kicks in (target-dies-mid-cast, no trailing CAST_FAILED).
     private const long WatchdogWindowMs = 2500;
+
+    // JimsProxy (experimental cast-kit-stop): defer (ms) before the synthesized cast-kit stop, so it
+    // lands in a clean client frame past the coalesced START+GO burst. A couple of frames at 60fps.
+    private const int CastKitStopDeferMs = 8;
 
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_SEND_KNOWN_SPELLS)]
@@ -1750,6 +1755,44 @@ public partial class WorldClient
                     forced_cooldown_ms = gcdMs,
                     flags = 0x01,
                 });
+            }
+
+            // JimsProxy (Spell Success Kit Reset): an instant cast forwards SPELL_START and SPELL_GO
+            // in the same client frame; the 1.14 client can lose the cast kit's stop-event, leaving
+            // the cast-hold kit (pose + its looping sound, e.g. BF SpellVisual 211 kit 353 "InnerFire")
+            // running until logout. On the cast's SPELL_GO (success), re-fire the stop via
+            // SMSG_CANCEL_SPELL_VISUAL a few ms later in a clean frame, past the coalesced START+GO.
+            // No-op on clean casts (the kit already stopped at the real stop-event). Local-player
+            // instants only; opt-in via SpellSuccessKitReset (works in both latency modes).
+            if (Settings.SpellSuccessKitReset && pendingCast.StartedCastTimeMs == 0)
+            {
+                uint kitVisual = GameData.GetSpellVisualIdFromXSpellVisual(spell.Cast.SpellXSpellVisualID);
+                if (kitVisual != 0)
+                {
+                    WowGuid128 kitCaster = spell.Cast.CasterUnit;
+                    int kitSpellId = spell.Cast.SpellID;
+                    uint kitXVisual = spell.Cast.SpellXSpellVisualID;
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay(CastKitStopDeferMs);
+                        try
+                        {
+                            SendPacketToClient(new CancelSpellVisual { Source = kitCaster, SpellVisualID = (int)kitVisual });
+                            if (Framework.Settings.DebugOutput)
+                                Log.Event("cast.kit_stop_synth", new
+                                {
+                                    spell_id = kitSpellId,
+                                    spell_x_spell_visual_id = kitXVisual,
+                                    resolved_visual = kitVisual,
+                                    defer_ms = CastKitStopDeferMs,
+                                });
+                        }
+                        catch
+                        {
+                            // session/socket may have torn down during the defer — best-effort cosmetic cleanup
+                        }
+                    });
+                }
             }
 
             var gameStateAfter = GetSession().GameState;
