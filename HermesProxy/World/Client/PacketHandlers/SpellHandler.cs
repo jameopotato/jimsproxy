@@ -1757,15 +1757,18 @@ public partial class WorldClient
                 });
             }
 
-            // JimsProxy (Spell Success Kit Reset — B2 probe): an instant cast forwards SPELL_START and
-            // SPELL_GO in the same client frame; the 1.14 client can drop the cast's teardown, leaving
-            // the casting pose + sound stuck until logout. Re-fire the cast-finish a few ms later in a
-            // clean frame via a DUPLICATE SPELL_GO with the visual suppressed and no targets/log — so
-            // nothing replays (no double explosion/ring), only the UNIT_SPELLCAST_SUCCEEDED that clears
-            // the pose. The real GO forwards first (below, synchronously); this fires after the bounded
-            // delay. Cancels nothing, so it can't blank a spell effect. Local-player instants only;
-            // opt-in via SpellSuccessKitReset, off by default. Probe for the duplicate-GO mechanism.
-            if (Settings.SpellSuccessKitReset && pendingCast.StartedCastTimeMs == 0)
+            // Cast Success Handler — RefireGo mode. This runs on the FIRST SMSG_SPELL_GO the proxy
+            // receives from the server (Kronos always sends it — that's what triggers us). The 1.14
+            // client can coalesce that GO with the same-frame START and fail to process it (renders the
+            // GO as absent), so the cast never closes → frozen pose + looping sound + lit button + no
+            // cooldown, until logout. We re-fire the cast-finish ~8ms later as a DUPLICATE SPELL_GO in a
+            // CLEAN frame (visual suppressed, no targets/log): the client processes the clean-frame copy
+            // and closes the cast (clears the pose, restores the cooldown). No effect/CLEU replay,
+            // cancels nothing. The real GO forwards first (below); this fires after the bounded delay.
+            // Local-player instants only. (Off = legacy no-op; DelayGo = experimental sibling, not yet
+            // wired so it currently behaves as Off.) Caveat: requires the server to send the first GO —
+            // a truly server-missing GO wouldn't trigger this (believed to be the client-coalesce case).
+            if (Settings.CastSuccessHandler == CastSuccessMode.RefireGo && pendingCast.StartedCastTimeMs == 0)
             {
                 var rfCasterGuid = spell.Cast.CasterGUID;
                 var rfCasterUnit = spell.Cast.CasterUnit;
