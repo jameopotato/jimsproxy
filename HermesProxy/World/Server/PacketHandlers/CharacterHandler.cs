@@ -260,6 +260,12 @@ public partial class WorldSocket
                 AbortLogin(LoginFailureReason.NoWorld);
                 return;
             }
+            // JimsProxy (relogin name "Unknown"): the new WorldClient starts with empty delayed
+            // queues; carry over the old client's queued name queries (queued at char-select
+            // delayUntil SMSG_LOGIN_VERIFY_WORLD) so they flush on the new login-verify instead of
+            // being dropped — otherwise the player's own name shows "Unknown" in target frames.
+            if (staleWorldClient != null)
+                GetSession().WorldClient!.AdoptDelayedServerPacketsFrom(staleWorldClient);
             GetSession().WorldClientNeedsRecreateOnNextLogin = false;
         }
         GetSession().IsInCharacterSelect = false;

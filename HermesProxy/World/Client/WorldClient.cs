@@ -556,6 +556,26 @@ public partial class WorldClient
         }
     }
 
+    // JimsProxy (relogin name "Unknown"): the delayed-send queues live on the WorldClient
+    // instance, so a CMSG_NAME_QUERY queued at char-select (delayUntil SMSG_LOGIN_VERIFY_WORLD)
+    // is discarded when HandlePlayerLogin recreates the WorldClient on relogin — and the
+    // player's own name then resolves to "Unknown" in target / target-of-target frames. Carry
+    // the SERVER-bound queue (only name queries are ever delayed there) over to the new
+    // instance so it flushes on the new login-verify. The client-bound queue is intentionally
+    // NOT migrated: it holds world-state-specific ordering packets that must not cross a relogin.
+    public void AdoptDelayedServerPacketsFrom(WorldClient previous)
+    {
+        if (previous == null || previous == this)
+            return;
+        foreach (var (opcode, packets) in previous._delayedPacketsToServer)
+        {
+            if (!_delayedPacketsToServer.TryGetValue(opcode, out var list))
+                _delayedPacketsToServer[opcode] = list = new List<WorldPacket>();
+            list.AddRange(packets);
+        }
+        previous._delayedPacketsToServer.Clear();
+    }
+
     /// <summary>
     /// Opcodes the legacy server may legitimately send before SMSG_AUTH_RESPONSE
     /// which we don't (yet) translate. They arrive during the auth handshake
