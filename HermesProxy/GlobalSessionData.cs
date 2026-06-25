@@ -1552,6 +1552,29 @@ public sealed class GameSessionData
     }
 
     /// <summary>
+    /// JimsProxy (ghost-swing fix): the local player's auto-attack target just died, proven
+    /// terminally by SMSG_PARTY_KILL_LOG. If we were in a SETTLED auto-attack on it — the stop
+    /// victim matches CurrentAttackTarget, no swing-start handshake is in flight
+    /// (WaitingForAttackStart) and no stop is deferred (DeferredAttackStop) — clear the target
+    /// and return true so the caller can push the modern client an immediate SMSG_ATTACK_STOP
+    /// instead of waiting ~1 RTT for the legacy server to echo our CMSG_ATTACK_STOP. A dead unit
+    /// can never be auto-attacked, so the server can never contradict the early stop. Returns
+    /// false for the handshake / target-switch states, which are owned by the SMSG_ATTACK_STOP
+    /// handler's PR #321 logic — the two fixes stay on disjoint state. Pure data operation —
+    /// no socket dependency, easy to unit-test.
+    /// </summary>
+    public bool TryClearSettledAttackTargetOnDeath(WowGuid64 deadVictim)
+    {
+        if (CurrentAttackTarget == default || deadVictim != CurrentAttackTarget)
+            return false;
+        if (WaitingForAttackStart || DeferredAttackStop)
+            return false;
+
+        CurrentAttackTarget = default;
+        return true;
+    }
+
+    /// <summary>
     /// JimsProxy (PR #161 follow-up): walks PendingNormalCasts and PendingPetCasts,
     /// dequeues any entry whose WatchdogDeadlineMs has expired, and returns the
     /// evicted entries via the out parameters. Caller (GlobalSessionData
