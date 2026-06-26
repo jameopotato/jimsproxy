@@ -1385,6 +1385,24 @@ public partial class WorldClient
                         client_cast_id = failed.ClientGUID.ToString(),
                     });
             }
+
+            // JimsProxy (GCD held_pending race): if this START is a cast-time spell, release any
+            // press parked behind it (ForceHoldCast via the HasForwardedPendingCast guard) so it
+            // doesn't ride the whole cast and fire a full cast-time late. Cast-time spells arm no
+            // GCD-expiry timer and their next SPELL_GO is at completion. Forward the released
+            // press so the server returns its real response (SpellInProgress while the cast
+            // occupies the caster); instant starts (CastTime == 0) are left to the GO/BeginGcd
+            // path. Placed after the non-started sweep so the released press isn't swept here.
+            var orphanedHold = GetSession().GameState.TakeForcedHoldOrphanedByCastTimeStart(spell.Cast.CastTime);
+            if (orphanedHold != null)
+            {
+                Log.Event("spell.held_release_on_casttime_start", new
+                {
+                    started_spell_id = spell.Cast.SpellID,
+                    held_spell_id = orphanedHold.SpellId,
+                });
+                GetSession().GameState.OnGcdHeldCastFire?.Invoke(orphanedHold);
+            }
         }
         bool petCastWasPlayerPressed = false;
         if (casterIsLocalPet &&

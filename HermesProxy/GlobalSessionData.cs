@@ -1781,6 +1781,36 @@ public sealed class GameSessionData
         }
     }
 
+    /// <summary>
+    /// JimsProxy (GCD held_pending race): release a press parked in _heldGcdCast by the
+    /// HasForwardedPendingCast guard (ForceHoldCast) when the forwarded cast that blocked it
+    /// turns out to be a CAST-TIME spell, learned at its SPELL_START. Cast-time spells arm no
+    /// GCD-expiry timer (BeginGcd is GO-side, instants only) and their next SPELL_GO is at
+    /// completion — so the parked press would otherwise ride the entire cast and fire a full
+    /// cast-time late. Returns the parked cast for the caller to forward (the server answers
+    /// SpellInProgress while the cast occupies the caster). Returns null for an instant START
+    /// (startedCastTimeMs == 0 — left to the GO/BeginGcd path), while a GCD timer is still
+    /// pending (it will release the hold), while another forwarded cast is still unstarted
+    /// (keep waiting for it), or when nothing is parked.
+    /// </summary>
+    public ClientCastRequest? TakeForcedHoldOrphanedByCastTimeStart(uint startedCastTimeMs)
+    {
+        if (startedCastTimeMs == 0)
+            return null;
+        if (HasForwardedPendingCast())
+            return null;
+        lock (_gcdLock)
+        {
+            if (_heldGcdCast == null)
+                return null;
+            if (_gcdExpireTimestampMs > Environment.TickCount64)
+                return null; // GCD timer still pending — it will release the hold
+            var cast = _heldGcdCast;
+            _heldGcdCast = null;
+            return cast;
+        }
+    }
+
     // ── RTT measurement and adaptive GCD offset ───────────────────────
 
     public void RecordPingSent(uint serial)
