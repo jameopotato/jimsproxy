@@ -4171,7 +4171,17 @@ public partial class WorldClient
             int GAMEOBJECT_TYPE_ID = LegacyVersion.GetUpdateField(GameObjectField.GAMEOBJECT_TYPE_ID);
             if (GAMEOBJECT_TYPE_ID >= 0 && updateMaskArray[GAMEOBJECT_TYPE_ID])
             {
-                updateData.GameObjectData.TypeID = (sbyte)updates[GAMEOBJECT_TYPE_ID].Int32Value;
+                sbyte goType = (sbyte)updates[GAMEOBJECT_TYPE_ID].Int32Value;
+
+                // Rookery Egg (175124): vanilla GO type is TRAP (6), which fires Summon Rookery
+                // Whelp on proximity. The 1.14 client won't let you select/spell-target a TRAP, so
+                // the Eggscilloscope (Freeze Rookery Egg 15748) finds no valid target. Present it
+                // as GOOBER (10) — a selectable "use/activate" quest object — so the client can
+                // target it. The whelp-spawn trap is server-side and unaffected. See #387.
+                if (updateData.ObjectData.EntryID == 175124 && goType == 6)
+                    goType = 10;
+
+                updateData.GameObjectData.TypeID = goType;
             }
             int GAMEOBJECT_LEVEL = LegacyVersion.GetUpdateField(GameObjectField.GAMEOBJECT_LEVEL);
             if (GAMEOBJECT_LEVEL >= 0 && updateMaskArray[GAMEOBJECT_LEVEL])
