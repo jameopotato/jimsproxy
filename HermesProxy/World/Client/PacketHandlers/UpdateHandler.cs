@@ -2683,6 +2683,19 @@ public partial class WorldClient
                 uint spellVisual = GameData.GetSpellVisual((uint)spellId);
                 updateData.UnitData.ChannelData = new UnitChannel(spellId, (int)spellVisual);
 
+                // #383: ritual participants get UNIT_CHANNEL_SPELL but no channel object
+                // from Kronos, so the client has the channel spell yet no portal to face
+                // and never poses. Restore the object from the GO that cast this same
+                // spell's SPELL_GO. Rides the channel lifecycle (cleared on channel end).
+                if (spellId != 0 &&
+                    updateData.UnitData.ChannelObject == null &&
+                    guid != GetSession().GameState.CurrentPlayerGuid &&
+                    GetSession().GameState.ChannelSourceObjectByUnit.TryGetValue(guid, out var ritualSource) &&
+                    ritualSource.SpellId == spellId)
+                {
+                    updateData.UnitData.ChannelObject = ritualSource.SourceObject;
+                }
+
                 if (guid != GetSession().GameState.CurrentPlayerGuid)
                 {
                     var channelSpells = GetSession().GameState.UnitChannelSpells;
@@ -2704,6 +2717,7 @@ public partial class WorldClient
                         else
                         {
                             channelSpells.TryRemove(guid, out _);
+                            GetSession().GameState.ChannelSourceObjectByUnit.TryRemove(guid, out _); // #383
                             if (GetSession().GameState.JimsPlusSideband)
                             {
                                 var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,

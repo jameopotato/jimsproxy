@@ -1597,6 +1597,18 @@ public partial class WorldClient
             return;
         }
 
+        // JimsProxy (#383): a Summoning Portal (GameObject) casting a participant's
+        // "Arcane Channeling" appears as the SPELL_GO cast-source. Remember it per
+        // caster so the UNIT_CHANNEL_SPELL handler can restore the channel object
+        // Kronos omits for ritual participants; cleared when the channel ends.
+        if (spell.Cast.CasterGUID.GetObjectType() == ObjectType.GameObject &&
+            spell.Cast.CasterGUID != spell.Cast.CasterUnit &&
+            !spell.Cast.CasterUnit.IsEmpty())
+        {
+            GetSession().GameState.ChannelSourceObjectByUnit[spell.Cast.CasterUnit] =
+                (spell.Cast.CasterGUID, spell.Cast.SpellID);
+        }
+
         // Cannibalize channel (20578): matching the SPELL_START suppression.
         // No pending-cast entry exists for 20578, so all dequeue/GCD paths
         // below are no-ops. GCD is driven by SPELL_GO 20577 (the wrapper).

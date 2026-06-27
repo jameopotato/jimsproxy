@@ -547,6 +547,11 @@ public sealed class GameSessionData
     // SMSG_SPELL_CHANNEL_START/UPDATE for observers (vanilla only sends
     // MSG_CHANNEL_START to the caster, not to nearby players).
     public ConcurrentDictionary<WowGuid128, int> UnitChannelSpells = new();
+    // #383: maps a channeling unit -> (GameObject that triggered the channel, spellId).
+    // Kronos sends ritual participants UNIT_CHANNEL_SPELL but no channel object, so the
+    // 1.14 client has the channel spell yet no portal to face and never strikes the pose.
+    // We recall the portal from the unit's SPELL_GO cast-source to restore the object.
+    public ConcurrentDictionary<WowGuid128, (WowGuid128 SourceObject, int SpellId)> ChannelSourceObjectByUnit = new();
     public WowGuid64 LastLootTargetGuid;
     //MIRASU - ConcurrentDictionary because abandon-clear runs on the modern-server thread
     //MIRASU   (CMSG_QUEST_LOG_REMOVE_QUEST handler in Server/QuestHandler.cs) while item-credit
