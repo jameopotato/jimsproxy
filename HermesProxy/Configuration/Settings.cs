@@ -73,12 +73,12 @@ public static class Settings
     public static bool IdentityPinnedCastIds;
     // Effective gate for the T1 mechanism: the sub-toggle is live only under LowLatencyMode.
     public static bool IdentityPinnedCastIdsActive => LowLatencyMode && IdentityPinnedCastIds;
-    // JimsProxy (Spell Success Kit Reset): an instant cast forwards SPELL_START+SPELL_GO in the same
-    // client frame; the 1.14 client can drop the cast kit's stop (SpellVisualEvent end-event 13),
-    // leaving the cast-hold kit — which carries the cast pose AND its looping sound — stuck on until
-    // logout. When set, on a local instant's SPELL_GO (cast success) re-fire the kit stop
-    // (SMSG_CANCEL_SPELL_VISUAL) a few ms later in a clean frame. No-op on clean casts (the kit
-    // already stopped). Independent of LowLatencyMode — works in both. Default OFF — opt-in.
+    // JimsProxy (RefireSpellGo): an instant cast forwards SPELL_START+SPELL_GO in the same client
+    // frame; the 1.14 client can drop the coalesced SPELL_GO, so the cast never closes — a stuck
+    // cast pose + looping cast sound + lit action button that persists until logout (survives
+    // /reload). When set, on a local instant's first SPELL_GO re-fire a stripped duplicate SPELL_GO
+    // (~8ms later, in a clean frame, visual suppressed, no targets/log) so the client processes it
+    // and closes the cast. No-op on clean casts. Independent of LowLatencyMode. Default OFF — opt-in.
     public static bool RefireSpellGo;
     // JimsProxy (#313): width (ms) of the spell-queue hold window. A press arriving in the
     // last SpellQueueWindowMs of an active GCD or cast bar is held and fired at expiry; earlier
@@ -136,7 +136,7 @@ public static class Settings
         LowLatencyMode = config.GetBoolean("LowLatencyMode", false);
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);
         IdentityPinnedCastIds = config.GetBoolean("IdentityPinnedCastIds", false);
-        RefireSpellGo = config.GetBoolean("RefireSpellGo", true);
+        RefireSpellGo = config.GetBoolean("RefireSpellGo", false);
         SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 1300), 0, 1300);
         ThreatEngine = config.GetBoolean("ThreatEngine", false);
         var serverTypeStr = config.GetString("ServerType", "Kronos");
