@@ -104,6 +104,12 @@ public partial class WorldClient
                 history.CategoryRecoveryTime = packet.ReadInt32();
 
                 histories.Entries.Add(history);
+
+                // JimsProxy (Kronos Chronoboon): capture item on-use cooldowns so HandleShowBank can repaint
+                // a banked boon's sweep — the client gets the spell cooldown now but won't bind it to a bank
+                // item that only becomes visible when the bank opens. Keyed by on-use spell; endTick = now+left.
+                if (history.ItemID != 0 && history.RecoveryTime > 0)
+                    GetSession().GameState.ChronoboonOnUseCooldownEndMs[history.SpellID] = Environment.TickCount64 + history.RecoveryTime;
             }
             SendPacketToClient(histories, Opcode.SMSG_SEND_UNLEARN_SPELLS);
         }
@@ -354,15 +360,30 @@ public partial class WorldClient
         bool isTransientReason = reason == (uint)SpellCastResultVanilla.NotReady ||
                                  reason == (uint)SpellCastResultVanilla.SpellInProgress;
 
-        // JimsProxy (transient-no-dismiss-started): under LowLatencyMode a transient failure
-        // (NOT_READY / SpellInProgress) is the server rejecting a DUPLICATE press, never an
-        // interrupt of the cast already in progress. If no unstarted duplicate is still queued to
-        // consume (the on-START sweep already cleared + acked it), this rejection is stale — drop it
-        // BEFORE the suppression branch and the dequeue below, both of which would otherwise fall
-        // back to the STARTED cast and dismiss its bar (the "interrupted but fired" desync). Normal
-        // mode is unaffected (no dups reach the server); real failures (OOR/LoS/OOM) are non-transient.
-        if (isTransientReason && Settings.LowLatencyMode &&
-            !GetSession().GameState.HasNonStartedPendingCastForSpell(spellId))
+        // JimsProxy (#379 form-exit): a REAL failure crossing the form-exit defer must retract
+        // the not-yet-sent START (see CancelFormExitDeferredCast). Transient dup-rejections
+        // leave it — the started cast is healthy and its GO will pair the deferred START.
+        if (!isTransientReason)
+            CancelFormExitDeferredCast(spellId, "cast_failed");
+
+        // JimsProxy (transient-no-dismiss-started): a transient failure (NOT_READY /
+        // SpellInProgress) is the server rejecting a DUPLICATE press, never an interrupt of the
+        // cast already in progress — the server never starts a cast and then rejects it with a
+        // pre-cast reason. If no unstarted duplicate is still queued to consume (the on-START
+        // sweep already cleared + acked it), this rejection is stale — drop it BEFORE the
+        // suppression branch and the dequeue below, both of which would otherwise fall back to
+        // the STARTED cast and dismiss its bar (the "interrupted but fired" desync, and in queue
+        // mode the client-side START→CastFailed→GO one-frame contradiction that orphans the cast
+        // kit — the #394 looping sound). Originally gated to LowLatencyMode on the premise that
+        // queue mode sends no dups; the #394 JSONL disproved that — the GCD-boundary held-release
+        // timer race double-forwards in queue mode too (see ForwardHeldGcdCast's supersede skip).
+        // Real failures (OOR/LoS/OOM) are non-transient and unaffected. Next-melee / auto-repeat
+        // slots live outside PendingNormalCasts — a transient rejection matching one of those
+        // must still flow to the special-cast branch below to resolve and clear its slot.
+        if (isTransientReason &&
+            !GetSession().GameState.HasNonStartedPendingCastForSpell(spellId) &&
+            GetSession().GameState.CurrentClientNextMeleeCast?.SpellId != spellId &&
+            GetSession().GameState.CurrentClientAutoRepeatCast?.SpellId != spellId)
         {
             if (Framework.Settings.DebugOutput)
                 Log.Event("cast.transient_stale_dropped", new { spell_id = spellId });
@@ -1044,6 +1065,11 @@ public partial class WorldClient
         if (casterIsLocalPlayer)
         {
             GetSession().HealCommBridge.OnLocalPlayerSpellStop(spellId);
+
+            // JimsProxy (#379 form-exit): SPELL_FAILURE is the interrupt signal (vmangos/Kronos
+            // hardcode reason 0, the real reason follows in CAST_FAILED) — retract a deferred/
+            // stashed form-exit START for this spell before the failure reaches the client.
+            CancelFormExitDeferredCast(spellId, "spell_failure");
         }
 
         // Ranged auto-attack exception (mirrors the SPELL_START allowlist in
@@ -1375,6 +1401,90 @@ public partial class WorldClient
     // JimsProxy (observed-bow): forwarding an observed ranged auto-repeat SPELL_START (Auto Shot/Shoot) latches the 1.14 client's intrinsic auto-repeat aim (spell 75 = SPELL_ATTR2_AUTO_REPEAT, no client SpellVisual) and nothing retracts it for observers (SPELL_GO / SPELL_FAILURE / SPELL_FAILED_OTHER / CANCEL_AUTO_REPEAT / a SheatheState push were all verified non-working in-client — SheatheState only stows the weapon, leaving the arms locked in the aim). So we hold each observed auto-repeat START here and replay it paired with its SPELL_GO (HandleSpellGo) only when the shot fires — the draw shows for shots that fire, and a shot that aborts (no GO) is never forwarded, so it can't stick. Held per caster; touched only on the WorldClient ReceiveLoop (HandleSpellStart/Go), so no lock needed.
     private readonly Dictionary<WowGuid128, SpellStart> _pendingObservedAutoRepeatStart = new();
 
+    // JimsProxy (observed-bow retract): lower an observed shooter's latched ranged-aim by synthesizing SMSG_CANCEL_AUTO_REPEAT with THAT unit's GUID (the legacy handler only ever cancels the local player, and vanilla never broadcasts a stop for other units). Driven both from deterministic stop edges on the WorldClient ReceiveLoop (target death / shooter death / move / retarget) and from the quiescence sweep's ThreadPool thread; SendPacketToClient is already used off-thread (taxi/GCD), so this is safe.
+    private void SendObservedAutoRepeatCancel(WowGuid128 shooter)
+    {
+        // If the session is mid-teardown skip rather than block in SendPacketToClient's wait-for-instance loop — the aim is moot once disconnected.
+        if (GetSession().InstanceSocket == null || !GetSession().GameState.IsConnectedToInstance)
+            return;
+        SendPacketToClient(new CancelAutoRepeat { Guid = shooter });
+        if (Framework.Settings.DebugOutput)
+            Log.Event("ranged.auto_repeat.remote_cancel", new { caster_low = shooter.GetCounter() });
+    }
+
+    // JimsProxy (observed-bow retract): a shooter stopped firing in place (moved) or died — lower its bow if it was latched. One dict remove => exactly one cancel.
+    private void RetractObservedShooterOnStop(WowGuid128 shooter)
+    {
+        if (GetSession().GameState.TryEndObservedAutoRepeat(shooter))
+            SendObservedAutoRepeatCancel(shooter);
+    }
+
+    // JimsProxy (observed-bow retract): the shooter switched or cleared its target — the prior auto-repeat series ended; retract if it was latched and the target actually changed.
+    private void RetractObservedShooterOnTargetChange(WowGuid128 shooter, WowGuid128 newTarget)
+    {
+        if (GetSession().GameState.TryEndObservedAutoRepeatOnTargetChange(shooter, newTarget))
+            SendObservedAutoRepeatCancel(shooter);
+    }
+
+    // JimsProxy (observed-bow retract): a unit died — retract every observed shooter aimed at it (terminal-proof), plus the dead unit itself if it was a shooter.
+    private void RetractObservedShootersOnUnitDeath(WowGuid128 victim)
+    {
+        foreach (var shooter in GetSession().GameState.EndObservedAutoRepeatForVictim(victim))
+            SendObservedAutoRepeatCancel(shooter);
+        RetractObservedShooterOnStop(victim);
+    }
+
+    // JimsProxy (#379 form-exit): a cast-time START forwarded via Task.Delay. Cancelled is set
+    // (ReceiveLoop) when a real failure for the same spell arrives inside the defer — otherwise
+    // the failure would reach the client BEFORE the delayed START and the START would be
+    // orphaned (a new instance of the very stuck-visual class this fix targets). Volatile:
+    // written on the ReceiveLoop, read by the ThreadPool defer task.
+    private sealed class FormExitDeferredStart
+    {
+        public int SpellId;
+        public volatile bool Cancelled;
+    }
+    private FormExitDeferredStart? _formExitDeferredStart;
+
+    // JimsProxy (#379 form-exit): an INSTANT cast's START stashed to be sent together with its
+    // SPELL_GO after the defer (splitting an instant's START from its same-tick GO sticks the
+    // shifted-into form's transform — ice-92's form→form finding). Mirrors the observed-bow
+    // stash: touched only on the ReceiveLoop; a stash whose GO never arrives (real failure
+    // evicts it, or it goes stale) is simply never shown — harmless.
+    private SpellStart? _formExitHeldStart;
+    private long _formExitHeldStartAtMs;
+    private const long FormExitHeldStartMaxAgeMs = 2000;
+
+    // JimsProxy (#379 form-exit): a real failure for the deferred/stashed cast arriving inside
+    // the defer window must retract the not-yet-sent START — otherwise the failure reaches the
+    // client BEFORE the START and the START lands last with no terminator (orphaned visual, the
+    // exact class this fix targets). E.g. form-exit Healing Touch cancelled by movement within
+    // FormExitStartDeferMs. Transient dup-rejections must NOT call this (the started cast is
+    // healthy; its GO is coming). ReceiveLoop-only.
+    private void CancelFormExitDeferredCast(uint spellId, string source)
+    {
+        var deferred = _formExitDeferredStart;
+        if (deferred != null && deferred.SpellId == spellId && !deferred.Cancelled)
+        {
+            deferred.Cancelled = true;
+            Log.Event("spell.start.form_exit_defer_cancelled", new
+            {
+                spell_id = spellId,
+                source,
+            });
+        }
+        var held = _formExitHeldStart;
+        if (held != null && held.Cast.SpellID == spellId)
+        {
+            _formExitHeldStart = null;
+            Log.Event("spell.start.form_exit_stash_dropped", new
+            {
+                spell_id = spellId,
+                source,
+            });
+        }
+    }
+
     [PacketHandler(Opcode.SMSG_SPELL_START)]
     void HandleSpellStart(WorldPacket packet)
     {
@@ -1444,6 +1554,24 @@ public partial class WorldClient
                         triggering_spell_id = (uint)spell.Cast.SpellID,
                         client_cast_id = failed.ClientGUID.ToString(),
                     });
+            }
+
+            // JimsProxy (GCD held_pending race): if this START is a cast-time spell, release any
+            // press parked behind it (ForceHoldCast via the HasForwardedPendingCast guard) so it
+            // doesn't ride the whole cast and fire a full cast-time late. Cast-time spells arm no
+            // GCD-expiry timer and their next SPELL_GO is at completion. Forward the released
+            // press so the server returns its real response (SpellInProgress while the cast
+            // occupies the caster); instant starts (CastTime == 0) are left to the GO/BeginGcd
+            // path. Placed after the non-started sweep so the released press isn't swept here.
+            var orphanedHold = GetSession().GameState.TakeForcedHoldOrphanedByCastTimeStart(spell.Cast.CastTime);
+            if (orphanedHold != null)
+            {
+                Log.Event("spell.held_release_on_casttime_start", new
+                {
+                    started_spell_id = spell.Cast.SpellID,
+                    held_spell_id = orphanedHold.SpellId,
+                });
+                GetSession().GameState.OnGcdHeldCastFire?.Invoke(orphanedHold);
             }
         }
         bool petCastWasPlayerPressed = false;
@@ -1586,7 +1714,8 @@ public partial class WorldClient
         if (!casterIsLocalPlayer && !casterIsLocalPet && isRangedAutoAttack)
         {
             _pendingObservedAutoRepeatStart[spell.Cast.CasterUnit] = spell;
-            Log.Event("ranged.auto_repeat.start_held", new { caster_low = spell.Cast.CasterUnit.GetCounter(), spell_id = spell.Cast.SpellID });
+            if (Framework.Settings.DebugOutput)
+                Log.Event("ranged.auto_repeat.start_held", new { caster_low = spell.Cast.CasterUnit.GetCounter(), spell_id = spell.Cast.SpellID });
         }
         else
         {
@@ -1604,7 +1733,62 @@ public partial class WorldClient
                 else
                     GetSession().GameState.PlayerForwardedCastIds[(uint)spell.Cast.SpellID] = spell.Cast.CastID;
             }
-            SendPacketToClient(spell);
+
+            // JimsProxy (#379 form-exit): this START belongs to the cast that auto-shifted the
+            // player out of a form. The 1.12 server emits it ~20ms BEFORE the form-removal
+            // UPDATE_OBJECT, so forwarded as-is its visual kit starts on the still-shifted model
+            // and is orphaned during the model swap — looping cast sound until /reload.
+            // Cast-time spell: defer the START by a small bounded delay so the model swap
+            // renders first. The delay is ≪ the cast time, so the START can NEVER land after its
+            // own GO (an unbounded hold — delayUntilOpcode — bricks the client's cast state
+            // machine when START crosses GO; verified by ice-92 in #379, do not use it).
+            // Instant (incl. the shifted-INTO form's own cast on form→form): stash the START and
+            // send it together with its GO from one deferred continuation in HandleSpellGo —
+            // splitting an instant's START from its same-tick GO sticks the new form's transform.
+            if (casterIsLocalPlayer && Settings.FormExitStartDeferMs > 0 &&
+                GetSession().GameState.TryConsumeFormExitWindow())
+            {
+                // Channeled casts report CastTime == 0 on the wire but never emit a SPELL_GO —
+                // stashing their START would orphan the channel bar. Defer them like cast-time.
+                if (spell.Cast.CastTime > 0 || isChanneled)
+                {
+                    var deferred = new FormExitDeferredStart { SpellId = spell.Cast.SpellID };
+                    _formExitDeferredStart = deferred;
+                    var deferredStart = spell;
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay(Settings.FormExitStartDeferMs);
+                        try
+                        {
+                            if (!deferred.Cancelled)
+                                SendPacketToClient(deferredStart);
+                        }
+                        catch
+                        {
+                            // session/socket may have torn down during the defer — best-effort
+                        }
+                    });
+                    Log.Event("spell.start.form_exit_deferred", new
+                    {
+                        spell_id = spell.Cast.SpellID,
+                        cast_time = spell.Cast.CastTime,
+                        defer_ms = Settings.FormExitStartDeferMs,
+                    });
+                }
+                else
+                {
+                    _formExitHeldStart = spell;
+                    _formExitHeldStartAtMs = Environment.TickCount64;
+                    Log.Event("spell.start.form_exit_stashed", new
+                    {
+                        spell_id = spell.Cast.SpellID,
+                    });
+                }
+            }
+            else
+            {
+                SendPacketToClient(spell);
+            }
         }
 
         // JimsProxy HealComm bridge: when local player begins a resurrection
@@ -1667,6 +1851,22 @@ public partial class WorldClient
         {
             GetSession().GameState.ChannelSourceObjectByUnit[spell.Cast.CasterUnit] =
                 (spell.Cast.CasterGUID, spell.Cast.SpellID);
+        }
+
+        // JimsProxy (Kronos Chronoboon): the long on-use cast just completed → NOW re-query the item
+        // (its tooltip changed server-side once the buffs were stored) and let HandleItemQueryResponse
+        // mint the refreshed alias + recreate. Deferred from HandleUseItem because refreshing mid-cast
+        // cancels the cast. Match on (player caster, on-use spell id).
+        if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
+            GetSession().GameState.ChronoboonCastAwaitingGo.TryGetValue((uint)spell.Cast.SpellID, out var chronoPending))
+        {
+            GetSession().GameState.ChronoboonCastAwaitingGo.TryRemove((uint)spell.Cast.SpellID, out _);
+            GetSession().GameState.DynamicItemRefreshPending[chronoPending.Entry] = chronoPending.Guid;
+            WorldPacket chronoQuery = new WorldPacket(Opcode.CMSG_ITEM_QUERY_SINGLE);
+            chronoQuery.WriteUInt32(chronoPending.Entry);
+            if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+                chronoQuery.WriteGuid(WowGuid64.Empty);
+            SendPacketToServer(chronoQuery);
         }
 
         // Cannibalize channel (20578): matching the SPELL_START suppression.
@@ -2030,18 +2230,80 @@ public partial class WorldClient
             spell.Cast.CasterUnit = stunTarget;
         }
 
-        // JimsProxy (observed-bow): replay this observed caster's held auto-repeat START now, paired to this GO (CastID-matched) so the client renders a complete draw+fire. A held START whose GO never arrives is never forwarded, so it can't latch the aim.
+        // JimsProxy (observed-bow): replay this observed caster's held auto-repeat START now, paired to this GO (CastID-matched) so the client renders a complete draw+fire, and latch the shooter against its target so a deterministic stop edge can lower the weapon. A held START whose GO never arrives is never forwarded, so it can't latch the aim.
         if (spell.Cast.CasterUnit != GetSession().GameState.CurrentPlayerGuid
             && spell.Cast.CasterUnit != GetSession().GameState.CurrentPetGuid
-            && GameData.AutoRepeatSpells.Contains((uint)spell.Cast.SpellID)
-            && _pendingObservedAutoRepeatStart.Remove(spell.Cast.CasterUnit, out var heldStart))
+            && GameData.AutoRepeatSpells.Contains((uint)spell.Cast.SpellID))
         {
-            heldStart.Cast.CastID = spell.Cast.CastID;
-            SendPacketToClient(heldStart);
-            Log.Event("ranged.auto_repeat.start_replayed", new { caster_low = spell.Cast.CasterUnit.GetCounter(), spell_id = spell.Cast.SpellID });
+            if (_pendingObservedAutoRepeatStart.Remove(spell.Cast.CasterUnit, out var heldStart))
+            {
+                heldStart.Cast.CastID = spell.Cast.CastID;
+                SendPacketToClient(heldStart);
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("ranged.auto_repeat.start_replayed", new { caster_low = spell.Cast.CasterUnit.GetCounter(), spell_id = spell.Cast.SpellID });
+            }
+            // Latch the shooter against the unit it's shooting (explicit target, else the hit/miss target) so target-death retracts it; refreshed each shot so a mid-series retarget updates the death-match key. Every observed shot re-latches (replayed START or bare tick GO).
+            WowGuid128 shotTarget = !spell.Cast.Target.Unit.IsEmpty() ? spell.Cast.Target.Unit
+                : spell.Cast.HitTargets.Count > 0 ? spell.Cast.HitTargets[0]
+                : spell.Cast.MissTargets.Count > 0 ? spell.Cast.MissTargets[0]
+                : WowGuid128.Empty;
+            // Bind the sweep's cancel callback lazily to this live WorldClient (mirrors OnGcdHeldCastFire); also gates the quiescence timer on in NoteObservedAutoRepeatActivity.
+            GetSession().GameState.OnObservedAutoRepeatExpire ??= SendObservedAutoRepeatCancel;
+            GetSession().GameState.NoteObservedAutoRepeatActivity(spell.Cast.CasterUnit, shotTarget);
         }
 
-        SendPacketToClient(spell);
+        // JimsProxy (#379 form-exit): this GO completes the instant cast whose START was stashed
+        // at the form-exit (see HandleSpellStart). Send START+GO together after the defer so the
+        // pair lands ordered, in one clean frame, AFTER the model swap. CastID re-stamped from
+        // the GO (dequeue/T1/recovery upstream already resolved it) so the pair always matches.
+        // A stale stash (GO never came — its cast failed without reaching the eviction, or a
+        // world transfer intervened) is dropped rather than paired with a later cast's GO.
+        // Note: the ThreatTracker update below still runs immediately, so a THREAT_UPDATE can
+        // precede this GO by up to the defer — cosmetic meter-ordering only.
+        if (spell.Cast.CasterUnit == GetSession().GameState.CurrentPlayerGuid &&
+            _formExitHeldStart != null &&
+            _formExitHeldStart.Cast.SpellID == spell.Cast.SpellID)
+        {
+            var formExitStart = _formExitHeldStart;
+            _formExitHeldStart = null;
+            if (Environment.TickCount64 - _formExitHeldStartAtMs <= FormExitHeldStartMaxAgeMs)
+            {
+                formExitStart.Cast.CastID = spell.Cast.CastID;
+                var pairedGo = spell;
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(Settings.FormExitStartDeferMs);
+                    try
+                    {
+                        SendPacketToClient(formExitStart);
+                        SendPacketToClient(pairedGo);
+                    }
+                    catch
+                    {
+                        // session/socket may have torn down during the defer — best-effort
+                    }
+                });
+                Log.Event("spell.go.form_exit_pair_deferred", new
+                {
+                    spell_id = spell.Cast.SpellID,
+                    defer_ms = Settings.FormExitStartDeferMs,
+                });
+            }
+            else
+            {
+                // Stale stash: drop it, forward this GO normally (a lone GO is safe — it's the
+                // START-without-GO ordering that sticks).
+                Log.Event("spell.start.form_exit_stash_stale_dropped", new
+                {
+                    stashed_spell_id = formExitStart.Cast.SpellID,
+                });
+                SendPacketToClient(spell);
+            }
+        }
+        else
+        {
+            SendPacketToClient(spell);
+        }
 
         // JimsProxy threat translation: route Hunter / Pet / class abilities
         // through the threat tracker so SMSG_THREAT_UPDATE reflects the cast.
@@ -2545,6 +2807,17 @@ public partial class WorldClient
         cooldown.SpellID = packet.ReadUInt32();
         WowGuid64 guid = packet.ReadGuid();
         cooldown.IsPet = guid.GetHighType() == HighGuidType.Pet;
+
+        // JimsProxy (Kronos Chronoboon): drop the on-use cooldown event for the player's Chronoboon
+        // spell — it would briefly paint the cooldown on the OLD item just before the destroy+recreate
+        // (a visible blink). We re-assert the cooldown on the recreated item instead (the dynamic
+        // refresh in HandleItemQueryResponse), so it only ever appears on the new item.
+        if (!cooldown.IsPet &&
+            GetSession().GameState.ChronoboonOnUseSpells.ContainsKey(cooldown.SpellID))
+        {
+            return;
+        }
+
         SendPacketToClient(cooldown);
     }
 

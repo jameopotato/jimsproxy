@@ -288,12 +288,45 @@ public partial class WorldClient
     {
         PartyKillLog log = new();
         log.Player = packet.ReadGuid().To128(GetSession().GameState);
-        log.Victim = packet.ReadGuid().To128(GetSession().GameState);
+        var rawVictim = packet.ReadGuid();
+        log.Victim = rawVictim.To128(GetSession().GameState);
         SendPacketToClient(log);
+
+        var state = GetSession().GameState;
+
+        // JimsProxy (ghost-swing fix): if our SETTLED auto-attack target is the unit that just
+        // died, tear our melee down NOW instead of waiting ~1 RTT (~200ms on a remote realm)
+        // for the legacy server to echo our CMSG_ATTACK_STOP. The modern client treats
+        // auto-attack as server-authoritative, so until that SMSG_ATTACK_STOP lands it keeps
+        // swinging the corpse — a damage-less "ghost swing" with no combat-log line.
+        //
+        // Terminal proof, so safe to preempt: PARTY_KILL_LOG means the victim is already dead
+        // server-side, and a dead unit can never be auto-attacked — the server cannot contradict
+        // "you stopped attacking it." TryClearSettledAttackTargetOnDeath gates on a settled
+        // attack state so a swing-start handshake / target-switch (owned by PR #321's
+        // SMSG_ATTACK_STOP handling) is never disturbed; the real stop ~200ms later is a no-op.
+        // Same shape as the movement-cancel preempt (Server/PacketHandlers/MovementHandler.cs).
+        if (state.TryClearSettledAttackTargetOnDeath(rawVictim))
+        {
+            SAttackStop stop = new();
+            stop.Attacker = state.CurrentPlayerGuid;
+            stop.Victim = log.Victim;
+            stop.NowDead = true; // proven by PARTY_KILL_LOG
+            SendPacketToClient(stop);
+
+            Framework.Logging.Log.Event("combat.attack_stop_preempted", new
+            {
+                victim_low = log.Victim.GetCounter(),
+                trigger = "party_kill_log",
+            });
+        }
 
         // Mob just died — drop its threat list immediately so the modern
         // client's threat APIs go quiet on this unit instead of waiting for
         // the corpse-despawn SMSG_DESTROY_OBJECT.
         GetSession().ThreatTracker.ClearMob(log.Victim);
+
+        // JimsProxy (observed-bow retract): the victim's death is a terminal stop edge — lower the bow of any observed shooter aimed at it (a corpse can't be shot, so this can't be contradicted).
+        RetractObservedShootersOnUnitDeath(log.Victim);
     }
 }

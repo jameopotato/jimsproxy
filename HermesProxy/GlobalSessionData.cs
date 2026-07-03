@@ -442,6 +442,22 @@ public sealed class GameSessionData
     public Action<ClientCastRequest>? OnGcdHeldCastFire; // set by WorldSocket at attach time; invoked on a ThreadPool thread at GCD expiry
     public Action<ClientCastRequest>? OnAutoRepeatRetry; // set by WorldSocket; refires Shoot/Auto Shot after retryable legacy failures
 
+    // JimsProxy (observed-bow retract): an observed (non-local) unit auto-repeating — Auto Shot 75 / wand Shoot 5019 — latches the 1.14 client's intrinsic ranged-aim the moment we forward its SPELL_START, and vanilla never broadcasts a stop for other units, so once the shooter quits nothing lowers the weapon (your own char is fine — SMSG_SPELL_FAILURE retracts the local aim). Hybrid retract: DETERMINISTIC stop edges — the target dies (PARTY_KILL_LOG / health->0), or the shooter itself dies, moves, or retargets — lower the bow instantly, AND a quiescence timer is the catch-all for the case no edge covers: the shooter stops with its target still alive and stands still (out of ammo, /stopattack, LoS, target dummy). Each latched shooter tracks its current target (for the death/retarget edges) and its last-shot time (for the sweep). The sweep fires SMSG_CANCEL_AUTO_REPEAT carrying THAT unit's GUID once it goes quiet past ObservedAutoRepeatQuietMs (the modern packet is per-GUID; the legacy handler only ever cancels the local player); the threshold sits above the slowest bow cadence + jitter so a steady shooter never flickers, and a premature retract self-heals — the next shot's START re-raises the aim.
+    private readonly object _observedAutoRepeatLock = new();
+    private readonly Dictionary<WowGuid128, ObservedShooterState> _observedShooterTargets = new();
+    private Timer? _observedAutoRepeatSweepTimer;
+    public Action<WowGuid128>? OnObservedAutoRepeatExpire; // set by WorldClient; invoked on a ThreadPool thread per quiesced shooter (also gates the timer — null in tests, so no real timer is armed)
+    private const long ObservedAutoRepeatQuietMs = 4000;   // no shot for this long => series ended, lower the weapon (above slowest ~3.0s bow cadence + jitter so a steady shooter never flickers)
+    private const long ObservedAutoRepeatSweepTickMs = 500;
+
+    // JimsProxy (observed-bow retract): per-shooter latch state — the unit it's shooting (death/retarget edges match on it) and its last-shot time (the quiescence sweep retracts once this goes stale).
+    private readonly struct ObservedShooterState
+    {
+        public readonly WowGuid128 Target;
+        public readonly long LastShotMs;
+        public ObservedShooterState(WowGuid128 target, long lastShotMs) { Target = target; LastShotMs = lastShotMs; }
+    }
+
     // JimsProxy: cast-time spell queue. While a cast-time spell is in progress
     // (HasStartedNormalCast), presses are held here instead of dropped. Fired
     // on SPELL_GO when the cast completes. Most-recent-press-wins, one slot.
@@ -651,6 +667,49 @@ public sealed class GameSessionData
     public TradeSession? CurrentTrade = null;
     public HashSet<uint> RequestedItemHotfixes = [];
     public HashSet<uint> RequestedItemSparseHotfixes = [];
+
+    // JimsProxy (Kronos Chronoboon): items whose tooltip is dynamic server-side — Kronos rewrites
+    // the stored-world-buff list into the item's Description on each store/restore. The 1.14 client
+    // caches item templates by id and won't re-render a cached one from any push, so instead we
+    // alias the item to a throwaway entry id bumped on each change (the client re-fetches a never-
+    // seen id clean). DynamicItemRefreshPending parks (real entry -> item GUID) between the
+    // HandleUseItem re-query and its SMSG_ITEM_QUERY_SINGLE_RESPONSE. The guid->alias map itself lives in
+    // GameData.ItemEntryAlias (STATIC, so it survives a relogin — this per-session dict used to hold it,
+    // which wiped the alias on relog and reverted the item to its stale base-25007 cache).
+    public Dictionary<uint, WowGuid128> DynamicItemRefreshPending = [];
+
+    // JimsProxy (Kronos Chronoboon): alias Item + ItemEffect hotfix packets pre-built at mint on the WC
+    // thread, drained + sent once by HandleDbQueryBulk (WS thread) in the client's ItemSparse query
+    // window. Pre-building keeps HandleDbQueryBulk from MUTATING the shared record stores off the WS
+    // thread (it would race the loot path's writes on the WC thread). ConcurrentDictionary: written WC,
+    // read/removed WS.
+    public ConcurrentDictionary<uint, List<ServerPacket>> AliasPendingPackets = new();
+
+    // JimsProxy (Kronos Chronoboon): a Chronoboon use whose tooltip refresh must wait for its long
+    // on-use cast to COMPLETE — the store only changes the item when the cast finishes, and
+    // recreating the item mid-cast cancels it. Keyed by the on-use (legacy) spell id; the matching
+    // SMSG_SPELL_GO (player caster) fires the deferred re-query. Value = (real entry, item GUID).
+    // ConcurrentDictionary: written on the WS thread (HandleUseItem), read+removed on the WC thread
+    // (HandleSpellGo). Normally separated by the ~10s cast, but a rapid re-use could overlap.
+    public ConcurrentDictionary<uint, (uint Entry, WowGuid128 Guid)> ChronoboonCastAwaitingGo = new();
+
+    // JimsProxy (Kronos Chronoboon): on-use spell ids of Chronoboon items the player has used this
+    // session. The server's SMSG_COOLDOWN_EVENT for these is dropped (HandleCooldownEvent) so the
+    // cooldown doesn't briefly paint on the OLD item before the destroy+recreate; it's re-asserted on
+    // the recreated item instead.
+    // ConcurrentDictionary (value unused): written WS (HandleUseItem), read WC (HandleCooldownEvent).
+    public ConcurrentDictionary<uint, byte> ChronoboonOnUseSpells = new();
+
+    // JimsProxy (Kronos Chronoboon): on-use cooldown END time (Environment.TickCount64 ms) keyed by the
+    // on-use spell id. Captured from SMSG_SEND_KNOWN_SPELLS at login (the legacy server sends every active
+    // cooldown there, banked items included) and refreshed on each use-path re-assert. Lets HandleShowBank
+    // repaint the sweep on a BANKED Chronoboon: the client learns the spell cooldown at login but never
+    // binds it to a bank item that only becomes visible when the bank opens. WC-thread only.
+    public Dictionary<uint, long> ChronoboonOnUseCooldownEndMs = new();
+
+    // JimsProxy (Kronos Chronoboon): item GUIDs presented as aliased Chronoboons this session, so
+    // HandleShowBank can repaint their cooldown without scanning the global (all-players) alias map. WC only.
+    public HashSet<WowGuid128> ChronoboonItemGuids = new();
 
     // Mobs we've seen send Flying spline or FixedZ movement flags. Vanilla servers
     // don't populate UNIT_FIELD_HOVERHEIGHT consistently (Twinstar e.g. leaves it at 0),
@@ -1558,6 +1617,29 @@ public sealed class GameSessionData
     }
 
     /// <summary>
+    /// JimsProxy (ghost-swing fix): the local player's auto-attack target just died, proven
+    /// terminally by SMSG_PARTY_KILL_LOG. If we were in a SETTLED auto-attack on it — the stop
+    /// victim matches CurrentAttackTarget, no swing-start handshake is in flight
+    /// (WaitingForAttackStart) and no stop is deferred (DeferredAttackStop) — clear the target
+    /// and return true so the caller can push the modern client an immediate SMSG_ATTACK_STOP
+    /// instead of waiting ~1 RTT for the legacy server to echo our CMSG_ATTACK_STOP. A dead unit
+    /// can never be auto-attacked, so the server can never contradict the early stop. Returns
+    /// false for the handshake / target-switch states, which are owned by the SMSG_ATTACK_STOP
+    /// handler's PR #321 logic — the two fixes stay on disjoint state. Pure data operation —
+    /// no socket dependency, easy to unit-test.
+    /// </summary>
+    public bool TryClearSettledAttackTargetOnDeath(WowGuid64 deadVictim)
+    {
+        if (CurrentAttackTarget == default || deadVictim != CurrentAttackTarget)
+            return false;
+        if (WaitingForAttackStart || DeferredAttackStop)
+            return false;
+
+        CurrentAttackTarget = default;
+        return true;
+    }
+
+    /// <summary>
     /// JimsProxy (PR #161 follow-up): walks PendingNormalCasts and PendingPetCasts,
     /// dequeues any entry whose WatchdogDeadlineMs has expired, and returns the
     /// evicted entries via the out parameters. Caller (GlobalSessionData
@@ -1781,6 +1863,36 @@ public sealed class GameSessionData
                 return null;
             if (_gcdExpireTimestampMs > Environment.TickCount64)
                 return null;
+            var cast = _heldGcdCast;
+            _heldGcdCast = null;
+            return cast;
+        }
+    }
+
+    /// <summary>
+    /// JimsProxy (GCD held_pending race): release a press parked in _heldGcdCast by the
+    /// HasForwardedPendingCast guard (ForceHoldCast) when the forwarded cast that blocked it
+    /// turns out to be a CAST-TIME spell, learned at its SPELL_START. Cast-time spells arm no
+    /// GCD-expiry timer (BeginGcd is GO-side, instants only) and their next SPELL_GO is at
+    /// completion — so the parked press would otherwise ride the entire cast and fire a full
+    /// cast-time late. Returns the parked cast for the caller to forward (the server answers
+    /// SpellInProgress while the cast occupies the caster). Returns null for an instant START
+    /// (startedCastTimeMs == 0 — left to the GO/BeginGcd path), while a GCD timer is still
+    /// pending (it will release the hold), while another forwarded cast is still unstarted
+    /// (keep waiting for it), or when nothing is parked.
+    /// </summary>
+    public ClientCastRequest? TakeForcedHoldOrphanedByCastTimeStart(uint startedCastTimeMs)
+    {
+        if (startedCastTimeMs == 0)
+            return null;
+        if (HasForwardedPendingCast())
+            return null;
+        lock (_gcdLock)
+        {
+            if (_heldGcdCast == null)
+                return null;
+            if (_gcdExpireTimestampMs > Environment.TickCount64)
+                return null; // GCD timer still pending — it will release the hold
             var cast = _heldGcdCast;
             _heldGcdCast = null;
             return cast;
@@ -2021,6 +2133,7 @@ public sealed class GameSessionData
         CurrentClientNextMeleeCast = null;
         CurrentClientAutoRepeatCast = null;
         OnAutoRepeatRetry = null;
+        ClearAllObservedAutoRepeat();
         return (normalCount, petCount, otherCount);
     }
 
@@ -2077,6 +2190,33 @@ public sealed class GameSessionData
         {
             return _gcdExpireTimestampMs > Environment.TickCount64;
         }
+    }
+
+    // JimsProxy (#379 form-exit): deadline (TickCount64) of the form-exit defer window, opened
+    // when the local player cancels a shapeshift form aura (HandleCancelAura). The next local
+    // SMSG_SPELL_START consumes it and is deferred so the form-removal UPDATE_OBJECT and the
+    // model swap render before the cast visual starts. 0 = no window. Written on the WorldServer
+    // dispatch thread, consumed on the WorldClient receive thread — accessed via Interlocked.
+    private long _formExitWindowUntilMs;
+
+    /// <summary>
+    /// JimsProxy (#379 form-exit): arm the form-exit defer window for <paramref name="windowMs"/>.
+    /// Sized to cover CANCEL_AURA→SPELL_START (one server round-trip + emit spacing), not tuned
+    /// to the model swap — that's Settings.FormExitStartDeferMs.
+    /// </summary>
+    public void OpenFormExitWindow(long windowMs)
+    {
+        Interlocked.Exchange(ref _formExitWindowUntilMs, Environment.TickCount64 + windowMs);
+    }
+
+    /// <summary>
+    /// JimsProxy (#379 form-exit): one-shot consume of the form-exit window. True if the window
+    /// is still open (and closes it); false when expired or never opened.
+    /// </summary>
+    public bool TryConsumeFormExitWindow()
+    {
+        long until = Interlocked.Exchange(ref _formExitWindowUntilMs, 0);
+        return until != 0 && Environment.TickCount64 <= until;
     }
 
     /// <summary>
@@ -2262,6 +2402,103 @@ public sealed class GameSessionData
         }
         if (toFire != null)
             OnGcdHeldCastFire?.Invoke(toFire);
+    }
+
+    // JimsProxy (observed-bow retract): mark an observed shooter latched (we forwarded its auto-repeat aim), cache the unit it's shooting (refreshed each shot so a mid-series retarget updates the death-match key) and stamp the shot time, then lazily arm the quiescence sweep. The timer is armed only when OnObservedAutoRepeatExpire is bound (production WorldClient) — null in tests, so the suite never spins a real timer; the deterministic edges run regardless.
+    public void NoteObservedAutoRepeatActivity(WowGuid128 shooter, WowGuid128 target)
+    {
+        lock (_observedAutoRepeatLock)
+        {
+            _observedShooterTargets[shooter] = new ObservedShooterState(target, Environment.TickCount64);
+            if (OnObservedAutoRepeatExpire != null)
+                _observedAutoRepeatSweepTimer ??= new Timer(OnObservedAutoRepeatSweepTick, null, ObservedAutoRepeatSweepTickMs, ObservedAutoRepeatSweepTickMs);
+        }
+    }
+
+    // Test seam: latch a shooter at an injected timestamp without arming the real background timer (which runs on Environment.TickCount64 and would race injected-clock sweeps).
+    internal void NoteObservedAutoRepeatActivityForTest(WowGuid128 shooter, WowGuid128 target, long nowMs)
+    {
+        lock (_observedAutoRepeatLock)
+            _observedShooterTargets[shooter] = new ObservedShooterState(target, nowMs);
+    }
+
+    // JimsProxy (observed-bow retract): a deterministic stop edge for one shooter (it moved or died, or we're tearing down) — drop the latch and report whether it WAS latched so the caller sends exactly one SMSG_CANCEL_AUTO_REPEAT.
+    public bool TryEndObservedAutoRepeat(WowGuid128 shooter)
+    {
+        lock (_observedAutoRepeatLock)
+            return _observedShooterTargets.Remove(shooter);
+    }
+
+    // JimsProxy (observed-bow retract): the shooter's UNIT_FIELD_TARGET changed — if it's latched and now aimed elsewhere (or cleared), the prior series ended, so drop the latch and report it for retract. A still-firing retarget self-heals on the next shot's START.
+    public bool TryEndObservedAutoRepeatOnTargetChange(WowGuid128 shooter, WowGuid128 newTarget)
+    {
+        lock (_observedAutoRepeatLock)
+        {
+            if (_observedShooterTargets.TryGetValue(shooter, out var cached) && cached.Target != newTarget)
+            {
+                _observedShooterTargets.Remove(shooter);
+                return true;
+            }
+            return false;
+        }
+    }
+
+    // JimsProxy (observed-bow retract): a unit died (PARTY_KILL_LOG victim or health->0) — collect and drop every observed shooter aimed at it so the caller retracts each. Terminal-proof: a corpse can't be shot, so the retract can never be contradicted.
+    public List<WowGuid128> EndObservedAutoRepeatForVictim(WowGuid128 victim)
+    {
+        var hit = new List<WowGuid128>();
+        lock (_observedAutoRepeatLock)
+        {
+            foreach (var kvp in _observedShooterTargets)
+                if (kvp.Value.Target == victim)
+                    hit.Add(kvp.Key);
+            foreach (var shooter in hit)
+                _observedShooterTargets.Remove(shooter);
+        }
+        return hit;
+    }
+
+    private void OnObservedAutoRepeatSweepTick(object? state)
+    {
+        // Invoke the cancel callback outside the lock (mirrors OnGcdTimerElapsed) so the off-thread SendPacketToClient never runs under _observedAutoRepeatLock.
+        foreach (var shooter in SweepObservedAutoRepeat(Environment.TickCount64))
+        {
+            // A sweep landing during session teardown must never surface an unhandled exception on the ThreadPool (would crash the process); the aim is moot once disconnected.
+            try { OnObservedAutoRepeatExpire?.Invoke(shooter); }
+            catch { }
+        }
+    }
+
+    // JimsProxy (observed-bow retract): the quiescence catch-all — remove and return shooters quiet past ObservedAutoRepeatQuietMs (no edge covered their stop: out of ammo, /stopattack, LoS, target dummy), and dispose the sweep timer once the table empties so it self-disarms. Internal + injectable clock for deterministic tests.
+    internal List<WowGuid128> SweepObservedAutoRepeat(long nowMs)
+    {
+        var expired = new List<WowGuid128>();
+        lock (_observedAutoRepeatLock)
+        {
+            foreach (var kvp in _observedShooterTargets)
+                if (nowMs - kvp.Value.LastShotMs >= ObservedAutoRepeatQuietMs)
+                    expired.Add(kvp.Key);
+            foreach (var shooter in expired)
+                _observedShooterTargets.Remove(shooter);
+            if (_observedShooterTargets.Count == 0)
+            {
+                _observedAutoRepeatSweepTimer?.Dispose();
+                _observedAutoRepeatSweepTimer = null;
+            }
+        }
+        return expired;
+    }
+
+    // JimsProxy (observed-bow retract): drop all observed auto-repeat tracking on reconnect, disarm the sweep, and unbind the cancel callback so a post-reconnect shot re-binds it to the live WorldClient. Called from ResetInFlightCastState alongside the other auto-repeat trackers.
+    public void ClearAllObservedAutoRepeat()
+    {
+        lock (_observedAutoRepeatLock)
+        {
+            _observedShooterTargets.Clear();
+            _observedAutoRepeatSweepTimer?.Dispose();
+            _observedAutoRepeatSweepTimer = null;
+            OnObservedAutoRepeatExpire = null;
+        }
     }
 
     /// <summary>

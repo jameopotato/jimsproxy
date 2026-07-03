@@ -118,7 +118,7 @@ public partial class WorldClient
     {
         MoveUpdate moveUpdate = new MoveUpdate();
         moveUpdate.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
-        // JimsProxy (out-of-range-ghost): drop a stray movement packet for a unit we just destroyed/out-of-ranged so it can't re-ghost the unit running-in-place on the modern client.
+        // JimsProxy (out-of-range-ghost): drop a stray movement packet for a unit we just destroyed/out-of-ranged so it can't re-ghost the unit running-in-place on the modern client. Runs BEFORE the observed-bow move edge — a destroyed unit isn't rendered, so its stray move must neither reach the client nor count as a stop edge (a dead latched shooter is retracted by the death edge; an out-of-ranged one despawns and its latch ages out via the sweep).
         if (moveUpdate.MoverGUID != GetSession().GameState.CurrentPlayerGuid &&
             GetSession().GameState.WasObjectRecentlyDestroyed(moveUpdate.MoverGUID, out long ghostAgoMs))
         {
@@ -131,6 +131,12 @@ public partial class WorldClient
                 });
             return;
         }
+        // JimsProxy (observed-bow retract): a unit physically moving stops its auto-repeat server-side — lower a latched observed shooter's bow on a translational-start move (excludes the local player; turn/facing/heartbeat/stop are not stop edges). A still-firing shooter that briefly steps self-heals on its next shot's START.
+        if (moveUpdate.MoverGUID != GetSession().GameState.CurrentPlayerGuid &&
+            IsAutoRepeatStoppingMove(packet.GetUniversalOpcode(false)))
+        {
+            RetractObservedShooterOnStop(moveUpdate.MoverGUID);
+        }
         moveUpdate.MoveInfo = new();
         moveUpdate.MoveInfo.ReadMovementInfoLegacy(packet, GetSession().GameState);
         ApplyHoverOverrideIfNeeded(moveUpdate.MoverGUID, moveUpdate.MoveInfo);
@@ -141,6 +147,18 @@ public partial class WorldClient
         moveUpdate.MoveInfo.ValidateMovementInfo();
         SendPacketToClient(moveUpdate);
     }
+
+    // JimsProxy (observed-bow retract): translational-start moves mean the mover left its firing stance (auto-shot requires standing still); turn/facing/heartbeat/stop are excluded so a shooter that only turns to track its target isn't falsely retracted.
+    private static bool IsAutoRepeatStoppingMove(Opcode op) => op switch
+    {
+        Opcode.MSG_MOVE_START_FORWARD or
+        Opcode.MSG_MOVE_START_BACKWARD or
+        Opcode.MSG_MOVE_START_STRAFE_LEFT or
+        Opcode.MSG_MOVE_START_STRAFE_RIGHT or
+        Opcode.MSG_MOVE_JUMP or
+        Opcode.MSG_MOVE_START_SWIM => true,
+        _ => false,
+    };
 
     [PacketHandler(Opcode.MSG_MOVE_KNOCK_BACK)]
     void HandleMoveKnockBack(WorldPacket packet)
