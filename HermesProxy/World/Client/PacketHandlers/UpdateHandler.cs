@@ -1728,6 +1728,42 @@ public partial class WorldClient
         AfterStoreObjectUpdateHook(guid, objectType, updateMaskArray, updates, auraUpdate, powerUpdate, isCreate, updateData, actuallyChangedValuesMaskArray);
     }
 
+    // JimsProxy (Kronos Chronoboon alias): re-create an item object on the client from the proxy's
+    // merged legacy field cache so the alias substitution (OBJECT_FIELD_ENTRY) takes effect and the
+    // client re-fetches the template. The modern client ignores a create for an object it already
+    // has (see the CreateObject1 note in HandleUpdateObject) and ignores a Values entry change, so
+    // we DESTROY then re-CREATE. Same GUID, so the bag-slot reference (in the player/container
+    // update) survives. Items carry no MoveInfo, so this is a minimal, valid create.
+    private void RecreateItemObjectForClient(WowGuid128 guid)
+    {
+        var cachedFields = GetSession().GameState.GetCachedObjectFieldsLegacy(guid);
+        if (cachedFields == null || cachedFields.Count == 0)
+            return;
+
+        // Mask must span the full item field range so StoreObjectUpdateInternal's per-field
+        // updateMaskArray[FIELD] probes (e.g. enchantment slots near ITEM_END) stay in bounds.
+        int maskLen = LegacyVersion.GetUpdateField(ItemField.ITEM_END);
+        foreach (var fieldIndex in cachedFields.Keys)
+            if (fieldIndex + 1 > maskLen) maskLen = fieldIndex + 1;
+        BitArray createMask = new BitArray(maskLen);
+        foreach (var fieldIndex in cachedFields.Keys)
+            createMask[fieldIndex] = true;
+
+        ObjectUpdate recreate = new ObjectUpdate(guid, UpdateTypeModern.CreateObject2, GetSession());
+        recreate.CreateData.ObjectType = ObjectType.Item;
+        StoreObjectUpdateInternal(guid, ObjectType.Item, createMask, cachedFields, new AuraUpdate(guid, true), null, true, recreate);
+
+        // Destroy + re-create in ONE SMSG_UPDATE_OBJECT to avoid a visible flash. The wire order is
+        // [destroy block] then [object updates] (UpdateObject.Write), so the client processes the
+        // destroy before the create and replaces the item atomically in a single frame — sending two
+        // separate packets dropped the item for a frame between them. Destroy-first also means the
+        // create isn't dropped as a "create for an existing object".
+        UpdateObject packet = new UpdateObject(GetSession().GameState);
+        packet.DestroyedGuids.Add(guid);
+        packet.ObjectUpdates.Add(recreate);
+        SendPacketToClient(packet);
+    }
+
     private void AfterStoreObjectUpdateHook(WowGuid128 guid, ObjectType objectType, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, AuraUpdate auraUpdate, PowerUpdate? powerUpdate, bool isCreate, ObjectUpdate updateData, BitArray changedValuesMask)
     {
         // JimsProxy: comprehensive pet diagnostics for the Hunter-Pet-Stealth-Stuck
@@ -1871,6 +1907,24 @@ public partial class WorldClient
         if (OBJECT_FIELD_ENTRY >= 0 && updateMaskArray[OBJECT_FIELD_ENTRY])
         {
             updateData.ObjectData.EntryID = updates[OBJECT_FIELD_ENTRY].Int32Value;
+
+            // JimsProxy (Kronos Chronoboon): proactive login-alias removed 2026-06-22 (it regressed the
+            // bag sound). The login bag sound is now delivered statically by the Kronos Item overlay
+            // (CSV/Hotfix/Item1.kronos.csv, ItemGroupSoundsId 24) — a fresh hotfix id the cached client
+            // re-fetches at login via SMSG_AVAILABLE_HOTFIXES, so no login alias is needed for the sound.
+
+            // JimsProxy (Kronos Chronoboon alias): present a throwaway alias entry to the client
+            // for items whose tooltip is dynamic server-side, so it re-fetches the template (the
+            // modern client caches per-id and won't refresh a cached one). The REAL entry stays in
+            // updates[OBJECT_FIELD_ENTRY] / the legacy field cache, so use-item + spell-slot logic
+            // (which read GetItemId/GetItemSpellSlot from that cache) are unaffected.
+            if (GameData.ItemEntryAlias.TryGetValue(guid, out var aliasEntry))
+            {
+                updateData.ObjectData.EntryID = (int)aliasEntry;
+                // JimsProxy (Kronos Chronoboon): remember this session's aliased boon GUIDs so HandleShowBank
+                // can repaint the on-use cooldown sweep when a banked one becomes visible after a relogin.
+                GetSession().GameState.ChronoboonItemGuids.Add(guid);
+            }
         }
         int OBJECT_FIELD_SCALE_X = LegacyVersion.GetUpdateField(ObjectField.OBJECT_FIELD_SCALE_X);
         if (OBJECT_FIELD_SCALE_X >= 0 && updateMaskArray[OBJECT_FIELD_SCALE_X])
@@ -2147,7 +2201,10 @@ public partial class WorldClient
             int UNIT_FIELD_TARGET = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_TARGET);
             if (UNIT_FIELD_TARGET >= 0 && updateMaskArray[UNIT_FIELD_TARGET])
             {
-                updateData.UnitData.Target = GetGuidValue(updates, UnitField.UNIT_FIELD_TARGET).To128(GetSession().GameState);
+                WowGuid128 newTarget = GetGuidValue(updates, UnitField.UNIT_FIELD_TARGET).To128(GetSession().GameState);
+                updateData.UnitData.Target = newTarget;
+                // JimsProxy (observed-bow retract): a latched shooter that retargets or drops its target has ended the prior series — lower its bow (a still-firing retarget self-heals on the next shot's START).
+                RetractObservedShooterOnTargetChange(guid, newTarget);
             }
             int UNIT_FIELD_CHANNEL_OBJECT = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_CHANNEL_OBJECT);
             if (UNIT_FIELD_CHANNEL_OBJECT >= 0 && updateMaskArray[UNIT_FIELD_CHANNEL_OBJECT])
@@ -2181,6 +2238,9 @@ public partial class WorldClient
                         healthUpdated ? updates[UNIT_FIELD_HEALTH].Int32Value : existing.Hp,
                         maxHealthUpdated ? updates[UNIT_FIELD_MAXHEALTH].Int32Value : existing.MaxHp));
             }
+            // JimsProxy (observed-bow retract): health hitting 0 is a terminal stop edge — retract any observed shooter aimed at this unit, plus the unit itself if it was a shooter (fallback for deaths PARTY_KILL_LOG doesn't cover: DoTs, non-party kills, environment).
+            if (healthUpdated && updates[UNIT_FIELD_HEALTH].Int32Value <= 0)
+                RetractObservedShootersOnUnitDeath(guid);
             int UNIT_FIELD_LEVEL = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_LEVEL);
             if (UNIT_FIELD_LEVEL >= 0 && updateMaskArray[UNIT_FIELD_LEVEL])
             {

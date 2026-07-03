@@ -157,6 +157,33 @@ public partial class WorldClient
         bank.Guid = packet.ReadGuid().To128(GetSession().GameState);
         GetSession().GameState.CurrentInteractedWithNPC = bank.Guid;
         SendPacketToClient(bank);
+
+        // JimsProxy (Kronos Chronoboon): repaint the on-use cooldown sweep on any aliased boon now that the
+        // bank is open. The client learns the spell cooldown at login (SMSG_SEND_KNOWN_SPELLS) but never binds
+        // it to a bank item — which only becomes visible here — so a boon relogged into the bank while on
+        // cooldown shows none. ItemCooldown binds by GUID (the proven use-path packet); idempotent for a boon
+        // sitting in bags. Self-expires via the captured end-time, so an off-cooldown boon repaints nothing.
+        long nowMs = Environment.TickCount64;
+        foreach (var chronoGuid in GetSession().GameState.ChronoboonItemGuids)
+        {
+            if (!GameData.ItemEntryAlias.TryGetValue(chronoGuid, out var aliasEntry))
+                continue;
+            var aliasTemplate = GameData.GetItemTemplate(aliasEntry);
+            uint onUseSpell = aliasTemplate != null ? (uint)aliasTemplate.TriggeredSpellIds[0] : 0;
+            if (onUseSpell == 0)
+                continue;
+            if (!GetSession().GameState.ChronoboonOnUseCooldownEndMs.TryGetValue(onUseSpell, out var endMs))
+                continue;
+            long remaining = endMs - nowMs;
+            if (remaining <= 0)
+                continue;
+
+            ItemCooldown itemCooldownPkt = new();
+            itemCooldownPkt.ItemGuid = chronoGuid;
+            itemCooldownPkt.SpellID = onUseSpell;
+            itemCooldownPkt.Cooldown = (uint)remaining;
+            SendPacketToClient(itemCooldownPkt);
+        }
     }
 
     [PacketHandler(Opcode.SMSG_TRAINER_LIST)]

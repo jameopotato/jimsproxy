@@ -68,6 +68,7 @@ public class ItemTemplate
     public uint StartQuestId;
     public uint LockId;
     public int Material;
+    public byte ItemGroupSoundsId; // JimsProxy: modern Item.db2 bag pickup/putdown sound group; absent from the legacy query (stays 0 = silent) — forced to 24 for the Chronoboon so it gets the soul-shard/empty-vial clink
     public int SheathType;
     public int RandomProperty;
     public uint RandomSuffix;
@@ -310,6 +311,15 @@ public class ItemTemplate
         // Mappings sourced from TrinityCore ItemPrototype::GetSkill().
         if (RequiredSkillId == 0)
             RequiredSkillId = DeriveSkillFromItemType(Class, SubClass);
+    }
+
+    // JimsProxy (Kronos Chronoboon alias): shallow copy under a new entry id. Arrays (Name,
+    // TriggeredSpellIds, etc.) are shared read-only with the source — callers don't mutate them.
+    public ItemTemplate CloneWithEntry(uint newEntry)
+    {
+        ItemTemplate clone = (ItemTemplate)MemberwiseClone();
+        clone.Entry = newEntry;
+        return clone;
     }
 
     // JimsProxy: ItemClass+SubClass -> SkillLine.dbc id mapping. Returns 0
