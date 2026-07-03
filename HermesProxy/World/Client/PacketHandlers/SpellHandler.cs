@@ -7,6 +7,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace HermesProxy.World.Client;
 
@@ -19,6 +20,10 @@ public partial class WorldClient
     // and shorter than feels-laggy to the user when the pathological Kronos
     // case kicks in (target-dies-mid-cast, no trailing CAST_FAILED).
     private const long WatchdogWindowMs = 2500;
+
+    // JimsProxy (Spell Success Kit Reset): defer (ms) before re-firing the cast-finish, so it lands
+    // in a clean client frame past the coalesced START+GO burst. A couple of frames at 60fps.
+    private const int SpellSuccessRefireDeferMs = 8;
 
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_SEND_KNOWN_SPELLS)]
@@ -338,14 +343,47 @@ public partial class WorldClient
         if (packet.CanRead())
             arg2 = packet.ReadInt32();
 
+        // JimsProxy (H7): NotReady / SpellInProgress is a duplicate-rejection — the press the
+        // server bounced because another cast of the same spell is already in progress. Its
+        // CAST_FAILED must consume the UNSTARTED dup entry, NOT the started entry whose SPELL_GO
+        // is still in flight (preferStarted=false below). Real failures (OOR, LoS, OOM) fall
+        // through to the main path and resolve the started cast (preferStarted=true).
+        bool isTransientReason = reason == (uint)SpellCastResultVanilla.NotReady ||
+                                 reason == (uint)SpellCastResultVanilla.SpellInProgress;
+
+        // JimsProxy (transient-no-dismiss-started): under LowLatencyMode a transient failure
+        // (NOT_READY / SpellInProgress) is the server rejecting a DUPLICATE press, never an
+        // interrupt of the cast already in progress. If no unstarted duplicate is still queued to
+        // consume (the on-START sweep already cleared + acked it), this rejection is stale — drop it
+        // BEFORE the suppression branch and the dequeue below, both of which would otherwise fall
+        // back to the STARTED cast and dismiss its bar (the "interrupted but fired" desync). Normal
+        // mode is unaffected (no dups reach the server); real failures (OOR/LoS/OOM) are non-transient.
+        if (isTransientReason && Settings.LowLatencyMode &&
+            !GetSession().GameState.HasNonStartedPendingCastForSpell(spellId))
+        {
+            if (Framework.Settings.DebugOutput)
+                Log.Event("cast.transient_stale_dropped", new { spell_id = spellId });
+            return;
+        }
+
         // JimsProxy: optional suppression of transient cast errors (NotReady = GCD active,
         // SpellInProgress = cast bar active). Useful with Low Latency Mode where mid-GCD
         // presses reach the server and bounce back. The 1.14 client's "Suppress Error Speech"
         // setting covers audio but not the red error text; this covers both.
-        if (Settings.SuppressSpellCastErrors &&
-            (reason == (uint)SpellCastResultVanilla.NotReady || reason == (uint)SpellCastResultVanilla.SpellInProgress))
+        if (Settings.SuppressSpellCastErrors && isTransientReason)
         {
-            GetSession().GameState.TryDequeuePendingNormalCast(spellId, out _);
+            // JimsProxy (suppress-ack-stuck-button): suppress the red error text, but STILL ack
+            // the client so the action-button pending/lit state clears. Under LowLatencyMode the
+            // mid-GCD press was forwarded immediately and bounced back NOT_READY/SpellInProgress;
+            // the SPELL_FAILURE broadcast is already skipped for the local caster, and this dequeue
+            // is the proxy's LAST record of the press — so returning silently strands the button
+            // lit forever (the later ClearNonStartedNormalCasts sweep can't help; the entry is
+            // gone). SendCastRequestFailed emits a SpellPrepare first (only if never started, so
+            // the client can match by CastID) then a CastFailed(DontReport) — clears the button
+            // with no popup / error sound. Mirrors the item-use-orphan eviction ack above.
+            // preferStarted:false (H7, from #372): consume the UNSTARTED dup, leave the started cast for its GO.
+            if (GetSession().GameState.TryDequeuePendingNormalCast(spellId, out var suppressedCast, preferStarted: false) && suppressedCast != null)
+                GetSession().InstanceSocket.SendCastRequestFailed(suppressedCast, false, SpellCastResultClassic.DontReport);
             Log.Event("cast.error_suppressed", new
             {
                 spell_id = spellId,
@@ -392,8 +430,10 @@ public partial class WorldClient
             else
                 GetSession().GameState.CurrentClientNextMeleeCast = null;
         }
-        // Look up pending normal cast by SpellId (queue-based, FIFO order)
-        else if (GetSession().GameState.TryDequeuePendingNormalCast(spellId, out var pendingCast))
+        // Look up pending normal cast by SpellId (queue-based, FIFO order). A transient
+        // duplicate-rejection (NotReady/SpellInProgress reaching here with suppression off)
+        // fails the unstarted dup; a real failure resolves the started cast. See H7.
+        else if (GetSession().GameState.TryDequeuePendingNormalCast(spellId, out var pendingCast, preferStarted: !isTransientReason))
         {
             // JimsProxy (PR #161 follow-up — movement preemption): if this
             // cast was marked when the user started moving, the modern client
@@ -440,9 +480,34 @@ public partial class WorldClient
             failed.SpellXSpellVisualID = pendingCast.SpellXSpellVisualId;
             failed.Reason = effectiveReason;
             failed.CastID = pendingCast.ServerGUID;
+            // T1 (identity-pinned): a real failure terminates the STARTED cast — stamp it with the
+            // recorded START CastID (popped FIFO) and consume the FIFO entry so a later same-spell
+            // GO can't pop this now-resolved cast's CastID. Transient dup rejections resolve the
+            // UNSTARTED dup (HasStarted=false, no FIFO entry) and leave the started cast's entry.
+            if (Settings.IdentityPinnedCastIdsActive && pendingCast.HasStarted &&
+                GetSession().GameState.TryPopForwardedStartCastId(pendingCast.SpellId, out var pinnedFailCastId))
+                failed.CastID = pinnedFailCastId;
             failed.FailedArg1 = arg1;
             failed.FailedArg2 = arg2;
             SendPacketToClient(failed);
+
+            // JimsProxy (transient-no-dismiss-started): under LowLatencyMode the SPELL_FAILURE
+            // deferred the caster-side visual-cancel to here so the REAL reason drives it. A real
+            // failure of a STARTED cast still needs its casting-pose / channel visual cancelled (the
+            // 1.14 client doesn't reliably do it from CAST_FAILED alone) — mirror HandleSpellFailure's
+            // cast-failure-stuck-visual cleanup. Transient dup-rejections and movement-cancelled casts
+            // never reach here started, so this is real failures only.
+            if (Settings.LowLatencyMode && pendingCast.HasStarted && !movementSuppressed)
+            {
+                uint resolvedVisual = GameData.GetSpellVisualIdFromXSpellVisual(pendingCast.SpellXSpellVisualId);
+                if (resolvedVisual != 0)
+                {
+                    CancelSpellVisual cancelVisual = new CancelSpellVisual();
+                    cancelVisual.Source = GetSession().GameState.CurrentPlayerGuid;
+                    cancelVisual.SpellVisualID = (int)resolvedVisual;
+                    SendPacketToClient(cancelVisual);
+                }
+            }
 
             var gameState = GetSession().GameState;
             var heldCastTimeDrop = gameState.ClearHeldCastTimeCast();
@@ -960,6 +1025,11 @@ public partial class WorldClient
         // reason and renders the correct popup.
         bool overrideReasonForLocalBroadcast = false;
         bool skipBroadcastFailure = false;
+        // JimsProxy (transient-no-dismiss-started): under LowLatencyMode, defer a STARTED local
+        // cast's bar-dismiss AND visual-cancel to the caller-aware trailing CAST_FAILED (which
+        // knows the real reason — spare a dup-rejection, dismiss a real failure). Set in the
+        // local-player branch; gates the cast-failure visual cleanup below.
+        bool deferLocalDismissToCastFailed = false;
         // 1.14 needs SMSG_SPELL_FAILURE to retract the bow-draw / wand-aim visual
         // for ranged auto-attacks; CastFailed + CANCEL_AUTO_REPEAT alone leaves the
         // bow stuck drawn. Other instants can drop the broadcast entirely -- there's
@@ -987,6 +1057,12 @@ public partial class WorldClient
             GetSession().GameState.PendingNormalCasts.FirstOrDefault(c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId)) is { } pendingNormal)
         {
             castId = pendingNormal.ServerGUID;
+            // T1 (identity-pinned): SPELL_FAILURE only PEEKS the pending cast (the trailing
+            // CAST_FAILED / GO / watchdog pops it), so stamp the forwarded failure's CastID from
+            // the FIFO front WITHOUT consuming it — the later pop stays paired.
+            if (Settings.IdentityPinnedCastIdsActive && pendingNormal.HasStarted &&
+                GetSession().GameState.TryPeekForwardedStartCastId(pendingNormal.SpellId, out var pinnedFailureCastId))
+                castId = pinnedFailureCastId;
             spellVisual = pendingNormal.SpellXSpellVisualId;
             if (pendingNormal.LegacySpellId != 0)
                 spellId = pendingNormal.SpellId;
@@ -1019,6 +1095,16 @@ public partial class WorldClient
             // which clears button-lit state and shows the correct popup.
             else if (!pendingNormal.HasStarted && !isRangedAutoAttack)
                 skipBroadcastFailure = true;
+            // JimsProxy (transient-no-dismiss-started): under LowLatencyMode this SPELL_FAILURE may be
+            // a duplicate-rejection rather than an interrupt of the in-progress cast (the server
+            // hardcodes the reason, so we can't tell here). Defer BOTH the bar-dismiss and the
+            // visual-cancel to the caller-aware trailing CAST_FAILED, which knows the real reason.
+            // Ranged auto-attacks still forward (the bow-draw / wand-aim retract needs it).
+            else if (Settings.LowLatencyMode && !isRangedAutoAttack)
+            {
+                skipBroadcastFailure = true;
+                deferLocalDismissToCastFailed = true;
+            }
             else
                 overrideReasonForLocalBroadcast = true;
         }
@@ -1189,7 +1275,7 @@ public partial class WorldClient
         // #72's instant-suppression was removed once SpellFailure switched to peek),
         // so for auto-repeat ticks the visual is live on the client regardless of
         // whether the pending queue tracked it.
-        if (casterIsLocalPlayer && (wasStarted || isRangedAutoAttack) && !sentCancelVisual)
+        if (casterIsLocalPlayer && (wasStarted || isRangedAutoAttack) && !sentCancelVisual && !deferLocalDismissToCastFailed)
         {
             resolvedSpellVisualId = GameData.GetSpellVisualIdFromXSpellVisual(spellVisual);
             if (resolvedSpellVisualId != 0)
@@ -1455,7 +1541,14 @@ public partial class WorldClient
             // duplicate's CAST_FAILED having consumed the entry). See PlayerForwardedCastIds.
             // Fallback only — normal casts override with ServerGUID at GO and never read it.
             if (casterIsLocalPlayer)
-                GetSession().GameState.PlayerForwardedCastIds[(uint)spell.Cast.SpellID] = spell.Cast.CastID;
+            {
+                if (Settings.IdentityPinnedCastIdsActive)
+                    // T1: per-spell FIFO supersedes the single-slot recovery so concurrent
+                    // same-spell starts each retain their forwarded CastID in START order.
+                    GetSession().GameState.EnqueueForwardedStartCastId((uint)spell.Cast.SpellID, spell.Cast.CastID);
+                else
+                    GetSession().GameState.PlayerForwardedCastIds[(uint)spell.Cast.SpellID] = spell.Cast.CastID;
+            }
             SendPacketToClient(spell);
         }
 
@@ -1507,6 +1600,18 @@ public partial class WorldClient
             LogSpellStartGoParseFailure(packet, e, isSpellGo: true);
             DrainOrphanedStartedNormalCastsOnParseFailure(isSpellGo: true);
             return;
+        }
+
+        // JimsProxy (#383): a Summoning Portal (GameObject) casting a participant's
+        // "Arcane Channeling" appears as the SPELL_GO cast-source. Remember it per
+        // caster so the UNIT_CHANNEL_SPELL handler can restore the channel object
+        // Kronos omits for ritual participants; cleared when the channel ends.
+        if (spell.Cast.CasterGUID.GetObjectType() == ObjectType.GameObject &&
+            spell.Cast.CasterGUID != spell.Cast.CasterUnit &&
+            !spell.Cast.CasterUnit.IsEmpty())
+        {
+            GetSession().GameState.ChannelSourceObjectByUnit[spell.Cast.CasterUnit] =
+                (spell.Cast.CasterGUID, spell.Cast.SpellID);
         }
 
         // Cannibalize channel (20578): matching the SPELL_START suppression.
@@ -1570,6 +1675,15 @@ public partial class WorldClient
             GetSession().GameState.TryDequeuePendingNormalCast((uint)spell.Cast.SpellID, out var pendingCast))
         {
             spell.Cast.CastID = pendingCast!.ServerGUID;
+            // T1 (identity-pinned): for a STARTED cast, stamp GO with the CastID recorded at
+            // SPELL_START (popped from the per-spell FIFO) instead of the dequeued entry's
+            // ServerGUID, so START↔GO pair even if the dequeue resolved a different concurrent
+            // same-spell entry. Skip-START instants (HasStarted=false, no FIFO entry) keep the
+            // dequeued ServerGUID. Belt-and-suspenders over #372's preferStarted dequeue: matches
+            // it in the common case, diverges only under concurrent same-spell starts.
+            if (Settings.IdentityPinnedCastIdsActive && pendingCast.HasStarted &&
+                GetSession().GameState.TryPopForwardedStartCastId(pendingCast.SpellId, out var pinnedGoCastId))
+                spell.Cast.CastID = pinnedGoCastId;
             spell.Cast.SpellXSpellVisualID = pendingCast.SpellXSpellVisualId;
             // SoM-renumbered item: rewrite the legacy spell id back to the modern one the client expects.
             if (pendingCast.LegacySpellId != 0)
@@ -1655,6 +1769,56 @@ public partial class WorldClient
                 });
             }
 
+            // RefireSpellGo: runs on the FIRST SMSG_SPELL_GO the proxy receives from the server (Kronos
+            // always sends it — that's the trigger). When the client doesn't process that GO for an
+            // instant, the cast never closes client-side → the reported stuck cast: frozen cast pose +
+            // looping cast sound + lit action button, persisting until logout (survives /reload). Seen on
+            // Blade Flurry, Sunder, Battle Shout, holy casts. (Natural trigger appears to be the client
+            // coalescing the GO with the same-frame START, but that's inferred — we reproduce it with the
+            // injector, not yet captured in the wild.) We re-fire the cast-finish ~8ms later as a
+            // DUPLICATE SPELL_GO in a CLEAN frame (visual suppressed, no targets/log): the client
+            // processes the clean-frame copy and closes the cast. No effect/CLEU replay, cancels nothing,
+            // no-op on clean casts. Original GO forwards first (below). Local-player instants only.
+            // Caveat: needs the server to send the first GO — a server-missing GO wouldn't trigger this.
+            if (Settings.RefireSpellGo && pendingCast.StartedCastTimeMs == 0)
+            {
+                var rfCasterGuid = spell.Cast.CasterGUID;
+                var rfCasterUnit = spell.Cast.CasterUnit;
+                var rfCastId = spell.Cast.CastID;
+                var rfOriginalCastId = spell.Cast.OriginalCastID;
+                int rfSpellId = spell.Cast.SpellID;
+                uint rfCastFlags = spell.Cast.CastFlags;
+                uint rfCastFlagsEx = spell.Cast.CastFlagsEx;
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(SpellSuccessRefireDeferMs);
+                    try
+                    {
+                        var refire = new SpellGo();
+                        refire.Cast.CasterGUID = rfCasterGuid;
+                        refire.Cast.CasterUnit = rfCasterUnit;
+                        refire.Cast.CastID = rfCastId;
+                        refire.Cast.OriginalCastID = rfOriginalCastId;
+                        refire.Cast.SpellID = rfSpellId;
+                        refire.Cast.SpellXSpellVisualID = 0; // suppress visual so nothing replays
+                        refire.Cast.CastFlags = rfCastFlags;
+                        refire.Cast.CastFlagsEx = rfCastFlagsEx;
+                        // targets + LogData left empty: a pure cast-finish, no effect/CLEU replay
+                        SendPacketToClient(refire);
+                        if (Framework.Settings.DebugOutput)
+                            Log.Event("cast.success_refire", new
+                            {
+                                spell_id = rfSpellId,
+                                defer_ms = SpellSuccessRefireDeferMs,
+                            });
+                    }
+                    catch
+                    {
+                        // session/socket may have torn down during the defer — best-effort
+                    }
+                });
+            }
+
             var gameStateAfter = GetSession().GameState;
             if (!gameStateAfter.HasForwardedPendingCast())
             {
@@ -1724,6 +1888,24 @@ public partial class WorldClient
         // Hits server-initiated player casts with no CMSG (GO loot subspells e.g. Whipper
         // Root 15343, weapon/trinket procs) and casts whose pending entry was consumed by a
         // duplicate's CAST_FAILED before the GO (Blade Flurry, re-clicked gathers).
+        // JimsProxy (T1 identity-pinned cast correspondence): FIFO-backed promotion of the
+        // #362 recovery below to the primary path. When the GO has no pending entry (consumed by
+        // a duplicate's CAST_FAILED, or a server-initiated cast with no CMSG), recover the
+        // forwarded START CastID from the per-spell FIFO so START↔GO still pair. Supersedes the
+        // single-slot recovery (next branch) when active; the single-slot isn't populated then.
+        else if (Settings.IdentityPinnedCastIdsActive &&
+                 GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
+                 GetSession().GameState.TryPopForwardedStartCastId((uint)spell.Cast.SpellID, out var pinnedRecoverCastId))
+        {
+            spell.Cast.CastID = pinnedRecoverCastId;
+            Log.Event("cast.go.castid_recovered", new
+            {
+                spell_id = spell.Cast.SpellID,
+                caster_low = spell.Cast.CasterUnit.GetCounter(),
+                recovered_cast_id = pinnedRecoverCastId.ToString(),
+                pinned = true,
+            });
+        }
         else if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
                  GetSession().GameState.PlayerForwardedCastIds.TryRemove((uint)spell.Cast.SpellID, out var forwardedStartCastId))
         {
@@ -3118,7 +3300,7 @@ public partial class WorldClient
     /// Sends an AuraUpdate packet to refresh the duration of an existing aura on a target.
     /// Called when an aura spell is recast on a target that already has the aura.
     /// </summary>
-    private void SendAuraRefreshUpdate(WowGuid128 target, uint spellId, WowGuid128 caster, byte slot, Dictionary<int, UpdateField> updateFields)
+    private void SendAuraRefreshUpdate(WowGuid128 target, uint spellId, WowGuid128 caster, byte slot, Dictionary<int, UpdateField> updateFields, bool forceFullRemaining = false)
     {
         AuraDataInfo? auraData = ReadAuraSlot(slot, target, updateFields);
         if (auraData == null || auraData.SpellID != spellId)
@@ -3168,7 +3350,7 @@ public partial class WorldClient
             {
                 auraData.Flags |= AuraFlagsModern.Duration;
                 auraData.Duration = durationFull;
-                auraData.Remaining = durationLeft > 0 ? durationLeft : durationFull;
+                auraData.Remaining = forceFullRemaining ? durationFull : (durationLeft > 0 ? durationLeft : durationFull);
 
                 GetSession().GameState.StoreAuraDurationLeft(target, slot, durationFull, Environment.TickCount);
                 GetSession().GameState.StoreAuraDurationFull(target, slot, durationFull);

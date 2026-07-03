@@ -318,6 +318,29 @@ public partial class WorldSocket
                 // for players with very low RTT.
                 if (Settings.LowLatencyMode)
                 {
+                    // Guard: in-flight same-spell duplicate. Mirrors the normal-mode guard below.
+                    // Low-Latency mode bypasses the hold/guard paths, which let an on-GCD
+                    // double-send (e.g. Blade Flurry 13877, which the 1.14 client double-sends)
+                    // enqueue TWO entries for one spell: SMSG_SPELL_START marks one started,
+                    // SMSG_SPELL_GO / CAST_FAILED resolve the other, so START and GO carry
+                    // different CastIDs, the client never closes the cast, and we get a stuck
+                    // cast animation + looping sound. Drop the duplicate and ack it via
+                    // SendCastFailedWithoutPrepare (same purpose/reasoning as normal mode) so
+                    // the button doesn't stick lit.
+                    if (GetSession().GameState.HasNonStartedPendingCastForSpell((uint)cast.Cast.SpellID))
+                    {
+                        Log.Event("cast.dropped.duplicate", new
+                        {
+                            spell_id = cast.Cast.SpellID,
+                            reason = "in_flight_same_spell",
+                            client_cast_id = cast.Cast.CastID.ToString(),
+                            queue_depth = GetSession().GameState.PendingNormalCasts.Count,
+                            source = "low_latency",
+                        });
+                        SendCastFailedWithoutPrepare(castRequest);
+                        return;
+                    }
+
                     // DIAGNOSTIC (stuck-spell investigation): remove when closed
                     if (Framework.Settings.DebugOutput)
                         Log.Event("cast.forwarded", new
@@ -389,7 +412,13 @@ public partial class WorldSocket
                 // displaced previously-held cast; don't ack-fail the new one. The eventual
                 // SpellPrepare at SPELL_START time keeps the button lit smoothly across the
                 // hold.
-                if (GetSession().GameState.HasStartedNormalCast())
+                //
+                // JimsProxy (1.14 SpellQueueWindow alignment): gate is the LAST 400 ms of the
+                // active cast bar, not the entire cast. Presses earlier than that are forwarded
+                // to the server, which returns SpellInProgress; the client renders that as the
+                // standard "Spell is already in progress" feedback. Matches what a real 1.14
+                // server does with default SpellQueueWindow=400.
+                if (GetSession().GameState.HasStartedCastInQueueWindow())
                 {
                     WorldPacket heldPacket = BuildCastSpellPacket(cast);
                     castRequest.HeldPacketForReplay = heldPacket;
@@ -414,7 +443,13 @@ public partial class WorldSocket
                 // packet now but don't forward it — store it as the pending held cast. The Timer
                 // set up in SMSG_SPELL_GO will release it at (estimated GCD expiry - early offset).
                 // Mashing during GCD overwrites the held slot so only the most recent press fires.
-                if (GetSession().GameState.IsGcdHoldActive())
+                //
+                // JimsProxy (1.14 SpellQueueWindow alignment): gate is the LAST 400 ms of the
+                // GCD, not the entire 1500 ms. Presses earlier than that are forwarded to the
+                // server, which returns NOT_READY; the client renders that as the standard
+                // "Spell is not ready yet" feedback. Matches what a real 1.14 server does with
+                // default SpellQueueWindow=400.
+                if (GetSession().GameState.IsInGcdQueueWindow())
                 {
                     WorldPacket heldPacket = BuildCastSpellPacket(cast);
                     castRequest.HeldPacketForReplay = heldPacket;
@@ -524,6 +559,30 @@ public partial class WorldSocket
             {
                 // Off-GCD path: still enqueue so SMSG_SPELL_GO can match back to the ClientGUID,
                 // but skip the cast-bar gate and the GCD hold.
+
+                // JimsProxy (off-GCD double-send collapse): the 1.14 client emits two
+                // CMSG_CAST_SPELL per off-GCD keypress. Collapse the still-unstarted same-spell
+                // duplicate so the server casts once and there's no second pending entry to
+                // mis-pair at SPELL_GO — fixing H7 at the source (the GO-side caller-aware dequeue
+                // stays as the deterministic backstop). Mirrors the on-GCD dup guard above (which
+                // off-GCD casts skip by design), but collapses only while the first press is still
+                // unstarted — the brief pre-server-response window the double-send's second CMSG
+                // lands in. A deliberate re-cast spaced beyond the round-trip finds the first
+                // already started and is NOT dropped; for off-GCD buffs/cooldowns a second cast
+                // within a round-trip is redundant anyway. The DontReport ack on the client's own
+                // CastID silently releases its second pending press.
+                if (GetSession().GameState.HasNonStartedPendingCastForSpell((uint)cast.Cast.SpellID))
+                {
+                    Log.Event("cast.dropped.duplicate", new
+                    {
+                        spell_id = cast.Cast.SpellID,
+                        reason = "off_gcd_double_send",
+                        client_cast_id = castRequest.ClientGUID.ToString(),
+                    });
+                    SendCastFailedWithoutPrepare(castRequest);
+                    return;
+                }
+
                 // DIAGNOSTIC (stuck-spell investigation): remove when closed
                 if (Framework.Settings.DebugOutput)
                     Log.Event("cast.forwarded", new

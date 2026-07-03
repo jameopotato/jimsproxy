@@ -67,7 +67,12 @@ local function KR_IsNonKey(id)
     if not id then return false end
     local classID = select(6, GetItemInfoInstant(id))
     if classID == nil then return false end -- unknown item: leave it alone
-    return classID ~= 13 -- 13 = Key
+    if classID == 13 then return false end -- 13 = Key
+    -- Keyring bag family (bit 256): Kronos marks some non-Key-class items keyring-able
+    -- (e.g. Alarm-O-Bot) and the proxy's item hotfixes pass that through — those belong
+    -- in the keyring, leave them there.
+    local family = GetItemFamily(id)
+    return not (family and bit.band(family, 256) ~= 0)
 end
 
 local function KR_FirstFreeBagSlot()
@@ -193,6 +198,12 @@ local btnBagAudit = CreateButton(panel, y, "Bag Audit", 150,
     "Moves non-key items out of your keyring and into your bags.\nUse it if a character has items stuck in the keyring from a past\nbug. Keys are left in place.")
 btnBagAudit:SetScript("OnClick", KR_StartCleanup)
 y = y - 30
+
+local cbBagSort = CreateCheckbox(panel, y,
+    "Custom bag sort order  |cFF888888(Bagnon)|r",
+    "Changes Bagnon's sort button to a curated layout:\npermanent fixtures (hearthstone) first, then profession and\ngathering tools, quest items, soulbound gear, other gear,\nconsumables, everything else, and junk last.\n\nAlso applies to Bagnon's bank sort. Takes effect on the\nnext sort — no reload needed.")
+y = y - 28
+
 -- More tool buttons can be added below (decrement y per button).
 
 ---------------------------------------------------------------------------
@@ -202,6 +213,7 @@ local function RefreshCheckboxes()
     local db = namespace.db or JimsPlusDB or {}
     cbTooltipFix:SetChecked(db.tooltipFix == true)
     cbMoonkinSound:SetChecked(db.moonkinSound ~= false)
+    cbBagSort:SetChecked(db.bagSortOrder ~= false)
 
     local cdb = JimsPlusCastbars and JimsPlusCastbars.db
     if cdb then
@@ -240,6 +252,14 @@ cbMoonkinSound:SetScript("OnClick", function(self)
         namespace.db.moonkinSound = enabled
     end
     print("|cFF00FF00[JimsPlus]|r Moonkin Form sound " .. (enabled and "enabled" or "disabled") .. ". Type /reload to apply.")
+end)
+
+cbBagSort:SetScript("OnClick", function(self)
+    local enabled = self:GetChecked() and true or false
+    if namespace.db then
+        namespace.db.bagSortOrder = enabled
+    end
+    print("|cFF00FF00[JimsPlus]|r Custom bag sort order " .. (enabled and "enabled" or "disabled") .. ".")
 end)
 
 for _, info in ipairs(castbarUnits) do

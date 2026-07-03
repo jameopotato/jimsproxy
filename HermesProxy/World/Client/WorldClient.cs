@@ -556,6 +556,26 @@ public partial class WorldClient
         }
     }
 
+    // JimsProxy (relogin name "Unknown"): the delayed-send queues live on the WorldClient
+    // instance, so a CMSG_NAME_QUERY queued at char-select (delayUntil SMSG_LOGIN_VERIFY_WORLD)
+    // is discarded when HandlePlayerLogin recreates the WorldClient on relogin — and the
+    // player's own name then resolves to "Unknown" in target / target-of-target frames. Carry
+    // the SERVER-bound queue (only name queries are ever delayed there) over to the new
+    // instance so it flushes on the new login-verify. The client-bound queue is intentionally
+    // NOT migrated: it holds world-state-specific ordering packets that must not cross a relogin.
+    public void AdoptDelayedServerPacketsFrom(WorldClient previous)
+    {
+        if (previous == null || previous == this)
+            return;
+        foreach (var (opcode, packets) in previous._delayedPacketsToServer)
+        {
+            if (!_delayedPacketsToServer.TryGetValue(opcode, out var list))
+                _delayedPacketsToServer[opcode] = list = new List<WorldPacket>();
+            list.AddRange(packets);
+        }
+        previous._delayedPacketsToServer.Clear();
+    }
+
     /// <summary>
     /// Opcodes the legacy server may legitimately send before SMSG_AUTH_RESPONSE
     /// which we don't (yet) translate. They arrive during the auth handshake
@@ -945,6 +965,16 @@ public partial class WorldClient
         // before we try to ping or trip the watchdog on a corpse.
         if (!IsConnected() || _isSuccessful == false)
             return;
+
+        // JimsProxy (T1 guaranteed-closure companion): pump the cast watchdog on the keepalive
+        // tick so an orphaned cast (server sent no GO / CAST_FAILED / SPELL_FAILURE) still gets
+        // its synthetic closure when the player goes idle. The existing watchdog otherwise only
+        // runs on the next inbound spell packet, so a truly idle orphan leaks until the next cast.
+        // The 2.5s per-cast deadline and the eviction logic are unchanged — this only adds a pump
+        // cadence (≤ one keepalive interval late). Gated with the T1 bundle so OFF is byte-identical;
+        // RunWatchdogEviction is already invoked cross-thread and no-ops when nothing is overdue.
+        if (Framework.Settings.IdentityPinnedCastIdsActive)
+            GetSession()?.RunWatchdogEviction();
 
         // JimsProxy silent-stall watchdog: before sending the next keepalive
         // ping, check whether the legacy server has gone silent on us. The

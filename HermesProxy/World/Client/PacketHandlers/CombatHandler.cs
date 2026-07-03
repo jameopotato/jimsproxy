@@ -146,6 +146,11 @@ public partial class WorldClient
         {
             int slot = (hitInfo & (uint)HitInfo.OffHand) != 0 ? 1 : 0;
             FlushDeferredBaseAttackTime(slot);
+
+            // JimsProxy (judgement-refresh-on-melee): our own swing refreshes our Judgement
+            // debuff on the victim server-side; synthesize the duration reset so the 1.14
+            // client's debuff timer follows (the 1.12 server doesn't echo enemy-debuff durations).
+            RefreshOwnJudgementOnVictim(attack.VictimGUID);
         }
 
         // Threat translation: feed melee swing damage into the threat tracker.
@@ -175,6 +180,52 @@ public partial class WorldClient
 
         state.LastSentBaseAttackTime[slot] = pending;
         state.HasPendingBaseAttackTime[slot] = false;
+    }
+
+    // JimsProxy (judgement-refresh-on-melee): mirror cmangos Unit.cpp DealMeleeDamage — a
+    // paladin's melee hit resets their OWN Judgement debuff (JoL/JoW/JoC/JoJ) on the victim
+    // to full duration server-side. The 1.12 server doesn't echo enemy-debuff durations, so
+    // the modern client's debuff timer would just count down. Re-emit a full-duration aura
+    // update for any of our Judgements on the victim. Gated to a paladin local player; an
+    // untracked caster is treated as ours since only the local paladin reaches here.
+    void RefreshOwnJudgementOnVictim(WowGuid128 victim)
+    {
+        var state = GetSession().GameState;
+        WowGuid128 localPlayer = state.CurrentPlayerGuid;
+        if (localPlayer == default || victim == default)
+            return;
+        if (state.CurrentPlayerClass != (byte)Class.Paladin)
+            return;
+
+        var updateFields = state.GetCachedObjectFieldsLegacy(victim);
+        if (updateFields == null)
+            return;
+        int auraField = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
+        if (auraField < 0)
+            return;
+
+        int slots = LegacyVersion.GetAuraSlotsCount();
+        for (byte i = 0; i < slots; i++)
+        {
+            if (!updateFields.TryGetValue(auraField + i, out var field))
+                continue;
+            uint spellId = field.UInt32Value;
+            if (spellId == 0 || !GameData.IsJudgementDebuff(spellId))
+                continue;
+            WowGuid128 caster = state.GetAuraCaster(victim, i, spellId);
+            if (caster != localPlayer && caster != default)
+                continue;
+
+            SendAuraRefreshUpdate(victim, spellId, localPlayer, i, updateFields, forceFullRemaining: true);
+            // JimsProxy: gate this per-swing diagnostic behind DebugOutput (fires on every melee hit while a Judgement is up).
+            if (Framework.Settings.DebugOutput)
+                Framework.Logging.Log.Event("judgement.refresh.synth", new
+                {
+                    victim_low = victim.GetCounter(),
+                    slot = (int)i,
+                    spell_id = spellId,
+                });
+        }
     }
     [PacketHandler(Opcode.SMSG_ATTACKSWING_NOTINRANGE)]
     void HandleAttackSwingNotInRange(WorldPacket packet)

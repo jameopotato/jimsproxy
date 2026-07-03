@@ -330,6 +330,41 @@ public sealed class GameSessionData
     // Forwarding the first one is sufficient — the client cancels the cast bar / visual and
     // subsequent same-cast failures add no new state.
     public Dictionary<(WowGuid128 Caster, uint SpellId), long> RecentlyForwardedSpellFailedOther = new();
+
+    // JimsProxy (out-of-range-ghost): guids just destroyed / out-of-ranged and not yet re-created. Vanilla broadcasts a moving unit's trailing MSG_MOVE_* at map-level distance AFTER the per-object-visibility destroy; relaying that stray movement re-ghosts the unit "running in place" on the modern client until re-approach. Movement for these guids is dropped until a CreateObject clears the mark.
+    private readonly ConcurrentDictionary<WowGuid128, long> _recentlyDestroyedObjects = new();
+    private const long RecentlyDestroyedTtlMs = 10000;
+
+    public void MarkObjectRecentlyDestroyed(WowGuid128 guid)
+    {
+        if (guid.IsEmpty())
+            return;
+        _recentlyDestroyedObjects[guid] = Environment.TickCount64;
+        // Opportunistic sweep so a long session of spawns/despawns can't grow this unbounded.
+        if (_recentlyDestroyedObjects.Count > 4096)
+        {
+            long cutoff = Environment.TickCount64 - RecentlyDestroyedTtlMs;
+            foreach (var kvp in _recentlyDestroyedObjects)
+                if (kvp.Value < cutoff)
+                    _recentlyDestroyedObjects.TryRemove(kvp.Key, out _);
+        }
+    }
+
+    public void ClearRecentlyDestroyedObject(WowGuid128 guid) => _recentlyDestroyedObjects.TryRemove(guid, out _);
+
+    public bool WasObjectRecentlyDestroyed(WowGuid128 guid, out long agoMs)
+    {
+        agoMs = 0;
+        if (_recentlyDestroyedObjects.TryGetValue(guid, out long when))
+        {
+            agoMs = Environment.TickCount64 - when;
+            if (agoMs < RecentlyDestroyedTtlMs)
+                return true;
+            _recentlyDestroyedObjects.TryRemove(guid, out _);
+        }
+        return false;
+    }
+
     public string LeftChannelName = "";
     public bool IsPassingOnLoot;
     public int GroupUpdateCounter;
@@ -386,6 +421,12 @@ public sealed class GameSessionData
     // Pre-existing Enqueues from the network-thread CMSG handlers stay lock-free (same-thread
     // semantics as before this PR); only the new cross-thread path takes the lock.
     internal readonly object PendingCastsLock = new();
+
+    // JimsProxy (#313): the spell-queue hold-window width is configurable via
+    // Framework.Settings.SpellQueueWindowMs (400 retail-accurate / 1000 / 1300 smoothest;
+    // default 1300). The hold gates (IsInGcdQueueWindow / HasStartedCastInQueueWindow) read it
+    // directly: a press in the last SpellQueueWindowMs of an active GCD or cast bar is held and
+    // fired at expiry; earlier presses are forwarded for the server to arbitrate.
 
     // JimsProxy (issue #43): GCD hold-and-fire state. While the player is on a GCD (tracked
     // from SMSG_SPELL_GO), new CMSG_CAST_SPELL presses are held in _heldGcdCast instead of
@@ -488,10 +529,29 @@ public sealed class GameSessionData
     // cast is dequeued at GO, so normal casts are wire-identical. Cleared on world
     // transfer alongside the pet/other-caster cast-id maps.
     public ConcurrentDictionary<uint, WowGuid128> PlayerForwardedCastIds = new();
+    // JimsProxy (T1 identity-pinned cast correspondence): per-spell FIFO of the CastIDs
+    // forwarded to the modern client at the LOCAL PLAYER's SMSG_SPELL_START. Supersedes the
+    // single-slot PlayerForwardedCastIds (above) when Settings.IdentityPinnedCastIdsActive.
+    // A single slot is overwritten when two same-spell casts are in flight at once (the
+    // immediate-forward / Low-Latency path), so a later GO recovers the wrong CastID; the
+    // FIFO preserves START order so each terminating event consumes the matching forwarded
+    // CastID and START↔GO/FAILED pair deterministically, independent of which queue entry
+    // the dequeue heuristic picks. Bounded per spell (oldest dropped past the cap) and
+    // cleared on reconnect so a missed pop can neither leak nor stale-head a future cast.
+    // Lock-guarded plain Dictionary/List (not Concurrent*) so enqueue+bound and the
+    // remove-by-value the watchdog needs are atomic; contention is negligible (cast events).
+    private readonly Dictionary<uint, List<WowGuid128>> _playerForwardedStartCastIds = new();
+    private readonly object _playerForwardedStartCastIdsLock = new();
+    private const int MaxForwardedStartCastIdsPerSpell = 8;
     // Tracks last-seen UNIT_CHANNEL_SPELL per unit so we can synthesize
     // SMSG_SPELL_CHANNEL_START/UPDATE for observers (vanilla only sends
     // MSG_CHANNEL_START to the caster, not to nearby players).
     public ConcurrentDictionary<WowGuid128, int> UnitChannelSpells = new();
+    // #383: maps a channeling unit -> (GameObject that triggered the channel, spellId).
+    // Kronos sends ritual participants UNIT_CHANNEL_SPELL but no channel object, so the
+    // 1.14 client has the channel spell yet no portal to face and never strikes the pose.
+    // We recall the portal from the unit's SPELL_GO cast-source to restore the object.
+    public ConcurrentDictionary<WowGuid128, (WowGuid128 SourceObject, int SpellId)> ChannelSourceObjectByUnit = new();
     public WowGuid64 LastLootTargetGuid;
     //MIRASU - ConcurrentDictionary because abandon-clear runs on the modern-server thread
     //MIRASU   (CMSG_QUEST_LOG_REMOVE_QUEST handler in Server/QuestHandler.cs) while item-credit
@@ -1216,40 +1276,49 @@ public sealed class GameSessionData
     // Spell Cast Queue Helper Methods
 
     /// <summary>
-    /// Try to find and dequeue a pending cast by SpellId.
-    /// Prefers non-started entries when multiple entries match the same spell.
-    /// A started entry (HasStarted=true) is being tracked by the SPELL_START →
-    /// SPELL_GO lifecycle; CAST_FAILED for a rapid same-spell duplicate should
-    /// consume the non-started entry (the rejected cast) rather than the started
-    /// one (whose SPELL_GO is still in flight).
+    /// Try to find and dequeue a pending cast by SpellId. <paramref name="preferStarted"/>
+    /// selects which entry wins when multiple same-spell entries are queued — the off-GCD
+    /// double-send shape in Low-Latency mode, where the CMSG-side dup guard is bypassed and two
+    /// entries coexist (e.g. Blade Flurry: the first press's START marked entry A (started); the
+    /// duplicate left entry B (unstarted)):
+    /// <list type="bullet">
+    /// <item>SMSG_SPELL_GO and <i>real</i> failures pass <c>true</c> — they complete/fail the cast
+    /// SMSG_SPELL_START opened (the STARTED entry, whose CastID the client's cast visual is
+    /// showing), so START and GO pair. Falls back to the oldest unstarted entry for the skip-START
+    /// instant path (server emits GO with no preceding START).</item>
+    /// <item>A duplicate's NOT_READY / SpellInProgress rejection passes <c>false</c> — it must fail
+    /// the UNSTARTED dup and LEAVE the started entry for its in-flight GO. Falls back to a started
+    /// entry only if no unstarted one exists.</item>
+    /// </list>
+    /// Routing the two callers to opposite preferences is what makes the double-send pair
+    /// correctly in BOTH packet orderings (GO-before-fail and fail-before-GO). See H7.
     /// </summary>
-    public bool TryDequeuePendingNormalCast(uint spellId, out ClientCastRequest? cast)
+    public bool TryDequeuePendingNormalCast(uint spellId, out ClientCastRequest? cast, bool preferStarted = true)
     {
         var pending = new List<ClientCastRequest>();
         cast = null;
-        ClientCastRequest? startedFallback = null;
-        int startedFallbackIndex = -1;
+        ClientCastRequest? fallback = null;
+        int fallbackIndex = -1;
+        bool sawOppositeMatch = false;   // a same-spell entry in the non-preferred state was also queued
 
         lock (PendingCastsLock)
         {
             while (PendingNormalCasts.TryDequeue(out var current))
             {
-                if (cast == null && CastMatchesSpellId(current, spellId))
+                bool matches = CastMatchesSpellId(current, spellId);
+                bool preferred = matches && current.HasStarted == preferStarted;
+                if (matches && !preferred)
+                    sawOppositeMatch = true;
+
+                if (cast == null && preferred)
                 {
-                    if (!current.HasStarted)
-                    {
-                        cast = current;
-                    }
-                    else if (startedFallback == null)
-                    {
-                        startedFallback = current;
-                        startedFallbackIndex = pending.Count;
-                        pending.Add(current);
-                    }
-                    else
-                    {
-                        pending.Add(current);
-                    }
+                    cast = current;                       // first preferred match (FIFO order)
+                }
+                else if (cast == null && matches && fallback == null)
+                {
+                    fallback = current;                   // remember the first non-preferred match
+                    fallbackIndex = pending.Count;
+                    pending.Add(current);
                 }
                 else
                 {
@@ -1257,17 +1326,32 @@ public sealed class GameSessionData
                 }
             }
 
-            // No non-started match found — fall back to the first started entry
-            if (cast == null && startedFallback != null)
+            // No preferred match — fall back to the first non-preferred same-spell entry.
+            if (cast == null && fallback != null)
             {
-                cast = startedFallback;
-                pending.RemoveAt(startedFallbackIndex);
+                cast = fallback;
+                pending.RemoveAt(fallbackIndex);
             }
 
             foreach (var item in pending)
             {
                 PendingNormalCasts.Enqueue(item);
             }
+        }
+
+        // DIAGNOSTIC (H7 stuck-cast investigation): fires only when the dequeue resolved to its
+        // PREFERRED entry while a same-spell entry in the OPPOSITE state was also queued — the
+        // exact double-send ambiguity H7 describes, now resolved correctly. preferStarted=true
+        // (GO) → the started entry was kept paired; preferStarted=false (dup-failure) → the
+        // started entry was spared for its GO. Presence in the tester's JSONL confirms the
+        // condition was occurring. Remove when the investigation closes.
+        if (cast != null && sawOppositeMatch && cast.HasStarted == preferStarted && Framework.Settings.DebugOutput)
+        {
+            Log.Event(preferStarted ? "cast.go.prefer_started" : "cast.fail.spared_started", new
+            {
+                spell_id = spellId,
+                cast_id = cast.ServerGUID.ToString(),
+            });
         }
 
         return cast != null;
@@ -1297,12 +1381,106 @@ public sealed class GameSessionData
             if (CastMatchesSpellId(item, spellId) && !item.HasStarted)
             {
                 item.HasStarted = true;
+                item.StartedAtTickMs = Environment.TickCount64;
                 cast = item;
                 return true;
             }
         }
 
         return false;
+    }
+
+    // JimsProxy (T1 identity-pinned cast correspondence) — per-spell forwarded-START CastID
+    // FIFO helpers. Active only when Settings.IdentityPinnedCastIdsActive; OFF path never
+    // calls these. See _playerForwardedStartCastIds.
+
+    /// <summary>
+    /// Record the CastID forwarded to the client at the local player's SMSG_SPELL_START.
+    /// Oldest-first; bounded so a missed pop can't grow without bound.
+    /// </summary>
+    public void EnqueueForwardedStartCastId(uint spellId, WowGuid128 castId)
+    {
+        lock (_playerForwardedStartCastIdsLock)
+        {
+            if (!_playerForwardedStartCastIds.TryGetValue(spellId, out var list))
+            {
+                list = new List<WowGuid128>(2);
+                _playerForwardedStartCastIds[spellId] = list;
+            }
+            list.Add(castId);
+            while (list.Count > MaxForwardedStartCastIdsPerSpell)
+                list.RemoveAt(0);
+        }
+    }
+
+    /// <summary>
+    /// Pop the oldest forwarded-START CastID for a spell — a terminating event (SPELL_GO or a
+    /// real CAST_FAILED) consuming the cast it opened.
+    /// </summary>
+    public bool TryPopForwardedStartCastId(uint spellId, out WowGuid128 castId)
+    {
+        lock (_playerForwardedStartCastIdsLock)
+        {
+            if (_playerForwardedStartCastIds.TryGetValue(spellId, out var list) && list.Count > 0)
+            {
+                castId = list[0];
+                list.RemoveAt(0);
+                if (list.Count == 0)
+                    _playerForwardedStartCastIds.Remove(spellId);
+                return true;
+            }
+        }
+        castId = default;
+        return false;
+    }
+
+    /// <summary>
+    /// Peek the oldest forwarded-START CastID without consuming it. SMSG_SPELL_FAILURE only
+    /// peeks the pending cast (the trailing SMSG_CAST_FAILED / GO / watchdog is what pops),
+    /// so it stamps from the FIFO front without removing it.
+    /// </summary>
+    public bool TryPeekForwardedStartCastId(uint spellId, out WowGuid128 castId)
+    {
+        lock (_playerForwardedStartCastIdsLock)
+        {
+            if (_playerForwardedStartCastIds.TryGetValue(spellId, out var list) && list.Count > 0)
+            {
+                castId = list[0];
+                return true;
+            }
+        }
+        castId = default;
+        return false;
+    }
+
+    /// <summary>
+    /// Remove a specific forwarded-START CastID by value. The watchdog evicts a known cast
+    /// that may not be the oldest, so removing by value (not popping the front) keeps the FIFO
+    /// consistent — a later same-spell cast's GO can't then pop this evicted cast's stale CastID.
+    /// </summary>
+    public bool RemoveForwardedStartCastId(uint spellId, WowGuid128 castId)
+    {
+        lock (_playerForwardedStartCastIdsLock)
+        {
+            if (_playerForwardedStartCastIds.TryGetValue(spellId, out var list) && list.Remove(castId))
+            {
+                if (list.Count == 0)
+                    _playerForwardedStartCastIds.Remove(spellId);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Drop all forwarded-START CastIDs (reconnect / world-transfer state reset).
+    /// </summary>
+    public void ClearForwardedStartCastIds()
+    {
+        lock (_playerForwardedStartCastIdsLock)
+        {
+            _playerForwardedStartCastIds.Clear();
+        }
     }
 
     /// <summary>
@@ -1348,6 +1526,31 @@ public sealed class GameSessionData
         foreach (var item in PendingNormalCasts)
         {
             if (item.HasStarted && item.TargetGuid == gameObjectGuid)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// JimsProxy: narrow variant of HasStartedNormalCast — returns true only when an
+    /// in-progress cast is within the last SpellQueueWindowMs of its cast bar. Mirrors
+    /// the 1.14 client's SpellQueueWindow=400 semantics: presses arriving in this window
+    /// get queued and fire on cast completion; earlier presses are forwarded to the server
+    /// and receive the server's actual response (SpellInProgress / NOT_READY etc.).
+    /// Used by the HandleCastSpell cast-time hold gate. The wider HasStartedNormalCast()
+    /// remains for callers that genuinely need "any started cast" (e.g. item-use duplicate
+    /// guards).
+    /// </summary>
+    public bool HasStartedCastInQueueWindow()
+    {
+        long now = Environment.TickCount64;
+        foreach (var item in PendingNormalCasts)
+        {
+            if (!item.HasStarted || item.StartedAtTickMs == 0 || item.StartedCastTimeMs == 0)
+                continue;
+            long castEnd = item.StartedAtTickMs + item.StartedCastTimeMs;
+            long remaining = castEnd - now;
+            if (remaining > 0 && remaining <= Framework.Settings.SpellQueueWindowMs)
                 return true;
         }
         return false;
@@ -1765,6 +1968,7 @@ public sealed class GameSessionData
             if (CastMatchesSpellId(item, spellId) && !item.HasStarted)
             {
                 item.HasStarted = true;
+                item.StartedAtTickMs = Environment.TickCount64;
                 cast = item;
                 return true;
             }
@@ -1808,6 +2012,7 @@ public sealed class GameSessionData
         OtherCasterActiveCastIds.Clear();
         PetAutoCastActiveCastIds.Clear();
         PlayerForwardedCastIds.Clear();
+        ClearForwardedStartCastIds();
         // Single-slot trackers for melee + auto-repeat (Auto Shot, Shoot Wand)
         // — same lifecycle as PendingNormalCasts; if a tracker was set when
         // the DC fired, it never gets cleared by the SPELL_GO/CAST_FAILED
@@ -1869,6 +2074,24 @@ public sealed class GameSessionData
         lock (_gcdLock)
         {
             return _gcdExpireTimestampMs > Environment.TickCount64;
+        }
+    }
+
+    /// <summary>
+    /// JimsProxy: narrow variant of IsGcdHoldActive — returns true only when the GCD has
+    /// at most SpellQueueWindowMs remaining. Mirrors the 1.14 client's SpellQueueWindow
+    /// semantics for the GCD case (instants pressed in the last 400 ms of the previous cast's
+    /// GCD get queued and fire on GCD expiry; earlier presses are forwarded and receive the
+    /// server's NOT_READY). Used by the HandleCastSpell GCD hold gate. The wider
+    /// IsGcdHoldActive() remains for callers that need "is any GCD active at all"
+    /// (e.g. the held-cast-on-failure release path in Client/SpellHandler.cs).
+    /// </summary>
+    public bool IsInGcdQueueWindow()
+    {
+        lock (_gcdLock)
+        {
+            long remaining = _gcdExpireTimestampMs - Environment.TickCount64;
+            return remaining > 0 && remaining <= Framework.Settings.SpellQueueWindowMs;
         }
     }
 
@@ -2346,6 +2569,13 @@ public class ClientCastRequest
     // separate path and are NOT tagged off-GCD here — tracked in jimsproxy issue #345.
     public bool IsOffGcd;
 
+    // JimsProxy: TickCount64 timestamp when SMSG_SPELL_START arrived for this cast.
+    // Set in TryMarkPendingNormalCastStarted / TryMarkPendingPetCastStarted. Used together
+    // with StartedCastTimeMs by HasStartedCastInQueueWindow to gate the cast-time hold
+    // to the last SpellQueueWindowMs of the cast bar (1.14 SpellQueueWindow semantics). 0 means
+    // SPELL_START has not yet arrived (entry is still !HasStarted).
+    public long StartedAtTickMs;
+
     // JimsProxy (PR #161 follow-up): when HandleSpellFailure peeks this entry
     // (instead of dequeuing) so the trailing SMSG_CAST_FAILED can deliver the
     // real reason, set this to TickCount64 + 2500ms. If HandleCastFailed
@@ -2567,6 +2797,12 @@ public class GlobalSessionData
                 had_started = cast.HasStarted,
                 ms_overdue = nowMs - cast.WatchdogDeadlineMs,
             });
+            // T1 (identity-pinned): the started cast is being force-closed without a server
+            // terminating event — release its forwarded-START CastID so a later same-spell cast
+            // can't pop this evicted cast's stale CastID. Remove by value (it may not be the FIFO
+            // head). The synthetic CastFailed below already carries cast.ServerGUID == that CastID.
+            if (Framework.Settings.IdentityPinnedCastIdsActive && cast.HasStarted)
+                GameState.RemoveForwardedStartCastId(cast.SpellId, cast.ServerGUID);
             if (!cast.HasStarted)
             {
                 SpellPrepare prepare = new();
@@ -2580,6 +2816,23 @@ public class GlobalSessionData
             failed.Reason = (byte)SpellCastResultClassic.DontReport;
             failed.CastID = cast.ServerGUID;
             InstanceSocket.SendPacket(failed);
+
+            // JimsProxy (transient-no-dismiss-started): under LowLatencyMode, HandleSpellFailure
+            // deferred a started cast's caster-side visual-cancel to its trailing CAST_FAILED. If
+            // that CAST_FAILED was dropped (e.g. Kronos target-dies-mid-cast) the cast lands here
+            // instead — so cancel the casting-pose / channel visual too, not just dismiss the bar,
+            // or the pose can linger until the next cast. Idempotent on the client.
+            if (Framework.Settings.LowLatencyMode && cast.HasStarted)
+            {
+                uint resolvedVisual = GameData.GetSpellVisualIdFromXSpellVisual(cast.SpellXSpellVisualId);
+                if (resolvedVisual != 0)
+                {
+                    CancelSpellVisual cancelVisual = new();
+                    cancelVisual.Source = GameState.CurrentPlayerGuid;
+                    cancelVisual.SpellVisualID = (int)resolvedVisual;
+                    InstanceSocket.SendPacket(cancelVisual);
+                }
+            }
         }
 
         foreach (var cast in petEvicted)

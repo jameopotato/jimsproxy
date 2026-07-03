@@ -635,6 +635,21 @@ public static partial class GameData
         return (int)(seconds * 1000f);
     }
 
+    // JimsProxy (judgement-refresh-on-melee): paladin Judgement DEBUFF auras applied to the
+    // target — NOT the heal/mana proc effects (20267/20341.., 20268/20352..) or the 1826/5373
+    // intermediates. cmangos Unit.cpp refreshes the caster's own ALWAYS_HIT paladin-family aura
+    // on the victim every melee hit; the 1.12 server doesn't echo enemy-debuff durations so we
+    // synthesize that refresh on the local paladin's swing. Vanilla 1.12 ranks only.
+    public static readonly FrozenSet<uint> JudgementDebuffSpells = new uint[]
+    {
+        20185, 20344, 20345, 20346,                 // Judgement of Light R1-R4
+        20186, 20354, 20355,                        // Judgement of Wisdom R1-R3
+        20188, 20300, 20301, 20302, 20303, 21183,   // Judgement of the Crusader R1-R6
+        20184,                                       // Judgement of Justice
+    }.ToFrozenSet();
+
+    public static bool IsJudgementDebuff(uint spellId) => JudgementDebuffSpells.Contains(spellId);
+
     /// <summary>
     /// JimsProxy: true if the spell is a CP-scaling enemy-debuff finisher we compute
     /// duration for locally. Used by the CMSG_CAST_SPELL handler to decide whether to

@@ -205,6 +205,9 @@ public partial class WorldClient
         // the source of the problem instead of the watchdog catch-all.
         GetSession().EvictPendingCastsForDestroyedTarget(guid);
 
+        // JimsProxy (out-of-range-ghost): suppress any stray trailing movement the legacy server broadcasts for this guid after the destroy, until a CreateObject re-creates it.
+        GetSession().GameState.MarkObjectRecentlyDestroyed(guid);
+
         UpdateObject updateObject = new UpdateObject(GetSession().GameState);
         updateObject.DestroyedGuids.Add(guid);
         SendPacketToClient(updateObject);
@@ -313,6 +316,8 @@ public partial class WorldClient
                     // FarObjects bookkeeping so a later Values update for
                     // this guid doesn't double-promote.
                     GetSession().GameState.NeedsFullAuraRefresh.Remove(guid);
+                    // JimsProxy (out-of-range-ghost): unit re-created → stop suppressing its movement.
+                    GetSession().GameState.ClearRecentlyDestroyedObject(guid);
                     ReadCreateObjectBlock(packet, guid, updateData, auraUpdate, i);
 
                     if (updateData.Guid == GetSession().GameState.CurrentPlayerGuid)
@@ -349,6 +354,8 @@ public partial class WorldClient
                     ObjectUpdate updateData = new ObjectUpdate(guid, UpdateTypeModern.CreateObject2, GetSession());
                     AuraUpdate auraUpdate = new AuraUpdate(guid, true);
                     GetSession().GameState.NeedsFullAuraRefresh.Remove(guid);
+                    // JimsProxy (out-of-range-ghost): unit re-created → stop suppressing its movement.
+                    GetSession().GameState.ClearRecentlyDestroyedObject(guid);
                     ReadCreateObjectBlock(packet, guid, updateData, auraUpdate, i);
 
                     if (guid.IsItem() && updateData.ObjectData.EntryID != null &&
@@ -547,6 +554,18 @@ public partial class WorldClient
                 SendPacketToClient(updateObject2);
 
             }
+            // JimsProxy (threat-wipe-on-combat-drop): an out-of-range guid is a visibility loss
+            // exactly like SMSG_DESTROY_OBJECT — the legacy cache is dropped above, so the threat
+            // tracker must drop it too. Without this, a mob that leaves via the FarObjects/out-of-range
+            // path (NOT an explicit destroy) keeps its threat list forever: we never get flags updates
+            // for an out-of-range unit, so the IN_COMBAT-evade edge can't fire, and threat kept building
+            // off range-independent combat-log broadcasts. Confirmed in 20260612 log: the mobs the player
+            // died to were uncached (in_client_cache=False) yet still emitting threat. Mirrors the destroy
+            // handler so out-of-range and destroy are consistent.
+            GetSession().ThreatTracker.OnUnitDestroyed(guid);
+            // JimsProxy (out-of-range-ghost): suppress stray trailing movement for this guid until it is re-created on re-approach.
+            GetSession().GameState.MarkObjectRecentlyDestroyed(guid);
+
             updateObject.OutOfRangeGuids.Add(guid);
         }
     }
@@ -2369,6 +2388,15 @@ public partial class WorldClient
                 if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V3_0_2_9056) &&
                     updateData.UnitData.PvpFlags == null)
                     updateData.UnitData.PvpFlags = ReadPvPFlags(guid, updates);
+
+                // JimsProxy (threat-wipe-on-combat-drop): vanilla / Kronos never emit SMSG_CANCEL_COMBAT and never
+                // emit a per-mob "threat ended" packet, so a unit that drops combat (death, evade, flee, Feign Death,
+                // Vanish, fight end) kept its stale threat list — a mob the player died to bled into the next
+                // engagement, and a raider's FD/death never cleared their bar. Feed every unit's UNIT_FLAG_IN_COMBAT
+                // bit to the tracker; it removes just that threater (or clears the mob, if it evaded) on the
+                // set->clear edge. Done for ALL units, not only the local player, so groupmate FD/death is handled too.
+                GetSession().ThreatTracker.OnUnitCombatStateObserved(
+                    guid, (updates[UNIT_FIELD_FLAGS].UInt32Value & (uint)UnitFlagsVanilla.InCombat) != 0);
             }
             int UNIT_FIELD_FLAGS_2 = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_FLAGS_2);
             if (UNIT_FIELD_FLAGS_2 >= 0 && updateMaskArray[UNIT_FIELD_FLAGS_2])
@@ -2655,6 +2683,19 @@ public partial class WorldClient
                 uint spellVisual = GameData.GetSpellVisual((uint)spellId);
                 updateData.UnitData.ChannelData = new UnitChannel(spellId, (int)spellVisual);
 
+                // #383: ritual participants get UNIT_CHANNEL_SPELL but no channel object
+                // from Kronos, so the client has the channel spell yet no portal to face
+                // and never poses. Restore the object from the GO that cast this same
+                // spell's SPELL_GO. Rides the channel lifecycle (cleared on channel end).
+                if (spellId != 0 &&
+                    updateData.UnitData.ChannelObject == null &&
+                    guid != GetSession().GameState.CurrentPlayerGuid &&
+                    GetSession().GameState.ChannelSourceObjectByUnit.TryGetValue(guid, out var ritualSource) &&
+                    ritualSource.SpellId == spellId)
+                {
+                    updateData.UnitData.ChannelObject = ritualSource.SourceObject;
+                }
+
                 if (guid != GetSession().GameState.CurrentPlayerGuid)
                 {
                     var channelSpells = GetSession().GameState.UnitChannelSpells;
@@ -2676,6 +2717,7 @@ public partial class WorldClient
                         else
                         {
                             channelSpells.TryRemove(guid, out _);
+                            GetSession().GameState.ChannelSourceObjectByUnit.TryRemove(guid, out _); // #383
                             if (GetSession().GameState.JimsPlusSideband)
                             {
                                 var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
@@ -4143,7 +4185,17 @@ public partial class WorldClient
             int GAMEOBJECT_TYPE_ID = LegacyVersion.GetUpdateField(GameObjectField.GAMEOBJECT_TYPE_ID);
             if (GAMEOBJECT_TYPE_ID >= 0 && updateMaskArray[GAMEOBJECT_TYPE_ID])
             {
-                updateData.GameObjectData.TypeID = (sbyte)updates[GAMEOBJECT_TYPE_ID].Int32Value;
+                sbyte goType = (sbyte)updates[GAMEOBJECT_TYPE_ID].Int32Value;
+
+                // Rookery Egg (175124): vanilla GO type is TRAP (6), which fires Summon Rookery
+                // Whelp on proximity. The 1.14 client won't let you select/spell-target a TRAP, so
+                // the Eggscilloscope (Freeze Rookery Egg 15748) finds no valid target. Present it
+                // as GOOBER (10) — a selectable "use/activate" quest object — so the client can
+                // target it. The whelp-spawn trap is server-side and unaffected. See #387.
+                if (updateData.ObjectData.EntryID == 175124 && goType == 6)
+                    goType = 10;
+
+                updateData.GameObjectData.TypeID = goType;
             }
             int GAMEOBJECT_LEVEL = LegacyVersion.GetUpdateField(GameObjectField.GAMEOBJECT_LEVEL);
             if (GAMEOBJECT_LEVEL >= 0 && updateMaskArray[GAMEOBJECT_LEVEL])

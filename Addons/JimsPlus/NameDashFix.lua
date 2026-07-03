@@ -18,15 +18,35 @@ local function StripRealm(name)
     return name
 end
 
--- 1) Broad coverage. Ambiguate() is the function most name-display code routes a
---    realm-qualified name through; wrapping it drops the realm everywhere at once
---    (unit frames, many chat paths, tooltips, etc.). Safe here -- single realm, so the
---    "short" form is always what we want and the realm suffix is always empty.
-if type(Ambiguate) == "function" then
-    local origAmbiguate = Ambiguate
-    Ambiguate = function(name, context)
-        if name == nil then return name end
-        return StripRealm(origAmbiguate(name, context))
+-- 1) Chat sender names. The realm dash rides in on the author field of every player chat
+--    event (whisper/say/guild/party/raid/channel). Strip it from the author BEFORE the
+--    chat frame formats the line. Author-only: we never rewrite the message body here,
+--    because that text is user-typed and may legitimately contain a "Name-..." substring
+--    (the emote path below is the one exception, since emotes embed the performer name).
+--
+--    This deliberately does NOT wrap the global Ambiguate(). Ambiguate is read inside
+--    secure UI paths -- notably the unit/guild right-click dropdown that drives Promote --
+--    so replacing it with an insecure closure taints those paths and the protected action
+--    is blocked (ADDON_ACTION_FORBIDDEN). There is no taint-safe way to wrap Ambiguate, so
+--    each display surface is covered individually with safe mechanisms instead.
+local function nameOnlyFilter(_, _, msg, author, ...)
+    local cleanAuthor = StripRealm(author)
+    if cleanAuthor ~= author then
+        return false, msg, cleanAuthor, ...
+    end
+end
+
+if type(ChatFrame_AddMessageEventFilter) == "function" then
+    local NAME_EVENTS = {
+        "CHAT_MSG_SAY", "CHAT_MSG_YELL",
+        "CHAT_MSG_WHISPER", "CHAT_MSG_WHISPER_INFORM",
+        "CHAT_MSG_GUILD", "CHAT_MSG_OFFICER",
+        "CHAT_MSG_PARTY", "CHAT_MSG_PARTY_LEADER",
+        "CHAT_MSG_RAID", "CHAT_MSG_RAID_LEADER", "CHAT_MSG_RAID_WARNING",
+        "CHAT_MSG_CHANNEL",
+    }
+    for _, ev in ipairs(NAME_EVENTS) do
+        ChatFrame_AddMessageEventFilter(ev, nameOnlyFilter)
     end
 end
 

@@ -542,6 +542,16 @@ public partial class WorldClient
         GameObjectStats gameObject = response.Stats;
 
         gameObject.Type = packet.ReadUInt32();
+
+        // Rookery Egg (175124): present vanilla TRAP (6) as GOOBER (10) so the 1.14 client lets
+        // the Eggscilloscope target it (see UpdateHandler / #387). This is the value cached in
+        // gameobjectcache.wdb, so players must clear that cache once to pick up the change.
+        if (response.GameObjectID == 175124 && gameObject.Type == 6)
+        {
+            gameObject.Type = 10;
+            Log.Event("gameobject.egg.typeoverride", new { entry = response.GameObjectID, from = 6, to = 10 });
+        }
+
         gameObject.DisplayID = packet.ReadUInt32();
 
         for (int i = 0; i < 4; i++)

@@ -4,7 +4,7 @@
 ## SavedVariables: JimsPlusDB, JimsPlusCastbarsDB
 ## SavedVariablesPerCharacter: JimsPlusCastbarsCharDB
 ## Author: JimsProxy Team (CastBars based on ClassicCastbars by Wardz)
-## Version: 1.1.0
+## Version: 1.2.2
 
 Core.lua
 Options.lua
@@ -17,6 +17,7 @@ AuctionsPaginationFix.lua
 MailNameFix.lua
 NameDashFix.lua
 KeyringClamp.lua
+BagnonSort.lua
 castbars/PoolManager.lua
 castbars/AnchorManager.lua
 castbars/Data.lua

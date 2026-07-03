@@ -45,6 +45,13 @@ public sealed class ThreatTracker
     // SMSG_HIGHEST_THREAT_UPDATE when the top actually changes.
     private readonly Dictionary<WowGuid128, WowGuid128> _lastHighest = new();
 
+    // Last-observed UNIT_FLAG_IN_COMBAT per unit (any unit whose flags we see).
+    // Lets OnUnitCombatStateObserved detect the in-combat -> out-of-combat edge
+    // that drops a threater/mob from the fight. We snapshot it here rather than
+    // diffing the legacy field cache because the values-update path overwrites
+    // that cache in place before we'd get to compare. Pruned on destroy / reset.
+    private readonly Dictionary<WowGuid128, bool> _lastInCombat = new();
+
     // Vanilla aggro hysteresis: a challenger must exceed the current tank's
     // threat by N% before aggro flips. LibThreatClassic2 picks the margin
     // per challenger class:
@@ -232,6 +239,10 @@ public sealed class ThreatTracker
 
         var pkt = new ThreatClearPkt { UnitGUID = mob };
         SendToClient(pkt);
+
+        // Threat emit-side diagnostics: mob cleared (death / evade / despawn). mob_guid (full) so a clear can be matched to the exact spawn instance in threat.emit.
+        if (Settings.DebugOutput)
+            Log.Event("threat.clear", new { mob_low = mob.GetCounter(), mob_guid = mob.ToString() });
     }
 
     // A single threater (e.g. a player who left the group, died) drops off a
@@ -371,6 +382,22 @@ public sealed class ThreatTracker
             }
             SendToClient(update);
 
+            // Threat emit-side diagnostics: SMSG threat packets bypass packet.translated logging.
+            // mob_guid (full) exposes the spawn-counter in the High word so a mid-fight re-create (respawn / out-of-range) shows as a changed guid for the same mob_low; in_client_cache flags emitting for a guid the client no longer has.
+            if (Settings.DebugOutput)
+                Log.Event("threat.emit", new
+                {
+                    mob_low = mob.GetCounter(),
+                    mob_guid = mob.ToString(),
+                    in_client_cache = _session.GameState.GetCachedObjectFieldsLegacy(mob) != null,
+                    // SMOKING GUN: client has THIS mob targeted (same low) but a different spawn-instance guid than we're emitting → UnitDetailedThreatSituation reads the wrong guid → empty meter.
+                    target_spawn_mismatch = _session.GameState.CurrentSelection.GetCounter() == mob.GetCounter() && _session.GameState.CurrentSelection != mob,
+                    threaters = list.Count,
+                    top_low = newHighest.GetCounter(),
+                    top_threat = highestValue,
+                    highest_changed = prevHighest != newHighest,
+                });
+
             // Emit HIGHEST only when the top changes — saves churn but keeps
             // tank-aggro indicators (red border, nameplate color) snappy.
             if (prevHighest != newHighest)
@@ -401,15 +428,14 @@ public sealed class ThreatTracker
         _threatLists.Clear();
         _lastHighest.Clear();
         _dirty.Clear();
+        _lastInCombat.Clear();
     }
 
     // Called from SMSG_CANCEL_COMBAT — the legacy server told the local player
-    // they've left combat. The 1.12 server does NOT broadcast leave-combat
-    // for other party members and doesn't emit a "drop the threat list" packet
-    // for mobs that evade / run away / lose interest. Without an explicit
-    // clear, the modern client retains the stale threat list and Luna /
-    // ThreatPlates keep their red indicators lit on every nameplate the
-    // player fought during the session.
+    // they've left combat. Most vanilla emulators (incl. Kronos) never emit it,
+    // so on those servers the per-unit UNIT_FLAG_IN_COMBAT edge in
+    // OnUnitCombatStateObserved is what actually drops threat; this stays as a
+    // full-wipe path for emulators that DO send CANCEL_COMBAT.
     //
     // Aggressive but matches vanilla feel: if WE'RE not in combat, nothing
     // should display threat anywhere. If a groupmate is still fighting, their
@@ -419,8 +445,87 @@ public sealed class ThreatTracker
         if (_threatLists.Count == 0) return;
 
         var mobsToClear = new List<WowGuid128>(_threatLists.Keys);
+
+        // Threat emit-side diagnostics: SMSG_CANCEL_COMBAT wiped every tracked mob at once.
+        if (Settings.DebugOutput)
+            Log.Event("threat.leave_combat_wipe", new { mobs_wiped = mobsToClear.Count });
+
         foreach (var mob in mobsToClear)
             ClearMob(mob);
+    }
+
+    // Called from UpdateHandler for every unit whose UNIT_FIELD_FLAGS we process,
+    // with the current state of its UNIT_FLAG_IN_COMBAT bit. A set->clear edge
+    // means that unit just left combat — death, evade, flee, Feign Death, Vanish,
+    // or a normal fight end. Vanilla / Kronos never send SMSG_CANCEL_COMBAT and
+    // never emit a per-mob "threat ended" packet, so this flag edge is our only
+    // signal that a threater or mob has dropped out of the fight.
+    //
+    // Per-threater, NOT a full wipe: when a single raider feign-deaths or dies we
+    // remove only THAT unit from every mob's list (other raiders keep their bars),
+    // which is exactly what a real threat meter shows. When the unit is itself a
+    // mob we track (it evaded / leashed home) we clear the whole mob. We keep our
+    // own last-seen snapshot because the values-update path mutates the legacy
+    // field cache in place, so the pre-update value can't be read back.
+    public void OnUnitCombatStateObserved(WowGuid128 guid, bool inCombat)
+    {
+        if (!Settings.ThreatEngine) return;
+        if (guid == default) return;
+
+        _lastInCombat.TryGetValue(guid, out bool wasInCombat);
+        _lastInCombat[guid] = inCombat;
+        if (!wasInCombat || inCombat) return; // only act on the in-combat -> out-of-combat edge
+
+        bool removedThreater = RemoveThreaterFromAllMobs(guid);
+        bool clearedMob = _threatLists.ContainsKey(guid);
+        if (clearedMob)
+            ClearMob(guid);
+
+        if (!removedThreater && !clearedMob) return;
+
+        EmitDirty();
+
+        // Threat emit-side diagnostics: a unit dropped combat (FD / death / evade / flee).
+        if (Settings.DebugOutput)
+            Log.Event("threat.combat_drop", new
+            {
+                guid_low = guid.GetCounter(),
+                is_local = guid == _session.GameState.CurrentPlayerGuid,
+                removed_threater = removedThreater,
+                cleared_mob = clearedMob,
+            });
+    }
+
+    // Remove a threater from every mob's list. Mobs that still have other
+    // threaters get an SMSG_THREAT_REMOVE + a dirty re-emit (top may have
+    // changed); mobs whose list empties as a result are fully cleared
+    // (SMSG_THREAT_CLEAR) so the client drops them from the threat APIs. Returns
+    // true if the threater was on at least one mob. Caller flushes via EmitDirty.
+    private bool RemoveThreaterFromAllMobs(WowGuid128 threater)
+    {
+        List<WowGuid128>? mobs = null;
+        foreach (var (mob, list) in _threatLists)
+        {
+            if (list.ContainsKey(threater))
+                (mobs ??= new List<WowGuid128>()).Add(mob);
+        }
+        if (mobs == null) return false;
+
+        foreach (var mob in mobs)
+        {
+            var list = _threatLists[mob];
+            list.Remove(threater);
+            if (list.Count == 0)
+            {
+                ClearMob(mob);
+            }
+            else
+            {
+                SendToClient(new ThreatRemovePkt { UnitGUID = mob, AboutGUID = threater });
+                _dirty.Add(mob);
+            }
+        }
+        return true;
     }
 
     // Called from the SMSG_DESTROY_OBJECT handler. Two cases to clean up:
@@ -430,6 +535,10 @@ public sealed class ThreatTracker
     public void OnUnitDestroyed(WowGuid128 guid)
     {
         if (guid == default) return;
+
+        // Drop the combat-state snapshot for this guid so it can't go stale and
+        // so the dictionary stays bounded to currently-visible units.
+        _lastInCombat.Remove(guid);
 
         // Case 1: this guid was a mob in our tracked set.
         if (_threatLists.ContainsKey(guid))

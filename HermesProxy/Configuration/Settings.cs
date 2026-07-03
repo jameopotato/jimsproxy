@@ -62,6 +62,30 @@ public static class Settings
     // the client doesn't show red error text during rapid spam. Independent of
     // LowLatencyMode — useful as a companion setting but not required.
     public static bool SuppressSpellCastErrors;
+    // JimsProxy (T1 identity-pinned cast correspondence): make the START↔terminating
+    // CastID pairing deterministic. Every local-player terminating event
+    // (SPELL_GO / CAST_FAILED / SPELL_FAILURE) and the watchdog's synthetic closure
+    // is stamped with the CastID recorded at SPELL_START, drawn from a per-spell FIFO,
+    // instead of relying on which queue entry the dequeue heuristic picked. Sub-toggle
+    // of LowLatencyMode: only the immediate-forward path creates the concurrent
+    // same-spell entries this disambiguates, so it has no effect (and the Hold-and-Fire
+    // path stays byte-identical) unless BOTH are on. Default OFF — opt-in experiment.
+    public static bool IdentityPinnedCastIds;
+    // Effective gate for the T1 mechanism: the sub-toggle is live only under LowLatencyMode.
+    public static bool IdentityPinnedCastIdsActive => LowLatencyMode && IdentityPinnedCastIds;
+    // JimsProxy (RefireSpellGo): an instant cast forwards SPELL_START+SPELL_GO in the same client
+    // frame; the 1.14 client can drop the coalesced SPELL_GO, so the cast never closes — a stuck
+    // cast pose + looping cast sound + lit action button that persists until logout (survives
+    // /reload). When set, on a local instant's first SPELL_GO re-fire a stripped duplicate SPELL_GO
+    // (~8ms later, in a clean frame, visual suppressed, no targets/log) so the client processes it
+    // and closes the cast. No-op on clean casts. Independent of LowLatencyMode. Default OFF — opt-in.
+    public static bool RefireSpellGo;
+    // JimsProxy (#313): width (ms) of the spell-queue hold window. A press arriving in the
+    // last SpellQueueWindowMs of an active GCD or cast bar is held and fired at expiry; earlier
+    // presses are forwarded and the server arbitrates (NOT_READY / SpellInProgress). Mirrors the
+    // 1.14 SpellQueueWindow contract. The launcher exposes 400 (retail-accurate) / 1000 / 1300
+    // (smoothest, closest to the old full-hold); lower values are allowed, capped at 1300 ms.
+    public static int SpellQueueWindowMs;
     // JimsProxy (PR #228 follow-up): synthesize SMSG_THREAT_UPDATE / HIGHEST /
     // CLEAR so the modern client's native threat APIs (UnitDetailedThreatSituation,
     // UNIT_THREAT_LIST_UPDATE) populate. Default on. Disable for players who
@@ -111,6 +135,9 @@ public static class Settings
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);
         LowLatencyMode = config.GetBoolean("LowLatencyMode", false);
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);
+        IdentityPinnedCastIds = config.GetBoolean("IdentityPinnedCastIds", false);
+        RefireSpellGo = config.GetBoolean("RefireSpellGo", false);
+        SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 1300), 0, 1300);
         ThreatEngine = config.GetBoolean("ThreatEngine", false);
         var serverTypeStr = config.GetString("ServerType", "Kronos");
         ServerType = serverTypeStr.Equals("Generic", StringComparison.OrdinalIgnoreCase)

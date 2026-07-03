@@ -244,6 +244,16 @@ public partial class WorldClient
         timer.Scale = packet.ReadInt32();
         timer.Paused = packet.ReadBool();
         timer.SpellID = packet.ReadInt32();
+
+        // JimsProxy: the 1.14 client's mirror-timer engine fails to re-show the
+        // breath bar on a START that arrives after a STOP for the same timer
+        // (e.g. leaving an underwater air pocket while still submerged — Kronos
+        // sends a clean depleting START but the bar never reappears). A fresh
+        // dive works because no BREATH timer exists when the START arrives, so
+        // reproduce that clean state by tearing down any lingering timer first.
+        if (timer.Timer == MirrorTimerType.Breath)
+            SendPacketToClient(new StopMirrorTimer { Timer = MirrorTimerType.Breath });
+
         SendPacketToClient(timer);
     }
 
