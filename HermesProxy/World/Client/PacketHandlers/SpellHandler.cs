@@ -351,6 +351,12 @@ public partial class WorldClient
         bool isTransientReason = reason == (uint)SpellCastResultVanilla.NotReady ||
                                  reason == (uint)SpellCastResultVanilla.SpellInProgress;
 
+        // JimsProxy (#379 form-exit): a REAL failure crossing the form-exit defer must retract
+        // the not-yet-sent START (see CancelFormExitDeferredCast). Transient dup-rejections
+        // leave it — the started cast is healthy and its GO will pair the deferred START.
+        if (!isTransientReason)
+            CancelFormExitDeferredCast(spellId, "cast_failed");
+
         // JimsProxy (transient-no-dismiss-started): under LowLatencyMode a transient failure
         // (NOT_READY / SpellInProgress) is the server rejecting a DUPLICATE press, never an
         // interrupt of the cast already in progress. If no unstarted duplicate is still queued to
@@ -989,6 +995,11 @@ public partial class WorldClient
         if (casterIsLocalPlayer)
         {
             GetSession().HealCommBridge.OnLocalPlayerSpellStop(spellId);
+
+            // JimsProxy (#379 form-exit): SPELL_FAILURE is the interrupt signal (vmangos/Kronos
+            // hardcode reason 0, the real reason follows in CAST_FAILED) — retract a deferred/
+            // stashed form-exit START for this spell before the failure reaches the client.
+            CancelFormExitDeferredCast(spellId, "spell_failure");
         }
 
         // Ranged auto-attack exception (mirrors the SPELL_START allowlist in
@@ -1320,6 +1331,57 @@ public partial class WorldClient
     // JimsProxy (observed-bow): forwarding an observed ranged auto-repeat SPELL_START (Auto Shot/Shoot) latches the 1.14 client's intrinsic auto-repeat aim (spell 75 = SPELL_ATTR2_AUTO_REPEAT, no client SpellVisual) and nothing retracts it for observers (SPELL_GO / SPELL_FAILURE / SPELL_FAILED_OTHER / CANCEL_AUTO_REPEAT / a SheatheState push were all verified non-working in-client — SheatheState only stows the weapon, leaving the arms locked in the aim). So we hold each observed auto-repeat START here and replay it paired with its SPELL_GO (HandleSpellGo) only when the shot fires — the draw shows for shots that fire, and a shot that aborts (no GO) is never forwarded, so it can't stick. Held per caster; touched only on the WorldClient ReceiveLoop (HandleSpellStart/Go), so no lock needed.
     private readonly Dictionary<WowGuid128, SpellStart> _pendingObservedAutoRepeatStart = new();
 
+    // JimsProxy (#379 form-exit): a cast-time START forwarded via Task.Delay. Cancelled is set
+    // (ReceiveLoop) when a real failure for the same spell arrives inside the defer — otherwise
+    // the failure would reach the client BEFORE the delayed START and the START would be
+    // orphaned (a new instance of the very stuck-visual class this fix targets). Volatile:
+    // written on the ReceiveLoop, read by the ThreadPool defer task.
+    private sealed class FormExitDeferredStart
+    {
+        public int SpellId;
+        public volatile bool Cancelled;
+    }
+    private FormExitDeferredStart? _formExitDeferredStart;
+
+    // JimsProxy (#379 form-exit): an INSTANT cast's START stashed to be sent together with its
+    // SPELL_GO after the defer (splitting an instant's START from its same-tick GO sticks the
+    // shifted-into form's transform — ice-92's form→form finding). Mirrors the observed-bow
+    // stash: touched only on the ReceiveLoop; a stash whose GO never arrives (real failure
+    // evicts it, or it goes stale) is simply never shown — harmless.
+    private SpellStart? _formExitHeldStart;
+    private long _formExitHeldStartAtMs;
+    private const long FormExitHeldStartMaxAgeMs = 2000;
+
+    // JimsProxy (#379 form-exit): a real failure for the deferred/stashed cast arriving inside
+    // the defer window must retract the not-yet-sent START — otherwise the failure reaches the
+    // client BEFORE the START and the START lands last with no terminator (orphaned visual, the
+    // exact class this fix targets). E.g. form-exit Healing Touch cancelled by movement within
+    // FormExitStartDeferMs. Transient dup-rejections must NOT call this (the started cast is
+    // healthy; its GO is coming). ReceiveLoop-only.
+    private void CancelFormExitDeferredCast(uint spellId, string source)
+    {
+        var deferred = _formExitDeferredStart;
+        if (deferred != null && deferred.SpellId == spellId && !deferred.Cancelled)
+        {
+            deferred.Cancelled = true;
+            Log.Event("spell.start.form_exit_defer_cancelled", new
+            {
+                spell_id = spellId,
+                source,
+            });
+        }
+        var held = _formExitHeldStart;
+        if (held != null && held.Cast.SpellID == spellId)
+        {
+            _formExitHeldStart = null;
+            Log.Event("spell.start.form_exit_stash_dropped", new
+            {
+                spell_id = spellId,
+                source,
+            });
+        }
+    }
+
     [PacketHandler(Opcode.SMSG_SPELL_START)]
     void HandleSpellStart(WorldPacket packet)
     {
@@ -1549,7 +1611,62 @@ public partial class WorldClient
                 else
                     GetSession().GameState.PlayerForwardedCastIds[(uint)spell.Cast.SpellID] = spell.Cast.CastID;
             }
-            SendPacketToClient(spell);
+
+            // JimsProxy (#379 form-exit): this START belongs to the cast that auto-shifted the
+            // player out of a form. The 1.12 server emits it ~20ms BEFORE the form-removal
+            // UPDATE_OBJECT, so forwarded as-is its visual kit starts on the still-shifted model
+            // and is orphaned during the model swap — looping cast sound until /reload.
+            // Cast-time spell: defer the START by a small bounded delay so the model swap
+            // renders first. The delay is ≪ the cast time, so the START can NEVER land after its
+            // own GO (an unbounded hold — delayUntilOpcode — bricks the client's cast state
+            // machine when START crosses GO; verified by ice-92 in #379, do not use it).
+            // Instant (incl. the shifted-INTO form's own cast on form→form): stash the START and
+            // send it together with its GO from one deferred continuation in HandleSpellGo —
+            // splitting an instant's START from its same-tick GO sticks the new form's transform.
+            if (casterIsLocalPlayer && Settings.FormExitStartDeferMs > 0 &&
+                GetSession().GameState.TryConsumeFormExitWindow())
+            {
+                // Channeled casts report CastTime == 0 on the wire but never emit a SPELL_GO —
+                // stashing their START would orphan the channel bar. Defer them like cast-time.
+                if (spell.Cast.CastTime > 0 || isChanneled)
+                {
+                    var deferred = new FormExitDeferredStart { SpellId = spell.Cast.SpellID };
+                    _formExitDeferredStart = deferred;
+                    var deferredStart = spell;
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay(Settings.FormExitStartDeferMs);
+                        try
+                        {
+                            if (!deferred.Cancelled)
+                                SendPacketToClient(deferredStart);
+                        }
+                        catch
+                        {
+                            // session/socket may have torn down during the defer — best-effort
+                        }
+                    });
+                    Log.Event("spell.start.form_exit_deferred", new
+                    {
+                        spell_id = spell.Cast.SpellID,
+                        cast_time = spell.Cast.CastTime,
+                        defer_ms = Settings.FormExitStartDeferMs,
+                    });
+                }
+                else
+                {
+                    _formExitHeldStart = spell;
+                    _formExitHeldStartAtMs = Environment.TickCount64;
+                    Log.Event("spell.start.form_exit_stashed", new
+                    {
+                        spell_id = spell.Cast.SpellID,
+                    });
+                }
+            }
+            else
+            {
+                SendPacketToClient(spell);
+            }
         }
 
         // JimsProxy HealComm bridge: when local player begins a resurrection
@@ -1985,7 +2102,58 @@ public partial class WorldClient
             Log.Event("ranged.auto_repeat.start_replayed", new { caster_low = spell.Cast.CasterUnit.GetCounter(), spell_id = spell.Cast.SpellID });
         }
 
-        SendPacketToClient(spell);
+        // JimsProxy (#379 form-exit): this GO completes the instant cast whose START was stashed
+        // at the form-exit (see HandleSpellStart). Send START+GO together after the defer so the
+        // pair lands ordered, in one clean frame, AFTER the model swap. CastID re-stamped from
+        // the GO (dequeue/T1/recovery upstream already resolved it) so the pair always matches.
+        // A stale stash (GO never came — its cast failed without reaching the eviction, or a
+        // world transfer intervened) is dropped rather than paired with a later cast's GO.
+        // Note: the ThreatTracker update below still runs immediately, so a THREAT_UPDATE can
+        // precede this GO by up to the defer — cosmetic meter-ordering only.
+        if (spell.Cast.CasterUnit == GetSession().GameState.CurrentPlayerGuid &&
+            _formExitHeldStart != null &&
+            _formExitHeldStart.Cast.SpellID == spell.Cast.SpellID)
+        {
+            var formExitStart = _formExitHeldStart;
+            _formExitHeldStart = null;
+            if (Environment.TickCount64 - _formExitHeldStartAtMs <= FormExitHeldStartMaxAgeMs)
+            {
+                formExitStart.Cast.CastID = spell.Cast.CastID;
+                var pairedGo = spell;
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(Settings.FormExitStartDeferMs);
+                    try
+                    {
+                        SendPacketToClient(formExitStart);
+                        SendPacketToClient(pairedGo);
+                    }
+                    catch
+                    {
+                        // session/socket may have torn down during the defer — best-effort
+                    }
+                });
+                Log.Event("spell.go.form_exit_pair_deferred", new
+                {
+                    spell_id = spell.Cast.SpellID,
+                    defer_ms = Settings.FormExitStartDeferMs,
+                });
+            }
+            else
+            {
+                // Stale stash: drop it, forward this GO normally (a lone GO is safe — it's the
+                // START-without-GO ordering that sticks).
+                Log.Event("spell.start.form_exit_stash_stale_dropped", new
+                {
+                    stashed_spell_id = formExitStart.Cast.SpellID,
+                });
+                SendPacketToClient(spell);
+            }
+        }
+        else
+        {
+            SendPacketToClient(spell);
+        }
 
         // JimsProxy threat translation: route Hunter / Pet / class abilities
         // through the threat tracker so SMSG_THREAT_UPDATE reflects the cast.

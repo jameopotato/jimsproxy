@@ -650,6 +650,23 @@ public static partial class GameData
 
     public static bool IsJudgementDebuff(uint spellId) => JudgementDebuffSpells.Contains(spellId);
 
+    // JimsProxy (#379 form-exit): vanilla 1.12 player-cancellable SPELL_AURA_MOD_SHAPESHIFT
+    // form auras. Cancelling one of these via CMSG_CANCEL_AURA opens the form-exit defer
+    // window (see Settings.FormExitStartDeferMs). Deliberately excludes warrior stances
+    // (never cancelled to "no stance", the client can't send CANCEL_AURA for them) and
+    // stealth/prowl (SPELL_AURA_MOD_STEALTH, no model swap). Vanilla 1.12 spell ids.
+    public static readonly FrozenSet<uint> ShapeshiftFormSpells = new uint[]
+    {
+        768,    // Cat Form
+        783,    // Travel Form
+        1066,   // Aquatic Form
+        5487,   // Bear Form
+        9634,   // Dire Bear Form
+        24858,  // Moonkin Form
+        2645,   // Ghost Wolf
+        15473,  // Shadowform
+    }.ToFrozenSet();
+
     /// <summary>
     /// JimsProxy: true if the spell is a CP-scaling enemy-debuff finisher we compute
     /// duration for locally. Used by the CMSG_CAST_SPELL handler to decide whether to

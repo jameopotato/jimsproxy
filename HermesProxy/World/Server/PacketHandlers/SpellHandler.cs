@@ -969,7 +969,27 @@ public partial class WorldSocket
         WorldPacket packet = new WorldPacket(Opcode.CMSG_CANCEL_AURA);
         packet.WriteUInt32(aura.SpellID);
         SendPacketToServer(packet);
+
+        // JimsProxy (#379 form-exit): the 1.14 client auto-shifts out of a form to cast —
+        // CANCEL_AURA(form) + CAST_SPELL land ~1ms apart. Arm the defer window so the cast's
+        // SMSG_SPELL_START (arriving ~RTT later, ~20ms AHEAD of the form-removal UPDATE_OBJECT)
+        // is held until the model swap renders. Form auras only — gating on any CANCEL_AURA
+        // would defer casts after ordinary buff cancels too (ice-92's correction in #379).
+        if (Settings.FormExitStartDeferMs > 0 && GameData.ShapeshiftFormSpells.Contains(aura.SpellID))
+        {
+            GetSession().GameState.OpenFormExitWindow(FormExitWindowMs);
+            Log.Event("spell.form_exit_window_opened", new
+            {
+                form_spell_id = aura.SpellID,
+            });
+        }
     }
+
+    // JimsProxy (#379 form-exit): how long after a form-cancel the next local SPELL_START is
+    // treated as the auto-shift cast. Covers CANCEL_AURA→SPELL_START (one server round-trip +
+    // ~20ms emit spacing) with headroom for high-RTT players. A window that outlives the shift
+    // (form cancelled, no cast) only defers one later START by FormExitStartDeferMs — cosmetic.
+    private const int FormExitWindowMs = 500;
     [PacketHandler(Opcode.CMSG_CANCEL_MOUNT_AURA)]
     void HandleCancelMountAura(EmptyClientPacket cancel)
     {

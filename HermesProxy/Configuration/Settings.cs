@@ -80,6 +80,16 @@ public static class Settings
     // (~8ms later, in a clean frame, visual suppressed, no targets/log) so the client processes it
     // and closes the cast. No-op on clean casts. Independent of LowLatencyMode. Default OFF — opt-in.
     public static bool RefireSpellGo;
+    // JimsProxy (#379 form-exit): the 1.14 client auto-shifts out of a form to cast
+    // (CMSG_CANCEL_AURA + CMSG_CAST_SPELL ~1ms apart), but the 1.12 server emits the cast's
+    // SMSG_SPELL_START ~20ms BEFORE the form-removal SMSG_UPDATE_OBJECT. The cast's visual kit
+    // then starts on the still-shifted model and is dropped/orphaned during the model swap —
+    // looping cast sound (cast-time spells) or stuck transform sound (instant / form→form) until
+    // /reload. Fix: after a local form-cancel, defer the next local SPELL_START by this many ms
+    // (bounded — never crosses its own GO) so the form-removal update lands and the model swap
+    // renders first. Covers the client-side model-swap render time (frame-rate dependent, ~30ms
+    // on a fast machine), NOT latency — do not tune per-connection. 0 disables.
+    public static int FormExitStartDeferMs;
     // JimsProxy (#313): width (ms) of the spell-queue hold window. A press arriving in the
     // last SpellQueueWindowMs of an active GCD or cast bar is held and fired at expiry; earlier
     // presses are forwarded and the server arbitrates (NOT_READY / SpellInProgress). Mirrors the
@@ -137,6 +147,7 @@ public static class Settings
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);
         IdentityPinnedCastIds = config.GetBoolean("IdentityPinnedCastIds", false);
         RefireSpellGo = config.GetBoolean("RefireSpellGo", false);
+        FormExitStartDeferMs = Math.Clamp(config.GetInt("FormExitStartDeferMs", 100), 0, 300);
         SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 1300), 0, 1300);
         ThreatEngine = config.GetBoolean("ThreatEngine", false);
         var serverTypeStr = config.GetString("ServerType", "Kronos");

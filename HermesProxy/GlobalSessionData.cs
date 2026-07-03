@@ -2077,6 +2077,33 @@ public sealed class GameSessionData
         }
     }
 
+    // JimsProxy (#379 form-exit): deadline (TickCount64) of the form-exit defer window, opened
+    // when the local player cancels a shapeshift form aura (HandleCancelAura). The next local
+    // SMSG_SPELL_START consumes it and is deferred so the form-removal UPDATE_OBJECT and the
+    // model swap render before the cast visual starts. 0 = no window. Written on the WorldServer
+    // dispatch thread, consumed on the WorldClient receive thread — accessed via Interlocked.
+    private long _formExitWindowUntilMs;
+
+    /// <summary>
+    /// JimsProxy (#379 form-exit): arm the form-exit defer window for <paramref name="windowMs"/>.
+    /// Sized to cover CANCEL_AURA→SPELL_START (one server round-trip + emit spacing), not tuned
+    /// to the model swap — that's Settings.FormExitStartDeferMs.
+    /// </summary>
+    public void OpenFormExitWindow(long windowMs)
+    {
+        Interlocked.Exchange(ref _formExitWindowUntilMs, Environment.TickCount64 + windowMs);
+    }
+
+    /// <summary>
+    /// JimsProxy (#379 form-exit): one-shot consume of the form-exit window. True if the window
+    /// is still open (and closes it); false when expired or never opened.
+    /// </summary>
+    public bool TryConsumeFormExitWindow()
+    {
+        long until = Interlocked.Exchange(ref _formExitWindowUntilMs, 0);
+        return until != 0 && Environment.TickCount64 <= until;
+    }
+
     /// <summary>
     /// JimsProxy: narrow variant of IsGcdHoldActive — returns true only when the GCD has
     /// at most SpellQueueWindowMs remaining. Mirrors the 1.14 client's SpellQueueWindow
