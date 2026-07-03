@@ -351,15 +351,24 @@ public partial class WorldClient
         bool isTransientReason = reason == (uint)SpellCastResultVanilla.NotReady ||
                                  reason == (uint)SpellCastResultVanilla.SpellInProgress;
 
-        // JimsProxy (transient-no-dismiss-started): under LowLatencyMode a transient failure
-        // (NOT_READY / SpellInProgress) is the server rejecting a DUPLICATE press, never an
-        // interrupt of the cast already in progress. If no unstarted duplicate is still queued to
-        // consume (the on-START sweep already cleared + acked it), this rejection is stale — drop it
-        // BEFORE the suppression branch and the dequeue below, both of which would otherwise fall
-        // back to the STARTED cast and dismiss its bar (the "interrupted but fired" desync). Normal
-        // mode is unaffected (no dups reach the server); real failures (OOR/LoS/OOM) are non-transient.
-        if (isTransientReason && Settings.LowLatencyMode &&
-            !GetSession().GameState.HasNonStartedPendingCastForSpell(spellId))
+        // JimsProxy (transient-no-dismiss-started): a transient failure (NOT_READY /
+        // SpellInProgress) is the server rejecting a DUPLICATE press, never an interrupt of the
+        // cast already in progress — the server never starts a cast and then rejects it with a
+        // pre-cast reason. If no unstarted duplicate is still queued to consume (the on-START
+        // sweep already cleared + acked it), this rejection is stale — drop it BEFORE the
+        // suppression branch and the dequeue below, both of which would otherwise fall back to
+        // the STARTED cast and dismiss its bar (the "interrupted but fired" desync, and in queue
+        // mode the client-side START→CastFailed→GO one-frame contradiction that orphans the cast
+        // kit — the #394 looping sound). Originally gated to LowLatencyMode on the premise that
+        // queue mode sends no dups; the #394 JSONL disproved that — the GCD-boundary held-release
+        // timer race double-forwards in queue mode too (see ForwardHeldGcdCast's supersede skip).
+        // Real failures (OOR/LoS/OOM) are non-transient and unaffected. Next-melee / auto-repeat
+        // slots live outside PendingNormalCasts — a transient rejection matching one of those
+        // must still flow to the special-cast branch below to resolve and clear its slot.
+        if (isTransientReason &&
+            !GetSession().GameState.HasNonStartedPendingCastForSpell(spellId) &&
+            GetSession().GameState.CurrentClientNextMeleeCast?.SpellId != spellId &&
+            GetSession().GameState.CurrentClientAutoRepeatCast?.SpellId != spellId)
         {
             if (Framework.Settings.DebugOutput)
                 Log.Event("cast.transient_stale_dropped", new { spell_id = spellId });

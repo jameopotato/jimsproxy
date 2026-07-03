@@ -754,6 +754,28 @@ public partial class WorldSocket
             return;
 
         var gameState = GetSession().GameState;
+
+        // JimsProxy (#394 GCD-boundary double-forward): the release timer runs on the Windows
+        // timer quantum (~15.6ms), so it can fire LATE relative to the GCD deadline. A fresh
+        // same-spell press landing in that gap sees the quantized clock as "GCD over" (window
+        // check and ShouldDropLateSameSpell both read expired) and forwards immediately — if we
+        // then still fire the held press, the server gets TWO CMSGs ~ms apart in reversed press
+        // order. The loser's transient CAST_FAILED lands between the winner's START and GO and
+        // desyncs the pairing (START→CastFailed→GO in one client frame = the #394 looping
+        // sound). The fresh press won the race and IS this spell's cast — ack the stale held
+        // press instead of double-forwarding. The reverse ordering (timer first, press after)
+        // is already handled: the press finds HasForwardedPendingCast() true and is parked.
+        if (gameState.HasNonStartedPendingCastForSpell(cast.SpellId))
+        {
+            SendCastRequestFailed(cast, false, SpellCastResultClassic.DontReport);
+            Log.Event("spell.held_fire_superseded", new
+            {
+                spell_id = cast.SpellId,
+                client_cast_id = cast.ClientGUID.ToString(),
+            });
+            return;
+        }
+
         // DIAGNOSTIC (stuck-spell investigation): remove when closed
         if (Framework.Settings.DebugOutput)
             Log.Event("cast.forwarded", new
