@@ -724,8 +724,9 @@ public sealed class GameSessionData
     // synthesize it. Same shape as KnownHoveringMobs above.
     public HashSet<WowGuid128> KnownSwimmingMobs = [];
 
-    // JimsProxy (#382 observer lockup): players we observe being CHARMED by someone other
-    // than the local player (Gnomish Mind Control Cap 13181 = vanilla MOD_CHARM on a player).
+    // JimsProxy (#382 observer lockup): players we observe being CHARMED by another PLAYER
+    // (Gnomish Mind Control Cap 13181 = vanilla MOD_CHARM on a player). NPC charmers (raid
+    // MCs like Lucifron's Dominate Mind) are excluded — long-stable content, no lockup reports.
     // Vanilla charm reaches observers as PLAYER_CONTROLLED + CHARMEDBY with no POSSESSED bit,
     // and the 1.14 client has no representation for a charmed PLAYER (modern can't charm
     // players; possess — priest MC 605 — renders fine, which is why priest MC never locks

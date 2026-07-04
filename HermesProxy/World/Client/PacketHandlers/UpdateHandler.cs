@@ -2189,14 +2189,17 @@ public partial class WorldClient
                 WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To128(GetSession().GameState);
                 updateData.UnitData.CharmedBy = charmedBy;
 
-                // JimsProxy (#382 observer lockup): track players charmed by someone other than us,
+                // JimsProxy (#382 observer lockup): track players charmed by ANOTHER PLAYER,
                 // so the flags translation below can present them as possessed (see
                 // GameSessionData.ObservedCharmedPlayers). Excludes the charmer (needs the real
                 // charm/pet bar) and the local player as target (lives the real charm), so the
                 // charm-vs-possess control difference is preserved for the participants.
+                // NPC charmers (Lucifron's Dominate Mind et al.) are deliberately excluded:
+                // years of raid MCs have produced no observer-lockup reports, so that
+                // long-stable content stays untouched.
                 var gameState = GetSession().GameState;
                 bool observedCharmedPlayer = guid.IsPlayer() &&
-                    charmedBy != WowGuid128.Empty &&
+                    charmedBy.IsPlayer() &&
                     guid != gameState.CurrentPlayerGuid &&
                     charmedBy != gameState.CurrentPlayerGuid;
                 if (observedCharmedPlayer)
