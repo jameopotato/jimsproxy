@@ -514,7 +514,7 @@ public partial class WorldClient
             // recorded START CastID (popped FIFO) and consume the FIFO entry so a later same-spell
             // GO can't pop this now-resolved cast's CastID. Transient dup rejections resolve the
             // UNSTARTED dup (HasStarted=false, no FIFO entry) and leave the started cast's entry.
-            if (Settings.IdentityPinnedCastIdsActive && pendingCast.HasStarted &&
+            if (pendingCast.HasStarted &&
                 GetSession().GameState.TryPopForwardedStartCastId(pendingCast.SpellId, out var pinnedFailCastId))
                 failed.CastID = pinnedFailCastId;
             failed.FailedArg1 = arg1;
@@ -1141,7 +1141,7 @@ public partial class WorldClient
             // T1 (identity-pinned): SPELL_FAILURE only PEEKS the pending cast (the trailing
             // CAST_FAILED / GO / watchdog pops it), so stamp the forwarded failure's CastID from
             // the FIFO front WITHOUT consuming it — the later pop stays paired.
-            if (Settings.IdentityPinnedCastIdsActive && pendingNormal.HasStarted &&
+            if (pendingNormal.HasStarted &&
                 GetSession().GameState.TryPeekForwardedStartCastId(pendingNormal.SpellId, out var pinnedFailureCastId))
                 castId = pinnedFailureCastId;
             spellVisual = pendingNormal.SpellXSpellVisualId;
@@ -1720,19 +1720,13 @@ public partial class WorldClient
         else
         {
             // JimsProxy (cast-go-castid-recovery): record the CastID we forward for the
-            // local player's SPELL_START so HandleSpellGo can recover it if the pending
-            // entry is gone by GO time (server-initiated casts with no CMSG, or a
-            // duplicate's CAST_FAILED having consumed the entry). See PlayerForwardedCastIds.
+            // local player's SPELL_START in a per-spell FIFO so HandleSpellGo can recover it
+            // if the pending entry is gone by GO time (server-initiated casts with no CMSG, or
+            // a duplicate's CAST_FAILED having consumed the entry). The FIFO preserves START
+            // order so concurrent same-spell starts each retain their forwarded CastID.
             // Fallback only — normal casts override with ServerGUID at GO and never read it.
             if (casterIsLocalPlayer)
-            {
-                if (Settings.IdentityPinnedCastIdsActive)
-                    // T1: per-spell FIFO supersedes the single-slot recovery so concurrent
-                    // same-spell starts each retain their forwarded CastID in START order.
-                    GetSession().GameState.EnqueueForwardedStartCastId((uint)spell.Cast.SpellID, spell.Cast.CastID);
-                else
-                    GetSession().GameState.PlayerForwardedCastIds[(uint)spell.Cast.SpellID] = spell.Cast.CastID;
-            }
+                GetSession().GameState.EnqueueForwardedStartCastId((uint)spell.Cast.SpellID, spell.Cast.CastID);
 
             // JimsProxy (#379 form-exit): this START belongs to the cast that auto-shifted the
             // player out of a form. The 1.12 server emits it ~20ms BEFORE the form-removal
@@ -1936,7 +1930,7 @@ public partial class WorldClient
             // same-spell entry. Skip-START instants (HasStarted=false, no FIFO entry) keep the
             // dequeued ServerGUID. Belt-and-suspenders over #372's preferStarted dequeue: matches
             // it in the common case, diverges only under concurrent same-spell starts.
-            if (Settings.IdentityPinnedCastIdsActive && pendingCast.HasStarted &&
+            if (pendingCast.HasStarted &&
                 GetSession().GameState.TryPopForwardedStartCastId(pendingCast.SpellId, out var pinnedGoCastId))
                 spell.Cast.CastID = pinnedGoCastId;
             spell.Cast.SpellXSpellVisualID = pendingCast.SpellXSpellVisualId;
@@ -2144,13 +2138,12 @@ public partial class WorldClient
         // Hits server-initiated player casts with no CMSG (GO loot subspells e.g. Whipper
         // Root 15343, weapon/trinket procs) and casts whose pending entry was consumed by a
         // duplicate's CAST_FAILED before the GO (Blade Flurry, re-clicked gathers).
-        // JimsProxy (T1 identity-pinned cast correspondence): FIFO-backed promotion of the
-        // #362 recovery below to the primary path. When the GO has no pending entry (consumed by
-        // a duplicate's CAST_FAILED, or a server-initiated cast with no CMSG), recover the
-        // forwarded START CastID from the per-spell FIFO so START↔GO still pair. Supersedes the
-        // single-slot recovery (next branch) when active; the single-slot isn't populated then.
-        else if (Settings.IdentityPinnedCastIdsActive &&
-                 GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
+        // JimsProxy (cast-go-castid-recovery, FIFO-backed): when the GO has no pending entry
+        // (consumed by a duplicate's CAST_FAILED, or a server-initiated cast with no CMSG),
+        // recover the forwarded START CastID from the per-spell FIFO so START↔GO still pair.
+        // The FIFO preserves START order, so concurrent same-spell casts each recover their own
+        // forwarded CastID (a single spellId->CastID slot would collapse them onto the newest).
+        else if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
                  GetSession().GameState.TryPopForwardedStartCastId((uint)spell.Cast.SpellID, out var pinnedRecoverCastId))
         {
             spell.Cast.CastID = pinnedRecoverCastId;
@@ -2159,18 +2152,6 @@ public partial class WorldClient
                 spell_id = spell.Cast.SpellID,
                 caster_low = spell.Cast.CasterUnit.GetCounter(),
                 recovered_cast_id = pinnedRecoverCastId.ToString(),
-                pinned = true,
-            });
-        }
-        else if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
-                 GetSession().GameState.PlayerForwardedCastIds.TryRemove((uint)spell.Cast.SpellID, out var forwardedStartCastId))
-        {
-            spell.Cast.CastID = forwardedStartCastId;
-            Log.Event("cast.go.castid_recovered", new
-            {
-                spell_id = spell.Cast.SpellID,
-                caster_low = spell.Cast.CasterUnit.GetCounter(),
-                recovered_cast_id = forwardedStartCastId.ToString(),
             });
         }
 
