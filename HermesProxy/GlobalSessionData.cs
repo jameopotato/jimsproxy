@@ -414,13 +414,44 @@ public sealed class GameSessionData
     public ClientCastRequest? CurrentClientNextMeleeCast; // next melee spells (Raptor Strike, Heroic Strike, etc.)
     public ClientCastRequest? CurrentClientAutoRepeatCast; // auto repeat spells (Auto Shot, Shoot, etc.)
     public ConcurrentQueue<ClientCastRequest> PendingPetCasts = new();  // pet spell casts (queue for proper FIFO handling)
-    // JimsProxy (issue #43): serializes the drain-filter-rebuild helpers below with the
-    // ThreadPool-thread Enqueue in WorldSocket.ForwardHeldGcdCast. Without this, the timer
-    // thread can enqueue a held cast mid-drain, causing the drain to observe the new item
-    // out-of-order and possibly return it as a FIFO match for an unrelated SMSG_SPELL_GO.
-    // Pre-existing Enqueues from the network-thread CMSG handlers stay lock-free (same-thread
-    // semantics as before this PR); only the new cross-thread path takes the lock.
+    // JimsProxy (issue #43): serializes EVERY mutation of PendingNormalCasts / PendingPetCasts.
+    //
+    // Both queues are drained and rebuilt by compound "dequeue-all, filter, re-enqueue-survivors"
+    // helpers. ConcurrentQueue makes each individual Enqueue/TryDequeue atomic, but it cannot make
+    // a whole drain-rebuild atomic: a concurrent Enqueue lands in the middle of one, and two
+    // concurrent drain-rebuilds split the queue between their private survivor lists. Either way
+    // FIFO order — which START/GO/CAST_FAILED matching depends on — is not preserved.
+    //
+    // These mutations genuinely run in parallel. CMSG handlers (HandleCastSpell, and the
+    // RunWatchdogEviction it calls on every press) execute on the modern socket's IOCP receive
+    // thread; SMSG handlers (SPELL_START/GO/CAST_FAILED) execute on WorldClient's ReceiveLoop
+    // task; the GCD hold-release timer fires on a ThreadPool thread. Nothing serializes them.
+    //
+    // So: take this lock around any mutation, and prefer the EnqueuePending*Cast helpers below.
+    // Read-only walks (HasStartedNormalCast, TryMarkPendingNormalCastStarted, ...) may stay
+    // lock-free: ConcurrentQueue enumeration is a snapshot and they mutate only entry fields.
     internal readonly object PendingCastsLock = new();
+
+    /// <summary>
+    /// Enqueue a normal cast under <see cref="PendingCastsLock"/>. Always use this rather than
+    /// touching <see cref="PendingNormalCasts"/> directly — a lock-free Enqueue racing a
+    /// drain-rebuild reorders the FIFO the cast-correspondence machinery relies on.
+    /// </summary>
+    public void EnqueuePendingNormalCast(ClientCastRequest cast)
+    {
+        lock (PendingCastsLock)
+            PendingNormalCasts.Enqueue(cast);
+    }
+
+    /// <summary>
+    /// Enqueue a pet cast under <see cref="PendingCastsLock"/>. See
+    /// <see cref="EnqueuePendingNormalCast"/>.
+    /// </summary>
+    public void EnqueuePendingPetCast(ClientCastRequest cast)
+    {
+        lock (PendingCastsLock)
+            PendingPetCasts.Enqueue(cast);
+    }
 
     // JimsProxy (#313): the spell-queue hold-window width is configurable via
     // Framework.Settings.SpellQueueWindowMs (400 retail-accurate / 1000 / 1300 smoothest;
@@ -1726,55 +1757,63 @@ public sealed class GameSessionData
         // DIAGNOSTIC (stuck-spell investigation): hoist toggle read; remove with diagnostics
         bool debugEvents = Framework.Settings.DebugOutput;
 
-        var keepNormal = new List<ClientCastRequest>();
-        while (PendingNormalCasts.TryDequeue(out var cast))
+        // The drain-rebuild is a compound mutation: hold the lock across it. Logging happens
+        // afterwards so no file I/O runs inside the critical section.
+        lock (PendingCastsLock)
         {
-            if (!cast.HasStarted && !cast.TargetGuid.IsEmpty() && cast.TargetGuid == destroyedGuid)
+            var keepNormal = new List<ClientCastRequest>();
+            while (PendingNormalCasts.TryDequeue(out var cast))
             {
-                normalEvicted.Add(cast);
-                // DIAGNOSTIC (stuck-spell investigation): remove when closed
-                if (debugEvents)
-                    Log.Event("cast.destroy_eviction", new
-                    {
-                        queue = "normal",
-                        spell_id = cast.SpellId,
-                        had_started = cast.HasStarted,
-                        is_channeled = GameData.IsChanneledSpell(cast.SpellId),
-                        destroyed_target_low = destroyedGuid.GetCounter(),
-                        client_cast_id = cast.ClientGUID.ToString(),
-                    });
+                if (!cast.HasStarted && !cast.TargetGuid.IsEmpty() && cast.TargetGuid == destroyedGuid)
+                    normalEvicted.Add(cast);
+                else
+                    keepNormal.Add(cast);
             }
-            else
-                keepNormal.Add(cast);
-        }
-        foreach (var c in keepNormal)
-            PendingNormalCasts.Enqueue(c);
+            foreach (var c in keepNormal)
+                PendingNormalCasts.Enqueue(c);
 
-        var keepPet = new List<ClientCastRequest>();
-        while (PendingPetCasts.TryDequeue(out var cast))
-        {
-            if (!cast.HasStarted && !cast.TargetGuid.IsEmpty() && cast.TargetGuid == destroyedGuid)
+            var keepPet = new List<ClientCastRequest>();
+            while (PendingPetCasts.TryDequeue(out var cast))
             {
-                petEvicted.Add(cast);
-                // DIAGNOSTIC (stuck-spell investigation): remove when closed
-                if (debugEvents)
-                    Log.Event("cast.destroy_eviction", new
-                    {
-                        queue = "pet",
-                        spell_id = cast.SpellId,
-                        had_started = cast.HasStarted,
-                        is_channeled = GameData.IsChanneledSpell(cast.SpellId),
-                        destroyed_target_low = destroyedGuid.GetCounter(),
-                        client_cast_id = cast.ClientGUID.ToString(),
-                    });
+                if (!cast.HasStarted && !cast.TargetGuid.IsEmpty() && cast.TargetGuid == destroyedGuid)
+                    petEvicted.Add(cast);
+                else
+                    keepPet.Add(cast);
             }
-            else
-                keepPet.Add(cast);
+            foreach (var c in keepPet)
+                PendingPetCasts.Enqueue(c);
         }
-        foreach (var c in keepPet)
-            PendingPetCasts.Enqueue(c);
+
+        // DIAGNOSTIC (stuck-spell investigation): remove when closed
+        if (debugEvents)
+        {
+            foreach (var cast in normalEvicted)
+                LogDestroyEviction("normal", cast, destroyedGuid);
+            foreach (var cast in petEvicted)
+                LogDestroyEviction("pet", cast, destroyedGuid);
+        }
     }
 
+    // DIAGNOSTIC (stuck-spell investigation): remove when closed
+    private static void LogDestroyEviction(string queue, ClientCastRequest cast, WowGuid128 destroyedGuid)
+    {
+        Log.Event("cast.destroy_eviction", new
+        {
+            queue,
+            spell_id = cast.SpellId,
+            had_started = cast.HasStarted,
+            is_channeled = GameData.IsChanneledSpell(cast.SpellId),
+            destroyed_target_low = destroyedGuid.GetCounter(),
+            client_cast_id = cast.ClientGUID.ToString(),
+        });
+    }
+
+    /// <summary>
+    /// Evict pending casts whose watchdog deadline has passed. Called from the top of every spell
+    /// event handler AND from CMSG_CAST_SPELL — i.e. on every single client cast press — so the
+    /// common case (nothing overdue) must not touch the queues at all: a drain-rebuild there would
+    /// churn the FIFO on the hot path and, worse, race the SMSG-thread dequeue.
+    /// </summary>
     public void DrainExpiredWatchdogCasts(long nowMs,
         out List<ClientCastRequest> normalEvicted,
         out List<ClientCastRequest> petEvicted)
@@ -1782,27 +1821,48 @@ public sealed class GameSessionData
         normalEvicted = new List<ClientCastRequest>();
         petEvicted = new List<ClientCastRequest>();
 
-        var keepNormal = new List<ClientCastRequest>();
-        while (PendingNormalCasts.TryDequeue(out var cast))
+        lock (PendingCastsLock)
         {
-            if (cast.WatchdogDeadlineMs > 0 && cast.WatchdogDeadlineMs < nowMs)
-                normalEvicted.Add(cast);
-            else
-                keepNormal.Add(cast);
-        }
-        foreach (var c in keepNormal)
-            PendingNormalCasts.Enqueue(c);
+            if (!HasOverdueWatchdogCast(PendingNormalCasts, nowMs) &&
+                !HasOverdueWatchdogCast(PendingPetCasts, nowMs))
+                return;   // hot path: nothing to evict, leave both queues untouched
 
-        var keepPet = new List<ClientCastRequest>();
-        while (PendingPetCasts.TryDequeue(out var cast))
-        {
-            if (cast.WatchdogDeadlineMs > 0 && cast.WatchdogDeadlineMs < nowMs)
-                petEvicted.Add(cast);
-            else
-                keepPet.Add(cast);
+            var keepNormal = new List<ClientCastRequest>();
+            while (PendingNormalCasts.TryDequeue(out var cast))
+            {
+                if (IsWatchdogOverdue(cast, nowMs))
+                    normalEvicted.Add(cast);
+                else
+                    keepNormal.Add(cast);
+            }
+            foreach (var c in keepNormal)
+                PendingNormalCasts.Enqueue(c);
+
+            var keepPet = new List<ClientCastRequest>();
+            while (PendingPetCasts.TryDequeue(out var cast))
+            {
+                if (IsWatchdogOverdue(cast, nowMs))
+                    petEvicted.Add(cast);
+                else
+                    keepPet.Add(cast);
+            }
+            foreach (var c in keepPet)
+                PendingPetCasts.Enqueue(c);
         }
-        foreach (var c in keepPet)
-            PendingPetCasts.Enqueue(c);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsWatchdogOverdue(ClientCastRequest cast, long nowMs)
+        => cast.WatchdogDeadlineMs > 0 && cast.WatchdogDeadlineMs < nowMs;
+
+    private static bool HasOverdueWatchdogCast(ConcurrentQueue<ClientCastRequest> queue, long nowMs)
+    {
+        foreach (var cast in queue)
+        {
+            if (IsWatchdogOverdue(cast, nowMs))
+                return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -2049,21 +2109,24 @@ public sealed class GameSessionData
         var pending = new List<ClientCastRequest>();
         cast = null;
 
-        while (PendingPetCasts.TryDequeue(out var current))
+        lock (PendingCastsLock)
         {
-            if (cast == null && CastMatchesSpellId(current, spellId))
+            while (PendingPetCasts.TryDequeue(out var current))
             {
-                cast = current;
+                if (cast == null && CastMatchesSpellId(current, spellId))
+                {
+                    cast = current;
+                }
+                else
+                {
+                    pending.Add(current);
+                }
             }
-            else
-            {
-                pending.Add(current);
-            }
-        }
 
-        foreach (var item in pending)
-        {
-            PendingPetCasts.Enqueue(item);
+            foreach (var item in pending)
+            {
+                PendingPetCasts.Enqueue(item);
+            }
         }
 
         return cast != null;
@@ -2095,7 +2158,10 @@ public sealed class GameSessionData
     /// </summary>
     public void ClearPendingPetCasts()
     {
-        while (PendingPetCasts.TryDequeue(out _)) { }
+        lock (PendingCastsLock)
+        {
+            while (PendingPetCasts.TryDequeue(out _)) { }
+        }
     }
 
     /// <summary>
@@ -2114,13 +2180,14 @@ public sealed class GameSessionData
     public (int normalCasts, int petCasts, int otherCasterIds) ResetInFlightCastState()
     {
         int normalCount;
+        int petCount;
         lock (PendingCastsLock)
         {
             normalCount = PendingNormalCasts.Count;
             while (PendingNormalCasts.TryDequeue(out _)) { }
+            petCount = PendingPetCasts.Count;
+            while (PendingPetCasts.TryDequeue(out _)) { }
         }
-        int petCount = PendingPetCasts.Count;
-        while (PendingPetCasts.TryDequeue(out _)) { }
         int otherCount = OtherCasterActiveCastIds.Count;
         OtherCasterActiveCastIds.Clear();
         PetAutoCastActiveCastIds.Clear();
@@ -2161,18 +2228,21 @@ public sealed class GameSessionData
         var cleared = new List<ClientCastRequest>();
         var keep = new List<ClientCastRequest>();
 
-        while (PendingPetCasts.TryDequeue(out var current))
+        lock (PendingCastsLock)
         {
-            if (current.HasStarted)
-                keep.Add(current);
-            else
-                cleared.Add(current);
-        }
+            while (PendingPetCasts.TryDequeue(out var current))
+            {
+                if (current.HasStarted)
+                    keep.Add(current);
+                else
+                    cleared.Add(current);
+            }
 
-        // Re-enqueue started casts
-        foreach (var item in keep)
-        {
-            PendingPetCasts.Enqueue(item);
+            // Re-enqueue started casts
+            foreach (var item in keep)
+            {
+                PendingPetCasts.Enqueue(item);
+            }
         }
 
         return cleared;

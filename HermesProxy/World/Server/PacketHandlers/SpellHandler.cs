@@ -354,10 +354,7 @@ public partial class WorldSocket
                             queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
                             source = "low_latency",
                         });
-                    lock (GetSession().GameState.PendingCastsLock)
-                    {
-                        GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
-                    }
+                    GetSession().GameState.EnqueuePendingNormalCast(castRequest);
                     Log.Event("cast.low_latency_forward", new
                     {
                         spell_id = cast.Cast.SpellID,
@@ -557,7 +554,7 @@ public partial class WorldSocket
                         queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
                         source = "immediate",
                     });
-                GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
+                GetSession().GameState.EnqueuePendingNormalCast(castRequest);
             }
             else
             {
@@ -596,7 +593,7 @@ public partial class WorldSocket
                         queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
                         source = "off_gcd",
                     });
-                GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
+                GetSession().GameState.EnqueuePendingNormalCast(castRequest);
 
                 // Off-GCD spells bypass the hold system, so SpellPrepare must be sent now
                 // (on-GCD casts defer SpellPrepare to SPELL_START/SPELL_GO time to avoid
@@ -789,10 +786,7 @@ public partial class WorldSocket
                 queue_depth_before = gameState.PendingNormalCasts.Count,
                 source = "held_gcd_release",
             });
-        lock (gameState.PendingCastsLock)
-        {
-            gameState.PendingNormalCasts.Enqueue(cast);
-        }
+        gameState.EnqueuePendingNormalCast(cast);
         // JimsProxy: spell.held_fire — captures total hold duration (press → server forward).
         // Compare against gcd_remaining_ms in the matching spell.held to reconstruct GCD timing.
         Log.Event("spell.held_fire", new
@@ -842,7 +836,7 @@ public partial class WorldSocket
                 queue_depth_before = GetSession().GameState.PendingPetCasts.Count,
                 source = "pet",
             });
-        GetSession().GameState.PendingPetCasts.Enqueue(castRequest);
+        GetSession().GameState.EnqueuePendingPetCast(castRequest);
 
         SpellCastTargetFlags targetFlags = ConvertSpellTargetFlags(cast.Cast.Target);
 
@@ -914,7 +908,7 @@ public partial class WorldSocket
                 queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
                 source = "item",
             });
-        GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
+        GetSession().GameState.EnqueuePendingNormalCast(castRequest);
 
         // MIRASU (cast-while-moving-out-of-range 2026-05-23): sync server position
         // for reticle-targeted item uses (bombs, sapper charge, grenades). See
