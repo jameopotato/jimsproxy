@@ -61,6 +61,12 @@ public partial class WorldClient
     uint _lastInboundOpcodeRaw;
     volatile int _lastInboundOpcodeTick;
 
+    // JimsProxy (gap-A modern-death watchdog): flips true the first keepalive tick both modern
+    // sockets (RealmSocket + InstanceSocket) are observed open. Guards the login/handshake window
+    // (before the sockets are assigned to the session) so the death check never false-fires
+    // mid-login -- the mirror of the silent-stall watchdog's `_lastInboundOpcodeTick != 0` guard.
+    bool _modernClientWasAlive;
+
     // packet order is not always the same as new client, sometimes we need to delay packet until another one
     Dictionary<Opcode, List<WorldPacket>> _delayedPacketsToServer = null!;
     Dictionary<Opcode, List<ServerPacket>> _delayedPacketsToClient = null!;
@@ -958,6 +964,17 @@ public partial class WorldClient
         _keepAliveTimer = null;
     }
 
+    // JimsProxy (gap-A): a modern-client socket counts as dead if it's null (already torn out of
+    // the session on close) or no longer open. Defensive try/catch -- a socket disposed in the
+    // close race can throw on the Connected probe; treat that as dead too.
+    private static bool IsModernSocketDead(WorldSocket? socket)
+    {
+        if (socket == null)
+            return true;
+        try { return !socket.IsOpen(); }
+        catch { return true; }
+    }
+
     private void SendKeepAlivePing(object? state)
     {
         // Race guard: the timer's queued callback can still execute briefly
@@ -975,6 +992,59 @@ public partial class WorldClient
         // RunWatchdogEviction is already invoked cross-thread and no-ops when nothing is overdue.
         if (Framework.Settings.IdentityPinnedCastIdsActive)
             GetSession()?.RunWatchdogEviction();
+
+        // JimsProxy (gap-A modern-death watchdog): the exact mirror of the silent-stall watchdog
+        // below, in the opposite direction. If the MODERN client dies abruptly (hard crash /
+        // taskkill / network partition) it never sends CMSG_LOG_DISCONNECT, so nothing tears down
+        // this legacy WorldClient -- it pings Kronos every 30s forever and the character is a ghost
+        // in-world (raid slot held, heals wasted) until the player relogs. Once we've seen the
+        // modern client alive, if BOTH its sockets are gone and it wasn't an intentional logout, we
+        // tear the legacy side down so the server logs the character out.
+        //
+        // Swap-safe by construction: a realm/char switch re-establishes the modern sockets in well
+        // under a second (far inside this 30s tick), so a coarse tick never sees a mid-switch
+        // transient as a death; and a switch always sets IsLogoutIntentional, gating out even a tick
+        // that landed in that sub-second window. Unlike the silent-stall path this does NOT
+        // reconnect -- the player is gone, so we set the intentional flag first to suppress the
+        // auto-reconnect that HandleDisconnect would otherwise trigger.
+        {
+            var deathSession = GetSession();
+            if (deathSession != null)
+            {
+                bool modernGone = IsModernSocketDead(deathSession.RealmSocket)
+                               && IsModernSocketDead(deathSession.InstanceSocket);
+                if (!modernGone)
+                {
+                    _modernClientWasAlive = true;
+                }
+                else if (ModernDeathWatchdog.ShouldTearDown(
+                             _modernClientWasAlive, modernGone,
+                             deathSession.IsLogoutIntentional(),
+                             ReferenceEquals(deathSession.WorldClient, this)))
+                {
+                    Log.Event("session.modern_client_death.detected", new
+                    {
+                        keepalive_serial = _keepAlivePingSerial,
+                        had_realm_socket = deathSession.RealmSocket != null,
+                        had_instance_socket = deathSession.InstanceSocket != null,
+                    });
+                    deathSession.SetLogoutIntentional();                                  // suppress HandleDisconnect's auto-reconnect
+                    Interlocked.CompareExchange(ref deathSession.WorldClient, null, this); // drop the slot (defense in depth)
+                    try { Disconnect(); }
+                    catch (Exception ex)
+                    {
+                        Log.Event("session.modern_client_death.disconnect_error", new
+                        {
+                            exception_type = ex.GetType().Name,
+                            message = ex.Message,
+                        });
+                    }
+                    StopKeepAliveTimer();
+                    deathSession.AuthClient?.Disconnect();                                // stop pinging Kronos -> server logs the char out
+                    return;                                                               // do NOT fall through to the silent-stall reconnect
+                }
+            }
+        }
 
         // JimsProxy silent-stall watchdog: before sending the next keepalive
         // ping, check whether the legacy server has gone silent on us. The
