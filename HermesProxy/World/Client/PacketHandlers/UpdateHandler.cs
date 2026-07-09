@@ -1143,21 +1143,29 @@ public partial class WorldClient
                 if (pendingMode != DeferredTransportSynthMode.None)
                 {
                     GetSession().GameState.PendingDeferredTransportSynth = DeferredTransportSynthMode.None;
-                    bool destinationOnTransport = !moveInfo.TransportGuid.IsEmpty();
-                    if (destinationOnTransport)
+                    // JimsProxy (#329/#331/#332 transport-clear wedge): fire the fabricated
+                    // transport-clear ONLY when the player carried a transport at the SOURCE
+                    // (or the source was unobserved -> fail-safe fire). Firing it when the player
+                    // was observed OFF a transport at the source is the wedge: a mage-teleport /
+                    // cross-continent / BG-exit transition gets a spurious MoveTeleport
+                    // (TransportGUID=empty) that leaves the client (esp. at EU latency) unable to
+                    // walk until /reload. prevTransport = the source state captured above (this
+                    // player UpdateObject's prior observation); moveInfo.TransportGuid = destination.
+                    if (TransportClearGate.ShouldFire(prevTransport, moveInfo.TransportGuid))
+                    {
+                        FireDeferredTransportClearSynth(guid, moveInfo.Position, moveInfo.Orientation, pendingMode.ToString());
+                    }
+                    else
                     {
                         Framework.Logging.Log.Event("movement.transport_clear.deferred_skipped", new
                         {
                             map_id = GetSession().GameState.CurrentMapId,
                             player_low = guid.GetCounter(),
+                            source_transport_guid = prevTransport?.ToString() ?? "<unobserved>",
                             destination_transport_guid = moveInfo.TransportGuid.ToString(),
                             mode = pendingMode.ToString(),
-                            reason = "destination_on_transport",
+                            reason = moveInfo.TransportGuid.IsEmpty() ? "source_off_transport" : "destination_on_transport",
                         });
-                    }
-                    else
-                    {
-                        FireDeferredTransportClearSynth(guid, moveInfo.Position, moveInfo.Orientation, pendingMode.ToString());
                     }
                 }
             }
