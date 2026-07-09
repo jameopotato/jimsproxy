@@ -178,8 +178,23 @@ public partial class WorldClient
         if (!IsConnected())
             return;
 
-        _clientSocket.Shutdown(SocketShutdown.Both);
-        _clientSocket.Disconnect(false);
+        // JimsProxy: teardown must not throw. A real FIN on the receive thread and the
+        // silent-stall watchdog can race into Disconnect() on the same client; the second
+        // Shutdown/Disconnect then throws SocketException/ObjectDisposedException and aborts
+        // the caller's teardown path (matching the silent-stall path's own try/catch).
+        try
+        {
+            _clientSocket.Shutdown(SocketShutdown.Both);
+            _clientSocket.Disconnect(false);
+        }
+        catch (Exception ex)
+        {
+            Log.Event("session.worldclient.disconnect_error", new
+            {
+                exception_type = ex.GetType().Name,
+                message = ex.Message,
+            });
+        }
 
         if (GetSession().WorldClient == this)
             GetSession().WorldClient = null;
