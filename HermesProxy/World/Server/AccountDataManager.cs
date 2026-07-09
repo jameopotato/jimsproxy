@@ -95,10 +95,69 @@ public class AccountMetaDataManager
         if (!File.Exists(path))
             return new List<uint>();
 
-        List<string> lines = File.ReadAllLines(path).ToList();
+        var completedQuestIds = ParseCompletedQuestLines(File.ReadAllLines(path), out var compactLines, out var needsRewrite);
 
-        var completedQuestIds = lines.Select(x => uint.Parse(x.Split(',').FirstOrDefault() ?? "0")).ToList();
+        // Self-heal: the old code called uint.Parse on every line, so a single corrupt line (a
+        // crash/kill mid-append can leave NUL bytes) threw FormatException and terminated the
+        // whole proxy on login. We now skip corrupt lines and de-duplicate repeated quest IDs
+        // (repeatable turn-ins append a line each completion; the file is only meaningful as a
+        // set). When anything was dropped, atomically rewrite the file so it can't recur or grow.
+        if (needsRewrite)
+        {
+            Log.Print(LogType.Warn, $"Compacting completed_quests.csv for '{charName}@{realmName}': " +
+                                    $"kept {compactLines.Count} distinct quest(s), dropped corrupt/duplicate line(s).");
+            try
+            {
+                var tmp = path + ".tmp";
+                File.WriteAllLines(tmp, compactLines);
+                File.Move(tmp, path, overwrite: true);
+            }
+            catch (Exception ex)
+            {
+                Log.Print(LogType.Error, $"Failed to rewrite completed_quests.csv at '{path}': {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
         return completedQuestIds;
+    }
+
+    // Parses completed_quests.csv content. A valid line is "<questId>,<unixSeconds>"; only the
+    // first field is used. Lines whose first field isn't a uint are skipped (corruption, e.g. a
+    // crash-truncated append that left NUL bytes) and repeated quest IDs collapse to their first
+    // occurrence. Returns the distinct quest IDs in first-seen order; compactLines is the matching
+    // raw lines to rewrite the file with. needsRewrite is true when any non-empty line was dropped
+    // (corruption) or any duplicate was collapsed.
+    internal static List<uint> ParseCompletedQuestLines(IReadOnlyList<string> lines,
+                                                        out List<string> compactLines, out bool needsRewrite)
+    {
+        var ids = new List<uint>(lines.Count);
+        compactLines = new List<string>(lines.Count);
+        var seen = new HashSet<uint>();
+        bool droppedCorrupt = false;
+        bool droppedDuplicate = false;
+
+        foreach (var line in lines)
+        {
+            if (uint.TryParse(line.Split(',').FirstOrDefault(), out var questId))
+            {
+                if (seen.Add(questId))
+                {
+                    ids.Add(questId);
+                    compactLines.Add(line);
+                }
+                else
+                {
+                    droppedDuplicate = true;
+                }
+            }
+            else if (!string.IsNullOrWhiteSpace(line))
+            {
+                droppedCorrupt = true;
+            }
+        }
+
+        needsRewrite = droppedCorrupt || droppedDuplicate;
+        return ids;
     }
 
     public void MarkQuestAsCompleted(string realmName, string charName, uint questId)
