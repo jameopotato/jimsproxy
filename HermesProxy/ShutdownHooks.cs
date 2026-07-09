@@ -104,6 +104,16 @@ internal static class ShutdownHooks
         Environment.Exit(0);
     }
 
+    // JimsProxy: invoked by the stdin launcher-shutdown listener (Server.ServerMain) when the
+    // launcher writes the shutdown sentinel to the proxy's stdin. Routes through the same
+    // idempotent final-event/flush path as the console-close and signal hooks, then exits 0 so
+    // the launcher sees a clean shutdown instead of resorting to taskkill /F.
+    public static void TriggerGracefulExit(string reason)
+    {
+        EmitFinalEvent("process.signal", new { reason });
+        Environment.Exit(0);
+    }
+
     private static void EmitFinalEvent(string eventType, object payload)
     {
         if (Interlocked.Exchange(ref _finalEventEmitted, 1) != 0)
