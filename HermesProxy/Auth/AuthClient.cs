@@ -48,6 +48,17 @@ public partial class AuthClient
         return _globalSession;
     }
 
+    // JimsProxy (clean handshake teardown): bound the realmd auth handshake. If realmd accepts
+    // the TCP connection but never sends LOGON_CHALLENGE (half-accepting / load-shed / firewall),
+    // the blocking wait in ConnectToAuthServer/Reconnect would hang the login thread forever
+    // ("stuck on Connecting..."). Wait at most timeoutMs, then fail the login cleanly so the
+    // client shows an error and can retry. Pure — unit-tested in AuthHandshakeTimeoutTests.
+    internal static AuthResult AwaitHandshakeResult(Task<AuthResult> handshake, int timeoutMs, out bool timedOut)
+    {
+        timedOut = !handshake.Wait(timeoutMs);
+        return timedOut ? AuthResult.FAIL_INTERNAL_ERROR : handshake.Result;
+    }
+
     public AuthResult ConnectToAuthServer(string username, string password, string locale)
     {
         _username = username;
@@ -84,16 +95,27 @@ public partial class AuthClient
             _response.SetResult(AuthResult.FAIL_INTERNAL_ERROR);
         }
 
-        _response.Task.ConfigureAwait(false).GetAwaiter().GetResult();
+        AuthResult result = AwaitHandshakeResult(_response.Task, Framework.Settings.AuthHandshakeTimeoutMs, out bool timedOut);
+        if (timedOut)
+        {
+            // Realmd accepted the TCP connection but never completed the handshake — give up
+            // cleanly rather than hang the login thread forever.
+            Log.Event("auth.realmd.handshake_timeout", new
+            {
+                username = username,
+                timeout_ms = Framework.Settings.AuthHandshakeTimeoutMs,
+            });
+            try { _clientSocket?.Close(); } catch { /* best-effort */ }
+        }
 
         // JimsProxy: record handshake outcome
         Log.Event("auth.realmd.handshake", new
         {
             username = username,
-            result = _response.Task.Result.ToString(),
+            result = result.ToString(),
         });
 
-        return _response.Task.Result;
+        return result;
     }
 
     public AuthResult Reconnect()
@@ -117,9 +139,18 @@ public partial class AuthClient
             _response.SetResult(AuthResult.FAIL_INTERNAL_ERROR);
         }
 
-        _response.Task.ConfigureAwait(false).GetAwaiter().GetResult();
+        AuthResult result = AwaitHandshakeResult(_response.Task, Framework.Settings.AuthHandshakeTimeoutMs, out bool timedOut);
+        if (timedOut)
+        {
+            Log.Event("auth.realmd.reconnect_handshake_timeout", new
+            {
+                username = _username,
+                timeout_ms = Framework.Settings.AuthHandshakeTimeoutMs,
+            });
+            try { _clientSocket?.Close(); } catch { /* best-effort */ }
+        }
 
-        return _response.Task.Result;
+        return result;
     }
 
     private void SetAuthResponse(AuthResult response)
