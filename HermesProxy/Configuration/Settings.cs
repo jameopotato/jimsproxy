@@ -47,6 +47,12 @@ public static class Settings
     // Hard timeout on the reconnect attempt — beyond this, abandon and propagate DC.
     // Clamped to 1000..30000 in LoadAndVerifyFrom.
     public static int UnplannedReconnectTimeoutMs;
+    // JimsProxy (clean handshake teardown): bound the realmd auth handshake. If realmd accepts
+    // the TCP connection but never sends LOGON_CHALLENGE (half-accepting login server, load-shed,
+    // firewall), the login thread would otherwise block forever ("stuck on Connecting..."). On
+    // expiry the login fails cleanly — the client shows an error and can retry — instead of
+    // hanging. Clamped to 1000..60000 in LoadAndVerifyFrom.
+    public static int AuthHandshakeTimeoutMs;
     // JimsProxy (cross-version addon interop): translate PallyPower ASSIGN class
     // index between 1.12 (0-indexed) and 1.14 (1-indexed) at the chat-addon
     // wire boundary so paladins on either client version can party with each
@@ -142,6 +148,7 @@ public static class Settings
         SpellCastEarlyFireOffsetMs = Math.Clamp(config.GetInt("SpellCastEarlyFireOffsetMs", 0), 0, 50);
         EnableUnplannedReconnect = config.GetBoolean("EnableUnplannedReconnect", false);
         UnplannedReconnectTimeoutMs = Math.Clamp(config.GetInt("UnplannedReconnectTimeoutMs", 5000), 1000, 30000);
+        AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);
         LowLatencyMode = config.GetBoolean("LowLatencyMode", false);
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);

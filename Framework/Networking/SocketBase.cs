@@ -20,6 +20,7 @@ using System;
 using System.Buffers;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 
 namespace Framework.Networking;
 
@@ -43,6 +44,9 @@ public abstract class SocketBase : ISocket, IDisposable
     byte[]? _asyncBuffer;
     const int BufferSize = 0x4000;
 
+    // JimsProxy: single-fire guard for Dispose (0 = live). See Dispose().
+    int _disposed;
+
     public delegate void SocketReadCallback(SocketAsyncEventArgs args);
 
     protected SocketBase(Socket socket)
@@ -63,6 +67,13 @@ public abstract class SocketBase : ISocket, IDisposable
 
     public virtual void Dispose()
     {
+        // JimsProxy: idempotent teardown. Two concurrent closers (e.g. a receive-thread RST
+        // and a cross-thread CloseSocket) can both pass the null checks below and return the
+        // SAME pooled buffer twice — handing one array to two future renters, a latent
+        // cross-session packet-corruption bug. Latch so the body runs exactly once.
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
         _socket.Dispose();
 
         if (_callbackBuffer != null)
