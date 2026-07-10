@@ -2186,7 +2186,44 @@ public partial class WorldClient
             int UNIT_FIELD_CHARMEDBY = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_CHARMEDBY);
             if (UNIT_FIELD_CHARMEDBY >= 0 && updateMaskArray[UNIT_FIELD_CHARMEDBY])
             {
-                updateData.UnitData.CharmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To128(GetSession().GameState);
+                WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To128(GetSession().GameState);
+                updateData.UnitData.CharmedBy = charmedBy;
+
+                // JimsProxy (#382 observer lockup): track players charmed by ANOTHER PLAYER,
+                // so the flags translation below can present them as possessed (see
+                // GameSessionData.ObservedCharmedPlayers). Excludes the charmer (needs the real
+                // charm/pet bar) and the local player as target (lives the real charm), so the
+                // charm-vs-possess control difference is preserved for the participants.
+                // NPC charmers (Lucifron's Dominate Mind et al.) are deliberately excluded:
+                // years of raid MCs have produced no observer-lockup reports, so that
+                // long-stable content stays untouched.
+                var gameState = GetSession().GameState;
+                bool observedCharmedPlayer = guid.IsPlayer() &&
+                    charmedBy.IsPlayer() &&
+                    guid != gameState.CurrentPlayerGuid &&
+                    charmedBy != gameState.CurrentPlayerGuid;
+                if (observedCharmedPlayer)
+                {
+                    if (gameState.ObservedCharmedPlayers.Add(guid))
+                        Log.Event("charm.observed_player.possess_shim", new
+                        {
+                            guid_low = guid.GetCounter(),
+                            charmed_by_low = charmedBy.GetCounter(),
+                        });
+                }
+                else if (gameState.ObservedCharmedPlayers.Remove(guid))
+                {
+                    Log.Event("charm.observed_player.possess_shim_cleared", new
+                    {
+                        guid_low = guid.GetCounter(),
+                    });
+                }
+            }
+            else if (isCreate)
+            {
+                // A create block without CHARMEDBY means the unit is not charmed — drop any
+                // stale shim entry from a charm that ended while the unit was out of range.
+                GetSession().GameState.ObservedCharmedPlayers.Remove(guid);
             }
             int UNIT_FIELD_SUMMONEDBY = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_SUMMONEDBY);
             if (UNIT_FIELD_SUMMONEDBY >= 0 && updateMaskArray[UNIT_FIELD_SUMMONEDBY])
@@ -2438,6 +2475,15 @@ public partial class WorldClient
                 // force the bit on so the client picks the swim animation.
                 if (Session.GameState.KnownSwimmingMobs.Contains(guid))
                     updateData.UnitData.Flags |= (uint)UnitFlags.CanSwim;
+
+                // JimsProxy (#382 observer lockup): present an observed charmed PLAYER as
+                // possessed. Vanilla MOD_CHARM (Gnomish MC Cap 13181) emits PLAYER_CONTROLLED
+                // + CHARMEDBY without POSSESSED; a charmed player is unrepresentable to the
+                // 1.14 client (BG bystanders FPS-lock rendering it), while possess (priest
+                // MC 605) renders fine. CHARMEDBY is processed above before this flags block,
+                // so apply/clear ordering within a single update is already correct.
+                if (Session.GameState.ObservedCharmedPlayers.Contains(guid))
+                    updateData.UnitData.Flags |= (uint)UnitFlags.Possessed;
 
                 // Here because of this bullshit in cmangos:
                 // https://github.com/cmangos/mangos-tbc/blob/fd093b33071b546545cc5973608304bccc5a041b/src/game/Entities/Object.cpp#L544
