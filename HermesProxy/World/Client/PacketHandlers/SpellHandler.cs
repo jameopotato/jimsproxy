@@ -2509,7 +2509,12 @@ public partial class WorldClient
         // 1.14 client chains GCD starts (new = old + 1500ms) instead of anchoring
         // to server time, causing ~RTT drift per cast. Stamp with proxy time so the
         // client's TIME_SYNC offset can convert it to local time.
-        if (isSpellGo && dbdata.CastTime == 0)
+        // JimsProxy (2026-07-10): skip under Low-Latency mode — the drift this fixes was
+        // observed under the hold-queue's re-timing; LL never queues, and SugarProxy
+        // (queue-less, sends 0) shows the client's GCD anchors fine without it. Second
+        // member of the GCD-sweep-sync cluster (see the #409 cooldown gate); covers the
+        // cast-time half of the LL residual (Frostbolt, I9/I10).
+        if (isSpellGo && dbdata.CastTime == 0 && !Settings.LowLatencyMode)
             dbdata.CastTime = Time.GetMSTime();
 
         // JimsProxy: emit structured spell.cast event so we can diagnose spell-ID
