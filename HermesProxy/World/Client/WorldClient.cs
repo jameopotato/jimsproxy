@@ -1003,8 +1003,9 @@ public partial class WorldClient
         // its synthetic closure when the player goes idle. The existing watchdog otherwise only
         // runs on the next inbound spell packet, so a truly idle orphan leaks until the next cast.
         // The 2.5s per-cast deadline and the eviction logic are unchanged — this only adds a pump
-        // cadence (≤ one keepalive interval late). Gated with the T1 bundle so OFF is byte-identical;
-        // RunWatchdogEviction is already invoked cross-thread and no-ops when nothing is overdue.
+        // cadence (≤ one keepalive interval late). Gated with the T1 bundle so OFF is byte-identical.
+        // RunWatchdogEviction is safe to call cross-thread: it takes PendingCastsLock, and returns
+        // without touching the queues when nothing is overdue.
         if (Framework.Settings.IdentityPinnedCastIdsActive)
             GetSession()?.RunWatchdogEviction();
 

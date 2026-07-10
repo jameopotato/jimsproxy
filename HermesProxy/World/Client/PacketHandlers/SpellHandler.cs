@@ -2331,35 +2331,55 @@ public partial class WorldClient
     // one cast — a small price to avoid the permanent lock.
     private void DrainOrphanedStartedNormalCastsOnParseFailure(bool isSpellGo)
     {
-        var queue = GetSession().GameState.PendingNormalCasts;
+        var gameState = GetSession().GameState;
+        var queue = gameState.PendingNormalCasts;
         var keep = new List<ClientCastRequest>();
-        int orphaned = 0;
-        while (queue.TryDequeue(out var cast))
-        {
-            if (cast.HasStarted)
-            {
-                CastFailed failed = new();
-                failed.SpellID = cast.SpellId;
-                failed.SpellXSpellVisualID = cast.SpellXSpellVisualId;
-                failed.Reason = (uint)SpellCastResultClassic.DontReport;
-                failed.CastID = cast.ServerGUID;
-                SendPacketToClient(failed);
-                orphaned++;
-            }
-            else
-            {
-                keep.Add(cast);
-            }
-        }
-        foreach (var c in keep)
-            queue.Enqueue(c);
+        var orphanedCasts = new List<ClientCastRequest>();
 
-        if (orphaned > 0)
+        // Compound drain-rebuild: hold PendingCastsLock across it (a concurrent CMSG-thread
+        // Enqueue or watchdog drain would otherwise scramble the FIFO). No packet I/O inside.
+        lock (gameState.PendingCastsLock)
+        {
+            while (queue.TryDequeue(out var cast))
+            {
+                if (cast.HasStarted)
+                    orphanedCasts.Add(cast);
+                else
+                    keep.Add(cast);
+            }
+            foreach (var c in keep)
+                queue.Enqueue(c);
+        }
+
+        foreach (var cast in orphanedCasts)
+        {
+            // Force-closing a STARTED cast without a server terminating event: release its
+            // forwarded-START CastID, exactly as RunWatchdogEviction does. Otherwise the dead
+            // cast's CastID stays at the head of the per-spell FIFO and the NEXT same-spell
+            // SPELL_GO pops it, stamping the new cast's GO with the dead cast's CastID — the
+            // 1.14 client pairs START↔GO by CastID, so the new cast never closes (stuck cast
+            // animation + looping cast sound). The synthetic CastFailed below already carries
+            // cast.ServerGUID, which is the value the FIFO holds.
+            //
+            // Deliberately ungated: a no-op while the FIFO is off (it is empty then), and correct
+            // once the FIFO becomes the unconditional recovery store. RunWatchdogEviction makes the
+            // same call for the same reason.
+            gameState.RemoveForwardedStartCastId(cast.SpellId, cast.ServerGUID);
+
+            CastFailed failed = new();
+            failed.SpellID = cast.SpellId;
+            failed.SpellXSpellVisualID = cast.SpellXSpellVisualId;
+            failed.Reason = (uint)SpellCastResultClassic.DontReport;
+            failed.CastID = cast.ServerGUID;
+            SendPacketToClient(failed);
+        }
+
+        if (orphanedCasts.Count > 0)
         {
             Log.Event("spell.parse_failed.queue_drained", new
             {
                 phase = isSpellGo ? "go" : "start",
-                orphaned_count = orphaned,
+                orphaned_count = orphanedCasts.Count,
             });
         }
     }
