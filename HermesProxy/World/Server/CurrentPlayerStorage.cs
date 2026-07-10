@@ -89,6 +89,11 @@ public class CompletedQuestTracker
 {
     private Dictionary<int, ulong> _cachedQuestCompleted = new();
 
+    // Every completed quest ID currently on disk. Used to avoid appending a duplicate line for a
+    // repeatable turn-in -- the file is only read back as a set of IDs, so without this it grew
+    // unbounded (e.g. Argent Dawn Scourgestone grinds add hundreds of rows for the same quest).
+    private readonly HashSet<uint> _completedQuestIds = new();
+
     public GlobalSessionData Session { get; }
 
     public CompletedQuestTracker(GlobalSessionData globalSession)
@@ -98,6 +103,7 @@ public class CompletedQuestTracker
 
     public void MarkQuestAsNotCompleted(uint questQuestId)
     {
+        _completedQuestIds.Remove(questQuestId);
         Session.AccountMetaDataMgr.MarkQuestAsNotCompleted(Session.GameState.CurrentPlayerInfo!.Realm.Name, Session.GameState.CurrentPlayerInfo!.Name!, questQuestId);
 
         var questBit = GameData.GetUniqueQuestBit(questQuestId);
@@ -109,7 +115,12 @@ public class CompletedQuestTracker
 
     public void MarkQuestAsCompleted(uint questQuestId)
     {
-        Session.AccountMetaDataMgr.MarkQuestAsCompleted(Session.GameState.CurrentPlayerInfo!.Realm.Name, Session.GameState.CurrentPlayerInfo!.Name!, questQuestId);
+        // Only persist the first completion of a (possibly repeatable) quest -- re-appending a
+        // repeatable turn-in just bloats the file, which is only read back as a set of IDs.
+        if (_completedQuestIds.Add(questQuestId))
+        {
+            Session.AccountMetaDataMgr.MarkQuestAsCompleted(Session.GameState.CurrentPlayerInfo!.Realm.Name, Session.GameState.CurrentPlayerInfo!.Name!, questQuestId);
+        }
 
         var questBit = GameData.GetUniqueQuestBit(questQuestId);
         if (questBit.HasValue)
@@ -123,8 +134,11 @@ public class CompletedQuestTracker
         var questIds = Session.AccountMetaDataMgr.GetAllCompletedQuests(Session.GameState.CurrentPlayerInfo!.Realm.Name, Session.GameState.CurrentPlayerInfo!.Name!);
 
         _cachedQuestCompleted = new Dictionary<int, ulong>();
+        _completedQuestIds.Clear();
         foreach (uint questId in questIds)
         {
+            _completedQuestIds.Add(questId);
+
             uint? questBit = GameData.GetUniqueQuestBit(questId);
             if (!questBit.HasValue)
                 continue;
