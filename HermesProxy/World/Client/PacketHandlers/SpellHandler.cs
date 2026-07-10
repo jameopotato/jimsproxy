@@ -2005,23 +2005,34 @@ public partial class WorldClient
                     legacy_lookup_id = pendingCast.LegacySpellId,
                 });
 
-                var gcdCooldown = new SpellCooldownPkt();
-                gcdCooldown.Caster = spell.Cast.CasterUnit;
-                gcdCooldown.Flags = 0x01; // SPELL_COOLDOWN_FLAG_INCLUDE_GCD
-                gcdCooldown.SpellCooldowns.Add(new SpellCooldownStruct
+                // JimsProxy (2026-07-10): skip the synthetic SMSG_SPELL_COOLDOWN under Low-Latency mode.
+                // The cooldown exists to stop the 1.14 GCD bar drifting across HELD instant casts (#124) —
+                // a drift the proxy hold-queue's re-timing induces. LL forwards every cast immediately and
+                // never uses the hold-queue, so there is no queue-induced drift to correct; the packet is
+                // just a gratuitous extra client-bound send in the coalesced cast burst (SugarProxy, the
+                // queue-less analogue, sends none and the client's own GCD anchors fine — user-verified).
+                // Leading suspect for raising the client's per-cast kit-teardown race odds under LL. Queue
+                // mode is unchanged; BeginGcd above still runs (inert in LL).
+                if (!Settings.LowLatencyMode)
                 {
-                    SpellID = (uint)spell.Cast.SpellID,
-                    ForcedCooldown = (uint)gcdMs,
-                    ModRate = 1.0f,
-                });
-                SendPacketToClient(gcdCooldown);
+                    var gcdCooldown = new SpellCooldownPkt();
+                    gcdCooldown.Caster = spell.Cast.CasterUnit;
+                    gcdCooldown.Flags = 0x01; // SPELL_COOLDOWN_FLAG_INCLUDE_GCD
+                    gcdCooldown.SpellCooldowns.Add(new SpellCooldownStruct
+                    {
+                        SpellID = (uint)spell.Cast.SpellID,
+                        ForcedCooldown = (uint)gcdMs,
+                        ModRate = 1.0f,
+                    });
+                    SendPacketToClient(gcdCooldown);
 
-                Log.Event("gcd.cooldown_synth", new
-                {
-                    spell_id = spell.Cast.SpellID,
-                    forced_cooldown_ms = gcdMs,
-                    flags = 0x01,
-                });
+                    Log.Event("gcd.cooldown_synth", new
+                    {
+                        spell_id = spell.Cast.SpellID,
+                        forced_cooldown_ms = gcdMs,
+                        flags = 0x01,
+                    });
+                }
             }
 
             // RefireSpellGo: runs on the FIRST SMSG_SPELL_GO the proxy receives from the server (Kronos
