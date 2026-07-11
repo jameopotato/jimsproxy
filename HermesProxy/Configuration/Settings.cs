@@ -13,6 +13,10 @@ namespace Framework;
 
 public enum ServerFork { Kronos, Generic }
 
+// JimsProxy (rtt-prefire): GCD-boundary chaining strategy under Low-Latency mode. See the
+// RttPrefire setting below for semantics.
+public enum RttPrefireMode { Off, Timer, Knocker }
+
 public static class Settings
 {
     public static byte[] ClientSeed = null!;
@@ -58,6 +62,22 @@ public static class Settings
     // without holding. Eliminates hold-queue race conditions that cause stuck
     // spells for players with <40ms RTT. Most players should leave this OFF.
     public static bool LowLatencyMode;
+    // JimsProxy (rtt-prefire): chain casts across the GCD boundary under Low-Latency mode.
+    //   Off     — pure forward-everything (the plain LL behavior; default).
+    //   Timer   — a press landing inside the SpellQueueWindowMs tail of the GCD is held in
+    //             the existing hold slot and released by the BeginGcd timer at (estimated
+    //             expiry − early-fire offset); SpellCastEarlyFireOffsetMs / OverrideRtt govern
+    //             the offset exactly as in queue mode. Public advanced toggle.
+    //   Knocker — SugarProxy-parity: forward immediately, then re-send the same CMSG every
+    //             20ms (max 10 knocks, ≤200ms) until the cast starts/resolves or a newer
+    //             press supersedes it. Server-rough (each early knock bounces NOT_READY) —
+    //             experimental; the launcher only offers it in Dev Mode.
+    // Read only while LowLatencyMode is on; queue mode ignores it entirely.
+    public static RttPrefireMode RttPrefire;
+    // Effective gates: the sub-mode is live only under LowLatencyMode (mirrors
+    // IdentityPinnedCastIdsActive).
+    public static bool RttPrefireTimerActive => LowLatencyMode && RttPrefire == RttPrefireMode.Timer;
+    public static bool RttPrefireKnockerActive => LowLatencyMode && RttPrefire == RttPrefireMode.Knocker;
     // JimsProxy: suppress transient cast errors (NotReady, SpellInProgress) so
     // the client doesn't show red error text during rapid spam. Independent of
     // LowLatencyMode — useful as a companion setting but not required.
@@ -147,6 +167,10 @@ public static class Settings
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);
         IdentityPinnedCastIds = config.GetBoolean("IdentityPinnedCastIds", false);
         RefireSpellGo = config.GetBoolean("RefireSpellGo", false);
+        var rttPrefireStr = config.GetString("RttPrefire", "off");
+        RttPrefire = rttPrefireStr.Equals("timer", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Timer
+            : rttPrefireStr.Equals("knocker", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Knocker
+            : RttPrefireMode.Off;
         FormExitStartDeferMs = Math.Clamp(config.GetInt("FormExitStartDeferMs", 100), 0, 300);
         SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 1300), 0, 1300);
         ThreatEngine = config.GetBoolean("ThreatEngine", false);
