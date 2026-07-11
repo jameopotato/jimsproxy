@@ -345,6 +345,56 @@ public partial class WorldSocket
                         return;
                     }
 
+                    // JimsProxy (rtt-prefire, Timer): the single hold path LL re-admits. A press
+                    // landing inside the SpellQueueWindowMs tail of the GCD parks in the existing
+                    // hold slot and the BeginGcd timer (already armed at instant GO even under LL,
+                    // C-SH:~1997) releases it at
+                    // (estimated expiry − adaptive/manual early-fire offset) — the same
+                    // #397-supersede-hardened machinery queue mode uses. Presses outside the
+                    // window still forward immediately; no other queue-mode guard is imported
+                    // (deliberately no ShouldDropLateSameSpell — LL philosophy stays
+                    // forward-everything outside the hold window). The held press is NOT enqueued
+                    // here — ForwardHeldGcdCast enqueues on release, so server responses pair
+                    // with the forwarded copy only.
+                    if (Settings.RttPrefireTimerActive && GetSession().GameState.IsInGcdQueueWindow())
+                    {
+                        WorldPacket heldLlPacket = BuildCastSpellPacket(cast);
+                        castRequest.HeldPacketForReplay = heldLlPacket;
+                        castRequest.HeldAtTickMs = Environment.TickCount64;
+                        long llGcdRemainingMs = GetSession().GameState.GetGcdRemainingMs();
+
+                        // Same-spell skip: the held press already yields this exact outcome — ack
+                        // the duplicate keypress and keep the earlier hold (mirrors queue mode).
+                        var llPeeked = GetSession().GameState.PeekHeldGcdCast();
+                        if (llPeeked != null && llPeeked.SpellId == cast.Cast.SpellID)
+                        {
+                            SendCastFailedWithoutPrepare(castRequest);
+                            return;
+                        }
+
+                        if (GetSession().GameState.TryHoldCastDuringGcd(castRequest, out var llDisplaced))
+                        {
+                            Log.Event("spell.held", new
+                            {
+                                spell_id = cast.Cast.SpellID,
+                                gcd_remaining_ms = llGcdRemainingMs,
+                                displaced_spell_id = llDisplaced?.SpellId ?? 0,
+                                client_cast_id = castRequest.ClientGUID.ToString(),
+                                source = "ll_prefire",
+                            });
+                            if (llDisplaced != null)
+                                SendCastFailedWithoutPrepare(llDisplaced);
+                            return;
+                        }
+                        // GCD expired between the window check and the hold (or the timer already
+                        // fired) — fall through and forward immediately, the LL default.
+                        Log.Event("spell.held_race_fallthrough", new
+                        {
+                            spell_id = cast.Cast.SpellID,
+                            gcd_remaining_ms_at_check = llGcdRemainingMs,
+                        });
+                    }
+
                     // DIAGNOSTIC (stuck-spell investigation): remove when closed
                     if (Framework.Settings.DebugOutput)
                         Log.Event("cast.forwarded", new
@@ -362,6 +412,17 @@ public partial class WorldSocket
                     });
                     WorldPacket llPacket = BuildCastSpellPacket(cast);
                     SendPacketToServer(llPacket);
+
+                    // JimsProxy (rtt-prefire, Knocker): SugarProxy-parity resend loop (dev/
+                    // experimental — the launcher offers it only in Dev Mode). Skip while a
+                    // cast-time cast is in progress: every knock would just bounce
+                    // SpellInProgress (Sugar gates the same way via a session flag). See
+                    // GameSessionData.StartKnockLoop for the full mechanism + termination.
+                    if (Settings.RttPrefireKnockerActive && !GetSession().GameState.HasStartedNormalCast())
+                    {
+                        GetSession().GameState.StartKnockLoop((uint)cast.Cast.SpellID,
+                            () => SendPacketToServer(llPacket));
+                    }
                     return;
                 }
 

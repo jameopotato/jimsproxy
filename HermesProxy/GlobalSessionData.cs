@@ -473,6 +473,59 @@ public sealed class GameSessionData
     public Action<ClientCastRequest>? OnGcdHeldCastFire; // set by WorldSocket at attach time; invoked on a ThreadPool thread at GCD expiry
     public Action<ClientCastRequest>? OnAutoRepeatRetry; // set by WorldSocket; refires Shoot/Auto Shot after retryable legacy failures
 
+    // JimsProxy (rtt-prefire, Knocker): SugarProxy-parity resend loop. The caller has already
+    // enqueued and forwarded the press once (LL forward-everything unchanged); this re-sends the
+    // SAME wire packet every 20ms, up to 10 knocks (Sugar's exact constants: time.Sleep(20ms),
+    // N=10 flat), so the first knock after the server-side GCD expires lands ≤~20ms late with
+    // zero GCD prediction — the server is the timing authority. Resends are wire-only: the FIFO
+    // entry is NOT re-enqueued (Sugar re-Adds into a per-spell map, which is idempotent; our
+    // FIFO is not). The loop self-terminates when the press starts/resolves (it leaves the
+    // non-started set — our equivalent of Sugar's per-entry cancel flag set at START/GO/FAILED),
+    // when ANY newer knock arms (global generation counter — Sugar's session-atomic semantics),
+    // or when knocks run out. Early-knock NOT_READY / SpellInProgress bounces are swallowed by
+    // HandleCastFailed's knock-chaff guard while IsKnockActiveForSpell is true; the final bounce
+    // (arriving after the guard drops) resolves the press through the normal transient path.
+    public const int KnockIntervalMs = 20;
+    public const int KnockCount = 10;
+    private long _knockGeneration;
+    public readonly ConcurrentDictionary<uint, long> ActiveKnocks = new();
+
+    public bool IsKnockActiveForSpell(uint spellId) => ActiveKnocks.ContainsKey(spellId);
+
+    public void StartKnockLoop(uint spellId, Action resendToServer)
+    {
+        long myGen = Interlocked.Increment(ref _knockGeneration);
+        ActiveKnocks[spellId] = myGen;
+        _ = System.Threading.Tasks.Task.Run(async () =>
+        {
+            int sent = 0;
+            try
+            {
+                for (int i = 0; i < KnockCount; i++)
+                {
+                    await System.Threading.Tasks.Task.Delay(KnockIntervalMs);
+                    if (Interlocked.Read(ref _knockGeneration) != myGen)
+                        break; // a newer press armed its own loop — it owns the GCD boundary now
+                    if (!HasNonStartedPendingCastForSpell(spellId))
+                        break; // started or resolved — the cast landed (or terminally failed)
+                    resendToServer();
+                    sent++;
+                }
+            }
+            catch
+            {
+                // Session teardown mid-loop (socket gone) — the knock is moot; never surface an
+                // unhandled exception on the ThreadPool (would crash the process).
+            }
+            finally
+            {
+                ActiveKnocks.TryRemove(new KeyValuePair<uint, long>(spellId, myGen));
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("cast.knock_loop_done", new { spell_id = spellId, knocks_sent = sent });
+            }
+        });
+    }
+
     // JimsProxy (observed-bow retract): an observed (non-local) unit auto-repeating — Auto Shot 75 / wand Shoot 5019 — latches the 1.14 client's intrinsic ranged-aim the moment we forward its SPELL_START, and vanilla never broadcasts a stop for other units, so once the shooter quits nothing lowers the weapon (your own char is fine — SMSG_SPELL_FAILURE retracts the local aim). Hybrid retract: DETERMINISTIC stop edges — the target dies (PARTY_KILL_LOG / health->0), or the shooter itself dies, moves, or retargets — lower the bow instantly, AND a quiescence timer is the catch-all for the case no edge covers: the shooter stops with its target still alive and stands still (out of ammo, /stopattack, LoS, target dummy). Each latched shooter tracks its current target (for the death/retarget edges) and its last-shot time (for the sweep). The sweep fires SMSG_CANCEL_AUTO_REPEAT carrying THAT unit's GUID once it goes quiet past ObservedAutoRepeatQuietMs (the modern packet is per-GUID; the legacy handler only ever cancels the local player); the threshold sits above the slowest bow cadence + jitter so a steady shooter never flickers, and a premature retract self-heals — the next shot's START re-raises the aim.
     private readonly object _observedAutoRepeatLock = new();
     private readonly Dictionary<WowGuid128, ObservedShooterState> _observedShooterTargets = new();

@@ -366,6 +366,23 @@ public partial class WorldClient
         if (!isTransientReason)
             CancelFormExitDeferredCast(spellId, "cast_failed");
 
+        // JimsProxy (rtt-prefire, Knocker): while a knock loop is live for this spell, transient
+        // rejections are expected chaff — the deliberate early knocks bouncing off the still-armed
+        // server GCD (NOT_READY) or the occupied caster (SpellInProgress). Swallow them WITHOUT
+        // consuming or acking the pending entry: a later knock inside the window is still
+        // eligible to land, and the loop self-terminates on START/GO/real failure (the entry
+        // leaves the non-started set) or on supersession. The loop's final bounce arrives after
+        // IsKnockActiveForSpell drops and resolves the press through the normal transient paths
+        // below. Real failures carry non-transient reasons and flow through unaffected. This is
+        // our-architecture equivalent of SugarProxy's AddFailedPacket chaff buffering —
+        // adjudicated purely by packet pairing, never by clocks.
+        if (isTransientReason && GetSession().GameState.IsKnockActiveForSpell(spellId))
+        {
+            if (Framework.Settings.DebugOutput)
+                Log.Event("cast.knock_chaff_swallowed", new { spell_id = spellId, reason_id = reason });
+            return;
+        }
+
         // JimsProxy (transient-no-dismiss-started): a transient failure (NOT_READY /
         // SpellInProgress) is the server rejecting a DUPLICATE press, never an interrupt of the
         // cast already in progress — the server never starts a cast and then rejects it with a
