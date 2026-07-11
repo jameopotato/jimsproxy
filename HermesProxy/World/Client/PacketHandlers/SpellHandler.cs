@@ -1944,6 +1944,15 @@ public partial class WorldClient
             if (pendingCast.LegacySpellId != 0)
                 spell.Cast.SpellID = (int)pendingCast.SpellId;
 
+            // JimsProxy (held-aware GCD anchoring): the parse-time CastTime stamp is skipped
+            // under LL, but a press released from the hold slot (RttPrefire=Timer) was RE-TIMED
+            // by the proxy — exactly the drift source the bb4bb18 stamp anchors. Re-stamp here,
+            // where the matched entry tells us this specific cast was held; never-held LL casts
+            // keep CastTime=0 (Sugar parity). Queue mode is unaffected (parse-time stamp already
+            // fired, CastTime != 0). Alpha review, cross-PR #411×#412.
+            if (Settings.LowLatencyMode && pendingCast.WasHeld && spell.Cast.CastTime == 0)
+                spell.Cast.CastTime = Time.GetMSTime();
+
             // For instant spells that skip SPELL_START, we need to send SpellPrepare
             // before SpellGo so the client knows which cast completed.
             // Off-GCD casts already sent SpellPrepare at forward time (HasSentPrepare).
@@ -2495,10 +2504,13 @@ public partial class WorldClient
         // to server time, causing ~RTT drift per cast. Stamp with proxy time so the
         // client's TIME_SYNC offset can convert it to local time.
         // JimsProxy (2026-07-10): skip under Low-Latency mode — the drift this fixes was
-        // observed under the hold-queue's re-timing; LL never queues, and SugarProxy
+        // observed under the hold-queue's re-timing; LL never queues (plain LL), and SugarProxy
         // (queue-less, sends 0) shows the client's GCD anchors fine without it. Second
         // member of the GCD-sweep-sync cluster (see the #409 cooldown gate); covers the
-        // cast-time half of the LL residual (Frostbolt, I9/I10).
+        // cast-time half of the LL residual (Frostbolt, I9/I10). HELD LL casts
+        // (RttPrefire=Timer re-admits the hold path) are re-stamped in HandleSpellGo's
+        // matched branch, where the pending entry's WasHeld tells us this cast WAS re-timed —
+        // the shared parse here runs before the queue match, so it can't know.
         if (isSpellGo && dbdata.CastTime == 0 && !Settings.LowLatencyMode)
             dbdata.CastTime = Time.GetMSTime();
 

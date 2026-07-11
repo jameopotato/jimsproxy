@@ -789,6 +789,10 @@ public partial class WorldSocket
                 queue_depth_before = gameState.PendingNormalCasts.Count,
                 source = "held_gcd_release",
             });
+        // JimsProxy (held-aware GCD anchoring): this press is being released from the hold
+        // slot — the proxy re-timed it. Mark it so the GCD-anchor packet gates (cooldown
+        // synth / GO.CastTime stamp) treat it as held even under LL (RttPrefire=Timer).
+        cast.WasHeld = true;
         lock (gameState.PendingCastsLock)
         {
             gameState.PendingNormalCasts.Enqueue(cast);
