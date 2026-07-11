@@ -1040,7 +1040,20 @@ public partial class WorldClient
                         });
                     }
                     StopKeepAliveTimer();
-                    deathSession.AuthClient?.Disconnect();                                // stop pinging Kronos -> server logs the char out
+                    // Guarded like the Disconnect() above: AuthClient.Disconnect does a raw
+                    // Shutdown/Disconnect behind a stale Socket.Connected check, so a socket
+                    // concurrently reset/disposed by another teardown path throws — and an
+                    // unhandled exception on this Timer ThreadPool callback would kill the
+                    // whole process instead of logging one ghost character out.
+                    try { deathSession.AuthClient?.Disconnect(); }                        // stop pinging Kronos -> server logs the char out
+                    catch (Exception ex)
+                    {
+                        Log.Event("session.modern_client_death.auth_disconnect_error", new
+                        {
+                            exception_type = ex.GetType().Name,
+                            message = ex.Message,
+                        });
+                    }
                     return;                                                               // do NOT fall through to the silent-stall reconnect
                 }
             }
