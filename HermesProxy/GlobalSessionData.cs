@@ -2950,6 +2950,14 @@ public class ClientCastRequest
 
     public bool HasSentPrepare;
 
+    // JimsProxy (held-aware GCD anchoring): true once this press was released from the GCD
+    // hold slot by the release timer (ForwardHeldGcdCast) — i.e. the proxy RE-TIMED it.
+    // The synthetic GCD-anchor packets (#124 cooldown synth, bb4bb18 GO.CastTime stamp) exist
+    // to correct drift the client accrues across re-timed casts; their LL gates key on this
+    // flag rather than on mode alone, so a hold path re-admitted under LL (RttPrefire=Timer)
+    // keeps its anchors while never-held LL casts stay packet-trimmed.
+    public bool WasHeld;
+
     // JimsProxy: cast time (ms) reported by SMSG_SPELL_START. 0 means instant.
     // Distinguishes truly cast-time spells (Frostbolt, Polymorph) from instants that
     // *also* emit SMSG_SPELL_START on Kronos 1.12 (Arcane Explosion, Counterspell, etc.).

@@ -2016,15 +2016,18 @@ public partial class WorldClient
                     legacy_lookup_id = pendingCast.LegacySpellId,
                 });
 
-                // JimsProxy (2026-07-10): skip the synthetic SMSG_SPELL_COOLDOWN under Low-Latency mode.
-                // The cooldown exists to stop the 1.14 GCD bar drifting across HELD instant casts (#124) —
-                // a drift the proxy hold-queue's re-timing induces. LL forwards every cast immediately and
-                // never uses the hold-queue, so there is no queue-induced drift to correct; the packet is
+                // JimsProxy (2026-07-10): skip the synthetic SMSG_SPELL_COOLDOWN under Low-Latency mode
+                // for casts that were never held. The cooldown exists to stop the 1.14 GCD bar drifting
+                // across HELD instant casts (#124) — a drift the proxy hold-queue's re-timing induces.
+                // A never-held LL cast forwarded immediately has no re-timing to correct; the packet is
                 // just a gratuitous extra client-bound send in the coalesced cast burst (SugarProxy, the
                 // queue-less analogue, sends none and the client's own GCD anchors fine — user-verified).
-                // Leading suspect for raising the client's per-cast kit-teardown race odds under LL. Queue
-                // mode is unchanged; BeginGcd above still runs (inert in LL).
-                if (!Settings.LowLatencyMode)
+                // Leading suspect for raising the client's per-cast kit-teardown race odds under LL.
+                // Gate on HELD-NESS, not mode alone: RttPrefire=Timer re-admits the hold path under LL,
+                // and a held-and-re-timed cast needs its anchor regardless of mode (alpha review,
+                // cross-PR #409×#412). Queue mode is unchanged (never LL ⇒ first clause fires); BeginGcd
+                // above still runs (inert in LL when nothing is held).
+                if (!Settings.LowLatencyMode || pendingCast.WasHeld)
                 {
                     var gcdCooldown = new SpellCooldownPkt();
                     gcdCooldown.Caster = spell.Cast.CasterUnit;
