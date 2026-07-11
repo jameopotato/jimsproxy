@@ -428,8 +428,14 @@ public sealed class GameSessionData
     // task; the GCD hold-release timer fires on a ThreadPool thread. Nothing serializes them.
     //
     // So: take this lock around any mutation, and prefer the EnqueuePending*Cast helpers below.
-    // Read-only walks (HasStartedNormalCast, TryMarkPendingNormalCastStarted, ...) may stay
-    // lock-free: ConcurrentQueue enumeration is a snapshot and they mutate only entry fields.
+    // Read walks (HasStartedNormalCast, TryMarkPendingNormalCastStarted, ...) take the lock
+    // too: a ConcurrentQueue enumeration IS a consistent snapshot, but a snapshot taken while
+    // another thread holds this lock mid drain-rebuild (every entry dequeued into a private
+    // survivor list, not yet re-enqueued) sees an EMPTY queue and false-misses a live entry —
+    // a SPELL_START landing in that window skips its match, START and GO then ship different
+    // CastIDs, and the client never closes the cast. The queue holds a handful of entries at
+    // most; the lock cost is noise. (This supersedes the earlier "read walks may stay
+    // lock-free" rule — that blessing was unsound during drain-rebuild windows.)
     internal readonly object PendingCastsLock = new();
 
     /// <summary>
@@ -529,13 +535,16 @@ public sealed class GameSessionData
 
     public bool HasNonStartedPendingCastForSpell(uint spellId)
     {
-        foreach (var item in PendingNormalCasts)
+        lock (PendingCastsLock)
         {
-            if (!item.HasStarted &&
-                (item.SpellId == spellId || (item.LegacySpellId != 0 && item.LegacySpellId == spellId)))
-                return true;
+            foreach (var item in PendingNormalCasts)
+            {
+                if (!item.HasStarted &&
+                    (item.SpellId == spellId || (item.LegacySpellId != 0 && item.LegacySpellId == spellId)))
+                    return true;
+            }
+            return false;
         }
-        return false;
     }
 
     // JimsProxy: proxy→server RTT measurement for adaptive GCD fire offset.
@@ -1467,18 +1476,21 @@ public sealed class GameSessionData
     {
         cast = null;
 
-        foreach (var item in PendingNormalCasts)
+        lock (PendingCastsLock)
         {
-            if (CastMatchesSpellId(item, spellId) && !item.HasStarted)
+            foreach (var item in PendingNormalCasts)
             {
-                item.HasStarted = true;
-                item.StartedAtTickMs = Environment.TickCount64;
-                cast = item;
-                return true;
+                if (CastMatchesSpellId(item, spellId) && !item.HasStarted)
+                {
+                    item.HasStarted = true;
+                    item.StartedAtTickMs = Environment.TickCount64;
+                    cast = item;
+                    return true;
+                }
             }
-        }
 
-        return false;
+            return false;
+        }
     }
 
     // JimsProxy (T1 identity-pinned cast correspondence) — per-spell forwarded-START CastID
@@ -1591,12 +1603,15 @@ public sealed class GameSessionData
     /// </summary>
     public bool HasStartedNormalCast()
     {
-        foreach (var item in PendingNormalCasts)
+        lock (PendingCastsLock)
         {
-            if (item.HasStarted)
-                return true;
+            foreach (var item in PendingNormalCasts)
+            {
+                if (item.HasStarted)
+                    return true;
+            }
+            return false;
         }
-        return false;
     }
 
     /// <summary>
@@ -1614,12 +1629,15 @@ public sealed class GameSessionData
             return false;
         if (gameObjectGuid.GetHighType() != HighGuidType.GameObject)
             return false;
-        foreach (var item in PendingNormalCasts)
+        lock (PendingCastsLock)
         {
-            if (item.HasStarted && item.TargetGuid == gameObjectGuid)
-                return true;
+            foreach (var item in PendingNormalCasts)
+            {
+                if (item.HasStarted && item.TargetGuid == gameObjectGuid)
+                    return true;
+            }
+            return false;
         }
-        return false;
     }
 
     /// <summary>
@@ -1635,16 +1653,19 @@ public sealed class GameSessionData
     public bool HasStartedCastInQueueWindow()
     {
         long now = Environment.TickCount64;
-        foreach (var item in PendingNormalCasts)
+        lock (PendingCastsLock)
         {
-            if (!item.HasStarted || item.StartedAtTickMs == 0 || item.StartedCastTimeMs == 0)
-                continue;
-            long castEnd = item.StartedAtTickMs + item.StartedCastTimeMs;
-            long remaining = castEnd - now;
-            if (remaining > 0 && remaining <= Framework.Settings.SpellQueueWindowMs)
-                return true;
+            foreach (var item in PendingNormalCasts)
+            {
+                if (!item.HasStarted || item.StartedAtTickMs == 0 || item.StartedCastTimeMs == 0)
+                    continue;
+                long castEnd = item.StartedAtTickMs + item.StartedCastTimeMs;
+                long remaining = castEnd - now;
+                if (remaining > 0 && remaining <= Framework.Settings.SpellQueueWindowMs)
+                    return true;
+            }
+            return false;
         }
-        return false;
     }
 
     /// <summary>
@@ -1694,24 +1715,27 @@ public sealed class GameSessionData
         long nowTick = Environment.TickCount64;
         // DIAGNOSTIC (stuck-spell investigation): hoist toggle read; remove with diagnostics
         bool debugEvents = Framework.Settings.DebugOutput;
-        foreach (var cast in PendingNormalCasts)
+        lock (PendingCastsLock)
         {
-            if (cast.HasStarted && cast.StartedCastTimeMs > 0
-                && !GameData.IsChanneledSpell(cast.SpellId))
+            foreach (var cast in PendingNormalCasts)
             {
-                cast.MovementCancelled = true;
-                cast.MarkedAtTickMs = nowTick;
-                if (cast.WatchdogDeadlineMs == 0)
-                    cast.WatchdogDeadlineMs = watchdogDeadlineMs;
-                marked++;
-                // DIAGNOSTIC (stuck-spell investigation): remove when closed
-                if (debugEvents)
-                    Log.Event("cast.movement_marked", new
-                    {
-                        spell_id = cast.SpellId,
-                        started_cast_time_ms = cast.StartedCastTimeMs,
-                        client_cast_id = cast.ClientGUID.ToString(),
-                    });
+                if (cast.HasStarted && cast.StartedCastTimeMs > 0
+                    && !GameData.IsChanneledSpell(cast.SpellId))
+                {
+                    cast.MovementCancelled = true;
+                    cast.MarkedAtTickMs = nowTick;
+                    if (cast.WatchdogDeadlineMs == 0)
+                        cast.WatchdogDeadlineMs = watchdogDeadlineMs;
+                    marked++;
+                    // DIAGNOSTIC (stuck-spell investigation): remove when closed
+                    if (debugEvents)
+                        Log.Event("cast.movement_marked", new
+                        {
+                            spell_id = cast.SpellId,
+                            started_cast_time_ms = cast.StartedCastTimeMs,
+                            client_cast_id = cast.ClientGUID.ToString(),
+                        });
+                }
             }
         }
         return marked;
@@ -1872,12 +1896,15 @@ public sealed class GameSessionData
     /// </summary>
     public bool HasInFlightNormalCastForSpell(uint spellId)
     {
-        foreach (var item in PendingNormalCasts)
+        lock (PendingCastsLock)
         {
-            if (CastMatchesSpellId(item, spellId))
-                return true;
+            foreach (var item in PendingNormalCasts)
+            {
+                if (CastMatchesSpellId(item, spellId))
+                    return true;
+            }
+            return false;
         }
-        return false;
     }
 
     /// <summary>
@@ -1887,12 +1914,15 @@ public sealed class GameSessionData
     /// </summary>
     public bool HasForwardedPendingCast()
     {
-        foreach (var item in PendingNormalCasts)
+        lock (PendingCastsLock)
         {
-            if (!item.HasStarted)
-                return true;
+            foreach (var item in PendingNormalCasts)
+            {
+                if (!item.HasStarted)
+                    return true;
+            }
+            return false;
         }
-        return false;
     }
 
     /// <summary>
