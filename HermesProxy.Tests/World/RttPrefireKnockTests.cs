@@ -34,6 +34,16 @@ public class RttPrefireKnockTests
         Assert.False(session.IsKnockActiveForSpell(spellId));
     }
 
+    private static async Task WaitForCounter(Func<int> read, int expected)
+    {
+        // The loop drops the chaff guard BEFORE invoking onAbandoned (deliberate production
+        // ordering), so loop-exit is observable before the callback runs — poll the counter
+        // itself with the same generous ceiling instead of racing that gap.
+        for (int i = 0; i < 100 && read() != expected; i++)
+            await Task.Delay(GameSessionData.KnockIntervalMs);
+        Assert.Equal(expected, read());
+    }
+
     [Fact]
     public async Task StartKnockLoop_UnresolvedPress_SendsExactlyKnockCount()
     {
@@ -113,5 +123,55 @@ public class RttPrefireKnockTests
         EnqueueNonStarted(session, 133);
         session.StartKnockLoop(133, () => { });
         Assert.True(session.IsKnockActiveForSpell(133));
+    }
+
+    [Fact]
+    public async Task StartKnockLoop_ExhaustedUnresolved_InvokesOnAbandonedOnce()
+    {
+        var session = NewSession();
+        EnqueueNonStarted(session, 133);
+        int abandoned = 0;
+        session.StartKnockLoop(133, () => { }, _ => Interlocked.Increment(ref abandoned));
+
+        await WaitForLoopExit(session, 133);
+
+        // Entry never started/resolved, so the exhausted loop must hand it to onAbandoned
+        // exactly once — the caller's resolution is what keeps it from blocking the spell.
+        await WaitForCounter(() => Volatile.Read(ref abandoned), 1);
+    }
+
+    [Fact]
+    public async Task StartKnockLoop_SupersededWithLiveEntry_InvokesOnAbandoned()
+    {
+        var session = NewSession();
+        EnqueueNonStarted(session, 133);
+        EnqueueNonStarted(session, 2136);
+        int abandonedOld = 0;
+        session.StartKnockLoop(133, () => { }, _ => Interlocked.Increment(ref abandonedOld));
+        session.StartKnockLoop(2136, () => { });
+
+        await WaitForLoopExit(session, 133);
+
+        // The superseded loop exits with its entry still unstarted — it must be abandoned
+        // to the resolver, not silently leaked (the knock-supersede leak from the review).
+        await WaitForCounter(() => Volatile.Read(ref abandonedOld), 1);
+    }
+
+    [Fact]
+    public async Task StartKnockLoop_ResolvedMidLoop_DoesNotInvokeOnAbandoned()
+    {
+        var session = NewSession();
+        EnqueueNonStarted(session, 133);
+        int abandoned = 0;
+        session.StartKnockLoop(133, () => { }, _ => Interlocked.Increment(ref abandoned));
+
+        Assert.True(session.TryDequeuePendingNormalCast(133, out _, preferStarted: false));
+        await WaitForLoopExit(session, 133);
+        // Give a would-be stray callback the same window the positive tests get.
+        await Task.Delay(GameSessionData.KnockIntervalMs * 3);
+
+        // A properly resolved press has an owner (the dequeuing packet path) — abandoning
+        // it too would double-ack.
+        Assert.Equal(0, Volatile.Read(ref abandoned));
     }
 }

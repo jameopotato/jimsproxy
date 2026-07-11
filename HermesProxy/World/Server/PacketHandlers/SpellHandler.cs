@@ -421,7 +421,34 @@ public partial class WorldSocket
                     if (Settings.RttPrefireKnockerActive && !GetSession().GameState.HasStartedNormalCast())
                     {
                         GetSession().GameState.StartKnockLoop((uint)cast.Cast.SpellID,
-                            () => SendPacketToServer(llPacket));
+                            () => SendPacketToServer(llPacket),
+                            abandonedSpellId =>
+                            {
+                                // The loop ended (superseded/exhausted) with the press still
+                                // unstarted — its bounces were swallowed as chaff and the final
+                                // one may have been swallowed inside the guard-teardown window,
+                                // so nothing else will pair the entry. Resolve it NOW, keyed to
+                                // the loop-exit event: dequeue the unstarted dup and ack it
+                                // silently, exactly like a displaced held press. If a concurrent
+                                // START won the race to the entry, put it back untouched — the
+                                // server owns started casts.
+                                var st = GetSession().GameState;
+                                if (st.TryDequeuePendingNormalCast(abandonedSpellId, out var abandoned, preferStarted: false) && abandoned != null)
+                                {
+                                    if (abandoned.HasStarted)
+                                    {
+                                        lock (st.PendingCastsLock)
+                                            st.PendingNormalCasts.Enqueue(abandoned);
+                                        return;
+                                    }
+                                    SendCastRequestFailed(abandoned, false, SpellCastResultClassic.DontReport);
+                                    Log.Event("cast.knock_abandoned_resolved", new
+                                    {
+                                        spell_id = abandonedSpellId,
+                                        client_cast_id = abandoned.ClientGUID.ToString(),
+                                    });
+                                }
+                            });
                     }
                     return;
                 }

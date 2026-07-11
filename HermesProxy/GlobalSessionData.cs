@@ -498,22 +498,34 @@ public sealed class GameSessionData
 
     public bool IsKnockActiveForSpell(uint spellId) => ActiveKnocks.ContainsKey(spellId);
 
-    public void StartKnockLoop(uint spellId, Action resendToServer)
+    // onAbandoned: invoked (once, on the loop's ThreadPool task) when the loop exits with the
+    // press still unstarted and enqueued — i.e. superseded by a newer press, or knocks exhausted
+    // while every bounce was swallowed as chaff. Nothing else reliably pairs that entry: the
+    // chaff guard ate its failures while the loop was live, and the final in-flight bounce can
+    // land inside the guard-teardown window and be swallowed too. The caller resolves the entry
+    // deterministically ON THIS EVENT (dequeue + DontReport ack) — never on a clock — otherwise
+    // it blocks the spell via the LL duplicate guard until the 2.5s watchdog (alpha review,
+    // knock-supersede leak).
+    public void StartKnockLoop(uint spellId, Action resendToServer, Action<uint>? onAbandoned = null)
     {
         long myGen = Interlocked.Increment(ref _knockGeneration);
         ActiveKnocks[spellId] = myGen;
         _ = System.Threading.Tasks.Task.Run(async () =>
         {
             int sent = 0;
+            bool entryLive = true;
             try
             {
                 for (int i = 0; i < KnockCount; i++)
                 {
                     await System.Threading.Tasks.Task.Delay(KnockIntervalMs);
+                    if (!HasNonStartedPendingCastForSpell(spellId))
+                    {
+                        entryLive = false;
+                        break; // started or resolved — the cast landed (or terminally failed)
+                    }
                     if (Interlocked.Read(ref _knockGeneration) != myGen)
                         break; // a newer press armed its own loop — it owns the GCD boundary now
-                    if (!HasNonStartedPendingCastForSpell(spellId))
-                        break; // started or resolved — the cast landed (or terminally failed)
                     resendToServer();
                     sent++;
                 }
@@ -525,7 +537,18 @@ public sealed class GameSessionData
             }
             finally
             {
+                // Drop the chaff guard FIRST: from here on arriving bounces resolve the entry
+                // through the normal transient paths; the abandonment re-check below fires only
+                // if the entry is still there after that ordering.
                 ActiveKnocks.TryRemove(new KeyValuePair<uint, long>(spellId, myGen));
+                if (entryLive && HasNonStartedPendingCastForSpell(spellId))
+                {
+                    try { onAbandoned?.Invoke(spellId); }
+                    catch
+                    {
+                        // Same teardown rationale as above — resolving on a dying session is moot.
+                    }
+                }
                 if (Framework.Settings.DebugOutput)
                     Log.Event("cast.knock_loop_done", new { spell_id = spellId, knocks_sent = sent });
             }
