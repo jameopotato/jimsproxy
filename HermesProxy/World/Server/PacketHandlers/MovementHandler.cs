@@ -45,6 +45,18 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MOVE_DOUBLE_JUMP)]
     void HandlePlayerMove(ClientPlayerMovement movement)
     {
+        // JimsProxy (transport-clear source-gate, staleness fix): keep the gate's source
+        // observation TRUE. DiagLastObservedPlayerTransportGuid was only written from the
+        // player's own UpdateObject block — which never fires for mid-session boarding (own
+        // movement is client-authoritative and arrives HERE, not via UpdateObject) — so a
+        // player who logged in on land and then boarded a boat/zeppelin was still "observed
+        // off-transport", and TransportClearGate skipped the dc39c39 stale-attach clear at
+        // the map boundary: the #331-class wedge regressed for the first transport leg after
+        // any login/teleport. Every own movement packet carries current transport state
+        // (empty when off-transport); stamp it so the observation tracks truth continuously.
+        // Stamped before the CHANGE_TRANSPORT drop below so boarding via that opcode counts.
+        GetSession().GameState.DiagLastObservedPlayerTransportGuid = movement.MoveInfo.TransportGuid;
+
         bool isMoveStart = IsMovementStartOpcode(movement.GetUniversalOpcode());
 
         // JimsProxy (PR #161 follow-up — movement preemption): mark any in-flight
