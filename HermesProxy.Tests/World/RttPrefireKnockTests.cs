@@ -114,4 +114,52 @@ public class RttPrefireKnockTests
         session.StartKnockLoop(133, () => { });
         Assert.True(session.IsKnockActiveForSpell(133));
     }
+
+    [Fact]
+    public async Task StartKnockLoop_ExhaustedUnresolved_InvokesOnAbandonedOnce()
+    {
+        var session = NewSession();
+        EnqueueNonStarted(session, 133);
+        int abandoned = 0;
+        session.StartKnockLoop(133, () => { }, _ => Interlocked.Increment(ref abandoned));
+
+        await WaitForLoopExit(session, 133);
+
+        // Entry never started/resolved, so the exhausted loop must hand it to onAbandoned
+        // exactly once — the caller's resolution is what keeps it from blocking the spell.
+        Assert.Equal(1, Volatile.Read(ref abandoned));
+    }
+
+    [Fact]
+    public async Task StartKnockLoop_SupersededWithLiveEntry_InvokesOnAbandoned()
+    {
+        var session = NewSession();
+        EnqueueNonStarted(session, 133);
+        EnqueueNonStarted(session, 2136);
+        int abandonedOld = 0;
+        session.StartKnockLoop(133, () => { }, _ => Interlocked.Increment(ref abandonedOld));
+        session.StartKnockLoop(2136, () => { });
+
+        await WaitForLoopExit(session, 133);
+
+        // The superseded loop exits with its entry still unstarted — it must be abandoned
+        // to the resolver, not silently leaked (the knock-supersede leak from the review).
+        Assert.Equal(1, Volatile.Read(ref abandonedOld));
+    }
+
+    [Fact]
+    public async Task StartKnockLoop_ResolvedMidLoop_DoesNotInvokeOnAbandoned()
+    {
+        var session = NewSession();
+        EnqueueNonStarted(session, 133);
+        int abandoned = 0;
+        session.StartKnockLoop(133, () => { }, _ => Interlocked.Increment(ref abandoned));
+
+        Assert.True(session.TryDequeuePendingNormalCast(133, out _, preferStarted: false));
+        await WaitForLoopExit(session, 133);
+
+        // A properly resolved press has an owner (the dequeuing packet path) — abandoning
+        // it too would double-ack.
+        Assert.Equal(0, Volatile.Read(ref abandoned));
+    }
 }
