@@ -331,19 +331,33 @@ public sealed class GameSessionData
     // subsequent same-cast failures add no new state.
     public Dictionary<(WowGuid128 Caster, uint SpellId), long> RecentlyForwardedSpellFailedOther = new();
 
-    // JimsProxy (out-of-range-ghost): guids just destroyed / out-of-ranged and not yet re-created. Vanilla broadcasts a moving unit's trailing MSG_MOVE_* at map-level distance AFTER the per-object-visibility destroy; relaying that stray movement re-ghosts the unit "running in place" on the modern client until re-approach. Movement for these guids is dropped until a CreateObject clears the mark.
+    // JimsProxy (out-of-range-ghost, #415): guids just destroyed / out-of-ranged and not yet
+    // re-created. Vanilla broadcasts a moving unit's trailing MSG_MOVE_* / monster-moves at
+    // map-level distance AFTER the per-object-visibility destroy; relaying that stray movement
+    // re-ghosts the unit "running in place" on the modern client until re-approach. Movement for
+    // these guids is dropped until a CreateObject clears the mark — suppression must NOT expire
+    // on a timer: movement for a destroyed-and-not-recreated guid is never legitimate (the modern
+    // client cannot render a unit before its create). The original 10s TTL leaked exactly there —
+    // units dwelling in the destroyed-but-still-broadcasting annulus past 10s (lateral
+    // boundary-skimming, patrol routes, trailing pets: 289 at-edge encounters across 67 field
+    // sessions) had their first post-TTL packet relayed and re-ghosted. The age constant below is
+    // pure dict hygiene for units that never return, far above any trailing-broadcast horizon —
+    // it is not a relay permission.
     private readonly ConcurrentDictionary<WowGuid128, long> _recentlyDestroyedObjects = new();
-    private const long RecentlyDestroyedTtlMs = 10000;
+    private const long RecentlyDestroyedSweepAgeMs = 600_000;
+    private const int RecentlyDestroyedSweepThreshold = 4096;
 
     public void MarkObjectRecentlyDestroyed(WowGuid128 guid)
     {
         if (guid.IsEmpty())
             return;
         _recentlyDestroyedObjects[guid] = Environment.TickCount64;
-        // Opportunistic sweep so a long session of spawns/despawns can't grow this unbounded.
-        if (_recentlyDestroyedObjects.Count > 4096)
+        // Opportunistic hygiene sweep so a long session of spawns/despawns can't grow this
+        // unbounded. Only long-stale entries go; recent marks are never evicted for size —
+        // evicting a live mark would reopen the leak in exactly the crowded scenes that grow it.
+        if (_recentlyDestroyedObjects.Count > RecentlyDestroyedSweepThreshold)
         {
-            long cutoff = Environment.TickCount64 - RecentlyDestroyedTtlMs;
+            long cutoff = Environment.TickCount64 - RecentlyDestroyedSweepAgeMs;
             foreach (var kvp in _recentlyDestroyedObjects)
                 if (kvp.Value < cutoff)
                     _recentlyDestroyedObjects.TryRemove(kvp.Key, out _);
@@ -352,15 +366,28 @@ public sealed class GameSessionData
 
     public void ClearRecentlyDestroyedObject(WowGuid128 guid) => _recentlyDestroyedObjects.TryRemove(guid, out _);
 
+    // Test seams (RecentlyDestroyedSuppressionTests): inject a mark with a chosen timestamp so
+    // age-dependent behavior is testable without wall-clock waits, and expose the entry count
+    // for the hygiene-sweep assertions.
+    internal void MarkObjectRecentlyDestroyedAtTick(WowGuid128 guid, long tickMs)
+    {
+        if (guid.IsEmpty())
+            return;
+        _recentlyDestroyedObjects[guid] = tickMs;
+    }
+
+    internal int RecentlyDestroyedCountForTest => _recentlyDestroyedObjects.Count;
+
     public bool WasObjectRecentlyDestroyed(WowGuid128 guid, out long agoMs)
     {
         agoMs = 0;
         if (_recentlyDestroyedObjects.TryGetValue(guid, out long when))
         {
+            // Suppress for as long as the mark stands — only a CreateObject (re-approach)
+            // clears it. agoMs feeds the drop diagnostics; values beyond the old 10s TTL are
+            // the packets that used to leak and re-ghost (#415).
             agoMs = Environment.TickCount64 - when;
-            if (agoMs < RecentlyDestroyedTtlMs)
-                return true;
-            _recentlyDestroyedObjects.TryRemove(guid, out _);
+            return true;
         }
         return false;
     }
