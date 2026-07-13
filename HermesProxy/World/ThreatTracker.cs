@@ -51,6 +51,17 @@ public sealed class ThreatTracker
     // SMSG_HIGHEST_THREAT_UPDATE when the top actually changes.
     private readonly Dictionary<WowGuid128, WowGuid128> _lastHighest = new();
 
+    // Ground-truth calibration: per mob, the last (server-target, model-top)
+    // pairing we logged as an UNEXPECTED aggro — the server is hitting someone
+    // our model ranked below its predicted top. The server never emits threat,
+    // so its actual UNIT_FIELD_TARGET is the only oracle; Kronos is a custom
+    // vmangos fork with its own threat bugs, so LTC2's numbers can't be trusted
+    // at face value. Logging every such disagreement (once per episode, not per
+    // event) both calibrates our model against Kronos reality over time AND
+    // gives a paper trail if a player disputes a threat reading. Cleared when
+    // the mob's target and our top agree again.
+    private readonly Dictionary<WowGuid128, (WowGuid128 server, WowGuid128 model)> _lastUnexpectedAggro = new();
+
     // Last-observed UNIT_FLAG_IN_COMBAT per unit (any unit whose flags we see).
     // Lets OnUnitCombatStateObserved detect the in-combat -> out-of-combat edge
     // that drops a threater/mob from the fight. We snapshot it here rather than
@@ -186,6 +197,7 @@ public sealed class ThreatTracker
 
         list.Clear();
         _lastHighest.Remove(mob);
+        _lastUnexpectedAggro.Remove(mob);
         _dirty.Add(mob);
     }
 
@@ -248,6 +260,7 @@ public sealed class ThreatTracker
         if (!_threatLists.Remove(mob))
             return;
         _lastHighest.Remove(mob);
+        _lastUnexpectedAggro.Remove(mob);
         _dirty.Remove(mob);
 
         var pkt = new ThreatClearPkt { UnitGUID = mob };
@@ -283,6 +296,7 @@ public sealed class ThreatTracker
         {
             _threatLists.Remove(mob);
             _lastHighest.Remove(mob);
+        _lastUnexpectedAggro.Remove(mob);
         }
     }
 
@@ -380,8 +394,45 @@ public sealed class ThreatTracker
             if (serverTarget != default && serverTarget != newHighest &&
                 list.TryGetValue(serverTarget, out var serverTargetValue))
             {
+                // Ground-truth calibration + complaint paper trail: the server is
+                // aggroed on serverTarget, but our model ranked them BELOW its
+                // predicted top (newHighest) — i.e. our threat numbers disagree
+                // with what Kronos actually did. Log it once per distinct episode
+                // (dedup on the pairing) with the ratio so systematic model error
+                // (e.g. a class/pet we over- or under-credit on this fork) shows
+                // up as a repeated signature across fights. Always on: aggro
+                // disagreements are infrequent and this is the audit trail.
+                if (serverTargetValue < highestValue)
+                {
+                    var pairing = (serverTarget, newHighest);
+                    if (!_lastUnexpectedAggro.TryGetValue(mob, out var last) || last != pairing)
+                    {
+                        _lastUnexpectedAggro[mob] = pairing;
+                        Log.Event("threat.aggro_unexpected", new
+                        {
+                            mob_low = mob.GetCounter(),
+                            mob_guid = mob.ToString(),
+                            server_target_low = serverTarget.GetCounter(),
+                            server_target_threat = serverTargetValue,
+                            model_top_low = newHighest.GetCounter(),
+                            model_top_threat = highestValue,
+                            // >1 = how much more threat our model gave its top than the
+                            // raider the server actually chose. Large / recurring =
+                            // a value we're getting wrong on Kronos.
+                            model_overcredit_ratio = serverTargetValue > 0 ? highestValue / serverTargetValue : 0.0,
+                            threaters = list.Count,
+                        });
+                    }
+                }
+
                 newHighest = serverTarget;
                 highestValue = serverTargetValue;
+            }
+            else
+            {
+                // Server target and our top agree (or the server target isn't in
+                // our list) — any prior disagreement for this mob is resolved.
+                _lastUnexpectedAggro.Remove(mob);
             }
 
             var update = new ThreatUpdatePkt { UnitGUID = mob };
@@ -440,6 +491,7 @@ public sealed class ThreatTracker
     {
         _threatLists.Clear();
         _lastHighest.Clear();
+        _lastUnexpectedAggro.Clear();
         _dirty.Clear();
         _lastInCombat.Clear();
     }
