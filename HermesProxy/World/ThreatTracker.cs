@@ -792,11 +792,25 @@ public sealed class ThreatTracker
         EmitDirty();
     }
 
-    // LTC2 ExemptGains: spells that should NOT generate energize threat.
+    // Spells whose power gain must NOT generate threat.
+    //   Warlock Life Tap (all ranks) — converts HP to mana; its threat was
+    //     removed in patch 0.8 (2004), so 0 is correct blizzlike, and both KTM
+    //     and LibThreatClassic2 exempt every rank. We were fabricating threat
+    //     from every tap — the one over-credit all three sources agree on
+    //     (Kronos research 2026-07-13). CAVEAT: vmangos-lineage cores have had
+    //     gain-threat bugs (vmangos #2589, Atlantiss #4978); if THIS fork
+    //     regenerates Life Tap threat, the threat.aggro_unexpected logger will
+    //     show warlocks over-credited and we revisit — but 0 is the grounded
+    //     default.
     //   34299 — Improved Leader of the Pack (heal-side, no threat)
     //   33778 — Lifebloom final bloom (overheal-like effect)
+    private static readonly HashSet<int> LifeTapRanks = new()
+    {
+        1454, 1455, 1456, 11687, 11688, 11689,
+    };
+
     private static bool IsEnergizeExempt(int spellId) =>
-        spellId == 34299 || spellId == 33778;
+        spellId == 34299 || spellId == 33778 || LifeTapRanks.Contains(spellId);
 
     // Per-challenger aggro flip margin, matching LibThreatClassic2's
     // GetPullAggroRangeModifier (LibThreatClassic2.lua line 1679-1713).
