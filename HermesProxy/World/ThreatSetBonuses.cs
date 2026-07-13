@@ -212,6 +212,12 @@ internal static class ThreatSetBonuses
     // — caller multiplies the two together.
     public static double GetGearDamageMultiplier(GameSessionData state, Class playerClass, WowGuid128 guid, int spellId)
     {
+        // Only these three classes have a damage-threat set bonus. Early-out
+        // before the (now per-raider, per-event) equipment scan so every other
+        // class's swings don't pay a 19-slot walk to always get 1.0.
+        if (playerClass != Class.Mage && playerClass != Class.Warlock && playerClass != Class.Rogue)
+            return 1.0;
+
         var counts = CountEquippedSetPieces(state, guid);
         double mult = 1.0;
 
@@ -289,6 +295,11 @@ internal static class ThreatSetBonuses
     // per-rank table — caller multiplies the flat amount by this scalar.
     public static double GetGearSpellMultiplier(GameSessionData state, Class playerClass, WowGuid128 guid, int spellId)
     {
+        // Only Warrior (Might→Sunder) and Rogue (Bloodfang→Feint) have a
+        // spell-flat set bonus — early-out before the equipment scan otherwise.
+        if (playerClass != Class.Warrior && playerClass != Class.Rogue)
+            return 1.0;
+
         var counts = CountEquippedSetPieces(state, guid);
 
         // Warrior Might 8-set: Sunder Armor x1.15
