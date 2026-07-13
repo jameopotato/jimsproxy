@@ -1,3 +1,4 @@
+using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
 using System.Collections.Frozen;
@@ -77,11 +78,24 @@ internal static class ThreatSetBonuses
         return map;
     }
 
-    // Count equipped pieces per set the player has on right now. Iterates
-    // slots 0..18 (head..feet + tabard + rings + trinkets) reading the
-    // cached OBJECT_FIELD_ENTRY for each item GUID. Skips empty slots and
-    // items whose entries aren't in any tracked set.
-    public static Dictionary<int, int> CountEquippedSetPieces(GameSessionData state)
+    // Count equipped set pieces for ANY raider (per-GUID). The LOCAL player is
+    // read the private, authoritative way — from their real inventory-slot item
+    // objects (immune to client-side iMorph, which only edits the local rendered
+    // view and never the wire). Every OTHER raider is read from their PUBLIC
+    // visible-item fields, which the server broadcasts for all players in view
+    // and which we already cache — so a groupmate's tier bonuses count exactly,
+    // no addon, no new packets. Vanilla has no transmog, so a visible item entry
+    // IS the equipped item. Only a server-side .morph could diverge, and that
+    // degrades gracefully (a morphed display id matches no set → 0 pieces).
+    public static Dictionary<int, int> CountEquippedSetPieces(GameSessionData state, WowGuid128 guid)
+    {
+        if (guid == state.CurrentPlayerGuid)
+            return CountEquippedSetPiecesLocal(state);
+        return CountEquippedSetPiecesVisible(state, guid);
+    }
+
+    // Local player — real equipped item entries via the private inventory slots.
+    private static Dictionary<int, int> CountEquippedSetPiecesLocal(GameSessionData state)
     {
         var counts = new Dictionary<int, int>();
         int entryIdx = LegacyVersion.GetUpdateField(ObjectField.OBJECT_FIELD_ENTRY);
@@ -106,6 +120,59 @@ internal static class ThreatSetBonuses
                 counts[setId] = counts.GetValueOrDefault(setId) + 1;
         }
         return counts;
+    }
+
+    // Other raiders — set piece entries from their public visible-item fields.
+    // Layout mirrors UpdateHandler's parse: PLAYER_VISIBLE_ITEM_1_0 is the base,
+    // each slot's entry sits at base + slot*offset (offset 12 vanilla / 16 tbc).
+    // Mask to the low 16 bits to recover the raw item entry (all vanilla tier
+    // items are < 65536); we only need armor slots but scan all 19 harmlessly.
+    private static Dictionary<int, int> CountEquippedSetPiecesVisible(GameSessionData state, WowGuid128 guid)
+    {
+        var counts = new Dictionary<int, int>();
+        var fields = state.GetCachedObjectFieldsLegacy(guid);
+        if (fields == null) return counts;
+
+        int baseIdx = LegacyVersion.GetUpdateField(PlayerField.PLAYER_VISIBLE_ITEM_1_0);
+        if (baseIdx < 0) return counts;
+        int offset = LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180) ? 16 : 12;
+
+        for (int slot = 0; slot < 19; slot++)
+        {
+            if (!fields.TryGetValue(baseIdx + slot * offset, out var entryField)) continue;
+            uint itemEntry = (uint)(entryField.Int32Value & 0xFFFF);
+            if (itemEntry == 0) continue;
+
+            if (ItemToSet.TryGetValue(itemEntry, out int setId))
+                counts[setId] = counts.GetValueOrDefault(setId) + 1;
+        }
+        return counts;
+    }
+
+    // Threat-modifying weapon/armor enchants, readable for ALL raiders from the
+    // per-GUID permanent-enchant cache (populated for the inspect UI from the
+    // public visible-item enchant field). Cloak "Subtlety" (2621) shaves 2% off
+    // all threat; gloves "Threat" (2613) adds 2%. Both are common tank enchants.
+    // Returns the combined multiplier (1.0 if neither present).
+    private const uint ENCHANT_CLOAK_SUBTLETY = 2621;
+    private const uint ENCHANT_GLOVES_THREAT  = 2613;
+
+    public static double GetGearEnchantMultiplier(GameSessionData state, WowGuid128 guid)
+    {
+        if (!state.CachedPlayerEnchants.TryGetValue(guid, out var enchants) || enchants == null)
+            return 1.0;
+
+        bool hasSubtlety = false, hasThreat = false;
+        for (int i = 0; i < enchants.Length; i++)
+        {
+            if (enchants[i] == ENCHANT_CLOAK_SUBTLETY) hasSubtlety = true;
+            else if (enchants[i] == ENCHANT_GLOVES_THREAT) hasThreat = true;
+        }
+
+        double mult = 1.0;
+        if (hasSubtlety) mult *= 0.98;
+        if (hasThreat)   mult *= 1.02;
+        return mult;
     }
 
     // Per-spell damage multipliers conditional on set bonuses. Combined with
@@ -143,9 +210,9 @@ internal static class ThreatSetBonuses
     // Returns the gear-derived damage multiplier for this spell (1.0 = no
     // adjustment). Applied alongside the base ThreatModules.DamageMultipliers
     // — caller multiplies the two together.
-    public static double GetGearDamageMultiplier(GameSessionData state, Class playerClass, int spellId)
+    public static double GetGearDamageMultiplier(GameSessionData state, Class playerClass, WowGuid128 guid, int spellId)
     {
-        var counts = CountEquippedSetPieces(state);
+        var counts = CountEquippedSetPieces(state, guid);
         double mult = 1.0;
 
         switch (playerClass)
@@ -177,20 +244,20 @@ internal static class ThreatSetBonuses
 
     // Heal-side multiplier (Vestments of Faith 8-set on Priest: x0.9 to
     // every heal threat event).
-    public static double GetGearHealMultiplier(GameSessionData state, Class playerClass)
+    public static double GetGearHealMultiplier(GameSessionData state, Class playerClass, WowGuid128 guid)
     {
         if (playerClass != Class.Priest) return 1.0;
-        var counts = CountEquippedSetPieces(state);
+        var counts = CountEquippedSetPieces(state, guid);
         return counts.GetValueOrDefault(SET_PRIEST_VESTMENTS_OF_FAITH) >= 8 ? 0.9 : 1.0;
     }
 
     // Per-spell flat threat ADD (not multiplier) for specific set effects.
     // Mage Netherwind 3-set: -100 flat on Scorch/Fireball/Frostbolt, -20 on
     // Arcane Missiles tick. Applied additively to the per-event threat.
-    public static double GetGearDamageFlatAdjust(GameSessionData state, Class playerClass, int spellId)
+    public static double GetGearDamageFlatAdjust(GameSessionData state, Class playerClass, WowGuid128 guid, int spellId)
     {
         if (playerClass != Class.Mage) return 0.0;
-        var counts = CountEquippedSetPieces(state);
+        var counts = CountEquippedSetPieces(state, guid);
         if (counts.GetValueOrDefault(SET_MAGE_NETHERWIND) < 3) return 0.0;
 
         // Scorch R1..9
@@ -220,9 +287,9 @@ internal static class ThreatSetBonuses
     // Spell-specific MULTIPLIER set bonuses (Bloodfang Feint, Might Sunder).
     // These wrap flat-threat spells where the value lives in ThreatModules'
     // per-rank table — caller multiplies the flat amount by this scalar.
-    public static double GetGearSpellMultiplier(GameSessionData state, Class playerClass, int spellId)
+    public static double GetGearSpellMultiplier(GameSessionData state, Class playerClass, WowGuid128 guid, int spellId)
     {
-        var counts = CountEquippedSetPieces(state);
+        var counts = CountEquippedSetPieces(state, guid);
 
         // Warrior Might 8-set: Sunder Armor x1.15
         if (playerClass == Class.Warrior && counts.GetValueOrDefault(SET_WARRIOR_MIGHT) >= 8 &&

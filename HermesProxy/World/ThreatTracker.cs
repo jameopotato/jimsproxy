@@ -18,13 +18,19 @@ namespace HermesProxy.World;
 // default UI target frame) get nothing to display.
 //
 // This class observes combat events forwarded from the legacy server, computes
-// threat per LibThreatClassic2 rules (port-in-progress, see ClassModules/), and
-// emits modern SMSG threat opcodes to the client.
+// threat per LibThreatClassic2 rules (LTC2 is the community model + what the
+// 1.12 KTM meters in the raid compute, so we align to it for raid consistency;
+// the server never emits threat, so live aggro behaviour is the final oracle),
+// and emits modern SMSG threat opcodes to the client.
 //
-// Phase 2 scope: track damage threat for the local player and their pet. Other
-// group members' threat is not yet shown (Phase 6 group sync). Class-specific
-// abilities (Distracting Shot, Feign Death, Sunder Armor flat threat, defensive
-// stance multipliers, etc.) ship in Phase 3+.
+// Scope: tracks threat for the WHOLE in-range group (local player, every party/
+// raid member, and their pets/guardians — see IsRelevantThreater), fed from the
+// combat log which the proxy observes for all units in range. For non-local
+// raiders we read every modifier that's observable on the wire — base damage/
+// heal, class, stance/form, threat auras (Salvation/Tranquil Air), gear set
+// bonuses + threat enchants (public visible-item fields). Only talent-derived
+// modifiers stay local-player-only, because vanilla 1.12 has no talent-inspect
+// opcode; an addon broadcast is the way to recover those (a follow-up).
 //
 // Threading: methods are called from the WorldClient thread (which dispatches
 // SMSG packet handlers). Emission goes back via WorldClient.SendPacketToClient
@@ -71,6 +77,13 @@ public sealed class ThreatTracker
     {
         _session = session;
     }
+
+    // Threat is a PvE-only stat. Computing it in battlegrounds / arenas spends
+    // per-event work (roster scans, aura reads, list building) on a metric no
+    // PvP encounter needs — AV NPC bosses included, by design. Every threat
+    // entry point gates on this instead of on Settings.ThreatEngine alone.
+    private bool ThreatDisabled =>
+        !Settings.ThreatEngine || _session.GameState.IsInBattleground();
 
     // Adds threat with the local player's stance / form / class passive
     // modifier applied. Use for ability-driven flat threat (Sunder, Distracting
@@ -469,7 +482,7 @@ public sealed class ThreatTracker
     // field cache in place, so the pre-update value can't be read back.
     public void OnUnitCombatStateObserved(WowGuid128 guid, bool inCombat)
     {
-        if (!Settings.ThreatEngine) return;
+        if (ThreatDisabled) return;
         if (guid == default) return;
 
         _lastInCombat.TryGetValue(guid, out bool wasInCombat);
@@ -581,7 +594,7 @@ public sealed class ThreatTracker
 
     public void OnDamage(WowGuid128 attacker, WowGuid128 victim, int spellId, double rawDamage)
     {
-        if (!Settings.ThreatEngine) return;
+        if (ThreatDisabled) return;
         if (rawDamage <= 0) return;
         if (!IsRelevantThreater(attacker))
         {
@@ -621,16 +634,17 @@ public sealed class ThreatTracker
 
         // Set-bonus gear adjustments (Mage Arcanist x0.85, Warlock Nemesis x0.8
         // on Destruction, Warlock Plagueheart x0.75, Rogue Bonescythe x0.92,
-        // Mage Netherwind -100/-20 flat). Player-only; pets / guardians don't
-        // carry sets. Layered on top of ability/passive/talent multipliers.
-        double gearMultiplier = 1.0;
-        double gearFlat = 0.0;
-        if (attacker == _session.GameState.CurrentPlayerGuid)
-        {
-            var playerClass = (Class)_session.GameState.CurrentPlayerClass;
-            gearMultiplier = ThreatSetBonuses.GetGearDamageMultiplier(_session.GameState, playerClass, spellId);
-            gearFlat = ThreatSetBonuses.GetGearDamageFlatAdjust(_session.GameState, playerClass, spellId);
-        }
+        // Mage Netherwind -100/-20 flat) + threat enchants (cloak Subtlety -2%,
+        // gloves Threat +2%). Applied for EVERY raider, not just the local
+        // player: the local player's gear comes from the private inventory
+        // slots (iMorph-immune), every groupmate's from their public visible-item
+        // fields + the per-GUID enchant cache. Pets / guardians (class == None)
+        // carry no sets, so their gear/enchant lookups no-op. Layered on top of
+        // ability/passive/talent multipliers.
+        Class attackerClass = GetThreaterClass(attacker);
+        double gearMultiplier = ThreatSetBonuses.GetGearDamageMultiplier(_session.GameState, attackerClass, attacker, spellId);
+        double gearFlat = ThreatSetBonuses.GetGearDamageFlatAdjust(_session.GameState, attackerClass, attacker, spellId);
+        double enchantMultiplier = ThreatSetBonuses.GetGearEnchantMultiplier(_session.GameState, attacker);
 
         // Aura-based threat multiplier (Blessing of Salvation x0.7, Greater
         // Bless of Salvation x0.7, Tranquil Air totem x0.8). Stacks
@@ -639,7 +653,7 @@ public sealed class ThreatTracker
         // we'd otherwise compute it.
         double auraMultiplier = ScanThreatMultiplierAuras(attacker);
 
-        double scaledThreat = (rawDamage * abilityMultiplier * gearMultiplier + gearFlat) * passiveModifier * talentMultiplier * auraMultiplier;
+        double scaledThreat = (rawDamage * abilityMultiplier * gearMultiplier + gearFlat) * passiveModifier * talentMultiplier * auraMultiplier * enchantMultiplier;
         if (scaledThreat < 0) scaledThreat = 0;
         AddThreat(victim, attacker, scaledThreat);
 
@@ -658,7 +672,7 @@ public sealed class ThreatTracker
     // off-healers who DPS, and self-heals while in combat.
     public void OnHeal(WowGuid128 healer, WowGuid128 healTarget, int spellId, double effectiveHeal)
     {
-        if (!Settings.ThreatEngine) return;
+        if (ThreatDisabled) return;
         if (effectiveHeal <= 0) return;
         if (!IsRelevantThreater(healer)) return;
         if (healTarget == default) return;
@@ -700,20 +714,20 @@ public sealed class ThreatTracker
         // heal threat when RF aura is active. Other classes' heals are no-op.
         double talentMultiplier = GetSpellTalentMultiplier(healer, spellId);
 
-        // Set-bonus heal-threat scalar (Priest Vestments of Faith 8-set: x0.9).
-        double gearHealMultiplier = 1.0;
-        if (healer == _session.GameState.CurrentPlayerGuid)
-        {
-            var playerClass = (Class)_session.GameState.CurrentPlayerClass;
-            gearHealMultiplier = ThreatSetBonuses.GetGearHealMultiplier(_session.GameState, playerClass);
-        }
+        // Set-bonus heal-threat scalar (Priest Vestments of Faith 8-set: x0.9) +
+        // threat enchants. Applied for every healer, not just the local player —
+        // groupmate gear from public visible items, enchants from the per-GUID
+        // cache (see OnDamage).
+        Class healerClass = GetThreaterClass(healer);
+        double gearHealMultiplier = ThreatSetBonuses.GetGearHealMultiplier(_session.GameState, healerClass, healer);
+        double enchantMultiplier = ThreatSetBonuses.GetGearEnchantMultiplier(_session.GameState, healer);
 
         // Aura-based threat multiplier (Salvation x0.7 etc.) applies to heal
         // threat just like damage threat — LTC2 puts it in threatMods() which
         // wraps all threat output regardless of source event.
         double auraMultiplier = ScanThreatMultiplierAuras(healer);
 
-        double totalThreat = effectiveHeal * 0.5 * passiveModifier * talentMultiplier * gearHealMultiplier * auraMultiplier;
+        double totalThreat = effectiveHeal * 0.5 * passiveModifier * talentMultiplier * gearHealMultiplier * auraMultiplier * enchantMultiplier;
         // LTC2 divides by EncounterMobs() — total mobs in the encounter, not
         // just the caster's combat list. We approximate with the caster's mob
         // count (close enough for solo/small-group; full encounter sync is a
@@ -770,7 +784,7 @@ public sealed class ThreatTracker
     // math needed proxy-side.
     public void OnEnergize(WowGuid128 caster, WowGuid128 recipient, int spellId, PowerType powerType, double amount)
     {
-        if (!Settings.ThreatEngine) return;
+        if (ThreatDisabled) return;
         if (amount <= 0) return;
         if (!IsRelevantThreater(caster)) return;
         if (IsEnergizeExempt(spellId)) return;
@@ -792,7 +806,7 @@ public sealed class ThreatTracker
     // set so the threat-update SMSG goes out alongside the SpellGo packet.
     public void OnSpellCast(WowGuid128 caster, int spellId, IList<WowGuid128> hitTargets)
     {
-        if (!Settings.ThreatEngine) return;
+        if (ThreatDisabled) return;
         if (caster == default) return;
 
         // First try player/pet handlers. If matched, flush + return.
@@ -1064,7 +1078,7 @@ public sealed class ThreatTracker
     // uses the table amount instead of effective-heal × 0.5.
     public void OnPowerWordShield(WowGuid128 caster, WowGuid128 shieldTarget, int spellId, double baseAmount)
     {
-        if (!Settings.ThreatEngine) return;
+        if (ThreatDisabled) return;
         if (baseAmount <= 0) return;
         if (caster != _session.GameState.CurrentPlayerGuid) return;
         if (shieldTarget == default) return;
