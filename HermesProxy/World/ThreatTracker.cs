@@ -656,12 +656,37 @@ public sealed class ThreatTracker
     // (a future phase) is the proper fix; until then, the limitation is
     // identical to the rest of the system — heal threat works for tanks,
     // off-healers who DPS, and self-heals while in combat.
+    // Heal events whose heal portion generates no threat. Warlock leech
+    // self-heals — Drain Life, Death Coil, Siphon Life (all ranks; LTC2
+    // Warlock.lua ExemptGains). Their DAMAGE still generates threat via
+    // OnDamage; only the self-heal is zeroed. (Holy Nova's heal side is a
+    // known additional gap — its exact heal-spell ids need verifying against
+    // the Priest module before adding.)
+    private static readonly HashSet<int> HealExemptSpells = new()
+    {
+        // Drain Life R1..6
+        689, 699, 709, 7651, 11699, 11700,
+        // Death Coil R1..3
+        6789, 17925, 17926,
+        // Siphon Life R1..4
+        18265, 18879, 18880, 18881,
+    };
+
+    private static bool IsHealExempt(int spellId) => HealExemptSpells.Contains(spellId);
+
     public void OnHeal(WowGuid128 healer, WowGuid128 healTarget, int spellId, double effectiveHeal)
     {
         if (!Settings.ThreatEngine) return;
         if (effectiveHeal <= 0) return;
         if (!IsRelevantThreater(healer)) return;
         if (healTarget == default) return;
+        // Warlock leech self-heals generate NO threat from the heal portion
+        // (their damage still threats normally in OnDamage). LTC2 and KTM both
+        // exempt every rank; blizzlike-correct. Mirrors the Life Tap energize
+        // exemption — same "we were fabricating threat from a leech" class of
+        // bug. Drain Life / Death Coil / Siphon Life heal ranks (LTC2
+        // Warlock.lua ExemptGains).
+        if (IsHealExempt(spellId)) return;
 
         // LTC2 ThreatClassModuleCore.lua line 1148 (prototype:AddThreat):
         //

@@ -48,11 +48,29 @@ internal static class ThreatNPCModules
     {
         var map = new Dictionary<(uint, int), NPCThreatAction>();
 
-        // Molten Core — Ragnaros 11502 / Wrath 20566
+        // Molten Core — Ragnaros 11502 / Wrath 20566.
+        // ⚠️ VALIDATION TARGET (Kronos research 2026-07-13): LTC2 wipes raid
+        // threat here, but KTM-Kronos DELETED this wipe (changelog "fixed
+        // Ragnaros threat reset on knockback"). Wrath is a random-target
+        // knockback firing every ~25-45s, so if Kronos doesn't reset, this
+        // zeroes the MC-endboss meter a dozen+ times per fight. Left AS-IS
+        // pending validation against a real Kronos Ragnaros log (the boss's
+        // melee-target sequence around each Wrath tells us whether threat
+        // actually reset). Remove/guard once confirmed — do NOT drop on LTC2's
+        // word alone (LTC2 is tuned for stock vmangos, not this fork).
         map[(11502, 20566)] = NPCThreatAction.WipeRaidOnMob;
 
         // Molten Core — Shazzrah 12264 / Gate 23138
         map[(12264, 23138)] = NPCThreatAction.WipeRaidOnMob;
+
+        // Naxxramas — Noth the Plaguebringer 15954 / Blink 29211 (teleport =
+        // real server threat wipe). LTC2 hooks this as a BUFF-GAIN because the
+        // 1.12 client surfaces it that way, but the proxy sees the raw
+        // SMSG_SPELL_GO for NPC self-casts (same path Ragnaros Wrath / Shazzrah
+        // Gate already use). Registered here speculatively: if Blink emits a
+        // cast this fires; if it's aura-only on this fork it stays inert (no
+        // harm) until a Noth .pkt confirms and we move it to an aura-edge hook.
+        map[(15954, 29211)] = NPCThreatAction.WipeRaidOnMob;
 
         // Naxxramas — Kel'Thuzad 15990 / Chains of Kel'Thuzad 28410
         map[(15990, 28410)] = NPCThreatAction.WipeRaidOnMob;
