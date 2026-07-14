@@ -2950,12 +2950,18 @@ public class GlobalSessionData
     // (vanilla 1.12), so mixed-population raids see each other's predictions.
     public HealCommBridge HealCommBridge = null!;
 
+    // JimsProxy KTM originator: broadcasts our engine's threat on the 1.12 KLHTM
+    // channel for KLHThreatMeter raiders when the local client has no KTM addon
+    // of its own (the addon case is handled by KtmThreatBridge.RewriteOutbound).
+    public KtmThreatOriginator KtmThreatOriginator = null!;
+
     public GlobalSessionData()
     {
         GameState = GameSessionData.CreateNewGameSessionData(this);
         AuthClient = new AuthClient(this);
         ThreatTracker = new ThreatTracker(this);
         HealCommBridge = new HealCommBridge(this);
+        KtmThreatOriginator = new KtmThreatOriginator(this);
     }
 
     /// <summary>
@@ -3755,6 +3761,7 @@ public class GlobalSessionData
         // Threat lists are tied to the previous character's mob/unit GUIDs;
         // wipe so the new login starts clean.
         ThreatTracker.Reset();
+        KtmThreatOriginator.Reset();
     }
 
     public void SendHermesTextMessage(string message, bool isError = false)

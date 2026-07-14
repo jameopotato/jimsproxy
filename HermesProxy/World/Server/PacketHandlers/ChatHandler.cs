@@ -281,7 +281,13 @@ public partial class WorldSocket
         // addon's LTC2 estimate. Only compute our threat for KLHTM traffic; every
         // other addon prefix skips the lookup and passes straight through.
         if (prefix == KtmThreatBridge.KtmPrefix)
+        {
+            // The local client is sending its own KLHTM → note it so our origination
+            // suppresses (that rewritten stream already carries our number), then
+            // rewrite the addon's value to ours.
+            GetSession().KtmThreatOriginator.NoteClientKtmActivity();
             body = KtmThreatBridge.RewriteOutbound(prefix, body, GetSession().ThreatTracker.GetKtmBroadcastThreat());
+        }
 
         if (string.IsNullOrEmpty(body)) return;
         string text = prefix + '\t' + body;
@@ -323,7 +329,13 @@ public partial class WorldSocket
 
         // JimsProxy KTM threat bridge: see HandleAddonMessage above.
         if (prefix == KtmThreatBridge.KtmPrefix)
+        {
+            // The local client is sending its own KLHTM → note it so our origination
+            // suppresses (that rewritten stream already carries our number), then
+            // rewrite the addon's value to ours.
+            GetSession().KtmThreatOriginator.NoteClientKtmActivity();
             body = KtmThreatBridge.RewriteOutbound(prefix, body, GetSession().ThreatTracker.GetKtmBroadcastThreat());
+        }
 
         if (string.IsNullOrEmpty(body)) return;
         string text = prefix + '\t' + body;

@@ -483,6 +483,15 @@ public sealed class ThreatTracker
                 SendToClient(highest);
             }
         }
+
+        // JimsProxy KTM origination: after pushing SMSG threat to our own client,
+        // consider broadcasting our current-target threat on the 1.12 "KLHTM"
+        // channel so KLHThreatMeter raiders see it too. No-op unless grouped, the
+        // local client isn't already emitting its own KLHTM (that stream is
+        // handled by KtmThreatBridge.RewriteOutbound), and the value changed since
+        // the last throttled emit. Event-driven off this flush — no heartbeat
+        // timer — which reproduces KTMClassic's change-gated cadence.
+        _session.KtmThreatOriginator.MaybeBroadcast();
     }
 
     // Wipe everything — used on session disconnect / character switch. Doesn't
