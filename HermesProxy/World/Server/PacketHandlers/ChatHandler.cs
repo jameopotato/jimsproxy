@@ -274,6 +274,15 @@ public partial class WorldSocket
         // JimsProxy PallyPower: rewrite outbound PLPWR class/skill fields from
         // modern numbering to legacy. Pass-through for non-PallyPower prefixes.
         body = AddonInteropTranslator.TranslateOutbound(prefix, body);
+
+        // JimsProxy KTM threat bridge: when our threat engine is active, replace
+        // the local client's outbound KTM (KLHTM) "t <n>" broadcast with our
+        // computed threat so 1.12 KLHThreatMeter raiders see our number, not the
+        // addon's LTC2 estimate. Only compute our threat for KLHTM traffic; every
+        // other addon prefix skips the lookup and passes straight through.
+        if (prefix == KtmThreatBridge.KtmPrefix)
+            body = KtmThreatBridge.RewriteOutbound(prefix, body, GetSession().ThreatTracker.GetKtmBroadcastThreat());
+
         if (string.IsNullOrEmpty(body)) return;
         string text = prefix + '\t' + body;
 
@@ -311,6 +320,11 @@ public partial class WorldSocket
 
         // JimsProxy PallyPower: see HandleAddonMessage above.
         body = AddonInteropTranslator.TranslateOutbound(prefix, body);
+
+        // JimsProxy KTM threat bridge: see HandleAddonMessage above.
+        if (prefix == KtmThreatBridge.KtmPrefix)
+            body = KtmThreatBridge.RewriteOutbound(prefix, body, GetSession().ThreatTracker.GetKtmBroadcastThreat());
+
         if (string.IsNullOrEmpty(body)) return;
         string text = prefix + '\t' + body;
         string channelName = packet.ChannelGuid.IsEmpty() ? "" :

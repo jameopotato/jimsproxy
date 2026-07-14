@@ -496,6 +496,60 @@ public sealed class ThreatTracker
         _lastInCombat.Clear();
     }
 
+    // KTM (KLHThreatMeter) interop: the local player's current-target threat,
+    // floored to an integer, for broadcast on the 1.12 "KLHTM" addon channel.
+    // KTMClassic's getThreatStringKTM emits floor(threat-on-current-target) as
+    // "t <n>"; we mirror that exactly so our engine's number can REPLACE the
+    // addon's LibThreatClassic2 estimate on the wire — see
+    // KtmThreatBridge.RewriteOutbound. Note we return the RAW floored threat,
+    // NOT ToWireThreat's ×100 modern packing: KTM's wire is the plain integer.
+    //
+    // Returns 0 when the engine is disabled or we're in a battleground (via
+    // ThreatDisabled), when the player has no current target, or when we aren't
+    // tracking threat on that target. The rewrite treats 0 as "no data — leave
+    // the addon's own number alone", so a 0 here never blanks a raider's meter
+    // during the observation gap.
+    //
+    // Target = the player's CurrentSelection. In the common case (no KTM master
+    // target set) that matches the addon's own current-target notion. If an
+    // officer has set a KTM master target that differs from the player's
+    // selection, the addon would report master-target threat while we report
+    // selection threat — a bounded, self-correcting mismatch we accept until
+    // the origination path tracks officer master-target state.
+    public long GetKtmBroadcastThreat()
+    {
+        if (ThreatDisabled)
+            return 0;
+
+        return ComputeKtmBroadcastThreat(
+            _threatLists,
+            _session.GameState.CurrentSelection,
+            _session.GameState.CurrentPlayerGuid);
+    }
+
+    // Pure lookup half of GetKtmBroadcastThreat, split out so the target /
+    // floor / untracked-pair logic is unit-testable with a hand-built threat
+    // list, without standing up a full GlobalSessionData graph (its RealmManager
+    // field initializer needs version config a bare test doesn't have). The
+    // ThreatDisabled gate — shared engine infrastructure — stays in the caller.
+    // Returns the player's floored threat on the mob, or 0 when either GUID is
+    // empty (no current target / no player) or we hold no positive threat for
+    // that pair.
+    internal static long ComputeKtmBroadcastThreat(
+        Dictionary<WowGuid128, Dictionary<WowGuid128, double>> lists,
+        WowGuid128 mob, WowGuid128 player)
+    {
+        if (mob.IsEmpty() || player.IsEmpty())
+            return 0;
+
+        if (!lists.TryGetValue(mob, out var list) ||
+            !list.TryGetValue(player, out double threat) ||
+            threat <= 0)
+            return 0;
+
+        return (long)Math.Floor(threat);
+    }
+
     // Called from SMSG_CANCEL_COMBAT — the legacy server told the local player
     // they've left combat. Most vanilla emulators (incl. Kronos) never emit it,
     // so on those servers the per-unit UNIT_FLAG_IN_COMBAT edge in
