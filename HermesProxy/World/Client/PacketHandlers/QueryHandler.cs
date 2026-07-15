@@ -568,6 +568,37 @@ public partial class WorldClient
         for (int i = 0; i < 24; i++)
             gameObject.Data[i] = packet.ReadInt32();
 
+        // JimsProxy (#403 DIAGNOSTIC — remove once settled): hunter-trap disarm
+        // data-shaping experiments. The 1.14 client blocks Disarm Trap pre-send with
+        // a fabricated "Requires Disarm Trap (300)" for vanilla trap templates
+        // (type 6, lockId 12, level 0, no ContentTuning). Variants reshape one
+        // template field each to discriminate which one the client's lock-gate
+        // reads. Type check runs AFTER the egg override above, so the Rookery Egg
+        // (now GOOBER) is never touched. Data[0] != 0 excludes lockless
+        // environmental/hazard traps.
+        if (Framework.Settings.TrapDisarmDataShape != 0 && gameObject.Type == 6 && gameObject.Data[0] != 0)
+        {
+            int variant = Framework.Settings.TrapDisarmDataShape;
+            int lockBefore = gameObject.Data[0];
+            int levelBefore = gameObject.Data[1];
+            if (variant == 1 || variant == 4)
+                gameObject.Data[1] = 1;              // trap level 0 -> 1 (required = 5*level theory)
+            if (variant == 2 || variant == 4)
+                gameObject.ContentTuningId = 2180;   // 1.14.2's sole ContentTuning row (1-60)
+            if (variant == 3 || variant == 4)
+                gameObject.Data[0] = 13;             // lock 13: explicit Disarm skill 50
+            Log.Event("gameobject.trap.shape", new
+            {
+                entry = response.GameObjectID,
+                variant,
+                lock_before = lockBefore,
+                lock_after = gameObject.Data[0],
+                level_before = levelBefore,
+                level_after = gameObject.Data[1],
+                content_tuning_after = gameObject.ContentTuningId,
+            });
+        }
+
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
             gameObject.Size = packet.ReadFloat();
 

@@ -120,6 +120,21 @@ public static class Settings
     // vmangos, Twinstar) have subtly different wire formats for some CMSGs.
     // Default Kronos since this launcher is built for Kronos.
     public static ServerFork ServerType = ServerFork.Kronos;
+    // JimsProxy (#403 DIAGNOSTIC — remove once the trap-disarm shape is settled):
+    // data-shaping experiments for hunter-trap GO query responses. The 1.14 client
+    // refuses Disarm Trap client-side with a fabricated "Requires Disarm Trap (300)"
+    // even though its Lock.db2 row 12 requires skill 0; these variants A/B-test which
+    // template field the client derives the requirement from.
+    //   0 = off (default)
+    //   1 = Data[1] (trap level) := 1            (required-skill = 5*level theory)
+    //   2 = ContentTuningId := 2180              (1.14.2's sole tuning row, 1-60;
+    //                                             missing-tuning-defaults-to-max theory)
+    //   3 = Data[0] lockId 12 -> 13              (row 13 carries explicit Disarm skill 50;
+    //                                             if the error becomes "(50)" the gate is
+    //                                             lock-row-driven with 0 defaulted to 300)
+    //   4 = all three at once
+    // Client caches GO templates in gameobjectcache.wdb — clear it between variants.
+    public static int TrapDisarmDataShape;
 
     public static bool LoadAndVerifyFrom(ConfigurationParser config)
     {
@@ -157,6 +172,7 @@ public static class Settings
         FormExitStartDeferMs = Math.Clamp(config.GetInt("FormExitStartDeferMs", 100), 0, 300);
         SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 1300), 0, 1300);
         ThreatEngine = config.GetBoolean("ThreatEngine", false);
+        TrapDisarmDataShape = Math.Clamp(config.GetInt("TrapDisarmDataShape", 0), 0, 4);
         var serverTypeStr = config.GetString("ServerType", "Kronos");
         ServerType = serverTypeStr.Equals("Generic", StringComparison.OrdinalIgnoreCase)
             ? ServerFork.Generic : ServerFork.Kronos;
