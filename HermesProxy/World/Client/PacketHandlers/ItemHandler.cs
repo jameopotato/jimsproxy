@@ -17,7 +17,34 @@ public partial class WorldClient
         SetProficiency proficiency = new SetProficiency();
         proficiency.ProficiencyClass = packet.ReadUInt8();
         proficiency.ProficiencyMask = packet.ReadUInt32();
-        SendPacketToClient(proficiency);
+
+        // #410 (item-proficiency tooltip): Kronos front-loads the whole proficiency burst BEFORE
+        // SMSG_LOGIN_VERIFY_WORLD -- confirmed 2026-07-15 in both the legacy JSONL and the modern
+        // .pkt (9/9 SMSG_SET_PROFICIENCY arrive pre-verify, 0 after), matching twinhead #13649
+        // "item proficiency packet is sent at incorrect time". The 1.14 client isn't in world yet,
+        // so it appears to drop them: items it can't use don't turn red and wearable armor shows a
+        // spurious "Requires <ArmorType>" line. Hold each packet until the client is in world (the
+        // delay queue flushes right after we forward login-verify) so it can actually apply it.
+        //
+        // The !IsInWorld gate is load-bearing: a MID-SESSION proficiency change (training a new
+        // weapon type at a trainer) arrives AFTER login-verify, and there is no future login-verify
+        // to flush a delayed copy against -- delaying it would strand it forever. Relogin is already
+        // safe: the client-bound delay queue is intentionally not migrated across a WorldClient
+        // recreate (#384), and proficiency is re-sent fresh on each login.
+        //
+        // *** UNVERIFIED -- hypothesis test, NOT a confirmed fix. ***
+        // It is not yet established that the 1.14 client applies proficiency delivered AFTER
+        // login-verify. JimsPlus TooltipFix concluded the client "ignores" SMSG_SET_PROFICIENCY --
+        // but that was observed with the packet arriving early (i.e. this very bug); a post-verify
+        // delivery has never been tried. If the client still ignores it once in world, this change
+        // is simply inert (harmless) and the client-side TooltipFix stays necessary. Needs a live
+        // test with TooltipFix DISABLED: do unusable items go red / does the "Requires <ArmorType>"
+        // line disappear on wearable armor? Do NOT retire TooltipFix, and do not call this fixed,
+        // until that test is green.
+        if (!GetSession().GameState.IsInWorld)
+            SendPacketToClient(proficiency, Opcode.SMSG_LOGIN_VERIFY_WORLD);
+        else
+            SendPacketToClient(proficiency);
     }
     [PacketHandler(Opcode.SMSG_BUY_SUCCEEDED)]
     void HandleBuySucceeded(WorldPacket packet)
