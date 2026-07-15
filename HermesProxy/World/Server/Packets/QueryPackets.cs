@@ -575,7 +575,7 @@ public class QueryGameObjectResponse : ServerPacket
             foreach (uint questItem in Stats.QuestItems)
                 statsData.WriteUInt32(questItem);
 
-            statsData.WriteUInt32(Stats.ContentTuningId);
+            statsData.WriteUInt32(Stats.RequiredLevel);
         }
 
         _worldPacket.WriteUInt32(statsData.GetSize());
@@ -605,7 +605,13 @@ public class GameObjectStats
     public int[] Data = new int[35];
     public float Size = 1;
     public List<uint> QuestItems = new();
-    public uint ContentTuningId;
+    // JimsProxy (#403 decode): retail-lineage layouts call this trailing field
+    // ContentTuningID, but the 1.14.2 client reads it as a plain REQUIRED LEVEL —
+    // feeding a tuning id here renders "Requires Level <id>" on the object and
+    // suppresses interaction (verified in-game 2026-07-14 by writing 2180 and
+    // watching the error text). Keep 0 (no level requirement) unless a template
+    // genuinely carries one.
+    public uint RequiredLevel;
 }
 
 public class QueryPageText : ClientPacket

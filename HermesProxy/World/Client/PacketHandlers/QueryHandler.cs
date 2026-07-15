@@ -568,6 +568,25 @@ public partial class WorldClient
         for (int i = 0; i < 24; i++)
             gameObject.Data[i] = packet.ReadInt32();
 
+        // JimsProxy (#403): hunter traps carry vanilla lock 12 (Skill=0) and the
+        // 1.14 client fabricates "Requires Disarm Trap (300)" for skill-0 lock
+        // rows, refusing the right-click disarm pre-send. Remap to lock 13
+        // (explicit Disarm 50) so the client's gate compares honestly; the legacy
+        // server still arbitrates the actual disarm cast. See
+        // GameObjectTemplateShaping for the full mechanism and verification.
+        // Cached in gameobjectcache.wdb — players need a one-time cache clear.
+        // Runs after the egg override above, so the Rookery Egg (now GOOBER type)
+        // is never touched.
+        int lockBefore = gameObject.Data[0];
+        gameObject.Data[0] = GameObjectTemplateShaping.RemapTrapLock(gameObject.Type, gameObject.Data[0]);
+        if (gameObject.Data[0] != lockBefore)
+            Log.Event("gameobject.trap.lock_remapped", new
+            {
+                entry = response.GameObjectID,
+                lock_before = lockBefore,
+                lock_after = gameObject.Data[0],
+            });
+
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
             gameObject.Size = packet.ReadFloat();
 
