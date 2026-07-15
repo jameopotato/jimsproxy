@@ -226,6 +226,10 @@ public partial class WorldClient
             return;
         }
 
+        // JimsProxy: never forward the server's echo of our own addon whisper — it carries the TARGET's guid, so addons (and the HealComm bridge below) would parse our message as if the target sent it.
+        if (chatType == ChatMessageTypeVanilla.WhisperInform && DropAddonWhisperInformEcho(language, text))
+            return;
+
         // JimsProxy HealComm bridge: rewrite inbound HealComm-1.0 addon
         // messages from 1.12-native players into LibHealComm-4.0 form so
         // the modern client's LHC40 prefix consumes them. Must run before
@@ -297,6 +301,22 @@ public partial class WorldClient
                 });
                 return $"|Hitem:{itemId}:{enchant}:0:0:0:0:{suffixModern}:0:60:0:0:0|h";
             });
+    }
+
+    // JimsProxy: a native modern client never receives its own addon whispers back; returns true when the message is an addon-language whisper-inform echo to discard.
+    private static bool DropAddonWhisperInformEcho(uint language, string text)
+    {
+        if (language != (uint)Language.Addon)
+            return false;
+        int tabIdx = string.IsNullOrEmpty(text) ? -1 : text.IndexOf('\t');
+        string prefix = tabIdx > 0 ? text.Substring(0, tabIdx) : "";
+        // Bodies can be binary and bursty (AceComm-style sync); only log PLPWR bodies, which are the diagnostic target.
+        Log.Event("addon.whisper_inform.dropped", new
+        {
+            prefix,
+            body = prefix == "PLPWR" ? text.Substring(tabIdx + 1) : null,
+        });
+        return true;
     }
 
     private void TryHealCommInboundTranslate(WowGuid128 sender, string senderName, uint language, ref string text)
@@ -438,6 +458,10 @@ public partial class WorldClient
             }
             return;
         }
+
+        // JimsProxy: see HandleServerChatMessageVanilla — never forward addon whisper-inform echoes.
+        if (chatType == ChatMessageTypeWotLK.WhisperInform && DropAddonWhisperInformEcho(language, text))
+            return;
 
         // JimsProxy HealComm bridge: see HandleServerChatMessageVanilla above.
         TryHealCommInboundTranslate(sender, senderName, language, ref text);

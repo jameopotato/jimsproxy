@@ -257,6 +257,8 @@ public partial class WorldSocket
         // in GameSessionData can forward held casts via this socket.
         if (isVanillaServer && GetSession().GameState.OnGcdHeldCastFire == null)
             GetSession().GameState.OnGcdHeldCastFire = ForwardHeldGcdCast;
+        if (isVanillaServer)
+            GetSession().GameState.OnAutoRepeatRetry = ForwardAutoRepeatRetry;
 
         if (isNextMelee || isAutoRepeat)
         {
@@ -268,6 +270,8 @@ public partial class WorldSocket
             castRequest.SpellXSpellVisualId = cast.Cast.SpellXSpellVisualID;
             castRequest.ClientGUID = cast.Cast.CastID;
             castRequest.TargetGuid = cast.Cast.Target.Unit;
+            if (isAutoRepeat)
+                castRequest.HeldPacketForReplay = BuildCastSpellPacket(cast);
 
             // Get the appropriate tracking variable based on spell type
             ref ClientCastRequest? currentCast = ref (isAutoRepeat
@@ -754,6 +758,28 @@ public partial class WorldSocket
             return;
 
         var gameState = GetSession().GameState;
+
+        // JimsProxy (#394 GCD-boundary double-forward): the release timer runs on the Windows
+        // timer quantum (~15.6ms), so it can fire LATE relative to the GCD deadline. A fresh
+        // same-spell press landing in that gap sees the quantized clock as "GCD over" (window
+        // check and ShouldDropLateSameSpell both read expired) and forwards immediately — if we
+        // then still fire the held press, the server gets TWO CMSGs ~ms apart in reversed press
+        // order. The loser's transient CAST_FAILED lands between the winner's START and GO and
+        // desyncs the pairing (START→CastFailed→GO in one client frame = the #394 looping
+        // sound). The fresh press won the race and IS this spell's cast — ack the stale held
+        // press instead of double-forwarding. The reverse ordering (timer first, press after)
+        // is already handled: the press finds HasForwardedPendingCast() true and is parked.
+        if (gameState.HasNonStartedPendingCastForSpell(cast.SpellId))
+        {
+            SendCastRequestFailed(cast, false, SpellCastResultClassic.DontReport);
+            Log.Event("spell.held_fire_superseded", new
+            {
+                spell_id = cast.SpellId,
+                client_cast_id = cast.ClientGUID.ToString(),
+            });
+            return;
+        }
+
         // DIAGNOSTIC (stuck-spell investigation): remove when closed
         if (Framework.Settings.DebugOutput)
             Log.Event("cast.forwarded", new
@@ -777,6 +803,16 @@ public partial class WorldSocket
         });
         SendPacketToServer(cast.HeldPacketForReplay);
     }
+
+    internal void ForwardAutoRepeatRetry(ClientCastRequest cast)
+    {
+        if (cast.HeldPacketForReplay == null)
+            return;
+
+        cast.Timestamp = Environment.TickCount;
+        SendPacketToServer(cast.HeldPacketForReplay);
+    }
+
     [PacketHandler(Opcode.CMSG_PET_CAST_SPELL)]
     void HandlePetCastSpell(PetCastSpell cast)
     {
@@ -899,6 +935,30 @@ public partial class WorldSocket
         SpellCastTargetFlags targetFlags = ConvertSpellTargetFlags(use.Cast.Target);
         WriteSpellTargets(use.Cast.Target, targetFlags, packet);
         SendPacketToServer(packet);
+
+        // JimsProxy (Kronos Chronoboon): the stored-world-buff list is rewritten into the item's
+        // Description server-side on each store/restore. The 1.14 client caches item templates by
+        // id and never re-queries, so the tooltip would stay frozen at whatever was first cached
+        // ("Empty"). The CMSG_USE_ITEM above is processed before this follow-up query (in-order on
+        // the legacy link), so the server answers it with the post-transform Description;
+        // HandleItemQueryResponse then live-pushes the fresh ItemSparse as a hotfix. Detect by
+        // name so empty/supercharged/base/XL variants all match.
+        if (!use.CastItem.IsEmpty())
+        {
+            uint chronoEntry = GetSession().GameState.GetItemId(use.CastItem);
+            ItemTemplate? chronoTemplate = chronoEntry != 0 ? GameData.GetItemTemplate(chronoEntry) : null;
+            if (chronoTemplate != null && chronoTemplate.Name[0] != null &&
+                chronoTemplate.Name[0].Contains("Chronoboon Displacer"))
+            {
+                // The Chronoboon's on-use is a LONG cast and only changes the item's tooltip once the
+                // cast COMPLETES. Re-querying/refreshing now would read the pre-cast state, and the
+                // refresh's destroy+recreate would cancel the in-progress cast. Defer until the cast's
+                // SMSG_SPELL_GO (HandleSpellGo) fires. Key on the legacy on-use spell id so the GO matches.
+                uint castSpellId = legacySpellId != 0 ? legacySpellId : (uint)use.Cast.SpellID;
+                GetSession().GameState.ChronoboonCastAwaitingGo[castSpellId] = (chronoEntry, use.CastItem);
+                GetSession().GameState.ChronoboonOnUseSpells[castSpellId] = 0;
+            }
+        }
     }
     [PacketHandler(Opcode.CMSG_CANCEL_CAST)]
     void HandleCancelCast(CancelCast cast)
@@ -956,6 +1016,7 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CANCEL_AUTO_REPEAT_SPELL)]
     void HandleCancelAutoRepeatSpell(CancelAutoRepeatSpell spell)
     {
+        GetSession().GameState.CurrentClientAutoRepeatCast = null;
         WorldPacket packet = new WorldPacket(Opcode.CMSG_CANCEL_AUTO_REPEAT_SPELL);
         SendPacketToServer(packet);
     }
@@ -969,7 +1030,27 @@ public partial class WorldSocket
         WorldPacket packet = new WorldPacket(Opcode.CMSG_CANCEL_AURA);
         packet.WriteUInt32(aura.SpellID);
         SendPacketToServer(packet);
+
+        // JimsProxy (#379 form-exit): the 1.14 client auto-shifts out of a form to cast —
+        // CANCEL_AURA(form) + CAST_SPELL land ~1ms apart. Arm the defer window so the cast's
+        // SMSG_SPELL_START (arriving ~RTT later, ~20ms AHEAD of the form-removal UPDATE_OBJECT)
+        // is held until the model swap renders. Form auras only — gating on any CANCEL_AURA
+        // would defer casts after ordinary buff cancels too (ice-92's correction in #379).
+        if (Settings.FormExitStartDeferMs > 0 && GameData.ShapeshiftFormSpells.Contains(aura.SpellID))
+        {
+            GetSession().GameState.OpenFormExitWindow(FormExitWindowMs);
+            Log.Event("spell.form_exit_window_opened", new
+            {
+                form_spell_id = aura.SpellID,
+            });
+        }
     }
+
+    // JimsProxy (#379 form-exit): how long after a form-cancel the next local SPELL_START is
+    // treated as the auto-shift cast. Covers CANCEL_AURA→SPELL_START (one server round-trip +
+    // ~20ms emit spacing) with headroom for high-RTT players. A window that outlives the shift
+    // (form cancelled, no cast) only defers one later START by FormExitStartDeferMs — cosmetic.
+    private const int FormExitWindowMs = 500;
     [PacketHandler(Opcode.CMSG_CANCEL_MOUNT_AURA)]
     void HandleCancelMountAura(EmptyClientPacket cancel)
     {

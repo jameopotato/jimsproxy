@@ -59,6 +59,21 @@ partial class Server
         // rest of startup gets a process.crash event with a flushed JSONL.
         ShutdownHooks.Install();
 
+        // JimsProxy: when launched by the launcher (stdin piped, not an interactive console),
+        // listen for a graceful-shutdown sentinel on stdin so the launcher can stop us cleanly
+        // (flush the JSONL diag log + emit a final event) instead of taskkill /F. Own-console
+        // runs (double-clicked exe) have stdin on the keyboard — skip, so Program.cs's
+        // end-of-run "Press enter to close" prompt stays intact.
+        if (Console.IsInputRedirected)
+        {
+            var stdinShutdownThread = new Thread(ListenForLauncherShutdown)
+            {
+                IsBackground = true,
+                Name = "StdinShutdownListener",
+            };
+            stdinShutdownThread.Start();
+        }
+
         if (Environment.CurrentDirectory != Path.GetDirectoryName(AppContext.BaseDirectory))
         {
             Log.Print(LogType.Storage, "Switching working directory");
@@ -181,6 +196,35 @@ partial class Server
         // JimsProxy: emit session.end and flush JSONL
         Log.Event("session.end", null);
         Log.FlushAndCloseStructuredLog();
+    }
+
+    // JimsProxy: the launcher writes this exact line to the proxy's stdin to request a clean
+    // shutdown (contract shared with the launcher's HermesManager::stop). All other stdin
+    // input is ignored.
+    private const string LauncherShutdownSentinel = "__LAUNCHER_SHUTDOWN__";
+
+    private static void ListenForLauncherShutdown()
+    {
+        try
+        {
+            string? line;
+            while ((line = Console.In.ReadLine()) != null)
+            {
+                if (line.Trim() == LauncherShutdownSentinel)
+                {
+                    Log.Event("process.shutdown_request", new { source = "stdin", sentinel = LauncherShutdownSentinel });
+                    ShutdownHooks.TriggerGracefulExit("stdin_launcher_shutdown");
+                    return;
+                }
+                // Any other stdin line is ignored.
+            }
+        }
+        catch (Exception ex)
+        {
+            // stdin closed / unreadable — nothing to do; the launcher's taskkill fallback
+            // covers a hard close.
+            Log.Event("process.stdin_listener_stopped", new { exception_type = ex.GetType().Name, message = ex.Message });
+        }
     }
 
     private static SocketManager<TSocketType> StartServer<TSocketType>(IPEndPoint bindIp) where TSocketType : ISocket

@@ -175,6 +175,80 @@ public class GcdHoldTests
         Assert.Equal(200u, fired?.SpellId);
     }
 
+    // JimsProxy (GCD held_pending race): a press parked by ForceHoldCast (the
+    // HasForwardedPendingCast guard) has no timer/deadline of its own. When the cast that
+    // blocked it is a CAST-TIME spell, TakeForcedHoldOrphanedByCastTimeStart releases it at
+    // that cast's SPELL_START so it doesn't ride the whole cast and fire a full cast-time late.
+
+    [Fact]
+    public void TakeForcedHoldOrphanedByCastTimeStart_CastTimeStart_NoActiveTimer_ReleasesParkedCast()
+    {
+        var session = NewSession();
+        var parked = MakeCast(10202); // Arcane Explosion (instant), parked behind the cast-time spell
+        session.ForceHoldCast(parked);
+
+        // Frostbolt (3000ms cast-time) reaches SPELL_START; no GCD timer is armed for it, and its
+        // next SPELL_GO is 3s away at completion. Without release here the press rides the cast.
+        var released = session.TakeForcedHoldOrphanedByCastTimeStart(startedCastTimeMs: 3000);
+
+        Assert.Same(parked, released);
+        Assert.Null(session.PeekHeldGcdCast());
+    }
+
+    [Fact]
+    public void TakeForcedHoldOrphanedByCastTimeStart_InstantStart_LeavesParkedCast()
+    {
+        var session = NewSession();
+        var parked = MakeCast(10202);
+        session.ForceHoldCast(parked);
+
+        // An instant START (CastTime == 0) is left to the existing GO/BeginGcd timer path,
+        // which correctly queues an instant-after-instant press for the next GCD expiry.
+        var released = session.TakeForcedHoldOrphanedByCastTimeStart(startedCastTimeMs: 0);
+
+        Assert.Null(released);
+        Assert.Same(parked, session.PeekHeldGcdCast());
+    }
+
+    [Fact]
+    public void TakeForcedHoldOrphanedByCastTimeStart_GcdTimerStillPending_LeavesParkedCast()
+    {
+        var session = NewSession();
+        long now = Environment.TickCount64;
+        session.BeginGcd(now + 5000, now + 5000); // GCD active — its timer will release the hold
+        var parked = MakeCast(10202);
+        session.ForceHoldCast(parked);
+
+        var released = session.TakeForcedHoldOrphanedByCastTimeStart(startedCastTimeMs: 3000);
+
+        Assert.Null(released);
+        Assert.Same(parked, session.PeekHeldGcdCast());
+
+        session.CancelGcdHold(); // dispose the pending timer
+    }
+
+    [Fact]
+    public void TakeForcedHoldOrphanedByCastTimeStart_AnotherForwardedCastUnstarted_LeavesParkedCast()
+    {
+        var session = NewSession();
+        var forwarded = MakeCast(10181); // a still-unstarted forwarded cast — keep waiting for it
+        session.PendingNormalCasts.Enqueue(forwarded);
+        var parked = MakeCast(10202);
+        session.ForceHoldCast(parked);
+
+        var released = session.TakeForcedHoldOrphanedByCastTimeStart(startedCastTimeMs: 3000);
+
+        Assert.Null(released);
+        Assert.Same(parked, session.PeekHeldGcdCast());
+    }
+
+    [Fact]
+    public void TakeForcedHoldOrphanedByCastTimeStart_NothingParked_ReturnsNull()
+    {
+        var session = NewSession();
+        Assert.Null(session.TakeForcedHoldOrphanedByCastTimeStart(startedCastTimeMs: 3000));
+    }
+
     // JimsProxy issue #43 post-review hardening tests:
 
     [Fact]

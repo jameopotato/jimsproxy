@@ -26,6 +26,19 @@ public partial class WorldSocket
 
             Log.PrintNet(LogType.Debug, LogNetDir.C2P, $"DB_QUERY_BULK requested ({query.TableHash}) #{id}");
 
+            // JimsProxy (Kronos Chronoboon alias): the client queries the alias's ItemSparse but NEVER the
+            // Item table, and push-delivering the Item record BEFORE the client's query makes it skip the
+            // query (stuck "Retrieving"). The Item + on-use ItemEffect hotfix packets were pre-built at
+            // mint on the WC thread (so this WS-thread handler never mutates the shared record stores —
+            // that would race the loot path's writes); drain + send them ONCE here, inside the ItemSparse
+            // query-response window. The ItemSparse reply itself is built from the template further below.
+            if (GameData.IsItemEntryAlias(id) && query.TableHash == DB2Hash.ItemSparse)
+            {
+                if (GetSession().GameState.AliasPendingPackets.TryRemove(id, out var aliasPackets))
+                    foreach (var aliasPacket in aliasPackets)
+                        SendPacket(aliasPacket);
+            }
+
             if (query.TableHash == DB2Hash.BroadcastText)
             {
                 BroadcastText? bct = GameData.GetBroadcastText(id);

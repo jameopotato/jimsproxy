@@ -639,6 +639,50 @@ public partial class WorldClient
         SendPacketToClient(response);
     }
 
+    // JimsProxy (Kronos Chronoboon): mint a fresh throwaway alias entry for a Chronoboon item GUID,
+    // cloning the given (current-state) template and pre-building its Item + on-use ItemEffect hotfix
+    // packets for HandleDbQueryBulk to deliver in the client's query window (building them here on the WC
+    // thread keeps that WS-thread handler from racing the loot path's record-store writes). Frees the
+    // prior alias for this GUID first. Returns the alias id. Used by BOTH the on-use refresh (which then
+    // destroy+recreates the item) and the login-time proactive alias (which lets the natural item create
+    // carry the alias — no recreate, so an active on-use cooldown survives).
+    private uint MintChronoboonAlias(WowGuid128 guid, ItemTemplate template)
+    {
+        if (GameData.ItemEntryAlias.TryGetValue(guid, out var priorAlias))
+        {
+            GameData.EvictItemEntryAlias(priorAlias);
+            GetSession().GameState.AliasPendingPackets.TryRemove(priorAlias, out _);
+        }
+
+        uint alias = GameData.NextItemEntryAlias();
+        ItemTemplate aliasTemplate = template.CloneWithEntry(alias);
+        GameData.StoreItemTemplate(alias, aliasTemplate);
+        GameData.ItemEntryAlias[guid] = alias;
+
+        var aliasPackets = new List<ServerPacket>();
+        var aliasItemMsg = GameData.GenerateItemUpdateIfNeeded(aliasTemplate);
+        if (aliasItemMsg != null)
+            aliasPackets.Add(aliasItemMsg);
+        for (byte slot = 0; slot < 5; slot++)
+        {
+            var effectMsg = GameData.GenerateItemEffectUpdateIfNeeded(aliasTemplate, slot);
+            if (effectMsg == null)
+                continue;
+            aliasPackets.Add(effectMsg);
+            var effectHotfix = effectMsg.Hotfixes[0];
+            aliasPackets.Add(new DBReply
+            {
+                Status = effectHotfix.Status,
+                Timestamp = (uint)Time.UnixTime,
+                RecordID = effectHotfix.RecordId,
+                TableHash = effectHotfix.TableHash,
+                Data = effectHotfix.HotfixContent,
+            });
+        }
+        GetSession().GameState.AliasPendingPackets[alias] = aliasPackets;
+        return alias;
+    }
+
     [PacketHandler(Opcode.SMSG_ITEM_QUERY_SINGLE_RESPONSE)]
     void HandleItemQueryResponse(WorldPacket packet)
     {
@@ -668,6 +712,74 @@ public partial class WorldClient
 
         ItemTemplate item = new ItemTemplate();
         item.ReadFromLegacyPacket((uint)entry.Key, packet);
+
+        // JimsProxy (Kronos Chronoboon): the modern client keys the bag pickup/putdown sound off the Item.db2 ItemGroupSoundsId (verified in the client's Item table: soul shards + empty/crystal/leaded vials = group 24 = the light glass "clink", full potions = 17, Misc class-15 = 16, a legacy-queried custom item = 0 = silent). Force 24 so the Chronoboon gets the soul-shard/empty-vial clink it has natively on 1.12. Set on the parsed template so the base item AND the alias clone (below) carry it; name shifts ("Empty"/"Supercharged...XL") as buffs store, so match on Contains.
+        if (item.Name[0]?.Contains("Chronoboon Displacer") == true)
+        {
+            item.ItemGroupSoundsId = 24;
+        }
+
+        // JimsProxy (Kronos Chronoboon): this answers the proxy-issued re-query fired from
+        // HandleUseItem after a store/restore. The server rebuilt the item's Name/Description
+        // (the stored-world-buff list) for the current state. The 1.14 client already has this
+        // item cached and won't re-query, so refresh its tooltip by live-pushing the updated
+        // ItemSparse as a hotfix with a fresh id (UpdateHotfix reuses ids, which the client
+        // treats as already-applied; only a fresh id takes mid-session). Bypasses the normal
+        // SendItemUpdatesIfNeeded path, whose existing-record branch is a documented client
+        // crash that defers to next login.
+        if (GetSession().GameState.DynamicItemRefreshPending.TryGetValue((uint)entry.Key, out var chronoGuid))
+        {
+            GetSession().GameState.DynamicItemRefreshPending.Remove((uint)entry.Key);
+            GameData.StoreItemTemplate((uint)entry.Key, item); // keep the REAL template current (use-side detection reads it)
+
+            // Mint a throwaway alias entry carrying the just-queried Name/Description/icon + on-use,
+            // and present the bag item to the client under it (see the alias substitution in
+            // StoreObjectUpdateInternal). The client has never seen this id, so it fetches it clean
+            // and renders the live tooltip — beating the per-id template cache that blocks every
+            // in-place refresh. The REAL entry stays in the legacy field cache, so use-item still
+            // forwards by slot/GUID untouched (HandleUseItem detection re-mints on the next use).
+            MintChronoboonAlias(chronoGuid, item);
+
+            // Swap the bag item to the alias so the client re-reads it (it ignores a create for an
+            // object it already has and a Values entry change, so RecreateItemObjectForClient does a
+            // destroy + re-create with the alias entry substituted in; same GUID keeps the slot).
+            // Safe to do immediately here: this re-query was triggered by the on-use cast's SMSG_SPELL_GO
+            // (HandleSpellGo), i.e. the cast already completed, so the destroy can't interrupt it.
+            RecreateItemObjectForClient(chronoGuid);
+
+            // Re-assert the on-use cooldown — the destroy+recreate wiped the recreated item's sweep and
+            // the server's one-shot SMSG_COOLDOWN_EVENT was consumed by the now-destroyed object. An item
+            // cooldown binds to the item GUID (which exists the moment the recreate above ran), so it
+            // applies even before the alias resolves and shows the instant it does. Sent SYNCHRONOUSLY on
+            // this (WC) thread: a Task.Delay continuation could spin a pool thread forever inside
+            // SendPacketToClient's wait-for-socket loop if the player DC'd in the delay window.
+            int onUseSpell = item.TriggeredSpellIds[0];
+            int onUseCooldown = item.TriggeredSpellCooldowns[0];
+            if (onUseSpell > 0 && onUseCooldown > 0)
+            {
+                ItemCooldown itemCooldownPkt = new();
+                itemCooldownPkt.ItemGuid = chronoGuid;
+                itemCooldownPkt.SpellID = (uint)onUseSpell;
+                itemCooldownPkt.Cooldown = (uint)onUseCooldown;
+                SendPacketToClient(itemCooldownPkt);
+
+                SpellCooldownPkt spellCooldownPkt = new();
+                spellCooldownPkt.Caster = GetSession().GameState.CurrentPlayerGuid;
+                spellCooldownPkt.SpellCooldowns.Add(new SpellCooldownStruct
+                {
+                    SpellID = (uint)onUseSpell,
+                    ForcedCooldown = (uint)onUseCooldown,
+                });
+                SendPacketToClient(spellCooldownPkt);
+
+                // JimsProxy (Kronos Chronoboon): keep the captured end-time current after a use so a later
+                // bank-open repaint (HandleShowBank) reflects the real remaining, not the stale login value.
+                GetSession().GameState.ChronoboonOnUseCooldownEndMs[(uint)onUseSpell] = Environment.TickCount64 + onUseCooldown;
+                GetSession().GameState.ChronoboonItemGuids.Add(chronoGuid);
+            }
+
+            return;
+        }
 
         SendItemUpdatesIfNeeded(item);
         GameData.StoreItemTemplate((uint)entry.Key, item);

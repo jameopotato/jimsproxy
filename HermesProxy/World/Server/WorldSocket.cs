@@ -463,7 +463,13 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
 
     private void SendPacketToServer(WorldPacket packet, Opcode delayUntilOpcode = Opcode.MSG_NULL_ACTION)
     {
-        if (GetSession().WorldClient != null)
+        // JimsProxy (teardown TOCTOU): read the field ONCE. The teardown paths (silent-stall
+        // watchdog, modern-death watchdog) null session.WorldClient cross-thread, and this
+        // method also runs on ThreadPool callbacks with no try/catch above it (the GCD
+        // hold-release timer via ForwardHeldGcdCast, knock loops) — a null landing between
+        // a re-checked read and the dereference would NRE and kill the whole process.
+        var worldClient = GetSession().WorldClient;
+        if (worldClient != null)
         {
             // Reset the drop-window counter on first successful send after a DC,
             // emit a final summary so the JSONL shows the size of the gap.
@@ -479,7 +485,7 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
                     window_ms = firstMs == 0 ? 0 : Environment.TickCount64 - firstMs,
                 });
             }
-            GetSession().WorldClient!.SendPacketToServer(packet, delayUntilOpcode);
+            worldClient.SendPacketToServer(packet, delayUntilOpcode);
             return;
         }
 

@@ -178,6 +178,52 @@ public class AddonInteropTranslatorTests
     }
 
     // -------------------------------------------------------------------
+    // COOLDOWNS normalization (inbound only) — malformed tails half-build
+    // the receiver's CooldownInfo and error every grid OnUpdate.
+    // -------------------------------------------------------------------
+
+    [Theory]
+    // Bare COOLDOWNS with no tail at all (empty cooldown list variants).
+    [InlineData("COOLDOWNS", "COOLDOWNS:n:n:n:n")]
+    [InlineData("FREEASSIGN NO | SYMCOUNT 184 | COOLDOWNS", "FREEASSIGN NO | SYMCOUNT 184 | COOLDOWNS:n:n:n:n")]
+    // Short tail: only one pair sent — pad the second pair.
+    [InlineData("COOLDOWNS:300:180", "COOLDOWNS:300:180:n:n")]
+    // Duration "n" but remaining numeric crashes the receiver — force the pair to n:n.
+    [InlineData("COOLDOWNS:n:300:n:n", "COOLDOWNS:n:n:n:n")]
+    // Garbage tokens become n:n pairs.
+    [InlineData("COOLDOWNS:abc:def:n:n", "COOLDOWNS:n:n:n:n")]
+    // Parseable-by-.NET but not receiver-safe tokens are rejected too.
+    [InlineData("COOLDOWNS:NaN:NaN:n:n", "COOLDOWNS:n:n:n:n")]
+    [InlineData("COOLDOWNS:Infinity:300:n:n", "COOLDOWNS:n:n:n:n")]
+    [InlineData("COOLDOWNS:1e5:300:n:n", "COOLDOWNS:n:n:n:n")]
+    // Space-delimited variant salvages the numeric pair.
+    [InlineData("COOLDOWNS 300 180", "COOLDOWNS:300:180:n:n")]
+    // Trailing segment after the tokens is dropped rather than fed to strsplit.
+    [InlineData("COOLDOWNS:300:180 | EXTRA", "COOLDOWNS:300:n:n:n")]
+    public void TranslateInbound_MalformedCooldowns_NormalizedToSafeTail(string input, string expected)
+    {
+        Assert.Equal(expected, AddonInteropTranslator.TranslateInbound("PLPWR", input));
+    }
+
+    [Theory]
+    // Well-formed tails must pass through byte-identical.
+    [InlineData("FREEASSIGN NO | SYMCOUNT 184 | COOLDOWNS:n:n:n:n")]
+    [InlineData("FREEASSIGN YES | SYMCOUNT 5 | COOLDOWNS:300:180:60:30")]
+    [InlineData("COOLDOWNS:1800:1799.5:n:n")]
+    public void TranslateInbound_WellFormedCooldowns_PassThrough(string body)
+    {
+        Assert.Equal(body, AddonInteropTranslator.TranslateInbound("PLPWR", body));
+    }
+
+    [Fact]
+    public void TranslateOutbound_MalformedCooldowns_NotNormalized()
+    {
+        // Outbound is never rewritten: modern senders are well-formed and the legacy wire stays canonical.
+        const string body = "FREEASSIGN NO | SYMCOUNT 184 | COOLDOWNS";
+        Assert.Equal(body, AddonInteropTranslator.TranslateOutbound("PLPWR", body));
+    }
+
+    // -------------------------------------------------------------------
     // Defensive guards.
     // -------------------------------------------------------------------
 

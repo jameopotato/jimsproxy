@@ -30,9 +30,10 @@ namespace HermesProxy.World.Server;
 //   - PASSIGN <name>@<assign>           assign chars via lookup (1.14-only,
 //                                          included for completeness)
 //
-// All other PallyPower messages (CLEAR, REQ, SYMCOUNT, COOLDOWNS, FREEASSIGN,
-// PPLEADER, NASSIGN, AASSIGN, ASELF) carry no class/skill IDs that need
-// translation, or they're 1.14-only features that 1.12 silently ignores.
+// All other PallyPower messages (CLEAR, REQ, SYMCOUNT, FREEASSIGN, PPLEADER,
+// NASSIGN, AASSIGN, ASELF) carry no class/skill IDs that need translation,
+// or they're 1.14-only features that 1.12 silently ignores. COOLDOWNS is
+// special-cased inbound only — see NormalizeCooldowns.
 public static class AddonInteropTranslator
 {
     private const string PallyPowerPrefix = "PLPWR";
@@ -103,9 +104,13 @@ public static class AddonInteropTranslator
         if (body.StartsWith("PASSIGN ", StringComparison.Ordinal))
             return TranslatePassign(body, modernToLegacy);
 
-        // Everything else (CLEAR / REQ / SYMCOUNT / COOLDOWNS / FREEASSIGN /
-        // PPLEADER / NASSIGN / AASSIGN / ASELF) carries no fields that need
-        // version remap — pass through untouched.
+        // Inbound only: modern senders always emit a well-formed COOLDOWNS tail.
+        if (!modernToLegacy && body.Contains("COOLDOWNS", StringComparison.Ordinal))
+            return NormalizeCooldowns(body);
+
+        // Everything else (CLEAR / REQ / SYMCOUNT / FREEASSIGN / PPLEADER /
+        // NASSIGN / AASSIGN / ASELF) carries no fields that need version
+        // remap — pass through untouched.
         return body;
     }
 
@@ -238,6 +243,86 @@ public static class AddonInteropTranslator
             }
         }
         return output.ToString();
+    }
+
+    // The 1.14 addon strsplits the whole message on ':' into 4 positional tokens and errors permanently on any malformed tail; rewrite it to 4 receiver-safe tokens.
+    private static string NormalizeCooldowns(string body)
+    {
+        int idx = body.IndexOf("COOLDOWNS", StringComparison.Ordinal);
+        string head = body.Substring(0, idx);
+        string tail = body.Substring(idx + "COOLDOWNS".Length);
+
+        string[] tokens = ExtractCooldownTokens(tail);
+        for (int pair = 0; pair < 2; pair++)
+        {
+            string duration = tokens[pair * 2];
+            string remaining = tokens[pair * 2 + 1];
+            // Mirror the receiver's guard: safe iff remaining is "n" or both numeric.
+            if (remaining != "n" && (!IsNumericToken(duration) || !IsNumericToken(remaining)))
+            {
+                tokens[pair * 2] = "n";
+                tokens[pair * 2 + 1] = "n";
+            }
+        }
+
+        // A colon before COOLDOWNS would shift every strsplit position on the receiver.
+        head = head.Replace(":", "");
+
+        string normalized = $"{head}COOLDOWNS:{tokens[0]}:{tokens[1]}:{tokens[2]}:{tokens[3]}";
+        if (normalized != body)
+        {
+            Log.Event("addon.interop.normalized", new
+            {
+                prefix = PallyPowerPrefix,
+                message_type = "COOLDOWNS",
+                original = body,
+                result = normalized,
+            });
+        }
+        return normalized;
+    }
+
+    // Salvage up to 4 leading valid tokens from the tail; anything else becomes "n".
+    private static string[] ExtractCooldownTokens(string tail)
+    {
+        var tokens = new[] { "n", "n", "n", "n" };
+        if (tail.Length == 0)
+            return tokens;
+        // Well-formed tails are colon-delimited; tolerate a space-delimited variant.
+        char separator = tail[0] == ':' ? ':' : ' ';
+        string[] parts = tail.Split(separator);
+        // parts[0] is the text between "COOLDOWNS" and the first separator — non-empty means an unknown shape.
+        if (parts[0].Length != 0)
+            return tokens;
+        int filled = 0;
+        for (int i = 1; i < parts.Length && filled < 4; i++)
+        {
+            if (parts[i] == "n" || IsNumericToken(parts[i]))
+                tokens[filled++] = parts[i];
+            else
+                break;
+        }
+        return tokens;
+    }
+
+    // Strict plain-decimal check, deliberately narrower than Lua tonumber() so NaN/Infinity/hex/exponent forms can never reach the receiver's arithmetic.
+    private static bool IsNumericToken(string s)
+    {
+        if (string.IsNullOrEmpty(s))
+            return false;
+        int start = s[0] == '-' ? 1 : 0;
+        bool hasDigit = false, hasDot = false;
+        for (int i = start; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (c >= '0' && c <= '9')
+                hasDigit = true;
+            else if (c == '.' && !hasDot)
+                hasDot = true;
+            else
+                return false;
+        }
+        return hasDigit;
     }
 
     private static int TranslateSkillId(int skillIdx, bool modernToLegacy)
