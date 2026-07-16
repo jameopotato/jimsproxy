@@ -164,9 +164,40 @@ public partial class WorldSocket
         }
     }
 
+    // DIAG (#382 fake-raid-roster, PTR ONLY): answer name queries for the fake roster
+    // members locally — the legacy server has never heard of these guids and would leave
+    // the query dangling ("Unknown" frames + client re-query spam). Names/classes were
+    // seeded into the player cache by the roster injection (Client/GroupHandler).
+    private bool TryAnswerDiagFakeNameQuery(WowGuid128 guid)
+    {
+        if (Framework.Settings.DiagFakeRaidMembers <= 0 || !guid.IsPlayer())
+            return false;
+        ulong counter = guid.GetCounter();
+        if (counter < Framework.Settings.DiagFakeRaidMemberBaseCounter ||
+            counter >= Framework.Settings.DiagFakeRaidMemberBaseCounter + (ulong)Framework.Settings.DiagFakeRaidMembers)
+            return false;
+
+        var cache = GetSession().GameState.CachedPlayers.TryGetValue(guid, out var cached) ? cached : null;
+        QueryPlayerNameResponse response = new QueryPlayerNameResponse();
+        response.Player = response.Data.GuidActual = guid;
+        response.Data.Name = cache?.Name ?? "Diagunknown";
+        response.Data.RaceID = Race.Human;
+        response.Data.Sex = Gender.Male;
+        response.Data.ClassID = cache?.ClassId ?? Class.Warrior;
+        response.Data.Level = 60;
+        response.Data.IsDeleted = false;
+        response.Data.AccountID = GetSession().GetGameAccountGuidForPlayer(guid);
+        response.Data.BnetAccountID = GetSession().GetBnetAccountGuidForPlayer(guid);
+        response.Data.VirtualRealmAddress = GetSession().RealmId.GetAddress();
+        SendPacket(response);
+        return true;
+    }
+
     [PacketHandler(Opcode.CMSG_QUERY_PLAYER_NAME)]
     void HandleNameQueryRequest(QueryPlayerName queryPlayerName)
     {
+        if (TryAnswerDiagFakeNameQuery(queryPlayerName.Player))
+            return;
         WorldPacket packet = new WorldPacket(Opcode.CMSG_NAME_QUERY);
         packet.WriteGuid(queryPlayerName.Player.To64());
         SendPacketToServer(packet, GetSession().GameState.IsInWorld ? Opcode.MSG_NULL_ACTION : Opcode.SMSG_LOGIN_VERIFY_WORLD);
@@ -177,6 +208,8 @@ public partial class WorldSocket
     {
         foreach (var guid in queryPlayerNames.Players)
         {
+            if (TryAnswerDiagFakeNameQuery(guid))
+                continue;
             WorldPacket packet = new WorldPacket(Opcode.CMSG_NAME_QUERY);
             packet.WriteGuid(guid.To64());
             SendPacketToServer(packet, GetSession().GameState.IsInWorld ? Opcode.MSG_NULL_ACTION : Opcode.SMSG_LOGIN_VERIFY_WORLD);

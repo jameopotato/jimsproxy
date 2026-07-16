@@ -169,6 +169,46 @@ public partial class WorldClient
             party.LootSettings.LootMaster = packet.ReadGuid().To128(GetSession().GameState);
             party.LootSettings.Threshold = packet.ReadUInt8();
 
+            // DIAG (#382 fake-raid-roster, PTR ONLY — never ship): inflate the modern roster
+            // with fake members and force raid presentation so the 1.14 client stands up a
+            // full BG-scale raid UI around a small real group. Frame-count dial for the
+            // MC-cap FPS investigation. Fakes are roster-only (no unit objects → frames
+            // render out-of-range); names/classes are seeded into the player cache and
+            // name queries for the fake guid range are answered locally (see
+            // Server/CharacterHandler.TryAnswerDiagFakeNameQuery). The fakes ARE stored in
+            // CurrentGroups, so proxy group consumers see them — acceptable only inside a
+            // controlled diag session.
+            if (Framework.Settings.DiagFakeRaidMembers > 0)
+            {
+                party.PartyFlags |= GroupFlags.Raid;
+                int realCount = party.PlayerList.Count;
+                for (int i = 0; i < Framework.Settings.DiagFakeRaidMembers; i++)
+                {
+                    var fakeGuid = WowGuid128.Create(HighGuidType703.Player, Framework.Settings.DiagFakeRaidMemberBaseCounter + (ulong)i);
+                    string fakeName = "Diag" + (char)('a' + i / 26) + (char)('a' + i % 26);
+                    var fake = new PartyPlayerInfo
+                    {
+                        GUID = fakeGuid,
+                        Name = fakeName,
+                        Status = GroupMemberOnlineStatus.Online,
+                        Subgroup = (byte)Math.Min(7, (realCount + i) / 5),
+                        Flags = GroupMemberFlags.None,
+                        ClassId = (Class)(1 + (i % 9)),
+                    };
+                    party.PlayerList.Add(fake);
+                    Session.GameState.UpdatePlayerCache(fakeGuid, new PlayerCache
+                    {
+                        Name = fakeName,
+                        ClassId = fake.ClassId,
+                    });
+                }
+                Framework.Logging.Log.Event("diag.fake_raid.injected", new
+                {
+                    fake_count = Framework.Settings.DiagFakeRaidMembers,
+                    real_count = realCount,
+                });
+            }
+
             GetSession().GameState.WeWantToLeaveGroup = false;
             GetSession().GameState.CurrentGroups[party.PartyIndex] = party;
         }

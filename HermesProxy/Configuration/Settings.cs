@@ -99,6 +99,18 @@ public static class Settings
     public static bool IdentityPinnedCastIds;
     // Effective gate for the T1 mechanism: the sub-toggle is live only under LowLatencyMode.
     public static bool IdentityPinnedCastIdsActive => LowLatencyMode && IdentityPinnedCastIds;
+    // DIAG (#382 fake-raid-roster, PTR ONLY — never ship / never set outside a controlled diag
+    // session): inflate the modern group roster with N fake player entries and force raid
+    // presentation, so the 1.14 client instantiates a full BG-scale CompactRaidFrame UI with a
+    // small real group. Frame-count dial for the MC-cap FPS-drop investigation (#382): fake
+    // members are roster-only (no unit objects), rendering as out-of-range frames — enough to
+    // exercise per-event UI dispatch across ~40 frames. Side effects accepted for diag: fakes
+    // are visible to proxy group consumers (loot lists, threat group reads). 0 disables.
+    public static int DiagFakeRaidMembers;
+    // Guid-counter base for the fake roster members: recognizable, far above any real PTR
+    // player counter, shared by the roster injection (Client/GroupHandler) and the local
+    // name-query answering (Server/CharacterHandler).
+    public const ulong DiagFakeRaidMemberBaseCounter = 990001;
     // JimsProxy (RefireSpellGo): an instant cast forwards SPELL_START+SPELL_GO in the same client
     // frame; the 1.14 client can drop the coalesced SPELL_GO, so the cast never closes — a stuck
     // cast pose + looping cast sound + lit action button that persists until logout (survives
@@ -174,6 +186,7 @@ public static class Settings
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);
         IdentityPinnedCastIds = config.GetBoolean("IdentityPinnedCastIds", false);
         RefireSpellGo = config.GetBoolean("RefireSpellGo", false);
+        DiagFakeRaidMembers = Math.Clamp(config.GetInt("DiagFakeRaidMembers", 0), 0, 38);
         var rttPrefireStr = config.GetString("RttPrefire", "off");
         RttPrefire = rttPrefireStr.Equals("timer", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Timer
             : rttPrefireStr.Equals("knocker", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Knocker
