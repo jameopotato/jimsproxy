@@ -98,6 +98,11 @@ public class PendingCastQueueLockingTests
         { "ClearNonStartedPetCasts", s => s.ClearNonStartedPetCasts() },
         { "ClearPendingPetCasts", s => s.ClearPendingPetCasts() },
         { "ResetInFlightCastState", s => s.ResetInFlightCastState() },
+        { "ClearPendingNormalCasts", s => s.ClearPendingNormalCasts() },
+        // 13261 = Malfunction Explosion, a known malfunction substitute — anything else
+        // early-outs before the lock (see MalfunctionSubstituteToDevice).
+        { "TryEvictForwardedItemUseCast", s => s.TryEvictForwardedItemUseCast(13261, out _) },
+        { "TryDequeueItemCast", s => s.TryDequeueItemCast(new WowGuid128(1, 2), out _) },
     };
 
     [Theory]
