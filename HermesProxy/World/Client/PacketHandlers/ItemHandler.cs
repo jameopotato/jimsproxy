@@ -32,15 +32,14 @@ public partial class WorldClient
         // safe: the client-bound delay queue is intentionally not migrated across a WorldClient
         // recreate (#384), and proficiency is re-sent fresh on each login.
         //
-        // *** UNVERIFIED -- hypothesis test, NOT a confirmed fix. ***
-        // It is not yet established that the 1.14 client applies proficiency delivered AFTER
-        // login-verify. JimsPlus TooltipFix concluded the client "ignores" SMSG_SET_PROFICIENCY --
-        // but that was observed with the packet arriving early (i.e. this very bug); a post-verify
-        // delivery has never been tried. If the client still ignores it once in world, this change
-        // is simply inert (harmless) and the client-side TooltipFix stays necessary. Needs a live
-        // test with TooltipFix DISABLED: do unusable items go red / does the "Requires <ArmorType>"
-        // line disappear on wearable armor? Do NOT retire TooltipFix, and do not call this fixed,
-        // until that test is green.
+        // VERIFIED 2026-07-15 (Kronos V, TooltipFix disabled, Mage + Rogue): delivered in world,
+        // the 1.14 client DOES apply proficiency -- unusable items go red and the spurious
+        // "Requires <ArmorType>" line disappears on wearable armor. The earlier "the client ignores
+        // this packet" belief was an artifact of the pre-verify timing. NOTE: this only holds with
+        // the forward-order flush in SendDelayedPacketsToClientOnOpcode -- SMSG_SET_PROFICIENCY is a
+        // cumulative absolute mask (only the last, full one is correct), and the queue's old reverse
+        // flush collapsed multi-proficiency classes to the smallest mask (a Rogue to Leather-only /
+        // Sword1H-only, wrongly reddening cloth/thrown). Both are needed together.
         if (!GetSession().GameState.IsInWorld)
             SendPacketToClient(proficiency, Opcode.SMSG_LOGIN_VERIFY_WORLD);
         else
