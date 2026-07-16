@@ -296,7 +296,7 @@ public sealed class ThreatTracker
         {
             _threatLists.Remove(mob);
             _lastHighest.Remove(mob);
-        _lastUnexpectedAggro.Remove(mob);
+            _lastUnexpectedAggro.Remove(mob);
         }
     }
 

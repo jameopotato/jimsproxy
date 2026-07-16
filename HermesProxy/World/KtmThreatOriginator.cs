@@ -10,8 +10,9 @@ namespace HermesProxy.World;
 //
 // The rewrite half (KtmThreatBridge.RewriteOutbound) makes our number win when
 // the local client ALSO runs a KTM addon: it rewrites that addon's outbound
-// KLHTM "t <n>" to our value. But the launcher disables KTM addons when the
-// threat engine is on, so the common case is a 1.14 player with our engine and
+// KLHTM "t <n>" to our value. But the launcher is slated to disable KTM addons
+// when the threat engine is on (launcher-side follow-up, not yet shipped), so
+// the common case is a 1.14 player with our engine and
 // NO KTM addon — nothing on the wire for the rewrite to catch, and 1.12
 // KLHThreatMeter raiders would see nothing from that player.
 //
