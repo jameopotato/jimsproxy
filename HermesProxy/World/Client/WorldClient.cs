@@ -566,14 +566,19 @@ public partial class WorldClient
 
     private void SendDelayedPacketsToClientOnOpcode(Opcode opcode)
     {
-        if (_delayedPacketsToClient.ContainsKey(opcode))
+        // Flush in FORWARD (arrival) order. The old reverse loop sent last-queued first, which
+        // is fine for order-independent single packets (#384 name query) but CORRUPTS an
+        // order-sensitive multi-packet burst. #410 delays SMSG_SET_PROFICIENCY here: it's an
+        // absolute cumulative mask -- the server emits one packet per proficiency carrying the
+        // running total, so only the LAST (full) mask is correct and the client keeps the last
+        // one it processes. Reversed, a Rogue collapsed to Leather-only armor / Sword1H-only
+        // weapons (final mask = the FIRST, smallest one), wrongly reddening cloth/thrown/misc
+        // items it can use. Detach the list before sending so a re-entrant flush can't double-send.
+        if (_delayedPacketsToClient.TryGetValue(opcode, out var packets))
         {
-            List<ServerPacket> packets = _delayedPacketsToClient[opcode];
-            for (int i = packets.Count - 1; i >= 0; i--)
-            {
-                SendPacketToClientDirect(packets[i]);
-                packets.RemoveAt(i);
-            }
+            _delayedPacketsToClient.Remove(opcode);
+            foreach (var packet in packets)
+                SendPacketToClientDirect(packet);
         }
     }
 
