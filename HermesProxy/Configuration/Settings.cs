@@ -70,7 +70,8 @@ public static class Settings
     public static bool LowLatencyMode;
     // JimsProxy (rtt-prefire): chain casts across the GCD boundary under Low-Latency mode.
     //   Off     — pure forward-everything (the plain LL behavior; default).
-    //   Timer   — a press landing inside the SpellQueueWindowMs tail of the GCD is held in
+    //   Timer   — a press landing inside the last RttPrefireTimerWindowMs (fixed 400 ms) of
+    //             the GCD is held in
     //             the existing hold slot and released by the BeginGcd timer at (estimated
     //             expiry − early-fire offset); SpellCastEarlyFireOffsetMs / OverrideRtt govern
     //             the offset exactly as in queue mode. Public advanced toggle.
@@ -84,6 +85,12 @@ public static class Settings
     // IdentityPinnedCastIdsActive).
     public static bool RttPrefireTimerActive => LowLatencyMode && RttPrefire == RttPrefireMode.Timer;
     public static bool RttPrefireKnockerActive => LowLatencyMode && RttPrefire == RttPrefireMode.Knocker;
+    // JimsProxy (rtt-prefire): Timer's hold-admission window is FIXED at the retail-accurate
+    // 400 ms and deliberately does not read SpellQueueWindowMs. The launcher greys the
+    // spell-queue controls under Low-Latency mode, so their stored value must not silently
+    // govern Timer (2026-07-15: a stored 1000 stretched Timer holds to ~500 ms and correlated
+    // with elevated stuck-lit button reports).
+    public const int RttPrefireTimerWindowMs = 400;
     // JimsProxy: suppress transient cast errors (NotReady, SpellInProgress) so
     // the client doesn't show red error text during rapid spam. Independent of
     // LowLatencyMode — useful as a companion setting but not required.
@@ -119,8 +126,10 @@ public static class Settings
     // JimsProxy (#313): width (ms) of the spell-queue hold window. A press arriving in the
     // last SpellQueueWindowMs of an active GCD or cast bar is held and fired at expiry; earlier
     // presses are forwarded and the server arbitrates (NOT_READY / SpellInProgress). Mirrors the
-    // 1.14 SpellQueueWindow contract. The launcher exposes 400 (retail-accurate) / 1000 / 1300
-    // (smoothest, closest to the old full-hold); lower values are allowed, capped at 1300 ms.
+    // 1.14 SpellQueueWindow contract. The launcher exposes 400 (retail-accurate, the default)
+    // / 1000 / 1300 (smoothest, closest to the old full-hold); lower values are allowed,
+    // capped at 1300 ms. Ignored by RTT Pre-Fire Timer, which uses the fixed
+    // RttPrefireTimerWindowMs instead.
     public static int SpellQueueWindowMs;
     // JimsProxy (PR #228 follow-up): synthesize SMSG_THREAT_UPDATE / HIGHEST /
     // CLEAR so the modern client's native threat APIs (UnitDetailedThreatSituation,
@@ -179,7 +188,7 @@ public static class Settings
             : rttPrefireStr.Equals("knocker", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Knocker
             : RttPrefireMode.Off;
         FormExitStartDeferMs = Math.Clamp(config.GetInt("FormExitStartDeferMs", 100), 0, 300);
-        SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 1300), 0, 1300);
+        SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 400), 0, 1300);
         ThreatEngine = config.GetBoolean("ThreatEngine", false);
         var serverTypeStr = config.GetString("ServerType", "Kronos");
         ServerType = serverTypeStr.Equals("Generic", StringComparison.OrdinalIgnoreCase)

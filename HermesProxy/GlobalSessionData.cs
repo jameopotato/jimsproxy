@@ -487,10 +487,13 @@ public sealed class GameSessionData
     }
 
     // JimsProxy (#313): the spell-queue hold-window width is configurable via
-    // Framework.Settings.SpellQueueWindowMs (400 retail-accurate / 1000 / 1300 smoothest;
-    // default 1300). The hold gates (IsInGcdQueueWindow / HasStartedCastInQueueWindow) read it
+    // Framework.Settings.SpellQueueWindowMs (default 400 retail-accurate / 1000 / 1300
+    // smoothest). The hold gates (IsInGcdQueueWindow / HasStartedCastInQueueWindow) read it
     // directly: a press in the last SpellQueueWindowMs of an active GCD or cast bar is held and
-    // fired at expiry; earlier presses are forwarded for the server to arbitrate.
+    // fired at expiry; earlier presses are forwarded for the server to arbitrate. Exception:
+    // under RTT Pre-Fire Timer the GCD gate ignores it and uses the fixed
+    // Settings.RttPrefireTimerWindowMs (the launcher greys the queue controls under LL, so
+    // their stored value must not govern Timer).
 
     // JimsProxy (issue #43): GCD hold-and-fire state. While the player is on a GCD (tracked
     // from SMSG_SPELL_GO), new CMSG_CAST_SPELL presses are held in _heldGcdCast instead of
@@ -2430,11 +2433,14 @@ public sealed class GameSessionData
     }
 
     /// <summary>
-    /// JimsProxy: narrow variant of IsGcdHoldActive — returns true only when the GCD has
-    /// at most SpellQueueWindowMs remaining. Mirrors the 1.14 client's SpellQueueWindow
-    /// semantics for the GCD case (instants pressed in the last 400 ms of the previous cast's
-    /// GCD get queued and fire on GCD expiry; earlier presses are forwarded and receive the
-    /// server's NOT_READY). Used by the HandleCastSpell GCD hold gate. The wider
+    /// JimsProxy: narrow variant of IsGcdHoldActive — returns true only when the GCD is inside
+    /// its hold-admission tail. Mirrors the 1.14 client's SpellQueueWindow semantics for the
+    /// GCD case (instants pressed in the tail of the previous cast's GCD get queued and fire
+    /// on GCD expiry; earlier presses are forwarded and receive the server's NOT_READY).
+    /// Queue mode reads the configurable Framework.Settings.SpellQueueWindowMs; under RTT
+    /// Pre-Fire Timer the width is the fixed Settings.RttPrefireTimerWindowMs (400 ms) so the
+    /// launcher's greyed-out spell-queue dropdown can't silently govern Timer holds.
+    /// Used by the HandleCastSpell GCD hold gate. The wider
     /// IsGcdHoldActive() remains for callers that need "is any GCD active at all"
     /// (e.g. the held-cast-on-failure release path in Client/SpellHandler.cs).
     /// </summary>
@@ -2443,7 +2449,10 @@ public sealed class GameSessionData
         lock (_gcdLock)
         {
             long remaining = _gcdExpireTimestampMs - Environment.TickCount64;
-            return remaining > 0 && remaining <= Framework.Settings.SpellQueueWindowMs;
+            long window = Framework.Settings.RttPrefireTimerActive
+                ? Framework.Settings.RttPrefireTimerWindowMs
+                : Framework.Settings.SpellQueueWindowMs;
+            return remaining > 0 && remaining <= window;
         }
     }
 

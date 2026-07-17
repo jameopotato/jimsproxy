@@ -346,7 +346,8 @@ public partial class WorldSocket
                     }
 
                     // JimsProxy (rtt-prefire, Timer): the single hold path LL re-admits. A press
-                    // landing inside the SpellQueueWindowMs tail of the GCD parks in the existing
+                    // landing inside the fixed RttPrefireTimerWindowMs (400 ms) tail of the GCD
+                    // parks in the existing
                     // hold slot and the BeginGcd timer (already armed at instant GO even under LL,
                     // C-SH:~1997) releases it at
                     // (estimated expiry − adaptive/manual early-fire offset) — the same
@@ -533,8 +534,9 @@ public partial class WorldSocket
                 // set up in SMSG_SPELL_GO will release it at (estimated GCD expiry - early offset).
                 // Mashing during GCD overwrites the held slot so only the most recent press fires.
                 //
-                // JimsProxy (1.14 SpellQueueWindow alignment): gate is the LAST 400 ms of the
-                // GCD, not the entire 1500 ms. Presses earlier than that are forwarded to the
+                // JimsProxy (1.14 SpellQueueWindow alignment): gate is the last
+                // SpellQueueWindowMs (default 400 ms) of the GCD, not the entire 1500 ms.
+                // Presses earlier than that are forwarded to the
                 // server, which returns NOT_READY; the client renders that as the standard
                 // "Spell is not ready yet" feedback. Matches what a real 1.14 server does with
                 // default SpellQueueWindow=400.
