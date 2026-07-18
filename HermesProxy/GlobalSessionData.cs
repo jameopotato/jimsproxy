@@ -89,6 +89,13 @@ public sealed class GameSessionData
     public bool ChannelDisplayList;
     public bool ShowPlayedTime;
     public bool IsInFarSight;
+    // JimsProxy (stuck-logout-stun): state for the artificial-logout-stun login fix; all four
+    // reset at CMSG_PLAYER_LOGIN so every world login runs exactly one fresh detection. See
+    // WorldClient.DetectStuckLogoutStunAtSelfCreate (UpdateHandler.cs) for the mechanism doc.
+    public bool StuckStunLoginCheckDone;        // first-self-create gate: one detection per login
+    public bool StuckStunDetectedThisLogin;     // enables raw CAST_RESULT logging + the server-clear breadcrumb
+    public bool StuckStunCancelArmed;           // detection → end-of-UPDATE_OBJECT synth handoff
+    public bool AwaitingSynthLogoutCancelAck;   // swallow the next SMSG_LOGOUT_CANCEL_ACK (client never asked)
     // JimsProxy (taxi-flight-robustness): IsInTaxiFlight is read on the dismount Task's
     // ThreadPool thread and written on the packet-handler thread. Always access via
     // Volatile.Read/Write so weak-memory-model reorderings can't deliver stale state to

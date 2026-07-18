@@ -601,6 +601,18 @@ public partial class WorldClient
         // MIRASU (mc-rune-dousing): after the packet's own updates are out, push rune targetability for any boss life-state edges seen in it, and hide respawned circles around doused runes.
         FlushPendingMcRuneResyncs();
         SuppressMcCirclesOnDousedRunes();
+
+        // JimsProxy (stuck-logout-stun): fire the cure only after the whole update packet is
+        // processed and forwarded. Armed exclusively by DetectStuckLogoutStunAtSelfCreate;
+        // one shot per login.
+        if (GetSession().GameState.StuckStunCancelArmed)
+        {
+            GetSession().GameState.StuckStunCancelArmed = false;
+            GetSession().GameState.AwaitingSynthLogoutCancelAck = true;
+            WorldPacket cancel = new WorldPacket(Opcode.CMSG_LOGOUT_CANCEL);
+            SendPacketToServer(cancel);
+            Log.Event("login.stuck_stun.cancel_synthesized", null);
+        }
     }
 
     public void ReadNearObjectsBlock(WorldPacket packet, object index)
@@ -1884,6 +1896,8 @@ public partial class WorldClient
 
     private void AfterStoreObjectUpdateHook(WowGuid128 guid, ObjectType objectType, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, AuraUpdate auraUpdate, PowerUpdate? powerUpdate, bool isCreate, ObjectUpdate updateData, BitArray changedValuesMask)
     {
+        DetectStuckLogoutStunAtSelfCreate(guid, updates, isCreate, updateData);
+
         // JimsProxy: comprehensive pet diagnostics for the Hunter-Pet-Stealth-Stuck
         // investigation. Fires on every UPDATE_OBJECT block targeting a pet GUID
         // OR the current pet (covers quest-tamed creatures which have a Creature/
@@ -1985,6 +1999,107 @@ public partial class WorldClient
                 SendPacketToClient(height, Opcode.SMSG_UPDATE_OBJECT);
             }
         }
+    }
+
+    // JimsProxy (stuck-logout-stun 2026-07-17): vanilla cores implement the logout countdown by
+    // writing a raw UNIT_FLAG_STUNNED + root + sit onto the player — no aura carries it (vmangos
+    // calls the state "artificially stunned"). When a session dies abruptly while in combat,
+    // Kronos keeps the body in-world, schedules its internal logout (applying that artificial
+    // stun), and a fast same-character relogin re-attaches the new session to the live object.
+    // vmangos's reconnect path removes the flag, unroots and stands the player back up; Kronos's
+    // demonstrably does only the unroot half (2026-07-17 incident: FORCE_MOVE_ROOT + UNROOT
+    // within 1 s of both re-logins, stunned flag never cleared, no aura beyond Battle Stance +
+    // Find Minerals). The orphaned flag blocks casting and turning client-side ("You can't do
+    // that while stunned") for the rest of the session; only a character switch — which forces
+    // the lingering object out of the world — clears it.
+    //
+    // Detection is one-shot per world login, on the FIRST create block for the local player,
+    // and only when the stunned flag arrives with ZERO debuff auras: every genuine vanilla stun
+    // is a MOD_STUN debuff occupying one of slots 32-47 of the same create block, so an aura-less
+    // stunned flag at login has exactly one producer — the logout machinery. A genuine stun at
+    // re-attach (debuff present) leaves the gate closed: a false negative is safe (no cure this
+    // login), a false positive is structurally impossible.
+    //
+    // Three layers, the last two individually toggleable:
+    //   tripwire — login.self_create_state always logs the raw wire state, gate hit or not
+    //   cure     — synthesize a legacy CMSG_LOGOUT_CANCEL (Settings.StuckLogoutStunCancelFix):
+    //              lineage cores' HandleLogoutCancelOpcode is the one client-reachable path that
+    //              removes the artificial stun (RemoveFlag + unroot + stand) — the same handler
+    //              every ordinary cancelled logout exercises. Armed here, sent after the whole
+    //              UPDATE_OBJECT finishes processing (end of HandleUpdateObject); the unsolicited
+    //              SMSG_LOGOUT_CANCEL_ACK is swallowed (CharacterHandler.HandleLogoutCancelAck).
+    //   strip    — clear the stunned bit from the create block we forward
+    //              (Settings.StuckLogoutStunClientStrip) so turn/cast input isn't locked
+    //              client-side even if the server ignores the cancel. The server still rejects
+    //              real casts until ITS state clears; the strip only restores input.
+    private void DetectStuckLogoutStunAtSelfCreate(WowGuid128 guid, Dictionary<int, UpdateField> updates, bool isCreate, ObjectUpdate updateData)
+    {
+        if (!isCreate || GetSession().GameState.StuckStunLoginCheckDone)
+            return;
+        if (guid != GetSession().GameState.CurrentPlayerGuid)
+            return;
+        // Vanilla-only: the slot layout and the incomplete-reconnect behavior are 1.12 facts.
+        if (!LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+            return;
+
+        int UNIT_FIELD_FLAGS = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_FLAGS);
+        int UNIT_FIELD_AURA = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
+        int UNIT_FIELD_BYTES_1 = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_BYTES_1);
+        if (UNIT_FIELD_FLAGS < 0 || UNIT_FIELD_AURA < 0)
+            return;
+
+        GetSession().GameState.StuckStunLoginCheckDone = true;
+
+        uint rawFlags = updates.TryGetValue(UNIT_FIELD_FLAGS, out var flagsField) ? flagsField.UInt32Value : 0;
+        uint standState = 0;
+        if (UNIT_FIELD_BYTES_1 >= 0 && updates.TryGetValue(UNIT_FIELD_BYTES_1, out var bytes1))
+            standState = bytes1.UInt32Value & 0xFF;
+
+        List<uint> buffSpellIds = new();
+        List<uint> debuffSpellIds = new();
+        for (int i = 0; i < VanillaAuraSlotCount; i++)
+        {
+            if (updates.TryGetValue(UNIT_FIELD_AURA + i, out var slot) && slot.UInt32Value != 0)
+                (i < VanillaFirstDebuffSlot ? buffSpellIds : debuffSpellIds).Add(slot.UInt32Value);
+        }
+
+        bool artificial = IsArtificialLogoutStun(rawFlags, debuffSpellIds.Count);
+
+        Log.Event("login.self_create_state", new
+        {
+            raw_unit_flags = rawFlags,
+            stunned = (rawFlags & (uint)UnitFlagsVanilla.Stunned) != 0,
+            stand_state = standState,
+            buff_spell_ids = buffSpellIds,
+            debuff_spell_ids = debuffSpellIds,
+            artificial_logout_stun = artificial,
+        });
+
+        if (!artificial)
+            return;
+
+        GetSession().GameState.StuckStunDetectedThisLogin = true;
+
+        if (Framework.Settings.StuckLogoutStunClientStrip && updateData.UnitData.Flags.HasValue)
+        {
+            updateData.UnitData.Flags &= ~(uint)UnitFlags.Stunned;
+            Log.Event("login.stuck_stun.client_strip", new { forwarded_flags = updateData.UnitData.Flags.Value });
+        }
+
+        if (Framework.Settings.StuckLogoutStunCancelFix)
+            GetSession().GameState.StuckStunCancelArmed = true;
+    }
+
+    // Vanilla aura slot layout: 32 buffs then 16 debuffs (the 2026-07-17 incident's Dazed
+    // landed in slot 32, the first debuff slot).
+    internal const int VanillaAuraSlotCount = 48;
+    internal const int VanillaFirstDebuffSlot = 32;
+
+    // Pure gate: the stunned flag with no debuff present cannot be a real stun — every vanilla
+    // MOD_STUN aura occupies a debuff slot in the same create block.
+    internal static bool IsArtificialLogoutStun(uint rawUnitFlags, int debuffAuraCount)
+    {
+        return (rawUnitFlags & (uint)UnitFlagsVanilla.Stunned) != 0 && debuffAuraCount == 0;
     }
 
     private bool ShouldClearMountDisplayOnDeadNonPlayerUnit(WowGuid128 guid, ObjectType objectType, ObjectUpdate updateData, Dictionary<int, UpdateField> updates, int mountDisplayField)
@@ -2624,6 +2739,21 @@ public partial class WorldClient
                 // set->clear edge. Done for ALL units, not only the local player, so groupmate FD/death is handled too.
                 GetSession().ThreatTracker.OnUnitCombatStateObserved(
                     guid, (updates[UNIT_FIELD_FLAGS].UInt32Value & (uint)UnitFlagsVanilla.InCombat) != 0);
+
+                // JimsProxy (stuck-logout-stun): adjudication breadcrumb — after a detection,
+                // the first self flags write WITHOUT the stunned bit is the server curing the
+                // artificial stun (canonically in response to our synthesized CMSG_LOGOUT_CANCEL).
+                // Also retires the raw CAST_RESULT capture in HandleCastFailed.
+                if (!isCreate && GetSession().GameState.StuckStunDetectedThisLogin &&
+                    guid == GetSession().GameState.CurrentPlayerGuid &&
+                    (updates[UNIT_FIELD_FLAGS].UInt32Value & (uint)UnitFlagsVanilla.Stunned) == 0)
+                {
+                    GetSession().GameState.StuckStunDetectedThisLogin = false;
+                    Log.Event("login.stuck_stun.cleared_by_server", new
+                    {
+                        raw_unit_flags = updates[UNIT_FIELD_FLAGS].UInt32Value,
+                    });
+                }
             }
             int UNIT_FIELD_FLAGS_2 = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_FLAGS_2);
             if (UNIT_FIELD_FLAGS_2 >= 0 && updateMaskArray[UNIT_FIELD_FLAGS_2])

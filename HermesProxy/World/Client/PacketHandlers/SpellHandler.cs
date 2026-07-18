@@ -310,6 +310,21 @@ public partial class WorldClient
         ReconcileTalentRankInjection();
     }
 
+    // JimsProxy (stuck-logout-stun): drain and hex-dump whatever the server appended beyond the
+    // fields we parse — the 2026-07-17 incident's CAST_RESULTs were 7 bytes on the wire, one more
+    // than the vanilla spellId+status+reason layout accounts for. Only called from the
+    // cast.result.while_stuck_stun captures, after all regular fields are consumed.
+    private static string ReadTrailingBytesHex(WorldPacket packet)
+    {
+        if (!packet.CanRead())
+            return "";
+        var sb = new System.Text.StringBuilder();
+        int guard = 0;
+        while (packet.CanRead() && guard++ < 16)
+            sb.Append(packet.ReadUInt8().ToString("X2"));
+        return sb.ToString();
+    }
+
     [PacketHandler(Opcode.SMSG_CAST_FAILED)]
     void HandleCastFailed(WorldPacket packet)
     {
@@ -327,6 +342,19 @@ public partial class WorldClient
             var status = packet.ReadUInt8();
             if (status != 2)
             {
+                // JimsProxy (stuck-logout-stun): while an artificial logout stun is live the
+                // server emits unsolicited own-cast CAST_RESULTs (2026-07-17 incident: one per
+                // Defensive State proc, ~2 s cadence) that the drop paths in this handler swallow
+                // silently. Their raw decode is the only record of WHAT the server refuses and
+                // WHY — capture while the condition is active. Twin below for status==2.
+                if (GetSession().GameState.StuckStunDetectedThisLogin)
+                    Log.Event("cast.result.while_stuck_stun", new
+                    {
+                        spell_id = spellId,
+                        status = status,
+                        trailing_hex = ReadTrailingBytesHex(packet),
+                    });
+
                 // JimsProxy (engineering-malfunction jam): a discarded CAST_FAILED can be a
                 // server-side substitute (e.g. Goblin Mortar -> Malfunction Explosion 13261) that
                 // preempted a forwarded item-use cast (13237). The item-use then never starts and
@@ -351,6 +379,19 @@ public partial class WorldClient
             arg1 = packet.ReadInt32();
         if (packet.CanRead())
             arg2 = packet.ReadInt32();
+
+        // JimsProxy (stuck-logout-stun): twin of the status!=2 capture above — a failed-status
+        // result's reason names the server's enforcement (e.g. 100 = vanilla Stunned).
+        if (GetSession().GameState.StuckStunDetectedThisLogin)
+            Log.Event("cast.result.while_stuck_stun", new
+            {
+                spell_id = spellId,
+                status = 2,
+                reason_id = reason,
+                arg1 = arg1,
+                arg2 = arg2,
+                trailing_hex = ReadTrailingBytesHex(packet),
+            });
 
         // JimsProxy (H7): NotReady / SpellInProgress is a duplicate-rejection — the press the
         // server bounced because another cast of the same spell is already in progress. Its

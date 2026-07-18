@@ -51,6 +51,18 @@ public static class Settings
     // Hard timeout on the reconnect attempt — beyond this, abandon and propagate DC.
     // Clamped to 1000..30000 in LoadAndVerifyFrom.
     public static int UnplannedReconnectTimeoutMs;
+    // JimsProxy (stuck-logout-stun): counter Kronos's incomplete reconnect cleanup. A fast
+    // same-character relogin after an abrupt in-combat disconnect re-attaches the session to
+    // the player object that lingered in-world; Kronos clears the logout root but leaves the
+    // aura-less "artificial" UNIT_FLAG_STUNNED, so the client logs in unable to cast or turn
+    // ("You can't do that while stunned") until a character switch. Detection fires once per
+    // login, on the first self create-block, only when the stunned flag arrives with zero
+    // debuff auras (every real vanilla stun occupies a debuff slot in the same block).
+    // CancelFix synthesizes a legacy CMSG_LOGOUT_CANCEL — the lineage server handler that
+    // removes the artificial stun. ClientStrip clears the bit from the forwarded create
+    // block so input isn't locked client-side even if the server ignores the cancel.
+    public static bool StuckLogoutStunCancelFix;
+    public static bool StuckLogoutStunClientStrip;
     // JimsProxy (clean handshake teardown): bound the realmd auth handshake. If realmd accepts
     // the TCP connection but never sends LOGON_CHALLENGE (half-accepting login server, load-shed,
     // firewall), the login thread would otherwise block forever ("stuck on Connecting..."). On
@@ -177,6 +189,8 @@ public static class Settings
         SpellCastEarlyFireOffsetMs = Math.Clamp(config.GetInt("SpellCastEarlyFireOffsetMs", 0), 0, 50);
         EnableUnplannedReconnect = config.GetBoolean("EnableUnplannedReconnect", false);
         UnplannedReconnectTimeoutMs = Math.Clamp(config.GetInt("UnplannedReconnectTimeoutMs", 5000), 1000, 30000);
+        StuckLogoutStunCancelFix = config.GetBoolean("StuckLogoutStunCancelFix", true);
+        StuckLogoutStunClientStrip = config.GetBoolean("StuckLogoutStunClientStrip", true);
         AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);
         LowLatencyMode = config.GetBoolean("LowLatencyMode", false);
