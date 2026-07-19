@@ -567,7 +567,11 @@ public partial class WorldClient
     private void SendDelayedPacketsToClientOnOpcode(Opcode opcode)
     {
         // Flush in FORWARD (arrival) order. The old reverse loop sent last-queued first, which
-        // is fine for order-independent single packets (#384 name query) but CORRUPTS an
+        // this queue's other users happen to tolerate -- the cooldown-histories delay
+        // (SMSG_SEND_UNLEARN_SPELLS key) is always a single packet per flush, and the
+        // collision-height delay (SMSG_UPDATE_OBJECT key) holds packets for distinct movers,
+        // so order across them is irrelevant. (The #384 name-query delay lives on the
+        // SERVER-bound queue, not this one.) But reverse order CORRUPTS an
         // order-sensitive multi-packet burst. #410 delays SMSG_SET_PROFICIENCY here: it's an
         // absolute cumulative mask -- the server emits one packet per proficiency carrying the
         // running total, so only the LAST (full) mask is correct and the client keeps the last
