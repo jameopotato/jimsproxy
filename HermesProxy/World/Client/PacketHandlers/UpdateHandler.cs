@@ -2086,6 +2086,30 @@ public partial class WorldClient
             Log.Event("login.stuck_stun.client_strip", new { forwarded_flags = updateData.UnitData.Flags.Value });
         }
 
+        // JimsProxy (stuck-logout-stun, layer 4 — the ACTUAL latch, 2026-07-19 byte-diff):
+        // the re-attach create is serialized while the zombie still carries the logout
+        // root, so its movement block ships MovementFlagModern.Root as the client's BASE
+        // move state (stuck login create Flags=0x400 vs clean login 0x0, all else equal).
+        // Kronos fires the matching FORCE_MOVE_ROOT before the create — the client
+        // discards force ops for a mover it hasn't created — so the later
+        // FORCE_MOVE_UNROOT has no force-root to cancel and the mover is left in a
+        // contradictory half-rooted state: fwd/back/strafe work, facing input and the
+        // spell system stay locked for the whole session. Empirically the acked unroot
+        // does NOT lift the latch, and stripping the unit-flags stun bit alone did not
+        // unlock the client — the create's movement flags are the load-bearing byte.
+        // Clear the root from the forwarded create; the server's own unroot ~1 s later
+        // is then a no-op (the clean login shows unroot-while-unrooted is harmless).
+        if (Framework.Settings.StuckLogoutStunClientStrip &&
+            updateData.CreateData?.MoveInfo != null &&
+            (updateData.CreateData.MoveInfo.Flags & (uint)MovementFlagModern.Root) != 0)
+        {
+            updateData.CreateData.MoveInfo.Flags &= ~(uint)MovementFlagModern.Root;
+            Log.Event("login.stuck_stun.create_root_strip", new
+            {
+                forwarded_move_flags = updateData.CreateData.MoveInfo.Flags,
+            });
+        }
+
         if (Framework.Settings.StuckLogoutStunCancelFix)
             GetSession().GameState.StuckStunCancelArmed = true;
     }
