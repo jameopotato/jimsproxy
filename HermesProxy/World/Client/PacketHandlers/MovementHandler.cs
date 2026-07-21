@@ -224,6 +224,16 @@ public partial class WorldClient
     // it can't fight the client's own movement clock. Also drop for a just-destroyed
     // mover (mirrors the WasObjectRecentlyDestroyed gate in HandleMovementMessages),
     // so a stale skip can't touch a unit we already retired.
+    //
+    // Possible relation to #418 (observed players "move laggy / delayed") — WEAK and
+    // unproven. That investigation exonerated the proxy's outbound leg and pinned the
+    // dominant cause to client-side cross-engine jump-arc reconstruction, not this.
+    // But it flagged one untested residual: "a laggy sender's TIME_SKIPPED path is
+    // code-verified but not field-exercised" (0 skips seen in that low-latency
+    // session). This handler is the observer-side (s2c) half of that path — before
+    // it, a hitching/lagging peer's clock skip was dropped, so observers never
+    // re-based that mover's movement time. Whether that feeds the #418 symptom is
+    // unproven; the peer-hitch-under-lag A/B is exactly the field test #418 lacked.
     [PacketHandler(Opcode.MSG_MOVE_TIME_SKIPPED)]
     void HandleMoveTimeSkipped(WorldPacket packet)
     {
