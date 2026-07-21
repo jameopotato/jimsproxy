@@ -211,6 +211,34 @@ public partial class WorldClient
         SendPacketToClient(knockback);
     }
 
+    // JimsProxy (move-time-skipped translation): the legacy server relays
+    // MSG_MOVE_TIME_SKIPPED (vanilla 0x319) as a peer clock-continuity signal — when
+    // *another* nearby player's client hitches/alt-tabs/loads, its movement clock
+    // jumps and the server tells observers so their per-unit movement-time base for
+    // that mover stays aligned with the (now time-jumped) movement packets that
+    // follow. Upstream dropped this as an unknown s2c opcode; the 1.14 client has a
+    // live handler for the modern twin SMSG_MOVE_SKIP_TIME (0x2E18), so we translate
+    // rather than drop. Wire: packed 64-bit guid + uint32 (all reference cores relay
+    // this shape). The relay is observer-only on every core (the server excludes the
+    // originator), so a self-targeted skip shouldn't arrive — drop it defensively so
+    // it can't fight the client's own movement clock. Also drop for a just-destroyed
+    // mover (mirrors the WasObjectRecentlyDestroyed gate in HandleMovementMessages),
+    // so a stale skip can't touch a unit we already retired.
+    [PacketHandler(Opcode.MSG_MOVE_TIME_SKIPPED)]
+    void HandleMoveTimeSkipped(WorldPacket packet)
+    {
+        MoveSkipTime skip = new MoveSkipTime();
+        skip.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
+        skip.TimeSkipped = packet.ReadUInt32();
+
+        if (skip.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+            return;
+        if (GetSession().GameState.WasObjectRecentlyDestroyed(skip.MoverGUID, out _))
+            return;
+
+        SendPacketToClient(skip);
+    }
+
     [PacketHandler(Opcode.SMSG_CONTROL_UPDATE)]
     void HandleControlUpdate(WorldPacket packet)
     {

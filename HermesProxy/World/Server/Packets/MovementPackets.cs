@@ -637,6 +637,37 @@ public class MoveSetFlag : ServerPacket, ISpanWritable
     public uint MoveCounter = 0;
 }
 
+// JimsProxy (move-time-skipped translation): modern s2c SMSG_MOVE_SKIP_TIME (0x2E18).
+// The observer-side twin of CMSG_MOVE_TIME_SKIPPED — the server relays it to nearby
+// clients when a mover's movement clock legitimately jumps (alt-tab / FPS-hitch /
+// load) so their per-unit movement-time base stays aligned. Wire shape mirrors
+// TrinityCore's MoveSkipTime and the vanilla relay: packed mover guid then uint32
+// time-skipped, no bit-packing. Emitted by HandleMoveTimeSkipped on the WorldClient
+// side; upstream had no translation for the legacy relay and dropped it.
+public class MoveSkipTime : ServerPacket, ISpanWritable
+{
+    public MoveSkipTime() : base(Opcode.SMSG_MOVE_SKIP_TIME, ConnectionType.Instance) { }
+
+    public override void Write()
+    {
+        _worldPacket.WritePackedGuid128(MoverGUID);
+        _worldPacket.WriteUInt32(TimeSkipped);
+    }
+
+    public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size + 4; // GUID + uint
+
+    public int WriteToSpan(Span<byte> buffer)
+    {
+        var writer = new SpanPacketWriter(buffer);
+        writer.WritePackedGuid128(MoverGUID.Low, MoverGUID.High);
+        writer.WriteUInt32(TimeSkipped);
+        return writer.Position;
+    }
+
+    public WowGuid128 MoverGUID;
+    public uint TimeSkipped;
+}
+
 public class MovementAckMessage : ClientPacket
 {
     public MovementAckMessage(WorldPacket packet) : base(packet) { }
