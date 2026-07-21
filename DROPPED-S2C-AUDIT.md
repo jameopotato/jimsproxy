@@ -147,6 +147,17 @@ worklist): `CMSG_AUCTION_LIST_PENDING_SALES` (1,849), `CMSG_COMMERCE_TOKEN_GET_L
   (0x102). Modern client sends it empty (stop-emote); vanilla expects `u32 emoteId`. Possible translate
   = forward with `ONESHOT_NONE` to clear state-emotes for observers [INFERENCE — verify vanilla
   HandleEmoteOpcode semantics before touching].
+  **RESOLVED 2026-07-21 — translated.** Semantics verified: TC modern = empty CMSG_EMOTE means
+  `SetEmoteState(EMOTE_ONESHOT_NONE)`; vmangos = the 1.12 client only ever sends `ONESHOT_NONE(0)` or
+  `WAVE`, and on 0 the server clears `UNIT_NPC_EMOTESTATE` (`Unit::HandleEmote → HandleEmoteState(0)`),
+  so forwarding `{u32 0}` is byte-authentic vanilla traffic that stops observers from seeing a stuck
+  state emote. Corpus neighborhoods show it fires in the interaction-close burst (same-ms as
+  `CMSG_CLOSE_INTERACTION`, usually double-sent) and at movement moments — never adjacent to own casts.
+  Implemented with two guards: hold while the local channel window is open (mangos-family
+  `HandleEmoteOpcode` interrupts `ANIM_CANCELS`-flagged channels; window tracked from
+  `MSG_CHANNEL_START/UPDATE`, duration-bounded) and a 250 ms same-burst dedupe. Diagnostics:
+  `emote.stop_forwarded` / `emote.stop_skipped_channeling`. **`SMSG_SPELL_MISS_LOG` is now the only
+  deliberate holdout.**
 
 ## 6. KnownBenignOpcodes re-audit
 

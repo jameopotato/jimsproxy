@@ -131,6 +131,17 @@ public sealed class GameSessionData
     // a stop SMSG_EMOTE on the first movement-start packet.
     public uint LastLoopingEmoteId; // 0 means no active loop
     public long LastLoopingEmoteTickMs;
+    // JimsProxy (emote-stop channel guard): the local player's active channel
+    // window, tracked from MSG_CHANNEL_START / MSG_CHANNEL_UPDATE (vanilla
+    // sends both only to the caster). The CMSG_EMOTE(0) stop-forward must not
+    // fire mid-channel — mangos-family HandleEmoteOpcode interrupts channels
+    // flagged ANIM_CANCELS. End-time bounded by the start's own duration so a
+    // missed 0-update can never wedge the guard permanently.
+    public uint LocalChannelSpellId; // 0 means not channeling
+    public long LocalChannelEndTickMs;
+    // JimsProxy (emote-stop double-send collapse): the modern client emits
+    // CMSG_EMOTE twice within the same interaction-close burst; forward one.
+    public long LastEmoteStopForwardMs;
     public string? TaxiAttemptId;
     public bool IsWaitingForNewWorld;
     public bool IsWaitingForWorldPortAck;

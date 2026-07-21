@@ -379,6 +379,50 @@ public partial class WorldSocket
         SendPacketToServer(packet);
     }
 
+    // JimsProxy: the modern client sends an empty CMSG_EMOTE meaning "clear my
+    // emote state" (TC master HandleEmoteOpcode → SetEmoteState(ONESHOT_NONE)).
+    // Corpus shows it firing in the interaction-close burst (same-ms as
+    // CMSG_CLOSE_INTERACTION, usually double-sent) and when movement ends a
+    // state emote. The vanilla client sends the same opcode with a u32 id —
+    // per vmangos the 1.12 client only ever sends ONESHOT_NONE(0) or WAVE,
+    // and on 0 the server clears UNIT_NPC_EMOTESTATE (Unit::HandleEmote →
+    // HandleEmoteState(0)). Forwarding the 0 is therefore byte-authentic
+    // vanilla traffic and stops observers from seeing our state emote
+    // (/read, /sleep, ...) forever after we move. Previously dropped as
+    // packet.untranslated (1,260 hits / 216 sessions, DROPPED-S2C-AUDIT.md).
+    // Complements the looping-emote tracker (Client ChatHandler + move-start
+    // synth), which only fixes the local player's own view.
+    //
+    // Guards: mangos-family HandleEmoteOpcode also interrupts channels
+    // flagged ANIM_CANCELS, and a real vanilla client never emits this
+    // mid-channel — hold it while our channel window is open. Collapse the
+    // same-burst double-send so the server sees one clear per burst.
+    [PacketHandler(Opcode.CMSG_EMOTE)]
+    void HandleEmoteStop(EmptyClientPacket emote)
+    {
+        var gameState = GetSession().GameState;
+
+        if (gameState.LocalChannelSpellId != 0 &&
+            Environment.TickCount64 < gameState.LocalChannelEndTickMs + 2000)
+        {
+            Log.Event("emote.stop_skipped_channeling", new
+            {
+                channel_spell = gameState.LocalChannelSpellId,
+            });
+            return;
+        }
+
+        long now = Environment.TickCount64;
+        if (now - gameState.LastEmoteStopForwardMs < 250)
+            return; // same-burst duplicate
+        gameState.LastEmoteStopForwardMs = now;
+
+        Log.Event("emote.stop_forwarded", null);
+        WorldPacket packet = new WorldPacket(Opcode.CMSG_EMOTE);
+        packet.WriteUInt32(0); // EMOTE_ONESHOT_NONE — clear emote state
+        SendPacketToServer(packet);
+    }
+
     [PacketHandler(Opcode.CMSG_CHAT_REGISTER_ADDON_PREFIXES)]
     void HandleChatRegisterAddonPrefixes(ChatRegisterAddonPrefixes addons)
     {
