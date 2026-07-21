@@ -363,6 +363,25 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_SEND_TEXT_EMOTE)]
     void HandleSendTextEmote(CTextEmote emote)
     {
+        // JimsProxy (#244): vanilla HandleTextEmoteOpcode interrupts channels
+        // and strips auras flagged ANIM_CANCELS for every anim-bearing text
+        // emote (vmangos ChatHandler.cpp — only sleep/sit/kneel/none are
+        // exempt). Modern servers dropped that interrupt, so the 1.14 client
+        // happily sends /clap mid-channel; forwarding it cancels
+        // bandage-class channels on Kronos. Hold text emotes while our
+        // channel window is open — the proxy can't tell anim-bearing from
+        // chat-only (no EmotesText anim mapping loaded), and a seconds-long
+        // hold beats a canceled channel.
+        if (GetSession().GameState.IsLocalChannelWindowOpen())
+        {
+            Log.Event("emote.text.dropped_channeling", new
+            {
+                text_emote_id = emote.EmoteID,
+                channel_spell = GetSession().GameState.LocalChannelSpellId,
+            });
+            return;
+        }
+
         var target = emote.Target;
 
         if (emote.EmoteID == TEXTEMOTE_SPIT && target.IsEmpty())
@@ -402,8 +421,7 @@ public partial class WorldSocket
     {
         var gameState = GetSession().GameState;
 
-        if (gameState.LocalChannelSpellId != 0 &&
-            Environment.TickCount64 < gameState.LocalChannelEndTickMs + 2000)
+        if (gameState.IsLocalChannelWindowOpen())
         {
             Log.Event("emote.stop_skipped_channeling", new
             {

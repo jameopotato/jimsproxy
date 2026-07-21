@@ -738,6 +738,17 @@ public partial class WorldClient
                 GetSession().GameState.LastLoopingEmoteId = 0;
             }
         }
+        else
+        {
+            // JimsProxy (observed-dance loop): same latch for OTHER units — their
+            // looping emote breaks on their next translational move-start
+            // (Client MovementHandler) since the 1.12 server never sends a stop
+            // for them either. A newer emote replaces/clears, mirroring the client.
+            if (IsClientLoopingEmote(emote.EmoteID))
+                GetSession().GameState.ObservedLoopingEmoteByUnit[emote.Guid] = emote.EmoteID;
+            else
+                GetSession().GameState.ObservedLoopingEmoteByUnit.TryRemove(emote.Guid, out _);
+        }
         SendPacketToClient(emote);
     }
 

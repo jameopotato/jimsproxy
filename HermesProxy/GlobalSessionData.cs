@@ -142,6 +142,26 @@ public sealed class GameSessionData
     // JimsProxy (emote-stop double-send collapse): the modern client emits
     // CMSG_EMOTE twice within the same interaction-close burst; forward one.
     public long LastEmoteStopForwardMs;
+    // JimsProxy (observed-dance loop): per-unit looping-emote latch for OTHER
+    // units — the 1.14 client loops EMOTE_ONESHOT_DANCE for any unit until
+    // another SMSG_EMOTE arrives for it, and the 1.12 server never sends a
+    // stop (corpus: 27 of 30 dance broadcasts were for other units, zero
+    // player emote-state field activity in 526 sessions). Self stays on the
+    // c2s move-start latch above (the server never echoes our own moves);
+    // observed units break on their s2c translational move-start — the same
+    // rule the 1.12 client applies locally. Entries are replaced/cleared by
+    // any newer SMSG_EMOTE for the unit and dropped on unit destroy.
+    public ConcurrentDictionary<WowGuid128, uint> ObservedLoopingEmoteByUnit = new();
+
+    /// <summary>True while the local player's channel window (tracked from
+    /// MSG_CHANNEL_START/UPDATE) is open, with a small grace margin. Used to
+    /// hold c2s emote forwards — mangos-family emote handlers interrupt
+    /// channels and strip auras flagged ANIM_CANCELS (#244).</summary>
+    public bool IsLocalChannelWindowOpen()
+    {
+        return LocalChannelSpellId != 0 &&
+               Environment.TickCount64 < LocalChannelEndTickMs + 2000;
+    }
     public string? TaxiAttemptId;
     public bool IsWaitingForNewWorld;
     public bool IsWaitingForWorldPortAck;
@@ -370,6 +390,9 @@ public sealed class GameSessionData
         if (guid.IsEmpty())
             return;
         _recentlyDestroyedObjects[guid] = Environment.TickCount64;
+        // A destroyed unit can't end its looping emote anymore — drop any latch
+        // so a later re-appearance can't trigger a stale stop synth.
+        ObservedLoopingEmoteByUnit.TryRemove(guid, out _);
         // Opportunistic hygiene sweep so a long session of spawns/despawns can't grow this
         // unbounded. Only long-stale entries go; recent marks are never evicted for size —
         // evicting a live mark would reopen the leak in exactly the crowded scenes that grow it.

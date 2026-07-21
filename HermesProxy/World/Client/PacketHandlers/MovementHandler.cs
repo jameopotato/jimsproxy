@@ -159,6 +159,26 @@ public partial class WorldClient
             IsAutoRepeatStoppingMove(packet.GetUniversalOpcode(false)))
         {
             RetractObservedShooterOnStop(moveUpdate.MoverGUID);
+
+            // JimsProxy (observed-dance loop): the same translational move-start
+            // also breaks a latched looping emote on an observed unit — the rule
+            // the 1.12 client applies locally, which the 1.14 client lacks. The
+            // server never sends the stop (zero player emote-state field activity
+            // across 526 corpus sessions), so synthesize the SMSG_EMOTE(0) the
+            // client is waiting for. TryRemove gives exactly-one stop per loop.
+            if (GetSession().GameState.ObservedLoopingEmoteByUnit.TryRemove(moveUpdate.MoverGUID, out uint loopingEmoteId))
+            {
+                EmoteMessage stopEmote = new EmoteMessage();
+                stopEmote.EmoteID = 0; // EMOTE_ONESHOT_NONE — clears the looping animation
+                stopEmote.Guid = moveUpdate.MoverGUID;
+                SendPacketToClient(stopEmote);
+                Framework.Logging.Log.Event("emote.loop.broken_by_observed_move", new
+                {
+                    guid = moveUpdate.MoverGUID.GetCounter(),
+                    emote_id = loopingEmoteId,
+                    trigger_opcode = packet.GetUniversalOpcode(false).ToString(),
+                });
+            }
         }
         moveUpdate.MoveInfo = new();
         moveUpdate.MoveInfo.ReadMovementInfoLegacy(packet, GetSession().GameState);

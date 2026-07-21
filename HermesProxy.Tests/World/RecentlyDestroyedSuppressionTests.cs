@@ -21,10 +21,12 @@ public class RecentlyDestroyedSuppressionTests
     {
         var state = WowGuidTestHelper.CreateMockGameSessionData();
         // The mock is built via GetUninitializedObject, which skips field initializers —
-        // initialize the one private field this suite exercises.
+        // initialize the fields this suite's code paths touch.
         typeof(GameSessionData)
             .GetField("_recentlyDestroyedObjects", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
             .SetValue(state, new System.Collections.Concurrent.ConcurrentDictionary<WowGuid128, long>());
+        // MarkObjectRecentlyDestroyed also drops the unit's observed-emote latch.
+        state.ObservedLoopingEmoteByUnit = new();
         return state;
     }
 
