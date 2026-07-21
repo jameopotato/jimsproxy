@@ -2996,6 +2996,34 @@ public partial class WorldClient
         GetSession().ThreatTracker.OnDamage(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, spell.Damage);
     }
 
+    // JimsProxy: combat-log fidelity forwards (DROPPED-S2C-AUDIT.md). Both
+    // vanilla packets share the shape { caster u64, target u64, spellId u32,
+    // logFormat u8 } (vmangos Spell.h); the trailing logFormat byte is a
+    // 0=default/1=debug formatting hint with no modern equivalent — discard
+    // it, do NOT map it onto IsPeriodic.
+    [PacketHandler(Opcode.SMSG_SPELL_OR_DAMAGE_IMMUNE)]
+    void HandleSpellOrDamageImmune(WorldPacket packet)
+    {
+        SpellOrDamageImmune immune = new SpellOrDamageImmune();
+        immune.CasterGUID = packet.ReadGuid().To128(GetSession().GameState);
+        immune.VictimGUID = packet.ReadGuid().To128(GetSession().GameState);
+        immune.SpellID = packet.ReadUInt32();
+        packet.ReadUInt8(); // logFormat
+        immune.IsPeriodic = false; // vanilla doesn't distinguish; don't guess
+        SendPacketToClient(immune);
+    }
+
+    [PacketHandler(Opcode.SMSG_PROC_RESIST)]
+    void HandleProcResist(WorldPacket packet)
+    {
+        ProcResist resist = new ProcResist();
+        resist.Caster = packet.ReadGuid().To128(GetSession().GameState);
+        resist.Target = packet.ReadGuid().To128(GetSession().GameState);
+        resist.SpellID = packet.ReadUInt32();
+        packet.ReadUInt8(); // logFormat
+        SendPacketToClient(resist);
+    }
+
     [PacketHandler(Opcode.SMSG_SPELL_EXECUTE_LOG)]
     void HandleSpellExecuteLog(WorldPacket packet)
     {

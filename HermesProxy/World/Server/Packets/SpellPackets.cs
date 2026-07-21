@@ -1579,6 +1579,80 @@ class SpellNonMeleeDamageLog : ServerPacket, ISpanWritable
     public ContentTuningParams ContentTuning = null!;
 }
 
+// JimsProxy: combat-log "Immune" feedback for spells. Vanilla
+// SMSG_SPELLORDAMAGE_IMMUNE { caster u64, target u64, spellId u32,
+// logFormat u8 } (vmangos Spell.h); modern shape per WPP 3.4-classic
+// HandleSpellOrDamageImmune and TC master SpellOrDamageImmune::Write.
+class SpellOrDamageImmune : ServerPacket, ISpanWritable
+{
+    public SpellOrDamageImmune() : base(Opcode.SMSG_SPELL_OR_DAMAGE_IMMUNE, ConnectionType.Instance) { }
+
+    public override void Write()
+    {
+        _worldPacket.WritePackedGuid128(CasterGUID);
+        _worldPacket.WritePackedGuid128(VictimGUID);
+        _worldPacket.WriteUInt32(SpellID);
+        _worldPacket.WriteBit(IsPeriodic);
+        _worldPacket.FlushBits();
+    }
+
+    public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size * 2 + 5; // 2 GUIDs + uint + bit byte
+
+    public int WriteToSpan(Span<byte> buffer)
+    {
+        var writer = new SpanPacketWriter(buffer);
+        writer.WritePackedGuid128(CasterGUID.Low, CasterGUID.High);
+        writer.WritePackedGuid128(VictimGUID.Low, VictimGUID.High);
+        writer.WriteUInt32(SpellID);
+        writer.WriteBit(IsPeriodic);
+        writer.FlushBits();
+        return writer.Position;
+    }
+
+    public WowGuid128 CasterGUID;
+    public WowGuid128 VictimGUID;
+    public uint SpellID;
+    public bool IsPeriodic;
+}
+
+// JimsProxy: combat-log proc-resist feedback. Vanilla SMSG_PROCRESIST
+// { caster u64, target u64, spellId u32, logFormat u8 } (vmangos Spell.h);
+// modern shape per WPP 3.4-classic HandleProcResist and TC master
+// ProcResist::Write — the optional Rolled/Needed floats are omitted
+// (vanilla has no equivalent data).
+class ProcResist : ServerPacket, ISpanWritable
+{
+    public ProcResist() : base(Opcode.SMSG_PROC_RESIST, ConnectionType.Instance) { }
+
+    public override void Write()
+    {
+        _worldPacket.WritePackedGuid128(Caster);
+        _worldPacket.WritePackedGuid128(Target);
+        _worldPacket.WriteUInt32(SpellID);
+        _worldPacket.WriteBit(false); // HasRolled
+        _worldPacket.WriteBit(false); // HasNeeded
+        _worldPacket.FlushBits();
+    }
+
+    public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size * 2 + 5; // 2 GUIDs + uint + bit byte
+
+    public int WriteToSpan(Span<byte> buffer)
+    {
+        var writer = new SpanPacketWriter(buffer);
+        writer.WritePackedGuid128(Caster.Low, Caster.High);
+        writer.WritePackedGuid128(Target.Low, Target.High);
+        writer.WriteUInt32(SpellID);
+        writer.WriteBit(false); // HasRolled
+        writer.WriteBit(false); // HasNeeded
+        writer.FlushBits();
+        return writer.Position;
+    }
+
+    public WowGuid128 Caster;
+    public WowGuid128 Target;
+    public uint SpellID;
+}
+
 class SpellHealLog : ServerPacket, ISpanWritable
 {
     private const int MaxPowerDataEntries = 10;

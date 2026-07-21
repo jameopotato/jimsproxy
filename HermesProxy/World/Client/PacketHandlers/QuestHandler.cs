@@ -405,6 +405,16 @@ public partial class WorldClient
         SendPacketToClient(quest);
     }
 
+    // JimsProxy: vanilla sends SMSG_QUEST_LOG_FULL (empty body) when the
+    // player accepts a quest with a full log. Forward it so the modern client
+    // shows the "Your quest log is full." error instead of Accept silently
+    // doing nothing (hit in 11 corpus sessions, DROPPED-S2C-AUDIT.md).
+    [PacketHandler(Opcode.SMSG_QUEST_LOG_FULL)]
+    void HandleQuestLogFull(WorldPacket packet)
+    {
+        SendPacketToClient(new QuestLogFull());
+    }
+
     [PacketHandler(Opcode.SMSG_QUEST_UPDATE_COMPLETE)]
     [PacketHandler(Opcode.SMSG_QUEST_UPDATE_FAILED)]
     [PacketHandler(Opcode.SMSG_QUEST_UPDATE_FAILED_TIMER)]

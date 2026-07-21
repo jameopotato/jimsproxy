@@ -18,6 +18,18 @@ public partial class WorldClient
         SendPacketToClient(instance);
     }
 
+    // JimsProxy: vanilla SMSG_UPDATE_LAST_INSTANCE { mapId u32 }. The proxy
+    // already synthesizes this packet on world-transfer (MovementHandler);
+    // also forward the server-initiated sends so the client's last-instance
+    // hint stays current outside transfers (DROPPED-S2C-AUDIT.md).
+    [PacketHandler(Opcode.SMSG_UPDATE_LAST_INSTANCE)]
+    void HandleUpdateLastInstance(WorldPacket packet)
+    {
+        UpdateLastInstance instance = new UpdateLastInstance();
+        instance.MapID = packet.ReadUInt32();
+        SendPacketToClient(instance);
+    }
+
     [PacketHandler(Opcode.SMSG_INSTANCE_RESET)]
     void HandleInstanceReset(WorldPacket packet)
     {

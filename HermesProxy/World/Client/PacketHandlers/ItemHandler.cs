@@ -379,6 +379,19 @@ public partial class WorldClient
         SendPacketToClient(enchant);
     }
 
+    // JimsProxy: forward remaining-duration ticks for timed items (vanilla
+    // sends one per duration item on login and as time elapses). Without it,
+    // item countdowns on the modern client stay stale until relog
+    // (DROPPED-S2C-AUDIT.md).
+    [PacketHandler(Opcode.SMSG_ITEM_TIME_UPDATE)]
+    void HandleItemTimeUpdate(WorldPacket packet)
+    {
+        ItemTimeUpdate item = new ItemTimeUpdate();
+        item.ItemGuid = packet.ReadGuid().To128(GetSession().GameState);
+        item.DurationLeft = packet.ReadUInt32();
+        SendPacketToClient(item);
+    }
+
     [PacketHandler(Opcode.SMSG_ENCHANTMENT_LOG)]
     void HandleEnchantmentLog(WorldPacket packet)
     {

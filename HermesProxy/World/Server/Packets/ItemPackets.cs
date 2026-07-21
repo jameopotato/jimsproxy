@@ -829,6 +829,34 @@ class ItemEnchantTimeUpdate : ServerPacket, ISpanWritable
     public WowGuid128 OwnerGuid;
 }
 
+// JimsProxy: remaining-duration tick for a timed item. Vanilla
+// SMSG_ITEM_TIME_UPDATE { itemGuid u64, duration u32 } (vmangos
+// Item::SendTimeUpdate) maps 1:1 to the modern { GUID, DurationLeft } shape
+// per WPP 3.4-classic HandleItemTimeUpdate and TC master.
+class ItemTimeUpdate : ServerPacket, ISpanWritable
+{
+    public ItemTimeUpdate() : base(Opcode.SMSG_ITEM_TIME_UPDATE, ConnectionType.Instance) { }
+
+    public override void Write()
+    {
+        _worldPacket.WritePackedGuid128(ItemGuid);
+        _worldPacket.WriteUInt32(DurationLeft);
+    }
+
+    public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size + 4; // GUID + uint
+
+    public int WriteToSpan(Span<byte> buffer)
+    {
+        var writer = new SpanPacketWriter(buffer);
+        writer.WritePackedGuid128(ItemGuid.Low, ItemGuid.High);
+        writer.WriteUInt32(DurationLeft);
+        return writer.Position;
+    }
+
+    public WowGuid128 ItemGuid;
+    public uint DurationLeft;
+}
+
 class EnchantmentLog : ServerPacket, ISpanWritable
 {
     public EnchantmentLog() : base(Opcode.SMSG_ENCHANTMENT_LOG) { }

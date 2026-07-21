@@ -226,6 +226,32 @@ public partial class WorldClient
         SendPacketToClient(sound);
     }
 
+    // JimsProxy: server-side pet mode sync (vanilla SMSG_PET_MODE
+    // { petGuid u64, react u8, command u8, flag1 u8 (always 0), enabledFlags
+    // u8 (0x0 enabled / 0x8 actions-disabled) } per vmangos Pet.cpp — same
+    // react/command byte order the PET_SPELLS handler above reads). Without
+    // the forward, the modern pet bar only ever shows its own optimistic
+    // click state; server-initiated react/command changes (summon restore,
+    // charm/possess, stance acks) desynced silently (DROPPED-S2C-AUDIT.md).
+    [PacketHandler(Opcode.SMSG_PET_MODE)]
+    void HandlePetMode(WorldPacket packet)
+    {
+        PetMode mode = new PetMode();
+        mode.PetGUID = packet.ReadGuid().To128(GetSession().GameState);
+        mode.ReactState = (ReactStates)packet.ReadUInt8();
+        mode.CommandState = (CommandStates)packet.ReadUInt8();
+        packet.ReadUInt8(); // flag1, always 0
+        mode.Flag = packet.ReadUInt8(); // enabledFlags: 0x8 = actions disabled (same bit modern-side)
+        Log.Event("pet.mode", new
+        {
+            pet_guid = mode.PetGUID.ToString(),
+            react_state = mode.ReactState.ToString(),
+            command_state = mode.CommandState.ToString(),
+            flag = mode.Flag,
+        });
+        SendPacketToClient(mode);
+    }
+
     [PacketHandler(Opcode.SMSG_PET_BROKEN)]
     void HandlePetBroken(WorldPacket packet)
     {

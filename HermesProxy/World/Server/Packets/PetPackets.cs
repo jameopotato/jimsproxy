@@ -113,6 +113,41 @@ public class PetClearSpells : ServerPacket, ISpanWritable
     public int WriteToSpan(Span<byte> buffer) => 0;
 }
 
+// JimsProxy: server-side pet react/command state sync. Vanilla SMSG_PET_MODE
+// carries { petGuid u64, react u8, command u8, flag1 u8, enabledFlags u8 }
+// (vmangos Pet.cpp); the modern body is { PetGUID, CommandState u8, Flag u8,
+// ReactState u8 } per WPP 3.4-classic ReadPetFlags344 and TC master
+// PetMode::Write — same trio PetSpells above already encodes.
+public class PetMode : ServerPacket, ISpanWritable
+{
+    public PetMode() : base(Opcode.SMSG_PET_MODE, ConnectionType.Instance) { }
+
+    public override void Write()
+    {
+        _worldPacket.WritePackedGuid128(PetGUID);
+        _worldPacket.WriteUInt8((byte)CommandState);
+        _worldPacket.WriteUInt8(Flag);
+        _worldPacket.WriteUInt8((byte)ReactState);
+    }
+
+    public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size + 3; // GUID + 3 bytes
+
+    public int WriteToSpan(Span<byte> buffer)
+    {
+        var writer = new SpanPacketWriter(buffer);
+        writer.WritePackedGuid128(PetGUID.Low, PetGUID.High);
+        writer.WriteUInt8((byte)CommandState);
+        writer.WriteUInt8(Flag);
+        writer.WriteUInt8((byte)ReactState);
+        return writer.Position;
+    }
+
+    public WowGuid128 PetGUID;
+    public CommandStates CommandState;
+    public byte Flag;
+    public ReactStates ReactState;
+}
+
 class PetAction : ClientPacket
 {
     public PetAction(WorldPacket packet) : base(packet) { }
