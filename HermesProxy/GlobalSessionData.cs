@@ -886,19 +886,6 @@ public sealed class GameSessionData
     // circle around already-doused runes on reload; the proxy destroys those client-side (paired rune has InUse). WC only.
     public Dictionary<uint, WowGuid128> McCirclesSeen = new();
 
-    // JimsProxy (#382 observer lockup): players we observe being CHARMED by another PLAYER
-    // (Gnomish Mind Control Cap 13181 = vanilla MOD_CHARM on a player). NPC charmers (raid
-    // MCs like Lucifron's Dominate Mind) are excluded — long-stable content, no lockup reports.
-    // Vanilla charm reaches observers as PLAYER_CONTROLLED + CHARMEDBY with no POSSESSED bit,
-    // and the 1.14 client has no representation for a charmed PLAYER (modern can't charm
-    // players; possess — priest MC 605 — renders fine, which is why priest MC never locks
-    // observers). While a guid is in here, the UNIT_FIELD_FLAGS translation forces
-    // UNIT_FLAG_POSSESSED so observing clients render their known possess path instead.
-    // Scoped to third-party observers only: the charmer keeps its real charm/pet bar and
-    // the target is untouched. Self-clears when CHARMEDBY empties (charm end) or on a
-    // fresh create block (re-appearance after an out-of-range charm end).
-    public HashSet<WowGuid128> ObservedCharmedPlayers = [];
-
     // JimsProxy (Tallstrider-Fix): per-GUID last-known facing orientation, populated from
     // any MovementInfo we observe (spawn, heartbeat, ObjectUpdate movement block). Used by
     // MovementHandler.HandleMonsterMove to compare the creature's current facing against
