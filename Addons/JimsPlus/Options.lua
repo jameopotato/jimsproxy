@@ -188,6 +188,12 @@ for _, info in ipairs(castbarUnits) do
     y = y - 28
 end
 
+y = y - 4
+local cbPerf = CreateCheckbox(panel, y,
+    "Performance Mode  |cFFFFD100(suspends cast bars)|r",
+    "For crowded fights (battlegrounds, big pulls) where FPS tanks: fully suspends the\ncast-bar engine — stops rendering, stops per-event tracking, and tells the proxy to\nstop sending cast data entirely. Toggle on when it's a zerg, off when it clears.\n\nAll other JimsPlus fixes stay active. Shortcut: /jp perf")
+y = y - 32
+
 ---------------------------------------------------------------------------
 -- Tools
 ---------------------------------------------------------------------------
@@ -222,6 +228,8 @@ local function RefreshCheckboxes()
             castbarCBs[info.key]:SetChecked(unitDB and unitDB.enabled and true or false)
         end
     end
+
+    cbPerf:SetChecked((namespace.db and namespace.db.performanceMode) and true or false)
 end
 panel:SetScript("OnShow", RefreshCheckboxes)
 panel.refresh = RefreshCheckboxes
@@ -262,6 +270,10 @@ cbBagSort:SetScript("OnClick", function(self)
     print("|cFF00FF00[JimsPlus]|r Custom bag sort order " .. (enabled and "enabled" or "disabled") .. ".")
 end)
 
+cbPerf:SetScript("OnClick", function(self)
+    namespace:SetPerformanceMode(self:GetChecked() and true or false)
+end)
+
 for _, info in ipairs(castbarUnits) do
     local key = info.key
     castbarCBs[key]:SetScript("OnClick", function(self)
@@ -284,7 +296,13 @@ InterfaceOptions_AddCategory(panel)
 
 SLASH_JIMSPLUS1 = "/jimsplus"
 SLASH_JIMSPLUS2 = "/jp"
-SlashCmdList["JIMSPLUS"] = function()
+SlashCmdList["JIMSPLUS"] = function(msg)
+    msg = (msg or ""):lower():gsub("%s+", "")
+    if msg == "perf" or msg == "performance" then
+        namespace:SetPerformanceMode(not (namespace.db and namespace.db.performanceMode))
+        if panel.refresh then panel.refresh() end
+        return
+    end
     InterfaceOptionsFrame_OpenToCategory(panel)
     InterfaceOptionsFrame_OpenToCategory(panel)
 end

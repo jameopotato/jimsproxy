@@ -86,6 +86,11 @@ public sealed class GameSessionData
     // haven't forwarded one yet this session — first request always passes.
     public long LastForwardedPvpLogDataTickMs;
     public bool JimsPlusSideband;
+    // JimsProxy (Performance Mode / handshake expiry): Environment.TickCount64 of the last "JP"/"1"
+    // affirmation from the addon (0 = never). The JimsPlus addon heartbeats the handshake every
+    // ~30s; if we stop hearing it (addon disabled or crashed) the sideband expires, so we don't
+    // keep streaming raw JP_ chat that the now-absent client-side filter can no longer suppress.
+    public long JimsPlusSidebandAffirmedMs;
     public bool ChannelDisplayList;
     public bool ShowPlayedTime;
     public bool IsInFarSight;
@@ -353,6 +358,15 @@ public sealed class GameSessionData
     private readonly ConcurrentDictionary<WowGuid128, long> _recentlyDestroyedObjects = new();
     private const long RecentlyDestroyedSweepAgeMs = 600_000;
     private const int RecentlyDestroyedSweepThreshold = 4096;
+
+    // JimsProxy (Performance Mode / handshake expiry): the sideband is live only while the addon
+    // keeps re-affirming "1" (it heartbeats every ~30s). A disabled/crashed addon can't send "0",
+    // so we time the handshake out — otherwise the proxy would keep emitting raw JP_ chat that the
+    // now-absent addon filter no longer suppresses (the reported "JP_CS:Player-..." spam).
+    public const long JimsPlusSidebandExpiryMs = 100_000;
+    public bool IsJimsPlusSidebandActive()
+        => JimsPlusSideband
+           && (Environment.TickCount64 - JimsPlusSidebandAffirmedMs) <= JimsPlusSidebandExpiryMs;
 
     public void MarkObjectRecentlyDestroyed(WowGuid128 guid)
     {

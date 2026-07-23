@@ -533,7 +533,10 @@ public partial class WorldSocket
 
         if (body == "0" || body == "1")
         {
-            GetSession().GameState.JimsPlusSideband = body == "1";
+            var gs = GetSession().GameState;
+            gs.JimsPlusSideband = body == "1";
+            if (body == "1")
+                gs.JimsPlusSidebandAffirmedMs = Environment.TickCount64;
             return;
         }
 

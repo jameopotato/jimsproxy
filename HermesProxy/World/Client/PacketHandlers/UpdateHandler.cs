@@ -3093,7 +3093,7 @@ public partial class WorldClient
                         if (spellId != 0)
                         {
                             channelSpells[guid] = spellId;
-                            if (GetSession().GameState.JimsPlusSideband)
+                            if (GetSession().GameState.IsJimsPlusSidebandActive())
                             {
                                 var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
                                     $"JP_CH:S:{guidStr}:{spellId}");
@@ -3104,7 +3104,7 @@ public partial class WorldClient
                         {
                             channelSpells.TryRemove(guid, out _);
                             GetSession().GameState.ChannelSourceObjectByUnit.TryRemove(guid, out _); // #383
-                            if (GetSession().GameState.JimsPlusSideband)
+                            if (GetSession().GameState.IsJimsPlusSidebandActive())
                             {
                                 var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
                                     $"JP_CH:X:{guidStr}");

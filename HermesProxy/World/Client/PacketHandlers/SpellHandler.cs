@@ -1868,7 +1868,7 @@ public partial class WorldClient
         // Send cast-time sideband for non-self casters so the addon gets
         // the server-reported cast time instead of GetSpellInfo() which
         // returns the observer's own modified value (wrong rank/talents).
-        if (GetSession().GameState.JimsPlusSideband &&
+        if (GetSession().GameState.IsJimsPlusSidebandActive() &&
             spell.Cast.CasterUnit != GetSession().GameState.CurrentPlayerGuid &&
             spell.Cast.CasterUnit != GetSession().GameState.CurrentPetGuid &&
             spell.Cast.CastTime > 0)

@@ -348,15 +348,72 @@ function addon:ToggleUnitEvents(shouldReset)
     end
 end
 
+-- JimsProxy (Performance Mode): announce the JP sideband handshake reflecting current state.
+-- "1" enables the proxy's cast-time/channel sideband; "0" tells it to STOP. Not-listening
+-- client-side is NOT enough — the proxy keeps streaming JP_ chat until it receives "0"
+-- (ChatHandler.HandleJimsPlusSideband). Also doubles as the heartbeat the proxy expires on.
+function addon:SendSidebandHandshake()
+    if C_ChatInfo and C_ChatInfo.SendAddonMessage then
+        C_ChatInfo.SendAddonMessage("JP", self.suspended and "0" or "1", "WHISPER", UnitName("player"))
+    end
+end
+
+-- JimsProxy (Performance Mode): fully suspend the cast-bar engine for crowded fights.
+-- Unchecking the per-unit boxes only stops DISPLAY; this also stops the proxy sideband,
+-- unregisters the high-volume inbound streams (CLEU, nameplate, chat), drops all tracked
+-- casts, and nils the per-frame OnUpdate — so the client pays neither the render cost nor
+-- the per-event tracking cost. Every other JimsPlus fix is left untouched.
+function addon:SuspendCastbars()
+    if self.suspended then return end
+    self.suspended = true
+
+    self:SendSidebandHandshake() -- "0": proxy stops emitting the sideband
+
+    self:UnregisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+    self:UnregisterEvent("CHAT_MSG_SYSTEM")
+    self:UnregisterEvent("PLAYER_TARGET_CHANGED")
+    self:UnregisterEvent("UNIT_AURA")
+    self:UnregisterEvent("NAME_PLATE_UNIT_ADDED")
+    self:UnregisterEvent("NAME_PLATE_UNIT_REMOVED")
+    self:UnregisterEvent("GROUP_ROSTER_UPDATE")
+    self:UnregisterEvent("GROUP_JOINED")
+    -- PLAYER_ENTERING_WORLD / ZONE_CHANGED_NEW_AREA stay registered so we re-affirm "0"
+    -- across loading screens (a reconnect resets the proxy to off, but re-affirming keeps
+    -- intent explicit and survives a mid-suspend session change).
+
+    wipe(activeGUIDs)
+    wipe(activeTimers)
+    wipe(activeFrames)
+    PoolManager:GetFramePool():ReleaseAll()
+    self:SetFocusDisplay(nil)
+    self:SetScript("OnUpdate", nil)
+end
+
+-- JimsProxy (Performance Mode): restore the cast-bar engine.
+function addon:ResumeCastbars()
+    if not self.suspended then return end
+    self.suspended = false
+
+    self:SetScript("OnUpdate", self.CastbarOnUpdate)
+    self:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+    self:RegisterEvent("CHAT_MSG_SYSTEM")
+    self:ToggleUnitEvents() -- restores NAME_PLATE / target / party per db.enabled
+
+    self:SendSidebandHandshake() -- "1": proxy resumes the sideband
+    if self.db and self.db.party and self.db.party.enabled and IsInGroup() then
+        self:GROUP_ROSTER_UPDATE()
+    end
+end
+
 function addon:PLAYER_ENTERING_WORLD(isInitialLogin)
     if isInitialLogin then return end
 
     -- Re-announce the JP sideband handshake. A reconnect (or any loading screen) gives the
     -- proxy a fresh session with JimsPlusSideband=false, so without re-sending "1" the cast-time
     -- and channel sidebands silently stop until /reload. Idempotent on same-session zone changes.
-    if C_ChatInfo and C_ChatInfo.SendAddonMessage then
-        C_ChatInfo.SendAddonMessage("JP", "1", "WHISPER", UnitName("player"))
-    end
+    -- While suspended (Performance Mode) this re-affirms "0" instead, and skips the rebuild below.
+    self:SendSidebandHandshake()
+    if self.suspended then return end
 
     -- Reset all data on loading screens
     wipe(activeGUIDs)
@@ -512,7 +569,7 @@ function addon:PLAYER_LOGIN()
     self:UnregisterEvent("PLAYER_LOGIN")
     self.PLAYER_LOGIN = nil
 
-    C_ChatInfo.SendAddonMessage("JP", "1", "WHISPER", UnitName("player"))
+    self:SendSidebandHandshake()
 
     ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", function(_, _, msg)
         local p = msg:sub(1, 3)
@@ -520,6 +577,19 @@ function addon:PLAYER_LOGIN()
             return true
         end
     end)
+
+    -- JimsProxy (Performance Mode): heartbeat the handshake so the proxy can expire it if the
+    -- addon is disabled or crashes. A gone addon can't send "0", so without this the proxy keeps
+    -- streaming raw JP_ lines that the (now-absent) chat filter no longer swallows — the reported
+    -- "JP_CS:Player-..." chat spam. Re-affirms "1" while active / "0" while suspended.
+    if C_Timer and C_Timer.NewTicker then
+        C_Timer.NewTicker(30, function() addon:SendSidebandHandshake() end)
+    end
+
+    -- Apply a persisted Performance Mode toggle on login.
+    if namespace.db and namespace.db.performanceMode then
+        self:SuspendCastbars()
+    end
 end
 
 local auraRows = 0
@@ -798,7 +868,9 @@ end
 
 local refresh = 0
 local castStopBlacklist = namespace.castStopBlacklist
-addon:SetScript("OnUpdate", function(self, elapsed)
+-- JimsProxy (Performance Mode): stored as a named ref so SuspendCastbars can detach it
+-- (SetScript("OnUpdate", nil)) and ResumeCastbars can reattach it.
+addon.CastbarOnUpdate = function(self, elapsed)
 
     if not next(activeTimers) then return end
     local currTime = GetTime()
@@ -878,4 +950,5 @@ addon:SetScript("OnUpdate", function(self, elapsed)
             end
         end
     end
-end)
+end
+addon:SetScript("OnUpdate", addon.CastbarOnUpdate)
