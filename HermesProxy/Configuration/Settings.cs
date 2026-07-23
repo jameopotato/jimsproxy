@@ -162,6 +162,16 @@ public static class Settings
     // Default Kronos since this launcher is built for Kronos.
     public static ServerFork ServerType = ServerFork.Kronos;
 
+    // JimsProxy (HoneyProxy): EXPERIMENTAL, isolated, default OFF, dev-gated. When set, the proxy
+    // restructures all IN-WORLD (post-login) packet processing into a single-actor + single ordered
+    // egress-writer model mirroring SugarProxy's decoded cast pipeline (SUGAR-CAST-MODEL.md — the 5
+    // pillars: one actor / one 2048 drop-and-warn egress FIFO / buffer-and-reconcile / fixed emission
+    // order / no cancels), to test whether faithfully matching Sugar stops the client-side
+    // looping-cast / stuck-visual bug. Hard-branches away from the LL/Queue/RTT machinery, which it
+    // makes inert. OFF is byte-identical to today. Shipped only as a dedicated test build; the
+    // launcher exposes it in Dev Mode only.
+    public static bool HoneyProxyMode;
+
     public static bool LoadAndVerifyFrom(ConfigurationParser config)
     {
         ClientSeed = config.GetByteArray("ClientSeed", "179D3DC3235629D07113A9B3867F97A7".ParseAsByteArray());
@@ -203,6 +213,7 @@ public static class Settings
             : RttPrefireMode.Off;
         FormExitStartDeferMs = Math.Clamp(config.GetInt("FormExitStartDeferMs", 100), 0, 300);
         SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 400), 0, 1300);
+        HoneyProxyMode = config.GetBoolean("HoneyProxyMode", false);
         ThreatEngine = config.GetBoolean("ThreatEngine", false);
         var serverTypeStr = config.GetString("ServerType", "Kronos");
         ServerType = serverTypeStr.Equals("Generic", StringComparison.OrdinalIgnoreCase)
@@ -213,6 +224,20 @@ public static class Settings
         // Without this, the first call to Log.Event evaluates payload args (including
         // Log.StructuredLogPath) before EnsureJsonlOpen runs inside Event().
         Log.StartStructuredLog();
+
+        if (HoneyProxyMode)
+        {
+            // D5: HoneyProxy hard-branches away from the serial/hold + LL/RTT machinery, so these
+            // config keys are inert while it is on. Log the override once; do NOT rewrite the config
+            // (the launcher owns it).
+            Log.Event("honeyproxy.active", new
+            {
+                inert_keys = new[] { "LowLatencyMode", "SpellQueueWindowMs", "RttPrefire", "SuppressSpellCastErrors", "IdentityPinnedCastIds", "RefireSpellGo" },
+                low_latency_mode = LowLatencyMode,
+                rtt_prefire = RttPrefire.ToString(),
+                spell_queue_window_ms = SpellQueueWindowMs,
+            });
+        }
 
         return VerifyConfig();
     }
