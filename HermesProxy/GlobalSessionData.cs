@@ -3159,6 +3159,18 @@ public class GlobalSessionData
     public volatile WorldSocket? LingeringInstanceSocket;
     public AuthClient AuthClient = null!;
     public WorldClient? WorldClient;
+    // JimsProxy (HoneyProxy): the per-session single actor (Pillar 1). Lazily created + started at the
+    // in-world handoff (WorldSocket.HandleEnterEncryptedModeAck); belongs to the SESSION, so it survives
+    // WorldClient recreation (realm swap / reconnect). Null + disengaged until then; OFF sessions never
+    // create it. See HoneyActor.
+    public World.HoneyActor? HoneyActor;
+    public volatile bool ActorEngaged;
+    private readonly object _honeyActorInitLock = new();
+    // JimsProxy (HoneyProxy): dispatch a packet via the actor only while genuinely in-world — flag on,
+    // actor engaged, and NOT in char-select. IsInCharacterSelect covers the logout->char-select->relogin
+    // window, keeping the login / WorldClient-recreate / ConnectToWorldServer blocking spin inline
+    // (scope A: login is never on the actor, so it can't self-deadlock the single thread).
+    public bool ShouldDispatchViaActor => Framework.Settings.HoneyProxyMode && ActorEngaged && !IsInCharacterSelect;
     // JimsProxy: set true on SMSG_LOGOUT_COMPLETE so the next CMSG_PLAYER_LOGIN
     // tears down and recreates WorldClient. Twinstar accepts a second
     // CMSG_PLAYER_LOGIN on the same world TCP (the LOGIN_VERIFY_WORLD comes
@@ -3933,6 +3945,20 @@ public class GlobalSessionData
         }
     }
 
+    // JimsProxy (HoneyProxy): idempotent; called at the in-world handoff. Creates a fresh actor if none
+    // exists or the previous one was stopped, so a reconnect after teardown re-engages cleanly.
+    public void EnsureActorStarted()
+    {
+        World.HoneyActor actor;
+        lock (_honeyActorInitLock)
+        {
+            if (HoneyActor == null || HoneyActor.IsStopped)
+                HoneyActor = new World.HoneyActor(this);
+            actor = HoneyActor;
+        }
+        actor.EnsureStarted();
+    }
+
     public void OnDisconnect()
     {
         // JimsProxy: structured session.disconnect — emitted once per cleanup with snapshot
@@ -3949,6 +3975,11 @@ public class GlobalSessionData
         // JimsProxy (issue #43): cancel any held GCD cast and dispose its timer so it can't
         // fire after InstanceSocket has been torn down.
         GameState?.CancelGcdHold();
+
+        // JimsProxy (HoneyProxy): stop the single actor and disengage so any late in-world packets fall
+        // back to inline handling; a subsequent reconnect handoff recreates a fresh actor.
+        ActorEngaged = false;
+        HoneyActor?.Stop();
 
         // JimsProxy (taxi-flight-robustness): same reasoning for the taxi-dismount Task —
         // a pending flight Task captures session/InstanceSocket references and would NRE

@@ -369,7 +369,12 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
                 HandleQueryRealmName(packet);
                 break;
             default:
-                HandlePacket(packet);
+                // JimsProxy (HoneyProxy): route in-world CMSG dispatch through the single actor when
+                // engaged; the auth/connect cases above stay inline. See HoneyActor.
+                if (GetSession().ShouldDispatchViaActor)
+                    GetSession().HoneyActor!.EnqueueModern(this, packet);
+                else
+                    HandlePacket(packet);
                 break;
         }
 
@@ -968,6 +973,14 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             Log.Print(LogType.Server, "Client has connected to the instance server.");
             SendPacket(new ResumeComms(ConnectionType.Instance));
             GetSession().InstanceSocket = this;
+            // JimsProxy (HoneyProxy): the session is now in-world — engage the single actor so every
+            // subsequent in-world packet (both directions) dispatches on one thread. Idempotent and
+            // survives reconnect; created only when the flag is on.
+            if (Framework.Settings.HoneyProxyMode)
+            {
+                GetSession().EnsureActorStarted();
+                GetSession().ActorEngaged = true;
+            }
         }
     }
 

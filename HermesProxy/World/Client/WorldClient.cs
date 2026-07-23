@@ -367,7 +367,14 @@ public partial class WorldClient
 
                 WorldPacket packet = new WorldPacket(buffer);
                 packet.SetReceiveTime(Environment.TickCount);
-                HandlePacket(packet);
+                // JimsProxy (HoneyProxy): route in-world SMSG dispatch through the single actor when
+                // engaged; otherwise inline as today. Auth SMSGs arrive pre-handoff (ActorEngaged false)
+                // and so stay inline.
+                var honeySession = GetSession();
+                if (honeySession.ShouldDispatchViaActor)
+                    honeySession.HoneyActor!.EnqueueLegacy(packet);
+                else
+                    HandlePacket(packet);
             }
         }
         catch(Exception e)
@@ -622,6 +629,10 @@ public partial class WorldClient
                 return false;
         }
     }
+
+    // JimsProxy (HoneyProxy): actor entry point — the single actor calls this to run the (unchanged)
+    // legacy dispatch on the actor thread. Internal so only the actor reaches the private handler.
+    internal void HandlePacketFromActor(WorldPacket packet) => HandlePacket(packet);
 
     private void HandlePacket(WorldPacket packet)
     {
