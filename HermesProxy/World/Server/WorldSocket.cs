@@ -518,9 +518,42 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         return _clientPacketTable.LookupByKey(opcode);
     }
 
-    // C<P S: Sends data to modern client
+    // C<P S: Sends data to modern client. JimsProxy (HoneyProxy): the single-ordered-egress chokepoint.
+    // When the session routes egress via the writer, enqueue and let the ONE writer thread emit
+    // (Pillar 2); otherwise emit inline as today. Both client-bound entry points (Server handlers' direct
+    // SendPacket, and WorldClient.SendPacketToClientDirect -> socket.SendPacket) converge here, so this
+    // one interception covers them all. The writer thread itself (InWriter) calls SendPacketReal directly.
     public void SendPacket(ServerPacket packet)
     {
+        if (!HoneyWriter.InWriter && GetSession()?.ShouldRouteEgressViaWriter == true)
+        {
+            GetSession().HoneyWriter!.Enqueue(this, packet);
+            return;
+        }
+        SendPacketReal(packet);
+    }
+
+    internal void SendPacketReal(ServerPacket packet)
+    {
+        // JimsProxy (HoneyProxy) chokepoint guard (D6): a cast-lifecycle packet must never reach the
+        // socket outside the writer thread while egress is routed via the writer. Cheap on the normal
+        // writer path (short-circuits at !InWriter). Logs always; throws only in Debug builds so a field
+        // (Release) test build degrades to a log line instead of crashing a tester.
+        if (Framework.Settings.HoneyProxyMode && !HoneyWriter.InWriter
+            && GetSession()?.ShouldRouteEgressViaWriter == true
+            && HoneyWriter.CastLifecycleOpcodes.Contains(packet.GetUniversalOpcode()))
+        {
+            Log.Event("honeyproxy.invariant_violation", new
+            {
+                opcode = packet.GetUniversalOpcode().ToString(),
+                stack = Environment.StackTrace,
+            });
+#if DEBUG
+            throw new InvalidOperationException(
+                $"HoneyProxy: cast-lifecycle {packet.GetUniversalOpcode()} reached the socket outside the writer");
+#endif
+        }
+
         if (!IsOpen())
         {
             Log.PrintNet(LogType.Error, LogNetDir.P2C, $"Can't send {packet.GetUniversalOpcode()}, socket is closed!");

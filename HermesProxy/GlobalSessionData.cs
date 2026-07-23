@@ -3171,6 +3171,12 @@ public class GlobalSessionData
     // window, keeping the login / WorldClient-recreate / ConnectToWorldServer blocking spin inline
     // (scope A: login is never on the actor, so it can't self-deadlock the single thread).
     public bool ShouldDispatchViaActor => Framework.Settings.HoneyProxyMode && ActorEngaged && !IsInCharacterSelect;
+    public World.HoneyWriter? HoneyWriter;
+    // JimsProxy (HoneyProxy): route client-bound packets through the single egress writer whenever the
+    // session is in-world (flag on + actor engaged), so ALL egress -- even from an inline handler --
+    // serializes through one thread (Pillar 2). No IsInCharacterSelect gate here: serializing char-select
+    // egress too is harmless and keeps the one-FIFO invariant simple.
+    public bool ShouldRouteEgressViaWriter => Framework.Settings.HoneyProxyMode && ActorEngaged;
     // JimsProxy: set true on SMSG_LOGOUT_COMPLETE so the next CMSG_PLAYER_LOGIN
     // tears down and recreates WorldClient. Twinstar accepts a second
     // CMSG_PLAYER_LOGIN on the same world TCP (the LOGIN_VERIFY_WORLD comes
@@ -3950,12 +3956,17 @@ public class GlobalSessionData
     public void EnsureActorStarted()
     {
         World.HoneyActor actor;
+        World.HoneyWriter writer;
         lock (_honeyActorInitLock)
         {
             if (HoneyActor == null || HoneyActor.IsStopped)
                 HoneyActor = new World.HoneyActor(this);
+            if (HoneyWriter == null || HoneyWriter.IsStopped)
+                HoneyWriter = new World.HoneyWriter();
             actor = HoneyActor;
+            writer = HoneyWriter;
         }
+        writer.EnsureStarted(); // start the writer first so it can drain the actor's emissions
         actor.EnsureStarted();
     }
 
@@ -3980,6 +3991,7 @@ public class GlobalSessionData
         // back to inline handling; a subsequent reconnect handoff recreates a fresh actor.
         ActorEngaged = false;
         HoneyActor?.Stop();
+        HoneyWriter?.Stop();
 
         // JimsProxy (taxi-flight-robustness): same reasoning for the taxi-dismount Task —
         // a pending flight Task captures session/InstanceSocket references and would NRE
