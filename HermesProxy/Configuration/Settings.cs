@@ -63,6 +63,25 @@ public static class Settings
     // block so input isn't locked client-side even if the server ignores the cancel.
     public static bool StuckLogoutStunCancelFix;
     public static bool StuckLogoutStunClientStrip;
+    // JimsProxy (#382 charm-presentation A/B levers, 2026-07-23): a player charmed by
+    // ANOTHER PLAYER (Gnomish MC Cap 13181 / priest MC 605) FPS-locks 1.14 clients in BGs
+    // for the charm's duration — victim and bystanders alike; native 1.12 clients and NPC
+    // charmers (Lucifron) are fine. Capture analysis exonerated the flags lane (PET_IN_COMBAT
+    // is routine pet-owner state; two of three captured charm windows carried no flags
+    // updates at all) and narrowed the held observer-side state to three legs: the
+    // CHARMEDBY relationship, the faction flip, and the charm aura itself. Each lever
+    // hides ONE leg from bystander sessions so a reporter can isolate the costly one.
+    // All default OFF (= current behavior); diagnostic use only — no lever ships enabled
+    // without A/B confirmation. Scope: observed player-charmed-by-player only; the victim's
+    // own session, the charmer's session, and all NPC-charmer content are untouched.
+    public static bool Charm382SuppressCharmedBy;
+    public static bool Charm382FactionHold;
+    public static bool Charm382SuppressCharmAura;
+    // Gate for the pre-existing #399 possess shim (OR UNIT_FLAG_POSSESSED onto observed
+    // charmed players). Default TRUE = current beta behavior; set false to A/B dropping
+    // the shim's synthetic possess bit. Default-init true so paths that bypass
+    // LoadAndVerifyFrom (tests) keep today's behavior.
+    public static bool Charm382ObserverPossess = true;
     // JimsProxy (clean handshake teardown): bound the realmd auth handshake. If realmd accepts
     // the TCP connection but never sends LOGON_CHALLENGE (half-accepting login server, load-shed,
     // firewall), the login thread would otherwise block forever ("stuck on Connecting..."). On
@@ -191,6 +210,10 @@ public static class Settings
         UnplannedReconnectTimeoutMs = Math.Clamp(config.GetInt("UnplannedReconnectTimeoutMs", 5000), 1000, 30000);
         StuckLogoutStunCancelFix = config.GetBoolean("StuckLogoutStunCancelFix", true);
         StuckLogoutStunClientStrip = config.GetBoolean("StuckLogoutStunClientStrip", true);
+        Charm382SuppressCharmedBy = config.GetBoolean("Charm382SuppressCharmedBy", false);
+        Charm382FactionHold = config.GetBoolean("Charm382FactionHold", false);
+        Charm382SuppressCharmAura = config.GetBoolean("Charm382SuppressCharmAura", false);
+        Charm382ObserverPossess = config.GetBoolean("Charm382ObserverPossess", true);
         AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);
         LowLatencyMode = config.GetBoolean("LowLatencyMode", false);

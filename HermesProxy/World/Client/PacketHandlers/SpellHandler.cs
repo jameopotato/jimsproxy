@@ -3738,6 +3738,22 @@ public partial class WorldClient
             return;
         }
 
+        // JimsProxy (#382, lever L3 Charm382SuppressCharmAura): this flicker-refresh path
+        // re-emits an existing aura when it's re-cast onto the target — without this gate a
+        // re-cap would leak the suppressed charm aura back to bystanders through here.
+        if (ShouldSuppressCharmAuraForObserver(Settings.Charm382SuppressCharmAura, target,
+                GetSession().GameState.CurrentPlayerGuid, spellId))
+        {
+            Framework.Logging.Log.Event("aura.slot.dropped_charm_observer", new
+            {
+                target_low = target.GetCounter(),
+                slot,
+                spell_id = spellId,
+                source = "refresh_update",
+            });
+            return;
+        }
+
         auraData.CastUnit = caster;
 
         // For the current player, SMSG_UPDATE_AURA_DURATION will follow with the

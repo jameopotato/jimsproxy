@@ -90,6 +90,43 @@ public partial class WorldClient
         return guid.GetHighType() == HighGuidType.Creature;
     }
 
+    // JimsProxy (#382 charm-presentation levers): scope predicate shared by the possess-shim
+    // tracking and the Charm382* A/B levers — a PLAYER charmed by ANOTHER PLAYER, seen from a
+    // bystander session. The victim (guid == self) and the charmer (charmedBy == self) keep
+    // the raw presentation; NPC charmers (Lucifron's Dominate Mind et al.) are long-stable
+    // raid content and stay untouched.
+    internal static bool IsObservedPlayerCharmedByPlayer(WowGuid128 guid, WowGuid128 charmedBy, WowGuid128 localPlayerGuid)
+    {
+        return guid.IsPlayer() &&
+            charmedBy.IsPlayer() &&
+            guid != localPlayerGuid &&
+            charmedBy != localPlayerGuid;
+    }
+
+    // JimsProxy (#382, lever L3 Charm382SuppressCharmAura): drop the charm aura itself
+    // (Gnomish MC Cap 13181 / priest MC 605) from a bystander's view of a charmed player.
+    // Spell-id gated rather than tracking-set gated so it holds even if the aura slot update
+    // arrives in a packet before the CHARMEDBY write — both spells are player-only casts, so
+    // spell id alone implies a player charmer. 20604 (Lucifron) is deliberately NOT listed.
+    internal static bool ShouldSuppressCharmAuraForObserver(bool leverOn, WowGuid128 guid, WowGuid128 localPlayerGuid, uint spellId)
+    {
+        if (!leverOn)
+            return false;
+        if (spellId != 13181 && spellId != 605) // Gnomish MC Cap / priest Mind Control
+            return false;
+        return guid.IsPlayer() && guid != localPlayerGuid;
+    }
+
+    // JimsProxy (#382, lever L2 Charm382FactionHold): hold a charmed player's pre-charm
+    // faction for bystanders instead of forwarding the server's flip to the charmer's
+    // faction. Only when the unit is tracked as an observed player-charmed-player AND we
+    // actually saw a pre-charm faction to hold (a unit walking into range mid-charm has no
+    // cached value — forward raw, same as today).
+    internal static bool ShouldHoldFactionForCharm(bool leverOn, bool isTrackedObservedCharm, bool hasCachedFaction)
+    {
+        return leverOn && isTrackedObservedCharm && hasCachedFaction;
+    }
+
     // (DisplayId, wire * 1000 rounded) pairs where Twinstar's bias on top of CMS_v
     // is the deliberate vanilla-intended visible scale, not a pre-scaled sibling.
     // The wirePreScaled heuristic would otherwise catch and shrink these to CMS_v,
@@ -2444,7 +2481,6 @@ public partial class WorldClient
             if (UNIT_FIELD_CHARMEDBY >= 0 && updateMaskArray[UNIT_FIELD_CHARMEDBY])
             {
                 WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To128(GetSession().GameState);
-                updateData.UnitData.CharmedBy = charmedBy;
 
                 // JimsProxy (#382 observer lockup): track players charmed by ANOTHER PLAYER,
                 // so the flags translation below can present them as possessed (see
@@ -2455,10 +2491,26 @@ public partial class WorldClient
                 // years of raid MCs have produced no observer-lockup reports, so that
                 // long-stable content stays untouched.
                 var gameState = GetSession().GameState;
-                bool observedCharmedPlayer = guid.IsPlayer() &&
-                    charmedBy.IsPlayer() &&
-                    guid != gameState.CurrentPlayerGuid &&
-                    charmedBy != gameState.CurrentPlayerGuid;
+                bool observedCharmedPlayer = IsObservedPlayerCharmedByPlayer(guid, charmedBy, gameState.CurrentPlayerGuid);
+
+                // JimsProxy (#382, lever L1 Charm382SuppressCharmedBy): hide the charm
+                // relationship itself from bystander sessions — the modern client's charm
+                // bookkeeping keys off CHARMEDBY, and the 07-23 capture narrowed the held
+                // observer state during a drop to CHARMEDBY + faction flip + charm aura.
+                // Charm-end clears (empty charmedBy → predicate false) always forward, which
+                // writes Empty over the Empty the client already holds — harmless.
+                if (Settings.Charm382SuppressCharmedBy && observedCharmedPlayer)
+                {
+                    Log.Event("charm.observed_player.charmedby_suppressed", new
+                    {
+                        guid_low = guid.GetCounter(),
+                        charmed_by_low = charmedBy.GetCounter(),
+                    });
+                }
+                else
+                {
+                    updateData.UnitData.CharmedBy = charmedBy;
+                }
                 if (observedCharmedPlayer)
                 {
                     if (gameState.ObservedCharmedPlayers.Add(guid))
@@ -2548,7 +2600,35 @@ public partial class WorldClient
             int UNIT_FIELD_FACTIONTEMPLATE = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_FACTIONTEMPLATE);
             if (UNIT_FIELD_FACTIONTEMPLATE >= 0 && updateMaskArray[UNIT_FIELD_FACTIONTEMPLATE])
             {
-                updateData.UnitData.FactionTemplate = updates[UNIT_FIELD_FACTIONTEMPLATE].Int32Value;
+                int newFaction = updates[UNIT_FIELD_FACTIONTEMPLATE].Int32Value;
+
+                // JimsProxy (#382, lever L2 Charm382FactionHold): for a tracked observed
+                // player-charmed-by-player, keep presenting the pre-charm faction instead of
+                // the server's flip to the charmer's faction. CHARMEDBY is processed above
+                // before this block, so within the charm-apply update the tracking set is
+                // already populated (hold applies) and within the charm-end update the set is
+                // already emptied (restore forwards raw — and equals the held value anyway).
+                // A unit first seen mid-charm has no cached pre-charm faction: forward raw,
+                // identical to today.
+                bool hasCachedFaction = GetSession().GameState.LastForwardedPlayerFaction.TryGetValue(guid, out int preCharmFaction);
+                if (ShouldHoldFactionForCharm(Settings.Charm382FactionHold,
+                        GetSession().GameState.ObservedCharmedPlayers.Contains(guid),
+                        hasCachedFaction))
+                {
+                    updateData.UnitData.FactionTemplate = preCharmFaction;
+                    Log.Event("charm.observed_player.faction_held", new
+                    {
+                        guid_low = guid.GetCounter(),
+                        held_faction = preCharmFaction,
+                        suppressed_faction = newFaction,
+                    });
+                }
+                else
+                {
+                    updateData.UnitData.FactionTemplate = newFaction;
+                    if (guid.IsPlayer())
+                        GetSession().GameState.LastForwardedPlayerFaction[guid] = newFaction;
+                }
             }
 
             int UNIT_FIELD_BYTES_0 = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_BYTES_0);
@@ -2742,7 +2822,12 @@ public partial class WorldClient
                 // 1.14 client (BG bystanders FPS-lock rendering it), while possess (priest
                 // MC 605) renders fine. CHARMEDBY is processed above before this flags block,
                 // so apply/clear ordering within a single update is already correct.
-                if (Session.GameState.ObservedCharmedPlayers.Contains(guid))
+                // Lever L4 (Charm382ObserverPossess, default true = shipped behavior): the
+                // shim did NOT fix #382 (07-22 capture: fired 3×, drops persisted) — the
+                // toggle lets a reporter A/B dropping the synthetic possess bit alongside
+                // the other Charm382* levers. Retirement tracked separately (PR #436).
+                if (Settings.Charm382ObserverPossess &&
+                    Session.GameState.ObservedCharmedPlayers.Contains(guid))
                     updateData.UnitData.Flags |= (uint)UnitFlags.Possessed;
 
                 // Here because of this bullshit in cmangos:
@@ -3524,6 +3609,16 @@ public partial class WorldClient
                                 is_player_target = guid == GetSession().GameState.CurrentPlayerGuid,
                             });
                         }
+                        // JimsProxy (#382, lever L3 Charm382SuppressCharmAura): hide the charm
+                        // aura itself (13181/605) from bystander views of a charmed player —
+                        // the third leg of the held observer state alongside CHARMEDBY and the
+                        // faction flip. The charm-end slot clear still forwards (AuraData null,
+                        // not gated), which removes nothing client-side since the add was
+                        // never seen.
+                        bool charmAuraSuppressed = aura.AuraData != null &&
+                            ShouldSuppressCharmAuraForObserver(Settings.Charm382SuppressCharmAura,
+                                guid, GetSession().GameState.CurrentPlayerGuid, (uint)aura.AuraData.SpellID);
+
                         if (aura.AuraData != null && ShouldDropModScaleAura(guid, (uint)aura.AuraData.SpellID))
                         {
                             Framework.Logging.Log.Event("aura.slot.dropped_mod_scale_npc", new
@@ -3532,6 +3627,16 @@ public partial class WorldClient
                                 high_type = guid.GetHighType().ToString(),
                                 slot = i,
                                 spell_id = aura.AuraData.SpellID,
+                                source = "object_update",
+                            });
+                        }
+                        else if (charmAuraSuppressed)
+                        {
+                            Framework.Logging.Log.Event("aura.slot.dropped_charm_observer", new
+                            {
+                                target_low = guid.GetCounter(),
+                                slot = i,
+                                spell_id = aura.AuraData!.SpellID,
                                 source = "object_update",
                             });
                         }
@@ -3544,7 +3649,9 @@ public partial class WorldClient
                         // next AURAAPPLICATIONS-quad-only update can detect a per-slot byte
                         // change and re-emit without spuriously refreshing the other three
                         // slots packed into the same uint32.
-                        if (aura.AuraData != null)
+                        // (#382 L3: skip when the charm aura was suppressed — storing it would
+                        // let a later apps-quad change synthesize the hidden aura back in.)
+                        if (aura.AuraData != null && !charmAuraSuppressed)
                             GetSession().GameState.StoreLastEmittedAura(guid, i, aura.AuraData);
 
                         // JimsProxy (vanilla synthesized spell stats): mirror active aura spell

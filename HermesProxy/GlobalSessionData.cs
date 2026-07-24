@@ -899,6 +899,13 @@ public sealed class GameSessionData
     // fresh create block (re-appearance after an out-of-range charm end).
     public HashSet<WowGuid128> ObservedCharmedPlayers = [];
 
+    // JimsProxy (#382, lever L2 Charm382FactionHold): last RAW-forwarded UNIT_FIELD_FACTIONTEMPLATE
+    // per PLAYER guid. Only written when a faction value is forwarded unmodified — never while a
+    // hold is active — so during an observed charm it retains the pre-charm faction. The charm-end
+    // restore equals the held value, making the whole charm faction-invisible to this client when
+    // the lever is on. Player guids only (bounded by players seen this session).
+    public Dictionary<WowGuid128, int> LastForwardedPlayerFaction = new();
+
     // JimsProxy (Tallstrider-Fix): per-GUID last-known facing orientation, populated from
     // any MovementInfo we observe (spawn, heartbeat, ObjectUpdate movement block). Used by
     // MovementHandler.HandleMonsterMove to compare the creature's current facing against
