@@ -275,6 +275,42 @@ public class HoneyWriterTests
         writer.Stop();
     }
 
+    // (f) Fable review: a guid-scoped hold is NOT released by an OBSERVED caster's same-spell GO — only
+    //     the player's own GO releases it (Sugar's buffer replays only on the player's GO path). Without
+    //     the guid constraint, a nearby caster of the same spell would release the held terminal early,
+    //     re-opening the reconcile-defeating START->GO split.
+    [Fact]
+    public void Hold_GuidScoped_NotReleasedByObservedCastersGo()
+    {
+        var sink = new OrderSink(expected: 3);
+        var writer = new HoneyWriter(sink);
+        writer.EnsureStarted();
+
+        var player = new WowGuid128(1, 42);
+        var observed = new WowGuid128(1, 99);
+
+        writer.EnqueueHold(null!, new OpcodePacket(Opcode.SMSG_CAST_FAILED),
+            releaseOpcode: Opcode.SMSG_SPELL_GO, releaseSpellId: 555, deadlineMs: 60_000,
+            releaseGuid: player);
+
+        var observedGo = new SpellGo();
+        observedGo.Cast.SpellID = 555;
+        observedGo.Cast.CasterUnit = observed; // same spell, WRONG caster -> must NOT release
+        writer.Enqueue(null!, observedGo);
+
+        var playerGo = new SpellGo();
+        playerGo.Cast.SpellID = 555;
+        playerGo.Cast.CasterUnit = player;     // the player's own GO -> releases the held terminal
+        writer.Enqueue(null!, playerGo);
+
+        Assert.True(sink.Wait(TimeSpan.FromSeconds(10)), "player's GO did not release the guid-scoped hold");
+        Assert.Equal(
+            new[] { Opcode.SMSG_SPELL_GO, Opcode.SMSG_SPELL_GO, Opcode.SMSG_CAST_FAILED },
+            sink.Opcodes());
+
+        writer.Stop();
+    }
+
     // (e) A retracted hold is discarded unsent: hold START behind UPDATE_OBJECT, retract it, then emit
     //     UPDATE_OBJECT -> only the UPDATE_OBJECT reaches the sink.
     [Fact]

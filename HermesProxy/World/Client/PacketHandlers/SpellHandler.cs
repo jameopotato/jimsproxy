@@ -600,7 +600,11 @@ public partial class WorldClient
             if (Framework.Settings.HoneyProxyMode && pendingCast.HasStarted && !movementSuppressed
                 && GetSession().HoneyWriter is { } honeyReconcileWriter)
                 honeyReconcileWriter.EnqueueHold(GetSession().InstanceSocket, failed,
-                    Opcode.SMSG_SPELL_GO, pendingCast.SpellId, HoneyFailedHoldDeadlineMs);
+                    Opcode.SMSG_SPELL_GO, pendingCast.SpellId, HoneyFailedHoldDeadlineMs,
+                    // Fable review: release only on the LOCAL PLAYER's GO — an observed caster's
+                    // same-spell GO must not release this terminal early (Sugar's buffer replays only
+                    // on the player's own GO path, Track C §4.2).
+                    releaseGuid: GetSession().GameState.CurrentPlayerGuid);
             else
                 SendPacketToClient(failed);
 
@@ -1884,7 +1888,12 @@ public partial class WorldClient
                     // hold bricks the client cast state machine, ice-92 #379). Replaces the OFF Task.Delay.
                     GetSession().HoneyWriter!.EnqueueHold(GetSession().InstanceSocket, spell,
                         Opcode.SMSG_UPDATE_OBJECT, releaseSpellId: 0,
-                        deadlineMs: Settings.FormExitStartDeferMs, retractKey: (uint)spell.Cast.SpellID);
+                        deadlineMs: Settings.FormExitStartDeferMs, retractKey: (uint)spell.Cast.SpellID,
+                        // Fable review: release only on an update that contains the PLAYER's own block —
+                        // the form-removal update. Without this, any nearby unit's update (constant in a
+                        // raid) releases the START within ~ms and the #379 ordering collapses exactly
+                        // where druids powershift most.
+                        releaseGuid: GetSession().GameState.CurrentPlayerGuid);
                     // Instant (incl. form->form): its same-tick GO must never precede the START (#428), so
                     // flag it -- HandleSpellGo holds the GO behind the SAME UPDATE_OBJECT, released FIFO
                     // right after the START. Cast-time GOs arrive long after the update (START already
@@ -2438,7 +2447,10 @@ public partial class WorldClient
                 _honeyFormExitInstantGoSpellId = 0;
                 GetSession().HoneyWriter!.EnqueueHold(GetSession().InstanceSocket, spell,
                     Opcode.SMSG_UPDATE_OBJECT, releaseSpellId: 0,
-                    deadlineMs: Settings.FormExitStartDeferMs, retractKey: (uint)spell.Cast.SpellID);
+                    deadlineMs: Settings.FormExitStartDeferMs, retractKey: (uint)spell.Cast.SpellID,
+                    // Fable review: player-scoped trigger — see the START hold above; the instant's GO
+                    // rides the same update so START,GO release FIFO together (#428, never split).
+                    releaseGuid: GetSession().GameState.CurrentPlayerGuid);
                 Log.Event("spell.go.form_exit_honey_held", new { spell_id = spell.Cast.SpellID });
             }
             else

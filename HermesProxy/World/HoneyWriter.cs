@@ -53,25 +53,26 @@ public sealed class HoneyWriter
         public readonly ServerPacket? Packet;
         public readonly Opcode ReleaseOpcode; // Hold: emit only after this opcode is emitted
         public readonly uint ReleaseSpellId;  // Hold: 0 = any packet of ReleaseOpcode; else must match spell
+        public readonly WowGuid128? ReleaseGuid; // Hold: null = any; else the trigger must involve this guid
         public readonly long DeadlineTicks;   // Hold: Environment.TickCount64 at/after which to release anyway
         public readonly uint RetractKey;      // Hold: retraction id (0 = not retractable); Retract: id to drop
 
         public OutboundItem(WorldSocket target, ServerPacket packet)
         {
             Kind = Kind.Emit; Target = target; Packet = packet;
-            ReleaseOpcode = default; ReleaseSpellId = 0; DeadlineTicks = 0; RetractKey = 0;
+            ReleaseOpcode = default; ReleaseSpellId = 0; ReleaseGuid = null; DeadlineTicks = 0; RetractKey = 0;
         }
 
-        public OutboundItem(WorldSocket target, ServerPacket packet, Opcode releaseOpcode, uint releaseSpellId, long deadlineTicks, uint retractKey)
+        public OutboundItem(WorldSocket target, ServerPacket packet, Opcode releaseOpcode, uint releaseSpellId, WowGuid128? releaseGuid, long deadlineTicks, uint retractKey)
         {
             Kind = Kind.Hold; Target = target; Packet = packet;
-            ReleaseOpcode = releaseOpcode; ReleaseSpellId = releaseSpellId; DeadlineTicks = deadlineTicks; RetractKey = retractKey;
+            ReleaseOpcode = releaseOpcode; ReleaseSpellId = releaseSpellId; ReleaseGuid = releaseGuid; DeadlineTicks = deadlineTicks; RetractKey = retractKey;
         }
 
         public OutboundItem(uint retractKey)
         {
             Kind = Kind.Retract; Target = null!; Packet = null;
-            ReleaseOpcode = default; ReleaseSpellId = 0; DeadlineTicks = 0; RetractKey = retractKey;
+            ReleaseOpcode = default; ReleaseSpellId = 0; ReleaseGuid = null; DeadlineTicks = 0; RetractKey = retractKey;
         }
     }
 
@@ -82,6 +83,7 @@ public sealed class HoneyWriter
         public required ServerPacket Packet;
         public required Opcode ReleaseOpcode;
         public required uint ReleaseSpellId;
+        public required WowGuid128? ReleaseGuid;
         public required long DeadlineTicks;
         public required uint RetractKey;
     }
@@ -151,10 +153,15 @@ public sealed class HoneyWriter
     // release it anyway `deadlineMs` after enqueue (bounded fallback -- Sugar's data-dependency defer
     // with a safety valve; #379 records that an UNBOUNDED hold bricks the client cast state machine).
     // `retractKey` (non-zero) makes the hold cancellable via EnqueueRetract before it releases.
-    public void EnqueueHold(WorldSocket target, ServerPacket packet, Opcode releaseOpcode, uint releaseSpellId, int deadlineMs, uint retractKey = 0)
+    // `releaseGuid` (Fable review): scope the trigger to a specific unit — for SMSG_SPELL_GO the caster,
+    // for SMSG_UPDATE_OBJECT any contained object block. Without it, an OBSERVED caster's same-spell GO
+    // would release a held local terminal early (Sugar's buffer replays only on the PLAYER's own GO
+    // path), and in a busy scene ANY unrelated unit's update would release a #379 form-exit hold
+    // immediately, collapsing the ordering fix exactly where druids powershift most (raids).
+    public void EnqueueHold(WorldSocket target, ServerPacket packet, Opcode releaseOpcode, uint releaseSpellId, int deadlineMs, uint retractKey = 0, WowGuid128? releaseGuid = null)
     {
         long deadline = Environment.TickCount64 + Math.Max(0, deadlineMs);
-        TryEnqueue(new OutboundItem(target, packet, releaseOpcode, releaseSpellId, deadline, retractKey), packet);
+        TryEnqueue(new OutboundItem(target, packet, releaseOpcode, releaseSpellId, releaseGuid, deadline, retractKey), packet);
     }
 
     // JimsProxy (HoneyProxy, Stage 4): discard any still-pending holds tagged with `retractKey` WITHOUT
@@ -217,6 +224,7 @@ public sealed class HoneyWriter
                                 Packet = item.Packet!,
                                 ReleaseOpcode = item.ReleaseOpcode,
                                 ReleaseSpellId = item.ReleaseSpellId,
+                                ReleaseGuid = item.ReleaseGuid,
                                 DeadlineTicks = item.DeadlineTicks,
                                 RetractKey = item.RetractKey,
                             });
@@ -251,11 +259,10 @@ public sealed class HoneyWriter
         {
             var (_, trigger) = work.Dequeue();
             Opcode op = trigger.GetUniversalOpcode();
-            uint spellId = ExtractSpellId(trigger);
             for (int i = 0; i < _held.Count; )
             {
                 var h = _held[i];
-                if (h.ReleaseOpcode == op && (h.ReleaseSpellId == 0 || h.ReleaseSpellId == spellId))
+                if (TriggerMatches(h, trigger, op))
                 {
                     _held.RemoveAt(i);
                     Emit(h.Target, h.Packet);
@@ -266,6 +273,36 @@ public sealed class HoneyWriter
                     i++;
                 }
             }
+        }
+    }
+
+    // A hold releases only when opcode, spell (if constrained), and unit (if constrained) all match the
+    // emitted trigger. An unknown trigger type under a guid constraint does NOT match — the deadline is
+    // the fallback, never a wrong-unit release.
+    private static bool TriggerMatches(HeldItem h, ServerPacket trigger, Opcode op)
+    {
+        if (h.ReleaseOpcode != op)
+            return false;
+        if (h.ReleaseSpellId != 0 && (trigger is not SpellGo goSpell || (uint)goSpell.Cast.SpellID != h.ReleaseSpellId))
+            return false;
+        if (h.ReleaseGuid != null && !TriggerContainsGuid(trigger, h.ReleaseGuid.Value))
+            return false;
+        return true;
+    }
+
+    private static bool TriggerContainsGuid(ServerPacket trigger, WowGuid128 guid)
+    {
+        switch (trigger)
+        {
+            case SpellGo go:
+                return go.Cast.CasterUnit == guid;
+            case UpdateObject uo:
+                foreach (var u in uo.ObjectUpdates)
+                    if (u.Guid == guid)
+                        return true;
+                return false;
+            default:
+                return false;
         }
     }
 
@@ -340,12 +377,6 @@ public sealed class HoneyWriter
             });
         }
     }
-
-    // Only SMSG_SPELL_GO carries a spell id the hold primitive keys on today (the CAST_FAILED reconcile);
-    // every other release trigger keys on opcode alone (ReleaseSpellId == 0). Kept deliberately narrow so
-    // the writer stays decoupled from packet internals.
-    private static uint ExtractSpellId(ServerPacket packet)
-        => packet is SpellGo go ? (uint)go.Cast.SpellID : 0u;
 
     public void Stop()
     {
