@@ -311,6 +311,16 @@ public partial class WorldSocket
             // normal cast's SPELL_START (see ClearNonStartedNormalCasts / IsOffGcd).
             castRequest.IsOffGcd = isOffGcd;
 
+            // JimsProxy (HoneyProxy, Stage 4 -- forward-everything submission): bypass the ENTIRE
+            // LL/RTT/queue/GCD-hold ladder below. Forward every press immediately; the only swallow is
+            // the in-flight same-spell duplicate (which still gets a fabricated terminal so the button
+            // never sticks). No hold, no knock, no GCD arming, no queue guards -- Sugar-shaped.
+            if (Framework.Settings.HoneyProxyMode)
+            {
+                HandleCastSpell_Honey(cast, castRequest, isOffGcd);
+                return;
+            }
+
             // JimsProxy (issue #43): off-GCD spells (Sprint, Evasion, Trinket, racials, etc)
             // bypass both the HasStartedNormalCast cast-bar gate and the GCD hold path. A real
             // 1.12 client would fire these mid-cast-bar and mid-GCD, so we match that.
@@ -697,6 +707,60 @@ public partial class WorldSocket
                 castRequest.HasSentPrepare = true;
             }
         }
+
+        WorldPacket packet = BuildCastSpellPacket(cast);
+        SendPacketToServer(packet);
+    }
+
+    // JimsProxy (HoneyProxy, Stage 4): forward-everything cast submission -- the single Honey path for
+    // normal (on- and off-GCD) player casts, replacing the whole LL/RTT/queue/GCD-hold ladder in
+    // HandleCastSpell. Mirrors the proven Low-Latency forward-immediately shape (EnqueuePendingNormalCast
+    // -> SendPacketToServer) but strips every hold/knock/queue guard: Sugar forwards each cast straight
+    // through and its client's GCD bar anchors itself (SUGAR-CAST-MODEL, forward-everything). The ONE
+    // retained guard is the in-flight same-spell duplicate collapse -- the 1.14 client double-sends some
+    // off-GCD spells (e.g. Blade Flurry 13877); two pending entries mis-pair START<->GO into a stuck
+    // cast. A swallowed press still fabricates its terminal ack (SendCastFailedWithoutPrepare, which
+    // routes through the ordered writer) so the action button never sticks lit. Auto-repeat / next-melee
+    // casts are handled by their own hold-free branch above and never reach here. The GCD-anchor extras
+    // (synthetic SMSG_SPELL_COOLDOWN, GO.CastTime stamp, RefireSpellGo) and BeginGcd's timer are skipped
+    // in HandleSpellGo under Honey, not here.
+    private void HandleCastSpell_Honey(CastSpell cast, ClientCastRequest castRequest, bool isOffGcd)
+    {
+        if (GetSession().GameState.HasNonStartedPendingCastForSpell((uint)cast.Cast.SpellID))
+        {
+            Log.Event("cast.dropped.duplicate", new
+            {
+                spell_id = cast.Cast.SpellID,
+                reason = "honey_in_flight_same_spell",
+                client_cast_id = cast.Cast.CastID.ToString(),
+                queue_depth = GetSession().GameState.PendingNormalCasts.Count,
+                source = "honey",
+            });
+            SendCastFailedWithoutPrepare(castRequest);
+            return;
+        }
+
+        // Off-GCD casts need SpellPrepare NOW (on-GCD casts defer it to SPELL_START/GO time so the GCD
+        // sweep doesn't start early): without it, a server reject (LoS/range) leaves the button with no
+        // SpellPrepare to match SpellFailure against, so it stays lit. Mirrors the OFF-mode off-GCD path.
+        if (isOffGcd)
+        {
+            SpellPrepare prepare = new SpellPrepare();
+            prepare.ClientCastID = castRequest.ClientGUID;
+            prepare.ServerCastID = castRequest.ServerGUID;
+            SendPacket(prepare);
+            castRequest.HasSentPrepare = true;
+        }
+
+        if (Framework.Settings.DebugOutput)
+            Log.Event("cast.forwarded", new
+            {
+                spell_id = cast.Cast.SpellID,
+                client_cast_id = castRequest.ClientGUID.ToString(),
+                queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
+                source = "honey",
+            });
+        GetSession().GameState.EnqueuePendingNormalCast(castRequest);
 
         WorldPacket packet = BuildCastSpellPacket(cast);
         SendPacketToServer(packet);

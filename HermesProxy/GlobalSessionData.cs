@@ -3333,7 +3333,10 @@ public class GlobalSessionData
             // that CAST_FAILED was dropped (e.g. Kronos target-dies-mid-cast) the cast lands here
             // instead — so cancel the casting-pose / channel visual too, not just dismiss the bar,
             // or the pose can linger until the next cast. Idempotent on the client.
-            if (Framework.Settings.LowLatencyMode && cast.HasStarted)
+            // JimsProxy (HoneyProxy, Stage 4 -- Pillar 5, S8): no cancels ever. The anti-lockout
+            // SpellPrepare + CastFailed above still fire (item 6: watchdog terminal set stays); only the
+            // cancel is stripped, and the client self-dismisses the pose from that CastFailed.
+            if (Framework.Settings.LowLatencyMode && cast.HasStarted && !Framework.Settings.HoneyProxyMode)
             {
                 uint resolvedVisual = GameData.GetSpellVisualIdFromXSpellVisual(cast.SpellXSpellVisualId);
                 if (resolvedVisual != 0)

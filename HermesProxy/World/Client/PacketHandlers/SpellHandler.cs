@@ -28,6 +28,20 @@ public partial class WorldClient
     // in a clean client frame past the coalesced START+GO burst. A couple of frames at 60fps.
     private const int SpellSuccessRefireDeferMs = 8;
 
+    // JimsProxy (HoneyProxy, Stage 4 -- Pillar 3 buffer-and-reconcile): bounded fallback for a held
+    // CAST_FAILED of an in-flight STARTED cast. If the spell's SMSG_SPELL_GO is emitted first, the writer
+    // replays the failure right after it (the common intent); if no GO ever comes (a genuine
+    // OOR/LoS/OOM failure -- the usual case, since a failed cast gets no GO), the deadline dismisses the
+    // cast bar. Long enough to catch a co-batched / slightly-delayed GO ("interrupted but fired"), short
+    // enough that a genuine failure's bar-dismiss isn't perceptibly late. Tunable.
+    private const int HoneyFailedHoldDeadlineMs = 200;
+
+    // JimsProxy (HoneyProxy, Stage 4 -- #379 as ordering): when an INSTANT form-exit SPELL_START is held
+    // behind the form-removal SMSG_UPDATE_OBJECT, its matching SPELL_GO must be held too so START never
+    // crosses its own GO (#428). Set at HandleSpellStart, consumed at HandleSpellGo. 0 = none.
+    // ReceiveLoop-only (like _formExitHeldStart), so no lock.
+    private uint _honeyFormExitInstantGoSpellId;
+
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_SEND_KNOWN_SPELLS)]
     void HandleSendKnownSpells(WorldPacket packet)
@@ -577,7 +591,18 @@ public partial class WorldClient
                 failed.CastID = pinnedFailCastId;
             failed.FailedArg1 = arg1;
             failed.FailedArg2 = arg2;
-            SendPacketToClient(failed);
+            // JimsProxy (HoneyProxy, Stage 4 -- Pillar 3 buffer-and-reconcile): a terminal for an
+            // in-flight STARTED cast must never split its START from a still-pending SPELL_GO (the #394
+            // "looping sound"). Freeze the built failure and hold it behind this spell's SPELL_GO; the
+            // ordered writer replays it strictly AFTER the GO, or on the bounded deadline if no GO comes
+            // (a genuine failure). Unstarted / movement-cancelled casts have no live START to cross, so
+            // they emit immediately. Mirrors Sugar's AddFailedPacket -> GetFailedPacket.
+            if (Framework.Settings.HoneyProxyMode && pendingCast.HasStarted && !movementSuppressed
+                && GetSession().HoneyWriter is { } honeyReconcileWriter)
+                honeyReconcileWriter.EnqueueHold(GetSession().InstanceSocket, failed,
+                    Opcode.SMSG_SPELL_GO, pendingCast.SpellId, HoneyFailedHoldDeadlineMs);
+            else
+                SendPacketToClient(failed);
 
             // JimsProxy (transient-no-dismiss-started): under LowLatencyMode the SPELL_FAILURE
             // deferred the caster-side visual-cancel to here so the REAL reason drives it. A real
@@ -585,7 +610,10 @@ public partial class WorldClient
             // 1.14 client doesn't reliably do it from CAST_FAILED alone) — mirror HandleSpellFailure's
             // cast-failure-stuck-visual cleanup. Transient dup-rejections and movement-cancelled casts
             // never reach here started, so this is real failures only.
-            if (Settings.LowLatencyMode && pendingCast.HasStarted && !movementSuppressed)
+            // JimsProxy (HoneyProxy, Stage 4 -- Pillar 5, S1): no cancels ever. The client self-dismisses
+            // its own visual from the standard failure packets. (Already LL-gated; !Honey keeps it out.)
+            if (Settings.LowLatencyMode && pendingCast.HasStarted && !movementSuppressed
+                && !Framework.Settings.HoneyProxyMode)
             {
                 uint resolvedVisual = GameData.GetSpellVisualIdFromXSpellVisual(pendingCast.SpellXSpellVisualId);
                 if (resolvedVisual != 0)
@@ -670,7 +698,9 @@ public partial class WorldClient
             {
                 uint spellVisual = GameData.GetSpellVisual(spellId);
                 uint resolvedSpellVisualId = GameData.GetSpellVisualIdFromXSpellVisual(spellVisual);
-                if (resolvedSpellVisualId != 0)
+                // JimsProxy (HoneyProxy, Stage 4 -- Pillar 5, S2): no cancels ever; the PetCastFailed
+                // fallback below (anti-lockout for the predicted pet-button GCD) still fires.
+                if (resolvedSpellVisualId != 0 && !Framework.Settings.HoneyProxyMode)
                 {
                     CancelSpellVisual cancelVisual = new CancelSpellVisual();
                     cancelVisual.Source = petGuid;
@@ -982,7 +1012,11 @@ public partial class WorldClient
         ulong interruptLogVictimLow = 0;
         int interruptLogBackfireSpellId = 0;
         ulong cancelVisualSourceLow = 0;
-        if (reason == 61 /* Interrupted */ && !casterIsPlayer && !casterIsPet)
+        // JimsProxy (HoneyProxy, Stage 4 -- Pillar 5): strip interrupt synthesis entirely. Vanilla 1.12
+        // has neither SMSG_SPELL_INTERRUPT_LOG nor SMSG_CANCEL_SPELL_VISUAL (both fabricated here, S3);
+        // Sugar emits none. Accepted cosmetic regression: a kicked mob's cast bar keeps filling.
+        if (reason == 61 /* Interrupted */ && !casterIsPlayer && !casterIsPet
+            && !Framework.Settings.HoneyProxyMode)
         {
             SpellInterruptLog interruptLog = new SpellInterruptLog();
             interruptLog.Caster = GetSession().GameState.CurrentPlayerGuid;
@@ -1014,7 +1048,8 @@ public partial class WorldClient
 
         // Pet auto-cast failure (mirrors HandleSpellFailure fix). Defensive: if the
         // server ever broadcasts pet auto-cast failure via FAILED_OTHER, dismiss visual.
-        if (casterIsPet && !sentCancelVisual)
+        // JimsProxy (HoneyProxy, Stage 4 -- Pillar 5, S4): no cancels ever.
+        if (casterIsPet && !sentCancelVisual && !Framework.Settings.HoneyProxyMode)
         {
             resolvedSpellVisualId = GameData.GetSpellVisualIdFromXSpellVisual(spellVisual);
             if (resolvedSpellVisualId != 0)
@@ -1336,7 +1371,11 @@ public partial class WorldClient
         ulong interruptLogVictimLow = 0;
         int interruptLogBackfireSpellId = 0;
         ulong cancelVisualSourceLow = 0;
-        if (reason == 61 /* Interrupted */ && foundActiveCastId && !casterIsPlayer && !casterIsPet)
+        // JimsProxy (HoneyProxy, Stage 4 -- Pillar 5): strip interrupt synthesis (SpellInterruptLog + the
+        // S5 CancelSpellVisual). Vanilla has neither opcode; Sugar emits none. Accepted regression: an
+        // enemy player's counterspelled cast bar keeps filling on your target frame until they move.
+        if (reason == 61 /* Interrupted */ && foundActiveCastId && !casterIsPlayer && !casterIsPet
+            && !Framework.Settings.HoneyProxyMode)
         {
             SpellInterruptLog interruptLog = new SpellInterruptLog();
             interruptLog.Caster = GetSession().GameState.CurrentPlayerGuid;
@@ -1365,7 +1404,8 @@ public partial class WorldClient
         // LoS, range), the cast fell through to the else branch (no PendingPetCasts
         // entry for auto-casts). SpellFailure packet dismisses the cast bar, but the
         // visual kit (animation + looping sound) needs explicit CancelSpellVisual.
-        if (casterIsPet && !dequeued && !sentCancelVisual)
+        // JimsProxy (HoneyProxy, Stage 4 -- Pillar 5, S6): no cancels ever.
+        if (casterIsPet && !dequeued && !sentCancelVisual && !Framework.Settings.HoneyProxyMode)
         {
             resolvedSpellVisualId = GameData.GetSpellVisualIdFromXSpellVisual(spellVisual);
             if (resolvedSpellVisualId != 0)
@@ -1414,7 +1454,11 @@ public partial class WorldClient
         // #72's instant-suppression was removed once SpellFailure switched to peek),
         // so for auto-repeat ticks the visual is live on the client regardless of
         // whether the pending queue tracked it.
-        if (casterIsLocalPlayer && (wasStarted || isRangedAutoAttack) && !sentCancelVisual && !deferLocalDismissToCastFailed)
+        // JimsProxy (HoneyProxy, Stage 4 -- Pillar 5, S7): no cancels ever. This local-player caster-side
+        // dismiss (casting pose / bow-draw / wand-aim) is the single most-user-visible cancel; Honey
+        // drops it and lets the client self-dismiss from CAST_FAILED (the whole point of the A/B).
+        if (casterIsLocalPlayer && (wasStarted || isRangedAutoAttack) && !sentCancelVisual && !deferLocalDismissToCastFailed
+            && !Framework.Settings.HoneyProxyMode)
         {
             resolvedSpellVisualId = GameData.GetSpellVisualIdFromXSpellVisual(spellVisual);
             if (resolvedSpellVisualId != 0)
@@ -1462,6 +1506,12 @@ public partial class WorldClient
     // JimsProxy (observed-bow retract): lower an observed shooter's latched ranged-aim by synthesizing SMSG_CANCEL_AUTO_REPEAT with THAT unit's GUID (the legacy handler only ever cancels the local player, and vanilla never broadcasts a stop for other units). Driven both from deterministic stop edges on the WorldClient ReceiveLoop (target death / shooter death / move / retarget) and from the quiescence sweep's ThreadPool thread; SendPacketToClient is already used off-thread (taxi/GCD), so this is safe.
     private void SendObservedAutoRepeatCancel(WowGuid128 shooter)
     {
+        // JimsProxy (HoneyProxy, Stage 4 -- Pillar 5): no cancels ever. Suppress the observed-bow retract
+        // (SMSG_CANCEL_AUTO_REPEAT) from BOTH its deterministic stop edges AND the quiescence sweep --
+        // this single chokepoint covers both callers. Accepted regression: observed shooters keep their
+        // bow drawn. The observed-START hold/replay stays, so the draw still shows for shots that fire.
+        if (Framework.Settings.HoneyProxyMode)
+            return;
         // If the session is mid-teardown skip rather than block in SendPacketToClient's wait-for-instance loop — the aim is moot once disconnected.
         if (GetSession().InstanceSocket == null || !GetSession().GameState.IsConnectedToInstance)
             return;
@@ -1521,6 +1571,18 @@ public partial class WorldClient
     // healthy; its GO is coming). ReceiveLoop-only.
     private void CancelFormExitDeferredCast(uint spellId, string source)
     {
+        // JimsProxy (HoneyProxy, Stage 4): a real failure crossing the form-exit window must retract the
+        // not-yet-sent START (and its held instant GO) from the ordered writer -- otherwise the failure
+        // reaches the client before the START and orphans it (the exact bug class #379 targets). Under
+        // Honey the held packets live in the writer, not _formExitDeferredStart/_formExitHeldStart, so
+        // retract by key; the OFF-mode field handling below is a harmless no-op under Honey (never set).
+        if (Framework.Settings.HoneyProxyMode)
+        {
+            GetSession().HoneyWriter?.EnqueueRetract(spellId);
+            if (_honeyFormExitInstantGoSpellId == spellId)
+                _honeyFormExitInstantGoSpellId = 0;
+        }
+
         var deferred = _formExitDeferredStart;
         if (deferred != null && deferred.SpellId == spellId && !deferred.Cancelled)
         {
@@ -1813,6 +1875,29 @@ public partial class WorldClient
                         spell_id = spell.Cast.SpellID,
                     });
                 }
+                else if (Framework.Settings.HoneyProxyMode)
+                {
+                    // JimsProxy (HoneyProxy, Stage 4 -- #379 as ORDERING, not a clock): hold the form-exit
+                    // START behind the form-removal SMSG_UPDATE_OBJECT so its visual kit anchors on the
+                    // humanoid model, not the still-shifted one. FormExitStartDeferMs is reused as the
+                    // BOUNDED fallback deadline (release anyway if the update never emits -- an UNBOUNDED
+                    // hold bricks the client cast state machine, ice-92 #379). Replaces the OFF Task.Delay.
+                    GetSession().HoneyWriter!.EnqueueHold(GetSession().InstanceSocket, spell,
+                        Opcode.SMSG_UPDATE_OBJECT, releaseSpellId: 0,
+                        deadlineMs: Settings.FormExitStartDeferMs, retractKey: (uint)spell.Cast.SpellID);
+                    // Instant (incl. form->form): its same-tick GO must never precede the START (#428), so
+                    // flag it -- HandleSpellGo holds the GO behind the SAME UPDATE_OBJECT, released FIFO
+                    // right after the START. Cast-time GOs arrive long after the update (START already
+                    // out), so they are NOT flagged and emit normally.
+                    if (spell.Cast.CastTime == 0)
+                        _honeyFormExitInstantGoSpellId = (uint)spell.Cast.SpellID;
+                    Log.Event("spell.start.form_exit_honey_held", new
+                    {
+                        spell_id = spell.Cast.SpellID,
+                        cast_time = spell.Cast.CastTime,
+                        deadline_ms = Settings.FormExitStartDeferMs,
+                    });
+                }
                 else if (spell.Cast.CastTime > 0)
                 {
                     var deferred = new FormExitDeferredStart { SpellId = spell.Cast.SpellID };
@@ -2057,9 +2142,14 @@ public partial class WorldClient
                 ? pendingCast.LegacySpellId
                 : (uint)spell.Cast.SpellID;
 
+            // JimsProxy (HoneyProxy, Stage 4): skip GCD hold-and-fire arming (BeginGcd's Timer) AND the
+            // synthetic SMSG_SPELL_COOLDOWN GCD anchor. Honey forwards every press (no hold to arm a
+            // timer for), and Sugar sends no cooldown packet -- the client's own GCD bar anchors fine.
+            // Both are indicted burst-payload / off-thread-emit sources this mode removes.
             if (LegacyVersion.ExpansionVersion == 1 &&
                 pendingCast.StartedCastTimeMs == 0 &&
-                !GameData.IsOffGcd(gcdLookupId))
+                !GameData.IsOffGcd(gcdLookupId) &&
+                !Framework.Settings.HoneyProxyMode)
             {
                 long gcdMs = GameData.GetGcdDurationMs(gcdLookupId);
                 long now = Environment.TickCount64;
@@ -2121,7 +2211,10 @@ public partial class WorldClient
             // processes the clean-frame copy and closes the cast. No effect/CLEU replay, cancels nothing,
             // no-op on clean casts. Original GO forwards first (below). Local-player instants only.
             // Caveat: needs the server to send the first GO — a server-missing GO wouldn't trigger this.
-            if (Settings.RefireSpellGo && pendingCast.StartedCastTimeMs == 0)
+            // JimsProxy (HoneyProxy, Stage 4): never RefireSpellGo under Honey (inert even if the config
+            // has it true). It emits a duplicate SPELL_GO from a Task.Run continuation -- precisely the
+            // off-writer, off-thread cast-packet emit the single ordered writer exists to eliminate.
+            if (Settings.RefireSpellGo && pendingCast.StartedCastTimeMs == 0 && !Framework.Settings.HoneyProxyMode)
             {
                 var rfCasterGuid = spell.Cast.CasterGUID;
                 var rfCasterUnit = spell.Cast.CasterUnit;
@@ -2333,7 +2426,27 @@ public partial class WorldClient
         // world transfer intervened) is dropped rather than paired with a later cast's GO.
         // Note: the ThreatTracker update below still runs immediately, so a THREAT_UPDATE can
         // precede this GO by up to the defer — cosmetic meter-ordering only.
-        if (spell.Cast.CasterUnit == GetSession().GameState.CurrentPlayerGuid &&
+        if (Framework.Settings.HoneyProxyMode)
+        {
+            // JimsProxy (HoneyProxy, Stage 4 -- #379 as ordering): if this GO belongs to an INSTANT
+            // form-exit whose START is held behind the form-removal UPDATE_OBJECT, hold the GO behind the
+            // SAME update so START+GO release together, in order, after the model swap (never split --
+            // #428). Otherwise emit the GO normally. Cast-time form-exit GOs never set the marker.
+            if (_honeyFormExitInstantGoSpellId != 0 && _honeyFormExitInstantGoSpellId == (uint)spell.Cast.SpellID
+                && spell.Cast.CasterUnit == GetSession().GameState.CurrentPlayerGuid)
+            {
+                _honeyFormExitInstantGoSpellId = 0;
+                GetSession().HoneyWriter!.EnqueueHold(GetSession().InstanceSocket, spell,
+                    Opcode.SMSG_UPDATE_OBJECT, releaseSpellId: 0,
+                    deadlineMs: Settings.FormExitStartDeferMs, retractKey: (uint)spell.Cast.SpellID);
+                Log.Event("spell.go.form_exit_honey_held", new { spell_id = spell.Cast.SpellID });
+            }
+            else
+            {
+                SendPacketToClient(spell);
+            }
+        }
+        else if (spell.Cast.CasterUnit == GetSession().GameState.CurrentPlayerGuid &&
             _formExitHeldStart != null &&
             _formExitHeldStart.Cast.SpellID == spell.Cast.SpellID)
         {
@@ -2595,7 +2708,11 @@ public partial class WorldClient
         // (RttPrefire=Timer re-admits the hold path) are re-stamped in HandleSpellGo's
         // matched branch, where the pending entry's WasHeld tells us this cast WAS re-timed —
         // the shared parse here runs before the queue match, so it can't know.
-        if (isSpellGo && dbdata.CastTime == 0 && !Settings.LowLatencyMode)
+        // JimsProxy (HoneyProxy, Stage 4): skip the GO.CastTime proxy-clock stamp. It exists to correct
+        // hold-queue re-timing drift; Honey never re-times (forward-everything), and Sugar sends
+        // CastTime=0 on all GOs with the client's GCD bar anchoring fine. A gratuitous per-GO field
+        // rewrite in the coalesced cast burst -- exactly what Pillar 5's "let the client be" removes.
+        if (isSpellGo && dbdata.CastTime == 0 && !Settings.LowLatencyMode && !Framework.Settings.HoneyProxyMode)
             dbdata.CastTime = Time.GetMSTime();
 
         // JimsProxy: emit structured spell.cast event so we can diagnose spell-ID
