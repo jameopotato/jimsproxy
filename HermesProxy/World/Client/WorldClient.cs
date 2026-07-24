@@ -369,11 +369,11 @@ public partial class WorldClient
                 packet.SetReceiveTime(Environment.TickCount);
                 // JimsProxy (HoneyProxy): route in-world SMSG dispatch through the single actor when
                 // engaged; otherwise inline as today. Auth SMSGs arrive pre-handoff (ActorEngaged false)
-                // and so stay inline.
+                // and so stay inline. TryRouteLegacy owns the disengage-quiesce boundary (F2) and
+                // returns false on teardown so the packet is never dropped (F3).
                 var honeySession = GetSession();
-                if (honeySession.ShouldDispatchViaActor)
-                    honeySession.HoneyActor!.EnqueueLegacy(packet);
-                else
+                if (!(Settings.HoneyProxyMode && honeySession.HoneyActor is { } honeyActor
+                      && honeyActor.TryRouteLegacy(packet)))
                     HandlePacket(packet);
             }
         }

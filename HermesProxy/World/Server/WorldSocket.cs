@@ -370,10 +370,13 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
                 break;
             default:
                 // JimsProxy (HoneyProxy): route in-world CMSG dispatch through the single actor when
-                // engaged; the auth/connect cases above stay inline. See HoneyActor.
-                if (GetSession().ShouldDispatchViaActor)
-                    GetSession().HoneyActor!.EnqueueModern(this, packet);
-                else
+                // engaged; the auth/connect cases above stay inline. Null-conditional session (Fable
+                // review F1): a gameplay opcode arriving before CMSG_AUTH_SESSION has no session yet —
+                // it must fall through to HandlePacket, whose per-packet try/catch contains the NRE as
+                // today (a bare deref here would escape ReadHandler, which has no catch, and could
+                // kill the process — in OFF mode too). TryRouteModern owns quiesce/teardown (F2/F3).
+                if (!(Framework.Settings.HoneyProxyMode && GetSession()?.HoneyActor is { } honeyActor
+                      && honeyActor.TryRouteModern(this, packet)))
                     HandlePacket(packet);
                 break;
         }

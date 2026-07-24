@@ -61,16 +61,44 @@ public sealed class HoneyActor
         }
     }
 
-    public void EnqueueLegacy(WorldPacket packet)
-        => Enqueue(new WorkItem(Direction.Legacy, Copy(packet), null));
+    // Fable-review F2 (disengage quiesce): when ShouldDispatchViaActor flips false (the actor itself
+    // processes SMSG_LOGOUT_COMPLETE, setting IsInCharacterSelect), items already behind it in the FIFO
+    // are still draining on the actor thread. If producers switched to inline dispatch at that instant,
+    // those queued items would run CONCURRENTLY with (and after) newer inline packets — briefly
+    // violating both single-threading and per-source FIFO, the exact properties this build tests.
+    // Fix: producers keep routing to the actor until the actor itself observes its queue empty after
+    // the disengage (_quiescedAfterDisengage, set under _routeLock so no add can interleave with the
+    // empty-check). Only then do they go inline. Routing decisions + adds + the quiesce-set all take
+    // _routeLock — uncontended in practice, and it makes the drain boundary provably race-free.
+    private readonly object _routeLock = new();
+    private bool _quiescedAfterDisengage = true; // pre-engage: producers dispatch inline
 
-    public void EnqueueModern(WorldSocket sender, WorldPacket packet)
-        => Enqueue(new WorkItem(Direction.Modern, Copy(packet), sender));
+    // Returns true if the packet was routed to the actor; false => caller must dispatch inline
+    // (flag off / pre-engage handled by the caller; disengaged-and-drained or stopped handled here).
+    // Fable-review F3: a stopped queue returns false (caller dispatches inline) instead of silently
+    // dropping — lossless ingress holds even at the teardown edge.
+    public bool TryRouteLegacy(WorldPacket packet) => TryRoute(Direction.Legacy, packet, null);
+    public bool TryRouteModern(WorldSocket sender, WorldPacket packet) => TryRoute(Direction.Modern, packet, sender);
 
-    private void Enqueue(WorkItem item)
+    private bool TryRoute(Direction dir, WorldPacket packet, WorldSocket? sender)
     {
-        try { _queue.Add(item); }
-        catch (InvalidOperationException) { /* CompleteAdding'd on teardown — drop late items */ }
+        lock (_routeLock)
+        {
+            bool active = _session.ShouldDispatchViaActor;
+            if (!active && _quiescedAfterDisengage)
+                return false; // disengaged and fully drained → inline (char-select behaves as today)
+            if (active)
+                _quiescedAfterDisengage = false;
+            try
+            {
+                _queue.Add(new WorkItem(dir, Copy(packet), sender));
+                return true;
+            }
+            catch (InvalidOperationException)
+            {
+                return false; // CompleteAdding'd on teardown → caller dispatches inline
+            }
+        }
     }
 
     // Defensive copy at enqueue (correctness pin): the modern receive path aliases
@@ -117,6 +145,18 @@ public sealed class HoneyActor
                         kind = item.Continuation != null ? "post" : item.Dir.ToString(),
                         error = e.Message,
                     });
+                }
+
+                // F2 quiesce: after each item, if we are disengaged and the queue is verifiably empty
+                // (checked under the same lock producers add under), latch quiesced so producers may
+                // go inline. Re-engagement (active=true routing) un-latches it in TryRoute.
+                if (!_session.ShouldDispatchViaActor)
+                {
+                    lock (_routeLock)
+                    {
+                        if (!_session.ShouldDispatchViaActor && _queue.Count == 0)
+                            _quiescedAfterDisengage = true;
+                    }
                 }
             }
         }
