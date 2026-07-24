@@ -35,6 +35,12 @@ public partial class WorldClient
     // cast bar. Long enough to catch a co-batched / slightly-delayed GO ("interrupted but fired"), short
     // enough that a genuine failure's bar-dismiss isn't perceptibly late. Tunable.
     private const int HoneyFailedHoldDeadlineMs = 200;
+    // JimsProxy (HoneyProxy, loop-capture fix 07-23): deadline for an UNSTARTED transient's
+    // prepare2+CastFailed held behind another same-spell STARTED cast's GO (Sugar's per-spell buffer).
+    // That GO arrives when the in-flight cast bar completes, so the bound must cover a full cast time;
+    // it is a safety valve only (double-failure case), the GO is the real release. Cost of the valve
+    // firing: the transient's button ack lands late — self-heals, no lockout.
+    private const int HoneyUnstartedHoldDeadlineMs = 4000;
 
     // JimsProxy (HoneyProxy, Stage 4 -- #379 as ordering): when an INSTANT form-exit SPELL_START is held
     // behind the form-removal SMSG_UPDATE_OBJECT, its matching SPELL_GO must be held too so START never
@@ -549,6 +555,20 @@ public partial class WorldClient
             uint effectiveReason = movementSuppressed
                 ? (uint)SpellCastResultClassic.DontReport
                 : LegacyVersion.ConvertSpellCastResult(reason);
+            // JimsProxy (HoneyProxy, loop-capture fix 07-23): Sugar's in-flight marker is per-SPELL
+            // (entry+0x30, set at SpellQueue.Start, cleared at Go — Track C §4.1), and its CAST_FAILED
+            // handler buffers BOTH the prepare re-emit and the failed packet whenever THE SPELL is in
+            // flight — not just when the failing cast itself started. The first captured loop
+            // (2026-07-23, Lesser Heal spam) hit exactly this gap: an UNSTARTED duplicate's
+            // PREPARE+CAST_FAILED landed mid-burst between the started cast's START and GO. Our
+            // per-spell in-flight analog is the #402 forwarded-CastID FIFO: an entry exists precisely
+            // between a START being forwarded and its terminal popping it. Movement-cancelled casts
+            // keep today's immediate ack (the client is waiting on it).
+            bool honeyHoldBehindGo = Framework.Settings.HoneyProxyMode
+                && GetSession().HoneyWriter is not null
+                && !movementSuppressed
+                && (pendingCast.HasStarted
+                    || GetSession().GameState.TryPeekForwardedStartCastId(pendingCast.SpellId, out _));
             if (movementSuppressed)
             {
                 Log.Event("cast.movement_cancel_suppressed", new
@@ -574,7 +594,14 @@ public partial class WorldClient
                 SpellPrepare prepare2 = new SpellPrepare();
                 prepare2.ClientCastID = pendingCast.ClientGUID;
                 prepare2.ServerCastID = pendingCast.ServerGUID;
-                SendPacketToClient(prepare2);
+                if (honeyHoldBehindGo)
+                    // Held FIRST so FIFO release replays prepare2 -> failed after the GO, mirroring
+                    // Sugar's buffered order (prepare buffered before failed, §4.2).
+                    GetSession().HoneyWriter!.EnqueueHold(GetSession().InstanceSocket, prepare2,
+                        Opcode.SMSG_SPELL_GO, pendingCast.SpellId, HoneyUnstartedHoldDeadlineMs,
+                        releaseGuid: GetSession().GameState.CurrentPlayerGuid);
+                else
+                    SendPacketToClient(prepare2);
             }
 
             CastFailed failed = new();
@@ -597,10 +624,13 @@ public partial class WorldClient
             // ordered writer replays it strictly AFTER the GO, or on the bounded deadline if no GO comes
             // (a genuine failure). Unstarted / movement-cancelled casts have no live START to cross, so
             // they emit immediately. Mirrors Sugar's AddFailedPacket -> GetFailedPacket.
-            if (Framework.Settings.HoneyProxyMode && pendingCast.HasStarted && !movementSuppressed
-                && GetSession().HoneyWriter is { } honeyReconcileWriter)
+            if (honeyHoldBehindGo && GetSession().HoneyWriter is { } honeyReconcileWriter)
                 honeyReconcileWriter.EnqueueHold(GetSession().InstanceSocket, failed,
-                    Opcode.SMSG_SPELL_GO, pendingCast.SpellId, HoneyFailedHoldDeadlineMs,
+                    Opcode.SMSG_SPELL_GO, pendingCast.SpellId,
+                    // Deadline: an own-started failure's GO is either imminent or never coming (short);
+                    // an unstarted transient waits for the OTHER started cast's GO, up to a full cast
+                    // bar (long). Both are safety valves only — the GO is the real release.
+                    pendingCast.HasStarted ? HoneyFailedHoldDeadlineMs : HoneyUnstartedHoldDeadlineMs,
                     // Fable review: release only on the LOCAL PLAYER's GO — an observed caster's
                     // same-spell GO must not release this terminal early (Sugar's buffer replays only
                     // on the player's own GO path, Track C §4.2).
