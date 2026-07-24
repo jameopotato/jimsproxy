@@ -43,30 +43,38 @@ public sealed class HoneyWriter
 
     // The client-bound cast-lifecycle opcodes that MUST flow through the writer while engaged. Single
     // source of truth for the D6 chokepoint assertion (WorldSocket.SendPacketReal). Names confirmed
-    // against HermesProxy/World/Enums/Opcodes.cs.
+    // against HermesProxy/World/Enums/Opcodes.cs. Deliberately EXCLUDED: SMSG_SPELL_EXECUTE_LOG — a
+    // combat-log narrative packet, not a kit/lifecycle driver (Fable review F4, recorded decision).
     public static readonly FrozenSet<Opcode> CastLifecycleOpcodes = new[]
     {
         Opcode.SMSG_SPELL_START, Opcode.SMSG_SPELL_GO, Opcode.SMSG_SPELL_PREPARE,
         Opcode.SMSG_CAST_FAILED, Opcode.SMSG_PET_CAST_FAILED,
         Opcode.SMSG_SPELL_FAILURE, Opcode.SMSG_SPELL_FAILED_OTHER,
         Opcode.SMSG_SPELL_COOLDOWN, Opcode.SMSG_SPELL_DELAYED,
+        Opcode.SMSG_COOLDOWN_EVENT, Opcode.SMSG_CLEAR_COOLDOWN, Opcode.SMSG_COOLDOWN_CHEAT,
         Opcode.SMSG_SPELL_CHANNEL_START, Opcode.SMSG_SPELL_CHANNEL_UPDATE,
         Opcode.SMSG_CANCEL_SPELL_VISUAL, Opcode.SMSG_CANCEL_SPELL_VISUAL_KIT,
         Opcode.SMSG_PLAY_SPELL_VISUAL, Opcode.SMSG_PLAY_SPELL_VISUAL_KIT,
         Opcode.SMSG_CANCEL_AUTO_REPEAT, Opcode.SMSG_SPELL_INTERRUPT_LOG,
     }.ToFrozenSet();
 
-    private const int Capacity = 2048; // 0x800, matching Sugar's send channel
+    private const int DefaultCapacity = 2048; // 0x800, matching Sugar's send channel
 
-    private readonly BlockingCollection<OutboundItem> _queue = new(boundedCapacity: Capacity);
+    private readonly BlockingCollection<OutboundItem> _queue;
     private readonly IEgressSink _sink;
     private readonly object _startLock = new();
     private Thread? _thread;
     private volatile bool _started;
     private long _droppedCount;
     public volatile bool IsStopped;
+    internal long DroppedCount => Interlocked.Read(ref _droppedCount);
 
-    public HoneyWriter(IEgressSink? sink = null) => _sink = sink ?? new SocketSink();
+    // capacity is overridable for tests only (drop-on-full is untestable at 2048).
+    public HoneyWriter(IEgressSink? sink = null, int capacity = DefaultCapacity)
+    {
+        _sink = sink ?? new SocketSink();
+        _queue = new BlockingCollection<OutboundItem>(boundedCapacity: capacity);
+    }
 
     public void EnsureStarted()
     {
