@@ -899,6 +899,21 @@ public sealed class GameSessionData
     // fresh create block (re-appearance after an out-of-range charm end).
     public HashSet<WowGuid128> ObservedCharmedPlayers = [];
 
+    // JimsProxy (#382 PetInCombat charm strip): players currently charmed by ANOTHER PLAYER,
+    // tracked from ALL perspectives (no self/charmer exclusion — the victim's own client
+    // drops too, and the charm+0x800 hybrid is wrong from every viewpoint). Maintained in
+    // the CHARMEDBY translation; cleared when CHARMEDBY empties or on a create block without
+    // CHARMEDBY (out-of-range charm end). While a guid is in here, UNIT_FLAG_PET_IN_COMBAT
+    // is stripped from its forwarded flags (Charm382StripPetInCombat).
+    public HashSet<WowGuid128> PlayerCharmedByPlayer = [];
+
+    // JimsProxy (#382): last RAW vanilla UNIT_FIELD_FLAGS seen per PLAYER guid — always the
+    // server's value, never the stripped presentation. Feeds the charm-edge flags re-sync:
+    // a pet-class player can enter a charm already carrying a legitimate pet-owner 0x800
+    // while the charm apply block carries no flags write at all, so the re-sync needs the
+    // pre-charm value to strip from (and to restore from at charm end).
+    public Dictionary<WowGuid128, uint> LastKnownPlayerUnitFlags = new();
+
     // JimsProxy (Tallstrider-Fix): per-GUID last-known facing orientation, populated from
     // any MovementInfo we observe (spawn, heartbeat, ObjectUpdate movement block). Used by
     // MovementHandler.HandleMonsterMove to compare the creature's current facing against

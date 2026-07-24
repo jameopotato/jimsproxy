@@ -63,6 +63,17 @@ public static class Settings
     // block so input isn't locked client-side even if the server ignores the cancel.
     public static bool StuckLogoutStunCancelFix;
     public static bool StuckLogoutStunClientStrip;
+    // JimsProxy (#382 MC-cap BG FPS drop): strip UNIT_FLAG_PET_IN_COMBAT (0x800) from a
+    // PLAYER for exactly the duration of a player-on-player charm (Gnomish MC Cap 13181,
+    // priest MC 605). Vanilla cores set that flag on the charmed unit itself; modern
+    // servers set it on the CHARMER — so charm state + 0x800 on one player is a hybrid no
+    // modern server produces, and the 1.14 client FPS-locking on charmed players (victim
+    // AND bystanders, BG-scale, native 1.12 clients unaffected) is suspected to be its
+    // cost. Includes a charm-edge flags re-sync for pet-class victims whose legitimate
+    // pet-owner 0x800 predates the charm (a charm apply can carry no flags write at all).
+    // NPC charmers (raid MC — Lucifron) are untouched. Default ON; key = kill switch.
+    // Default-init true so paths that bypass LoadAndVerifyFrom (tests) get the fix.
+    public static bool Charm382StripPetInCombat = true;
     // JimsProxy (clean handshake teardown): bound the realmd auth handshake. If realmd accepts
     // the TCP connection but never sends LOGON_CHALLENGE (half-accepting login server, load-shed,
     // firewall), the login thread would otherwise block forever ("stuck on Connecting..."). On
@@ -191,6 +202,7 @@ public static class Settings
         UnplannedReconnectTimeoutMs = Math.Clamp(config.GetInt("UnplannedReconnectTimeoutMs", 5000), 1000, 30000);
         StuckLogoutStunCancelFix = config.GetBoolean("StuckLogoutStunCancelFix", true);
         StuckLogoutStunClientStrip = config.GetBoolean("StuckLogoutStunClientStrip", true);
+        Charm382StripPetInCombat = config.GetBoolean("Charm382StripPetInCombat", true);
         AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);
         LowLatencyMode = config.GetBoolean("LowLatencyMode", false);

@@ -90,6 +90,40 @@ public partial class WorldClient
         return guid.GetHighType() == HighGuidType.Creature;
     }
 
+    // JimsProxy (#382 PetInCombat charm strip): tracking predicate for a PLAYER charmed by
+    // ANOTHER PLAYER — all perspectives (victim's own session and the charmer's included:
+    // the victim FPS-drops too, and the hybrid state is wrong from every viewpoint). NPC
+    // charmers (Lucifron's Dominate Mind et al.) are excluded — long-stable raid content.
+    internal static bool IsPlayerCharmedByPlayer(WowGuid128 guid, WowGuid128 charmedBy)
+    {
+        return guid.IsPlayer() && charmedBy.IsPlayer();
+    }
+
+    // JimsProxy (#382): strip UNIT_FLAG_PET_IN_COMBAT (0x800) from a player's forwarded
+    // flags for exactly the duration of a player-charm. Vanilla cores pin the flag on the
+    // charmed unit itself (cmangos/vmangos SetInCombatState: any unit with a charmer);
+    // modern servers pin it on the CHARMER — so charm+0x800 on one player is a hybrid no
+    // modern server produces, and the leading #382 suspect. Deliberate concession: a
+    // charmed pet-class player whose own pet keeps fighting loses the (then-legitimate)
+    // flag while charmed — that coexistence IS the suspected trigger, so no exemption.
+    internal static uint ApplyPetInCombatCharmStrip(uint modernFlags, bool leverOn, bool isCharmTracked)
+    {
+        if (!leverOn || !isCharmTracked)
+            return modernFlags;
+        return modernFlags & ~(uint)UnitFlags.PetInCombat;
+    }
+
+    // JimsProxy (#382, the pre-charmed-pet-owner corner): a charm apply can arrive with NO
+    // flags write in the block (capture cap2: CHARMEDBY+faction only) — a passive strip
+    // never fires and the client keeps its held pre-charm 0x800 alongside the new charm
+    // state. On a charm EDGE (apply or clear) with no flags in the update mask and a cached
+    // last-known raw carrying 0x800, synthesize a flags re-send (stripped on apply, restored
+    // on clear) so the client's held state never combines charm + PetInCombat.
+    internal static bool ShouldSynthPetInCombatFlagsResync(bool leverOn, bool charmEdgeThisBlock, bool flagsInUpdateMask, bool cachedRawHasPetInCombat)
+    {
+        return leverOn && charmEdgeThisBlock && !flagsInUpdateMask && cachedRawHasPetInCombat;
+    }
+
     // (DisplayId, wire * 1000 rounded) pairs where Twinstar's bias on top of CMS_v
     // is the deliberate vanilla-intended visible scale, not a pre-scaled sibling.
     // The wirePreScaled heuristic would otherwise catch and shrink these to CMS_v,
@@ -2430,6 +2464,11 @@ public partial class WorldClient
             (objectType == ObjectType.Player) ||
             (objectType == ObjectType.ActivePlayer))
         {
+            // JimsProxy (#382 PetInCombat charm strip): set when THIS update block changes a
+            // player's player-charm state (apply or clear) — arms the charm-edge flags
+            // re-sync below for blocks that carry no flags write of their own.
+            bool charmEdgeThisBlock = false;
+
             int UNIT_FIELD_CHARM = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_CHARM);
             if (UNIT_FIELD_CHARM >= 0 && updateMaskArray[UNIT_FIELD_CHARM])
             {
@@ -2475,12 +2514,39 @@ public partial class WorldClient
                         guid_low = guid.GetCounter(),
                     });
                 }
+
+                // JimsProxy (#382 PetInCombat charm strip): all-perspective tracking (no
+                // self/charmer exclusion, unlike the shim set above) — the strip applies to
+                // the victim's own view and the charmer's view too.
+                if (IsPlayerCharmedByPlayer(guid, charmedBy))
+                {
+                    if (gameState.PlayerCharmedByPlayer.Add(guid))
+                    {
+                        charmEdgeThisBlock = true;
+                        Log.Event("charm.petincombat.strip_armed", new
+                        {
+                            guid_low = guid.GetCounter(),
+                            charmed_by_low = charmedBy.GetCounter(),
+                        });
+                    }
+                }
+                else if (gameState.PlayerCharmedByPlayer.Remove(guid))
+                {
+                    charmEdgeThisBlock = true;
+                    Log.Event("charm.petincombat.strip_disarmed", new
+                    {
+                        guid_low = guid.GetCounter(),
+                    });
+                }
             }
             else if (isCreate)
             {
                 // A create block without CHARMEDBY means the unit is not charmed — drop any
                 // stale shim entry from a charm that ended while the unit was out of range.
+                // (Same lifecycle for the strip set: creates always carry flags, so the
+                // normal forwarding below restores the un-stripped value in this block.)
                 GetSession().GameState.ObservedCharmedPlayers.Remove(guid);
+                GetSession().GameState.PlayerCharmedByPlayer.Remove(guid);
             }
             int UNIT_FIELD_SUMMONEDBY = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_SUMMONEDBY);
             if (UNIT_FIELD_SUMMONEDBY >= 0 && updateMaskArray[UNIT_FIELD_SUMMONEDBY])
@@ -2745,6 +2811,17 @@ public partial class WorldClient
                 if (Session.GameState.ObservedCharmedPlayers.Contains(guid))
                     updateData.UnitData.Flags |= (uint)UnitFlags.Possessed;
 
+                // JimsProxy (#382 PetInCombat charm strip): cache the RAW server flags for
+                // players (never the stripped presentation — the charm-edge re-sync below
+                // needs the server truth to strip from and restore from), then remove the
+                // vanilla-only charm+0x800 hybrid from the forwarded value while the unit
+                // is player-charmed. See Charm382StripPetInCombat in Settings for rationale.
+                if (guid.IsPlayer())
+                    Session.GameState.LastKnownPlayerUnitFlags[guid] = updates[UNIT_FIELD_FLAGS].UInt32Value;
+                updateData.UnitData.Flags = ApplyPetInCombatCharmStrip(updateData.UnitData.Flags.Value,
+                    Settings.Charm382StripPetInCombat,
+                    Session.GameState.PlayerCharmedByPlayer.Contains(guid));
+
                 // Here because of this bullshit in cmangos:
                 // https://github.com/cmangos/mangos-tbc/blob/fd093b33071b546545cc5973608304bccc5a041b/src/game/Entities/Object.cpp#L544
                 if (updateData.UnitData.Flags.HasAnyFlag(UnitFlags.ServerControlled) && isCreate &&
@@ -2778,6 +2855,35 @@ public partial class WorldClient
                         raw_unit_flags = updates[UNIT_FIELD_FLAGS].UInt32Value,
                     });
                 }
+            }
+            else if (ShouldSynthPetInCombatFlagsResync(Settings.Charm382StripPetInCombat,
+                charmEdgeThisBlock,
+                flagsInUpdateMask: false,
+                cachedRawHasPetInCombat: GetSession().GameState.LastKnownPlayerUnitFlags.TryGetValue(guid, out uint lastRawUnitFlags) &&
+                    (lastRawUnitFlags & (uint)UnitFlagsVanilla.PetInCombat) != 0))
+            {
+                // JimsProxy (#382, pre-charmed-pet-owner corner): this block flipped the
+                // unit's player-charm state but carried NO flags write (real pattern — a
+                // charm apply can be CHARMEDBY+faction only), and the client's held flags
+                // include PET_IN_COMBAT (e.g. a warlock whose pet was fighting before the
+                // cap landed). Re-send the last-known flags so the held state never combines
+                // charm + 0x800: stripped while the charm is tracked (apply edge), restored
+                // verbatim once it isn't (clear edge). Same name-map as the real path; the
+                // possess shim's OR is kept consistent while that shim exists so the bit
+                // doesn't flap mid-charm.
+                uint synthFlags = (uint)((UnitFlagsVanilla)lastRawUnitFlags).CastFlags<UnitFlags>();
+                if (Session.GameState.ObservedCharmedPlayers.Contains(guid))
+                    synthFlags |= (uint)UnitFlags.Possessed;
+                synthFlags = ApplyPetInCombatCharmStrip(synthFlags,
+                    Settings.Charm382StripPetInCombat,
+                    Session.GameState.PlayerCharmedByPlayer.Contains(guid));
+                updateData.UnitData.Flags = synthFlags;
+                Log.Event("charm.petincombat.flags_resynced", new
+                {
+                    guid_low = guid.GetCounter(),
+                    raw_flags = lastRawUnitFlags,
+                    synth_flags = synthFlags,
+                });
             }
             int UNIT_FIELD_FLAGS_2 = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_FLAGS_2);
             if (UNIT_FIELD_FLAGS_2 >= 0 && updateMaskArray[UNIT_FIELD_FLAGS_2])
