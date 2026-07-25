@@ -2380,3 +2380,72 @@ public struct SpellModifierData
     public int ModifierValue;
     public byte ClassIndex;
 }
+
+// JimsProxy (loss-of-control synth): SMSG_ADD_LOSS_OF_CONTROL. A 1.12 server never sends
+// the loss-of-control family, so via the proxy the 1.14 client's LoC UI is dead for every
+// CC; both opcodes are in the 42597 dispatch table (0x266A/0x2669). Wire layout follows
+// WowPacketParser's sniff-derived V8_0_1 HandleAddLossOfControl exactly (byte-aligned,
+// no bit fields): Victim(g128) SpellID(i32) Caster(g128) Duration(u32)
+// DurationRemaining(u32) LockoutSchoolMask(u32) Mechanic(u8) Type(u8).
+public class AddLossOfControl : ServerPacket
+{
+    public AddLossOfControl() : base(Opcode.SMSG_ADD_LOSS_OF_CONTROL) { }
+
+    public override void Write() => WritePayload(_worldPacket);
+
+    internal void WritePayload(WorldPacket data)
+    {
+        data.WritePackedGuid128(Victim);
+        data.WriteInt32(SpellID);
+        data.WritePackedGuid128(Caster);
+        data.WriteUInt32(Duration);
+        data.WriteUInt32(DurationRemaining);
+        data.WriteUInt32(LockoutSchoolMask);
+        data.WriteUInt8(Mechanic);
+        data.WriteUInt8(Type);
+    }
+
+    public WowGuid128 Victim;
+    public int SpellID;
+    public WowGuid128 Caster;
+    public uint Duration;
+    public uint DurationRemaining;
+    public uint LockoutSchoolMask;
+    public byte Mechanic;
+    public byte Type;
+}
+
+// JimsProxy (loss-of-control synth): SMSG_LOSS_OF_CONTROL_AURA_UPDATE. Layout = WPP's
+// V7_0_3 HandleLossOfControlAuraUpdate for the 42597 lineage: AffectedGUID(g128, 7.2.5+)
+// count(i32) then per entry AuraSlot(u8) EffectIndex(u8) LocType(u8) Mechanic(u8) — the
+// per-entry Duration is 10.1.5+ only and must NOT be written for this build.
+public class LossOfControlAuraUpdate : ServerPacket
+{
+    public LossOfControlAuraUpdate() : base(Opcode.SMSG_LOSS_OF_CONTROL_AURA_UPDATE) { }
+
+    public override void Write() => WritePayload(_worldPacket);
+
+    internal void WritePayload(WorldPacket data)
+    {
+        data.WritePackedGuid128(AffectedGUID);
+        data.WriteInt32(LocInfos.Count);
+        foreach (var info in LocInfos)
+        {
+            data.WriteUInt8(info.AuraSlot);
+            data.WriteUInt8(info.EffectIndex);
+            data.WriteUInt8(info.LocType);
+            data.WriteUInt8(info.Mechanic);
+        }
+    }
+
+    public WowGuid128 AffectedGUID;
+    public List<LossOfControlInfo> LocInfos = new();
+}
+
+public struct LossOfControlInfo
+{
+    public byte AuraSlot;
+    public byte EffectIndex;
+    public byte LocType;
+    public byte Mechanic;
+}

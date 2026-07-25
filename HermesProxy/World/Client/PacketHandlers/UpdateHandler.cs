@@ -90,6 +90,67 @@ public partial class WorldClient
         return guid.GetHighType() == HighGuidType.Creature;
     }
 
+    // JimsProxy (loss-of-control synth): gate for synthesizing the loss-of-control packet
+    // pair. LOCAL PLAYER only — whether real Era servers multicast ADD_LOSS_OF_CONTROL to
+    // observers is unproven (the packet carries a Victim guid, but targeting needs a sniff),
+    // so the synth stays on the one audience whose contract is functionally certain.
+    internal static bool ShouldSynthLossOfControlFor(bool leverOn, WowGuid128 guid, WowGuid128 localPlayerGuid)
+    {
+        return leverOn && guid == localPlayerGuid;
+    }
+
+    // JimsProxy (loss-of-control synth): packets queued while translating an update and
+    // flushed AFTER the AuraUpdates are sent — the client binds LoC entries to aura slots,
+    // so the aura must exist client-side first. Filled and drained within a single
+    // HandleUpdateObject invocation (same single-threaded pattern as the MC-rune resyncs).
+    private readonly List<ServerPacket> _pendingLossOfControl = new();
+
+    private void QueuePendingLossOfControl(AuraInfo aura, GameData.LossOfControlEffect[] locEffects, int durationFull, int durationLeft)
+    {
+        var self = GetSession().GameState.CurrentPlayerGuid;
+        _pendingLossOfControl.Add(new AddLossOfControl
+        {
+            Victim = self,
+            SpellID = (int)aura.AuraData!.SpellID,
+            Caster = aura.AuraData.CastUnit == default ? WowGuid128.Empty : aura.AuraData.CastUnit,
+            Duration = (uint)Math.Max(durationFull, 0),
+            DurationRemaining = (uint)Math.Max(durationLeft, 0),
+            LockoutSchoolMask = 0, // school lockouts (kicks) are server-side in vanilla, never aura-borne — not synthesized
+            Mechanic = locEffects[0].Mechanic,
+            Type = locEffects[0].LocType,
+        });
+        var slotUpdate = new LossOfControlAuraUpdate { AffectedGUID = self };
+        foreach (var eff in locEffects)
+        {
+            slotUpdate.LocInfos.Add(new LossOfControlInfo
+            {
+                AuraSlot = aura.Slot,
+                EffectIndex = eff.EffectIndex,
+                LocType = eff.LocType,
+                Mechanic = eff.Mechanic,
+            });
+        }
+        _pendingLossOfControl.Add(slotUpdate);
+        Framework.Logging.Log.Event("loss_of_control.synth", new
+        {
+            spell_id = aura.AuraData.SpellID,
+            slot = aura.Slot,
+            loc_type = locEffects[0].LocType,
+            mechanic = locEffects[0].Mechanic,
+            duration_full = durationFull,
+            duration_left = durationLeft,
+        });
+    }
+
+    private void FlushPendingLossOfControl()
+    {
+        if (_pendingLossOfControl.Count == 0)
+            return;
+        foreach (var locPacket in _pendingLossOfControl)
+            SendPacketToClient(locPacket);
+        _pendingLossOfControl.Clear();
+    }
+
     // (DisplayId, wire * 1000 rounded) pairs where Twinstar's bias on top of CMS_v
     // is the deliberate vanilla-intended visible scale, not a pre-scaled sibling.
     // The wirePreScaled heuristic would otherwise catch and shrink these to CMS_v,
@@ -597,6 +658,10 @@ public partial class WorldClient
 
         foreach (var auraUpdate in auraUpdates)
             SendPacketToClient(auraUpdate);
+
+        // JimsProxy (loss-of-control synth): deliver queued LoC packets only after the aura
+        // updates are out — the client binds LoC entries to aura slots.
+        FlushPendingLossOfControl();
 
         // MIRASU (mc-rune-dousing): after the packet's own updates are out, push rune targetability for any boss life-state edges seen in it, and hide respawned circles around doused runes.
         FlushPendingMcRuneResyncs();
@@ -3503,6 +3568,15 @@ public partial class WorldClient
                             aura.AuraData.CastUnit = castUnit;
                             if (castUnit == default)
                                 aura.AuraData.Flags |= AuraFlagsModern.NoCaster;
+
+                            // JimsProxy (loss-of-control synth): the local player just gained a
+                            // CC aura — queue the loss-of-control pair (sent after the aura
+                            // update below, so the client can bind the entry to the slot).
+                            if (ShouldSynthLossOfControlFor(Settings.SynthLossOfControl, guid, GetSession().GameState.CurrentPlayerGuid) &&
+                                GameData.LossOfControlSpells.TryGetValue((uint)aura.AuraData.SpellID, out var locEffects))
+                            {
+                                QueuePendingLossOfControl(aura, locEffects, durationFull, durationLeft);
+                            }
                         }
                         else
                         {

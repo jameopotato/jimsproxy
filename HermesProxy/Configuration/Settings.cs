@@ -63,6 +63,15 @@ public static class Settings
     // block so input isn't locked client-side even if the server ignores the cancel.
     public static bool StuckLogoutStunCancelFix;
     public static bool StuckLogoutStunClientStrip;
+    // JimsProxy (loss-of-control synth): synthesize SMSG_ADD_LOSS_OF_CONTROL +
+    // SMSG_LOSS_OF_CONTROL_AURA_UPDATE for the LOCAL player's own CC auras (fear, stun,
+    // charm, possess, root, silence, ...). A 1.12 server never sends the family, so via
+    // the proxy the 1.14 client's loss-of-control UI (lock icon, alert, action-button
+    // desaturation — shipped and maintained in classic-era FrameXML) is otherwise dead
+    // for every CC in the game. Local-player-only: whether real Era servers multicast to
+    // observers is unproven. Default ON; key = kill switch. Default-init true so paths
+    // that bypass LoadAndVerifyFrom (tests) get the synth.
+    public static bool SynthLossOfControl = true;
     // JimsProxy (clean handshake teardown): bound the realmd auth handshake. If realmd accepts
     // the TCP connection but never sends LOGON_CHALLENGE (half-accepting login server, load-shed,
     // firewall), the login thread would otherwise block forever ("stuck on Connecting..."). On
@@ -191,6 +200,7 @@ public static class Settings
         UnplannedReconnectTimeoutMs = Math.Clamp(config.GetInt("UnplannedReconnectTimeoutMs", 5000), 1000, 30000);
         StuckLogoutStunCancelFix = config.GetBoolean("StuckLogoutStunCancelFix", true);
         StuckLogoutStunClientStrip = config.GetBoolean("StuckLogoutStunClientStrip", true);
+        SynthLossOfControl = config.GetBoolean("SynthLossOfControl", true);
         AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);
         LowLatencyMode = config.GetBoolean("LowLatencyMode", false);

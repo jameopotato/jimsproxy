@@ -97,6 +97,13 @@ public static partial class GameData
     // MOD_DAMAGE_DONE (13) for completeness — the server normally pushes MOD_DAMAGE_DONE_POS but
     // certain Kronos paths drop fields that are zero, so synthesizing fills any gaps.
     public static FrozenDictionary<uint, SpellAuraEffect[]> SpellAuraEffects = FrozenDictionary<uint, SpellAuraEffect[]>.Empty;
+    // JimsProxy (loss-of-control synth): every 1.12 spell that applies a CC aura
+    // (possess/confuse/charm/fear/stun/pacify/root/silence/pacify-silence), keyed by spell
+    // id, with the effect index carrying the aura, the modern LossOfControlType it maps to,
+    // and the spell's vanilla Mechanic. Loaded from LossOfControlSpells1.csv (generated from
+    // 1.12.1 vanilla spell data). Drives synthesis of SMSG_ADD_LOSS_OF_CONTROL +
+    // SMSG_LOSS_OF_CONTROL_AURA_UPDATE for the local player's own CC auras.
+    public static FrozenDictionary<uint, LossOfControlEffect[]> LossOfControlSpells = FrozenDictionary<uint, LossOfControlEffect[]>.Empty;
     public static FrozenDictionary<uint, TaxiPath> TaxiPaths = FrozenDictionary<uint, TaxiPath>.Empty;
     public static int[,] TaxiNodesGraph = new int[250, 250];
     public static FrozenDictionary<uint /*questId*/, uint /*questBit*/> QuestBits = FrozenDictionary<uint, uint>.Empty;
@@ -952,6 +959,7 @@ public static partial class GameData
             LoadDispellSpells,
             LoadSpellEffectPoints,
             LoadSpellAuraEffects,
+            LoadLossOfControlSpells,
             LoadStackableAuras,
             LoadMountAuras,
             LoadMeleeSpells,
@@ -1742,6 +1750,45 @@ public static partial class GameData
         }
 
         SpellAuraEffects = byId.ToFrozenDictionary(kv => kv.Key, kv => kv.Value.ToArray());
+    }
+
+    // JimsProxy (loss-of-control synth): CC-aura spells from 1.12.1 vanilla data
+    // (LossOfControlSpells1.csv, generated from the vmangos spell_template 1.12.1 rows and
+    // cross-verified against cmangos classic-db's direct Spell.dbc conversion — 824/826
+    // agreement, both discrepancies adjudicated to the direct-DBC value). Rows whose aura
+    // type doesn't map to a LossOfControlType are skipped defensively.
+    public static void LoadLossOfControlSpells()
+    {
+        if (LegacyVersion.ExpansionVersion != 1)
+            return;
+
+        var path = Path.Combine("CSV", $"LossOfControlSpells{LegacyVersion.ExpansionVersion}.csv");
+        if (!File.Exists(path))
+            return;
+
+        using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+
+        var byId = new Dictionary<uint, List<LossOfControlEffect>>();
+        foreach (var row in reader)
+        {
+            uint spellId = uint.Parse(row[0].Span);
+            byte effIdx = byte.Parse(row[1].Span);
+            uint auraType = uint.Parse(row[2].Span);
+            byte mechanic = byte.Parse(row[3].Span);
+
+            byte locType = LocTypeForAuraType(auraType);
+            if (locType == 0)
+                continue;
+
+            if (!byId.TryGetValue(spellId, out var list))
+            {
+                list = new List<LossOfControlEffect>(1);
+                byId[spellId] = list;
+            }
+            list.Add(new LossOfControlEffect(effIdx, locType, mechanic));
+        }
+
+        LossOfControlSpells = byId.ToFrozenDictionary(kv => kv.Key, kv => kv.Value.ToArray());
     }
 
     // JimsProxy: walk the player's equipped items + active aura spell ids and sum every
@@ -5394,6 +5441,40 @@ public static partial class GameData
             BasePoints = basePoints;
             MiscValue = miscValue;
         }
+    }
+
+    // JimsProxy (loss-of-control synth): one CC-bearing effect of a vanilla spell.
+    public readonly struct LossOfControlEffect
+    {
+        public readonly byte EffectIndex;  // 0..2 — which effect carries the CC aura
+        public readonly byte LocType;      // modern LossOfControlType (Possess=1..PacifySilence=9)
+        public readonly byte Mechanic;     // vanilla spell Mechanic (fear=5, stun=12, ...), 0 if none
+
+        public LossOfControlEffect(byte effectIndex, byte locType, byte mechanic)
+        {
+            EffectIndex = effectIndex;
+            LocType = locType;
+            Mechanic = mechanic;
+        }
+    }
+
+    // JimsProxy (loss-of-control synth): vanilla SPELL_AURA_* id → modern LossOfControlType
+    // (WPP Enums/LossOfControlType.cs). Returns 0 (None) for every non-CC aura type.
+    internal static byte LocTypeForAuraType(uint auraType)
+    {
+        return auraType switch
+        {
+            2 => 1,   // SPELL_AURA_MOD_POSSESS        -> Possess
+            5 => 2,   // SPELL_AURA_MOD_CONFUSE        -> Confuse
+            6 => 3,   // SPELL_AURA_MOD_CHARM          -> Charm
+            7 => 4,   // SPELL_AURA_MOD_FEAR           -> Fear
+            12 => 5,  // SPELL_AURA_MOD_STUN           -> Stun
+            25 => 6,  // SPELL_AURA_MOD_PACIFY         -> Pacify
+            26 => 7,  // SPELL_AURA_MOD_ROOT           -> Root
+            27 => 8,  // SPELL_AURA_MOD_SILENCE        -> Silence
+            60 => 9,  // SPELL_AURA_MOD_PACIFY_SILENCE -> PacifySilence
+            _ => 0,
+        };
     }
 
     public sealed class ItemRecord
