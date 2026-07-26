@@ -75,6 +75,23 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
 
     public WorldSocket(Socket socket) : base(socket)
     {
+        // JimsProxy (client-socket delivery restore): apply the NoDelay policy HERE, on the live
+        // accept path — the generic SocketManager<T> accept chain sets no socket options, and
+        // WorldSocketManager (which reads as if it applies NoDelay=true) is dead code that nothing
+        // instantiates since upstream 55e9fca8 (2022-11-26). The prior value is logged so every
+        // session carries runtime proof of the socket state — this exact belief-vs-reality gap went
+        // unnoticed for 3.5 years because nothing ever measured it. See Settings.ClientTcpNoDelay.
+        try
+        {
+            bool prior = socket.NoDelay;
+            socket.NoDelay = Framework.Settings.ClientTcpNoDelay;
+            Framework.Logging.Log.Event("client_socket.nodelay", new { prior, now = socket.NoDelay });
+        }
+        catch (Exception e)
+        {
+            Framework.Logging.Log.Event("client_socket.nodelay_error", new { error = e.Message });
+        }
+
         _connectType = ConnectionType.Realm;
         _serverChallenge = Array.Empty<byte>().GenerateRandomKey(16);
         _worldCrypt = new WorldCrypt();
@@ -349,10 +366,19 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
 
                 break;
             case Opcode.CMSG_ENABLE_NAGLE:
-                // Ignore: the proxy always needs TCP_NODELAY=true for low-latency
-                // forwarding. The packet is still processed (AES-GCM nonce stays in
-                // sync) but we don't obey the client's request to re-enable Nagle.
-                // Sent when the user unchecks "Optimize Network for Speed" in WoW.
+                // CORRECTED 2026-07-25: the previous comment here ("the proxy always needs
+                // TCP_NODELAY=true") described configuration that had been dead since upstream
+                // 55e9fca8 (2022-11) — these sockets actually ran at the .NET default (Nagle ON), so
+                // "ignoring" this request was a client-side no-op. With NoDelay genuinely restored
+                // (ClientTcpNoDelay, applied in the ctor), we now HONOR the request like SugarProxy
+                // and a real 1.14 server do: the client explicitly asked for batched delivery
+                // ("Optimize Network for Speed" unchecked, sent coalesced with AUTH_SESSION —
+                // Xian55 2960e779), so flip THIS client socket back to Nagle. The LEGACY socket is
+                // deliberately NOT touched (the real lesson of 73ba505d: Nagling proxy->server
+                // forwarding adds genuine latency). The packet is still processed either way so the
+                // AES-GCM nonce counter stays in sync.
+                SetNoDelay(false);
+                Log.Event("client_socket.nagle_honored", new { connection = _connectType.ToString() });
                 break;
             case Opcode.CMSG_CONNECT_TO_FAILED:
                 ConnectToFailed connectToFailed = new(packet);

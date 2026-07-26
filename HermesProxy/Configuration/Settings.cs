@@ -162,6 +162,21 @@ public static class Settings
     // Default Kronos since this launcher is built for Kronos.
     public static ServerFork ServerType = ServerFork.Kronos;
 
+    // JimsProxy (client-socket delivery restore, 2026-07-25): TCP_NODELAY on the CLIENT-facing world
+    // sockets. TRUE restores the original design: HermesProxy applied NoDelay=true at birth
+    // (WorldSocketManager, ratkosrb 2022-02) until upstream's 2022-11-26 "Cleanup service start
+    // procedure" (55e9fca8) replaced the manager with the generic StartServer<T> — which sets no
+    // socket options — silently flipping every client socket to the .NET default (Nagle ON) for 3.5
+    // years while the dead class kept reading as live configuration. Our 2026-04-29 73ba505d then
+    // "kept TCP_NODELAY=true permanently" — defending a state that no longer existed. Ground truth
+    // was established empirically (runtime probe logged prior=false on accept), and delivery-spread
+    // A/B rounds at peak cast-collision intensity produced zero looping-cast incidents alongside a
+    // better reported cast feel. Config-key-only escape hatch (no launcher UI): set false to return
+    // to the kernel-batched (Nagle) delivery this bug era shipped with. The LEGACY (proxy->server)
+    // socket is unaffected either way — it has its own explicit NoDelay=true (WorldClient).
+    // Default-init true so paths that bypass LoadAndVerifyFrom get the restored behavior.
+    public static bool ClientTcpNoDelay = true;
+
     public static bool LoadAndVerifyFrom(ConfigurationParser config)
     {
         ClientSeed = config.GetByteArray("ClientSeed", "179D3DC3235629D07113A9B3867F97A7".ParseAsByteArray());
@@ -193,6 +208,7 @@ public static class Settings
         StuckLogoutStunClientStrip = config.GetBoolean("StuckLogoutStunClientStrip", true);
         AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);
+        ClientTcpNoDelay = config.GetBoolean("ClientTcpNoDelay", true);
         LowLatencyMode = config.GetBoolean("LowLatencyMode", false);
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);
         IdentityPinnedCastIds = config.GetBoolean("IdentityPinnedCastIds", false);
