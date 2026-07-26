@@ -13,6 +13,10 @@ namespace Framework;
 
 public enum ServerFork { Kronos, Generic }
 
+// JimsProxy (rtt-prefire): GCD-boundary chaining strategy under Low-Latency mode. See the
+// RttPrefire setting below for semantics.
+public enum RttPrefireMode { Off, Timer, Knocker }
+
 public static class Settings
 {
     public static byte[] ClientSeed = null!;
@@ -47,6 +51,18 @@ public static class Settings
     // Hard timeout on the reconnect attempt — beyond this, abandon and propagate DC.
     // Clamped to 1000..30000 in LoadAndVerifyFrom.
     public static int UnplannedReconnectTimeoutMs;
+    // JimsProxy (stuck-logout-stun): counter Kronos's incomplete reconnect cleanup. A fast
+    // same-character relogin after an abrupt in-combat disconnect re-attaches the session to
+    // the player object that lingered in-world; Kronos clears the logout root but leaves the
+    // aura-less "artificial" UNIT_FLAG_STUNNED, so the client logs in unable to cast or turn
+    // ("You can't do that while stunned") until a character switch. Detection fires once per
+    // login, on the first self create-block, only when the stunned flag arrives with zero
+    // debuff auras (every real vanilla stun occupies a debuff slot in the same block).
+    // CancelFix synthesizes a legacy CMSG_LOGOUT_CANCEL — the lineage server handler that
+    // removes the artificial stun. ClientStrip clears the bit from the forwarded create
+    // block so input isn't locked client-side even if the server ignores the cancel.
+    public static bool StuckLogoutStunCancelFix;
+    public static bool StuckLogoutStunClientStrip;
     // JimsProxy (clean handshake teardown): bound the realmd auth handshake. If realmd accepts
     // the TCP connection but never sends LOGON_CHALLENGE (half-accepting login server, load-shed,
     // firewall), the login thread would otherwise block forever ("stuck on Connecting..."). On
@@ -64,6 +80,29 @@ public static class Settings
     // without holding. Eliminates hold-queue race conditions that cause stuck
     // spells for players with <40ms RTT. Most players should leave this OFF.
     public static bool LowLatencyMode;
+    // JimsProxy (rtt-prefire): chain casts across the GCD boundary under Low-Latency mode.
+    //   Off     — pure forward-everything (the plain LL behavior; default).
+    //   Timer   — a press landing inside the last RttPrefireTimerWindowMs (fixed 400 ms) of
+    //             the GCD is held in
+    //             the existing hold slot and released by the BeginGcd timer at (estimated
+    //             expiry − early-fire offset); SpellCastEarlyFireOffsetMs / OverrideRtt govern
+    //             the offset exactly as in queue mode. Public advanced toggle.
+    //   Knocker — SugarProxy-parity: forward immediately, then re-send the same CMSG every
+    //             20ms (max 10 knocks, ≤200ms) until the cast starts/resolves or a newer
+    //             press supersedes it. Server-rough (each early knock bounces NOT_READY) —
+    //             experimental; the launcher only offers it in Dev Mode.
+    // Read only while LowLatencyMode is on; queue mode ignores it entirely.
+    public static RttPrefireMode RttPrefire;
+    // Effective gates: the sub-mode is live only under LowLatencyMode (mirrors
+    // IdentityPinnedCastIdsActive).
+    public static bool RttPrefireTimerActive => LowLatencyMode && RttPrefire == RttPrefireMode.Timer;
+    public static bool RttPrefireKnockerActive => LowLatencyMode && RttPrefire == RttPrefireMode.Knocker;
+    // JimsProxy (rtt-prefire): Timer's hold-admission window is FIXED at the retail-accurate
+    // 400 ms and deliberately does not read SpellQueueWindowMs. The launcher greys the
+    // spell-queue controls under Low-Latency mode, so their stored value must not silently
+    // govern Timer (2026-07-15: a stored 1000 stretched Timer holds to ~500 ms and correlated
+    // with elevated stuck-lit button reports).
+    public const int RttPrefireTimerWindowMs = 400;
     // JimsProxy: suppress transient cast errors (NotReady, SpellInProgress) so
     // the client doesn't show red error text during rapid spam. Independent of
     // LowLatencyMode — useful as a companion setting but not required.
@@ -99,8 +138,10 @@ public static class Settings
     // JimsProxy (#313): width (ms) of the spell-queue hold window. A press arriving in the
     // last SpellQueueWindowMs of an active GCD or cast bar is held and fired at expiry; earlier
     // presses are forwarded and the server arbitrates (NOT_READY / SpellInProgress). Mirrors the
-    // 1.14 SpellQueueWindow contract. The launcher exposes 400 (retail-accurate) / 1000 / 1300
-    // (smoothest, closest to the old full-hold); lower values are allowed, capped at 1300 ms.
+    // 1.14 SpellQueueWindow contract. The launcher exposes 400 (retail-accurate, the default)
+    // / 1000 / 1300 (smoothest, closest to the old full-hold); lower values are allowed,
+    // capped at 1300 ms. Ignored by RTT Pre-Fire Timer, which uses the fixed
+    // RttPrefireTimerWindowMs instead.
     public static int SpellQueueWindowMs;
     // JimsProxy (PR #228 follow-up): synthesize SMSG_THREAT_UPDATE / HIGHEST /
     // CLEAR so the modern client's native threat APIs (UnitDetailedThreatSituation,
@@ -148,14 +189,20 @@ public static class Settings
         SpellCastEarlyFireOffsetMs = Math.Clamp(config.GetInt("SpellCastEarlyFireOffsetMs", 0), 0, 50);
         EnableUnplannedReconnect = config.GetBoolean("EnableUnplannedReconnect", false);
         UnplannedReconnectTimeoutMs = Math.Clamp(config.GetInt("UnplannedReconnectTimeoutMs", 5000), 1000, 30000);
+        StuckLogoutStunCancelFix = config.GetBoolean("StuckLogoutStunCancelFix", true);
+        StuckLogoutStunClientStrip = config.GetBoolean("StuckLogoutStunClientStrip", true);
         AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);
         LowLatencyMode = config.GetBoolean("LowLatencyMode", false);
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);
         IdentityPinnedCastIds = config.GetBoolean("IdentityPinnedCastIds", false);
         RefireSpellGo = config.GetBoolean("RefireSpellGo", false);
+        var rttPrefireStr = config.GetString("RttPrefire", "off");
+        RttPrefire = rttPrefireStr.Equals("timer", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Timer
+            : rttPrefireStr.Equals("knocker", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Knocker
+            : RttPrefireMode.Off;
         FormExitStartDeferMs = Math.Clamp(config.GetInt("FormExitStartDeferMs", 100), 0, 300);
-        SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 1300), 0, 1300);
+        SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 400), 0, 1300);
         ThreatEngine = config.GetBoolean("ThreatEngine", false);
         var serverTypeStr = config.GetString("ServerType", "Kronos");
         ServerType = serverTypeStr.Equals("Generic", StringComparison.OrdinalIgnoreCase)

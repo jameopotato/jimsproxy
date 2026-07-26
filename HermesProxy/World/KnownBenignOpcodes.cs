@@ -11,8 +11,8 @@
 // "packet.untranslated" (implies bug) to "packet.ignored" (implies
 // intentional no-op) lets real translation gaps stand out when reading logs.
 //
-// Source list: RESEARCH.md section 4.Z -- each subsystem has a citation-worthy
-// reason for being absent on the destination side. Grow this list cautiously;
+// Each entry has a citation-worthy reason for being absent on the destination
+// side. Grow this list cautiously;
 // when in doubt, leave the opcode in the untranslated pile so we at least get
 // a warning for it.
 

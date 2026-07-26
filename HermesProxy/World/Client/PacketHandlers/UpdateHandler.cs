@@ -175,6 +175,15 @@ public partial class WorldClient
     {
         WowGuid128 guid = packet.ReadGuid().To128(GetSession().GameState);
 
+        // MIRASU (mc-rune-dousing): record MC rune/circle despawns; a destroyed rune must also leave the resync map so a later boss-death synth can't target a stale guid.
+        uint destroyedEntry = guid.GetEntry();
+        if (guid.GetHighType() == HighGuidType.GameObject && ((destroyedEntry >= 176951 && destroyedEntry <= 176957) || (destroyedEntry >= 178187 && destroyedEntry <= 178193)))
+        {
+            GetSession().GameState.McRunesSeen.Remove(destroyedEntry);
+            GetSession().GameState.McCirclesSeen.Remove(destroyedEntry);
+            Log.Event("gameobject.mc_rune_or_circle.destroyed", new { guid = guid.ToString(), entry = destroyedEntry });
+        }
+
         // JimsProxy (mount-and-quest-diagnostics): capture cached entry/displayId BEFORE
         // the cache eviction below so the bundle records what was being destroyed. Used
         // to triage the Aean Swiftriver Outrunner cat-mount persistence bug — testers'
@@ -208,6 +217,9 @@ public partial class WorldClient
         // JimsProxy (out-of-range-ghost): suppress any stray trailing movement the legacy server broadcasts for this guid after the destroy, until a CreateObject re-creates it.
         GetSession().GameState.MarkObjectRecentlyDestroyed(guid);
 
+        // MIRASU (onyxia-landed-still-hovering): forget hover state on destroy — a missed UNSET_HOVER while out of range must not poison the stable guid; re-approach re-seeds if still airborne.
+        SetHoverState(guid, false, "destroyed", synthesize: false);
+
         UpdateObject updateObject = new UpdateObject(GetSession().GameState);
         updateObject.DestroyedGuids.Add(guid);
         SendPacketToClient(updateObject);
@@ -218,6 +230,105 @@ public partial class WorldClient
         // the fight). The first call emits SMSG_THREAT_CLEAR; the loop emits
         // per-mob updates so the modern client's threat APIs go quiet.
         GetSession().ThreatTracker.OnUnitDestroyed(guid);
+    }
+
+    // MIRASU (mc-rune-dousing): MC rune boss NPC entry -> paired Rune of Warding GO entry (cmangos molten_core.h).
+    private static readonly FrozenDictionary<uint, uint> McRuneEntryByBossEntry = new Dictionary<uint, uint>
+    {
+        [11982] = 176956, // Magmadar -> Rune of Kress
+        [12259] = 176957, // Gehennas -> Rune of Mohn
+        [12057] = 176955, // Garr -> Rune of Blaz
+        [12264] = 176953, // Shazzrah -> Rune of Mazj
+        [12056] = 176952, // Baron Geddon -> Rune of Zeth
+        [11988] = 176954, // Golemagg -> Rune of Theri
+        [12098] = 176951, // Sulfuron -> Rune of Koro
+    }.ToFrozenDictionary();
+
+    private static readonly FrozenDictionary<uint, uint> McBossEntryByRuneEntry =
+        McRuneEntryByBossEntry.ToDictionary(kv => kv.Value, kv => kv.Key).ToFrozenDictionary();
+
+    // MIRASU (mc-rune-dousing): rune entries whose boss life state flipped mid-packet; flushed after the containing update packet is sent so the resync can't outrun a same-packet rune create.
+    private readonly List<uint> _pendingMcRuneResyncs = new();
+
+    // MIRASU (mc-rune-dousing): douseable = not yet doused (no legacy InUse) and paired boss not currently known alive; never-seen bosses count as dead, matching what a 1.12 client could attempt.
+    private bool IsMcRuneDouseable(uint runeEntry, GameObjectFlagsLegacy legacyFlags)
+    {
+        if (legacyFlags.HasFlag(GameObjectFlagsLegacy.InUse))
+            return false;
+        return !(McBossEntryByRuneEntry.TryGetValue(runeEntry, out uint bossEntry)
+            && GetSession().GameState.McBossAlive.TryGetValue(bossEntry, out bool alive) && alive);
+    }
+
+    private void UpdateMcBossLifeState(uint bossEntry, bool alive)
+    {
+        var state = GetSession().GameState;
+        bool wasAlive = state.McBossAlive.TryGetValue(bossEntry, out bool prev) && prev;
+        state.McBossAlive[bossEntry] = alive;
+        if (wasAlive == alive)
+            return;
+        uint runeEntry = McRuneEntryByBossEntry[bossEntry];
+        Log.Event("mc_boss.life_state.changed", new { boss_entry = bossEntry, rune_entry = runeEntry, alive });
+        if (state.McRunesSeen.ContainsKey(runeEntry) && !_pendingMcRuneResyncs.Contains(runeEntry))
+            _pendingMcRuneResyncs.Add(runeEntry);
+    }
+
+    // MIRASU (mc-rune-dousing): re-send a rune's GAMEOBJECT_FLAGS with targetability recomputed after its boss's life state flipped (the server itself never resends rune fields on a kill).
+    private void FlushPendingMcRuneResyncs()
+    {
+        if (_pendingMcRuneResyncs.Count == 0)
+            return;
+        var state = GetSession().GameState;
+        foreach (uint runeEntry in _pendingMcRuneResyncs)
+        {
+            if (!state.McRunesSeen.TryGetValue(runeEntry, out var rune))
+                continue;
+            var legacyFlags = (GameObjectFlagsLegacy)rune.LegacyFlags;
+            var modernFlags = legacyFlags.ToModern();
+            bool douseable = IsMcRuneDouseable(runeEntry, legacyFlags);
+            if (douseable)
+                modernFlags &= ~GameObjectFlagsModern.NotSelectable;
+            UpdateObject updateObject = new UpdateObject(state);
+            ObjectUpdate update = new ObjectUpdate(rune.Guid, UpdateTypeModern.Values, GetSession());
+            update.GameObjectData.Flags = (uint)modernFlags;
+            updateObject.ObjectUpdates.Add(update);
+            SendPacketToClient(updateObject);
+            Log.Event("gameobject.mc_rune.resync", new
+            {
+                guid = rune.Guid.ToString(),
+                rune_entry = runeEntry,
+                douseable = douseable,
+                modern_flags = modernFlags.ToString(),
+            });
+        }
+        _pendingMcRuneResyncs.Clear();
+    }
+
+    // MIRASU (mc-rune-dousing): Kronos respawns the flame circle around already-doused runes on reload (vmangos deletes it only live, at douse time) — destroy such circles client-side so doused runes don't look active to late joiners. Circle entry = rune entry + 1236 (verified for all 7 pairs against vmangos GOHello_go_rune_MC).
+    private void SuppressMcCirclesOnDousedRunes()
+    {
+        var state = GetSession().GameState;
+        if (state.McCirclesSeen.Count == 0)
+            return;
+        List<uint>? suppressed = null;
+        foreach (var (circleEntry, circleGuid) in state.McCirclesSeen)
+        {
+            if (!state.McRunesSeen.TryGetValue(circleEntry - 1236, out var rune) ||
+                !((GameObjectFlagsLegacy)rune.LegacyFlags).HasFlag(GameObjectFlagsLegacy.InUse))
+                continue;
+            UpdateObject updateObject = new UpdateObject(state);
+            updateObject.DestroyedGuids.Add(circleGuid);
+            SendPacketToClient(updateObject);
+            (suppressed ??= new List<uint>()).Add(circleEntry);
+            Log.Event("gameobject.mc_circle.suppressed", new
+            {
+                guid = circleGuid.ToString(),
+                circle_entry = circleEntry,
+                rune_entry = circleEntry - 1236,
+            });
+        }
+        if (suppressed != null)
+            foreach (uint circleEntry in suppressed)
+                state.McCirclesSeen.Remove(circleEntry);
     }
 
     [PacketHandler(Opcode.SMSG_COMPRESSED_UPDATE_OBJECT)]
@@ -486,6 +597,22 @@ public partial class WorldClient
 
         foreach (var auraUpdate in auraUpdates)
             SendPacketToClient(auraUpdate);
+
+        // MIRASU (mc-rune-dousing): after the packet's own updates are out, push rune targetability for any boss life-state edges seen in it, and hide respawned circles around doused runes.
+        FlushPendingMcRuneResyncs();
+        SuppressMcCirclesOnDousedRunes();
+
+        // JimsProxy (stuck-logout-stun): fire the cure only after the whole update packet is
+        // processed and forwarded. Armed exclusively by DetectStuckLogoutStunAtSelfCreate;
+        // one shot per login.
+        if (GetSession().GameState.StuckStunCancelArmed)
+        {
+            GetSession().GameState.StuckStunCancelArmed = false;
+            GetSession().GameState.AwaitingSynthLogoutCancelAck = true;
+            WorldPacket cancel = new WorldPacket(Opcode.CMSG_LOGOUT_CANCEL);
+            SendPacketToServer(cancel);
+            Log.Event("login.stuck_stun.cancel_synthesized", null);
+        }
     }
 
     public void ReadNearObjectsBlock(WorldPacket packet, object index)
@@ -565,6 +692,9 @@ public partial class WorldClient
             GetSession().ThreatTracker.OnUnitDestroyed(guid);
             // JimsProxy (out-of-range-ghost): suppress stray trailing movement for this guid until it is re-created on re-approach.
             GetSession().GameState.MarkObjectRecentlyDestroyed(guid);
+
+            // MIRASU (onyxia-landed-still-hovering): out-of-range is a visibility loss like destroy — forget hover state so a missed UNSET_HOVER can't poison the guid.
+            SetHoverState(guid, false, "out_of_range", synthesize: false);
 
             updateObject.OutOfRangeGuids.Add(guid);
         }
@@ -1044,17 +1174,9 @@ public partial class WorldClient
 
             // Vanilla 1.12 carries hover state via MovementFlagVanilla.FixedZ. Seed our
             // hover registry from it, since some 1.12 cores never populate UNIT_FIELD_HOVERHEIGHT.
-            if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180) && moveInfo.Hover &&
-                guid != GetSession().GameState.CurrentPlayerGuid)
-            {
-                if (GetSession().GameState.KnownHoveringMobs.Add(guid))
-                {
-                    Framework.Logging.Log.Event("hover.detect_fixedz_flag", new
-                    {
-                        guid = guid.ToString(),
-                    });
-                }
-            }
+            // No synth: this runs mid-create-parse and the create block already carries the PlayHoverAnim bit.
+            if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180) && moveInfo.Hover)
+                SetHoverState(guid, true, "fixedz", synthesize: false);
 
             // MIRASU (swim-mob basketball-bounce 2026-05-23): vanilla NPCs in water
             // carry MovementFlagVanilla.Swimming on their MovementInfo. Modern 1.14 client
@@ -1143,21 +1265,29 @@ public partial class WorldClient
                 if (pendingMode != DeferredTransportSynthMode.None)
                 {
                     GetSession().GameState.PendingDeferredTransportSynth = DeferredTransportSynthMode.None;
-                    bool destinationOnTransport = !moveInfo.TransportGuid.IsEmpty();
-                    if (destinationOnTransport)
+                    // JimsProxy (#329/#331/#332 transport-clear wedge): fire the fabricated
+                    // transport-clear ONLY when the player carried a transport at the SOURCE
+                    // (or the source was unobserved -> fail-safe fire). Firing it when the player
+                    // was observed OFF a transport at the source is the wedge: a mage-teleport /
+                    // cross-continent / BG-exit transition gets a spurious MoveTeleport
+                    // (TransportGUID=empty) that leaves the client (esp. at EU latency) unable to
+                    // walk until /reload. prevTransport = the source state captured above (this
+                    // player UpdateObject's prior observation); moveInfo.TransportGuid = destination.
+                    if (TransportClearGate.ShouldFire(prevTransport, moveInfo.TransportGuid))
+                    {
+                        FireDeferredTransportClearSynth(guid, moveInfo.Position, moveInfo.Orientation, pendingMode.ToString());
+                    }
+                    else
                     {
                         Framework.Logging.Log.Event("movement.transport_clear.deferred_skipped", new
                         {
                             map_id = GetSession().GameState.CurrentMapId,
                             player_low = guid.GetCounter(),
+                            source_transport_guid = prevTransport?.ToString() ?? "<unobserved>",
                             destination_transport_guid = moveInfo.TransportGuid.ToString(),
                             mode = pendingMode.ToString(),
-                            reason = "destination_on_transport",
+                            reason = moveInfo.TransportGuid.IsEmpty() ? "source_off_transport" : "destination_on_transport",
                         });
-                    }
-                    else
-                    {
-                        FireDeferredTransportClearSynth(guid, moveInfo.Position, moveInfo.Orientation, pendingMode.ToString());
                     }
                 }
             }
@@ -1766,6 +1896,8 @@ public partial class WorldClient
 
     private void AfterStoreObjectUpdateHook(WowGuid128 guid, ObjectType objectType, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, AuraUpdate auraUpdate, PowerUpdate? powerUpdate, bool isCreate, ObjectUpdate updateData, BitArray changedValuesMask)
     {
+        DetectStuckLogoutStunAtSelfCreate(guid, updates, isCreate, updateData);
+
         // JimsProxy: comprehensive pet diagnostics for the Hunter-Pet-Stealth-Stuck
         // investigation. Fires on every UPDATE_OBJECT block targeting a pet GUID
         // OR the current pet (covers quest-tamed creatures which have a Creature/
@@ -1867,6 +1999,131 @@ public partial class WorldClient
                 SendPacketToClient(height, Opcode.SMSG_UPDATE_OBJECT);
             }
         }
+    }
+
+    // JimsProxy (stuck-logout-stun 2026-07-17): vanilla cores implement the logout countdown by
+    // writing a raw UNIT_FLAG_STUNNED + root + sit onto the player — no aura carries it (vmangos
+    // calls the state "artificially stunned"). When a session dies abruptly while in combat,
+    // Kronos keeps the body in-world, schedules its internal logout (applying that artificial
+    // stun), and a fast same-character relogin re-attaches the new session to the live object.
+    // vmangos's reconnect path removes the flag, unroots and stands the player back up; Kronos's
+    // demonstrably does only the unroot half (2026-07-17 incident: FORCE_MOVE_ROOT + UNROOT
+    // within 1 s of both re-logins, stunned flag never cleared, no aura beyond Battle Stance +
+    // Find Minerals). The orphaned flag blocks casting and turning client-side ("You can't do
+    // that while stunned") for the rest of the session; only a character switch — which forces
+    // the lingering object out of the world — clears it.
+    //
+    // Detection is one-shot per world login, on the FIRST create block for the local player,
+    // and only when the stunned flag arrives with ZERO debuff auras: every genuine vanilla stun
+    // is a MOD_STUN debuff occupying one of slots 32-47 of the same create block, so an aura-less
+    // stunned flag at login has exactly one producer — the logout machinery. A genuine stun at
+    // re-attach (debuff present) leaves the gate closed: a false negative is safe (no cure this
+    // login), a false positive is structurally impossible.
+    //
+    // Three layers, the last two individually toggleable:
+    //   tripwire — login.self_create_state always logs the raw wire state, gate hit or not
+    //   cure     — synthesize a legacy CMSG_LOGOUT_CANCEL (Settings.StuckLogoutStunCancelFix):
+    //              lineage cores' HandleLogoutCancelOpcode is the one client-reachable path that
+    //              removes the artificial stun (RemoveFlag + unroot + stand) — the same handler
+    //              every ordinary cancelled logout exercises. Armed here, sent after the whole
+    //              UPDATE_OBJECT finishes processing (end of HandleUpdateObject); the unsolicited
+    //              SMSG_LOGOUT_CANCEL_ACK is swallowed (CharacterHandler.HandleLogoutCancelAck).
+    //   strip    — clear the stunned bit from the create block we forward
+    //              (Settings.StuckLogoutStunClientStrip) so turn/cast input isn't locked
+    //              client-side even if the server ignores the cancel. The server still rejects
+    //              real casts until ITS state clears; the strip only restores input.
+    private void DetectStuckLogoutStunAtSelfCreate(WowGuid128 guid, Dictionary<int, UpdateField> updates, bool isCreate, ObjectUpdate updateData)
+    {
+        if (!isCreate || GetSession().GameState.StuckStunLoginCheckDone)
+            return;
+        if (guid != GetSession().GameState.CurrentPlayerGuid)
+            return;
+        // Vanilla-only: the slot layout and the incomplete-reconnect behavior are 1.12 facts.
+        if (!LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+            return;
+
+        int UNIT_FIELD_FLAGS = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_FLAGS);
+        int UNIT_FIELD_AURA = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
+        int UNIT_FIELD_BYTES_1 = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_BYTES_1);
+        if (UNIT_FIELD_FLAGS < 0 || UNIT_FIELD_AURA < 0)
+            return;
+
+        GetSession().GameState.StuckStunLoginCheckDone = true;
+
+        uint rawFlags = updates.TryGetValue(UNIT_FIELD_FLAGS, out var flagsField) ? flagsField.UInt32Value : 0;
+        uint standState = 0;
+        if (UNIT_FIELD_BYTES_1 >= 0 && updates.TryGetValue(UNIT_FIELD_BYTES_1, out var bytes1))
+            standState = bytes1.UInt32Value & 0xFF;
+
+        List<uint> buffSpellIds = new();
+        List<uint> debuffSpellIds = new();
+        for (int i = 0; i < VanillaAuraSlotCount; i++)
+        {
+            if (updates.TryGetValue(UNIT_FIELD_AURA + i, out var slot) && slot.UInt32Value != 0)
+                (i < VanillaFirstDebuffSlot ? buffSpellIds : debuffSpellIds).Add(slot.UInt32Value);
+        }
+
+        bool artificial = IsArtificialLogoutStun(rawFlags, debuffSpellIds.Count);
+
+        Log.Event("login.self_create_state", new
+        {
+            raw_unit_flags = rawFlags,
+            stunned = (rawFlags & (uint)UnitFlagsVanilla.Stunned) != 0,
+            stand_state = standState,
+            buff_spell_ids = buffSpellIds,
+            debuff_spell_ids = debuffSpellIds,
+            artificial_logout_stun = artificial,
+        });
+
+        if (!artificial)
+            return;
+
+        GetSession().GameState.StuckStunDetectedThisLogin = true;
+
+        if (Framework.Settings.StuckLogoutStunClientStrip && updateData.UnitData.Flags.HasValue)
+        {
+            updateData.UnitData.Flags &= ~(uint)UnitFlags.Stunned;
+            Log.Event("login.stuck_stun.client_strip", new { forwarded_flags = updateData.UnitData.Flags.Value });
+        }
+
+        // JimsProxy (stuck-logout-stun, layer 4 — the ACTUAL latch, 2026-07-19 byte-diff):
+        // the re-attach create is serialized while the zombie still carries the logout
+        // root, so its movement block ships MovementFlagModern.Root as the client's BASE
+        // move state (stuck login create Flags=0x400 vs clean login 0x0, all else equal).
+        // Kronos fires the matching FORCE_MOVE_ROOT before the create — the client
+        // discards force ops for a mover it hasn't created — so the later
+        // FORCE_MOVE_UNROOT has no force-root to cancel and the mover is left in a
+        // contradictory half-rooted state: fwd/back/strafe work, facing input and the
+        // spell system stay locked for the whole session. Empirically the acked unroot
+        // does NOT lift the latch, and stripping the unit-flags stun bit alone did not
+        // unlock the client — the create's movement flags are the load-bearing byte.
+        // Clear the root from the forwarded create; the server's own unroot ~1 s later
+        // is then a no-op (the clean login shows unroot-while-unrooted is harmless).
+        if (Framework.Settings.StuckLogoutStunClientStrip &&
+            updateData.CreateData?.MoveInfo != null &&
+            (updateData.CreateData.MoveInfo.Flags & (uint)MovementFlagModern.Root) != 0)
+        {
+            updateData.CreateData.MoveInfo.Flags &= ~(uint)MovementFlagModern.Root;
+            Log.Event("login.stuck_stun.create_root_strip", new
+            {
+                forwarded_move_flags = updateData.CreateData.MoveInfo.Flags,
+            });
+        }
+
+        if (Framework.Settings.StuckLogoutStunCancelFix)
+            GetSession().GameState.StuckStunCancelArmed = true;
+    }
+
+    // Vanilla aura slot layout: 32 buffs then 16 debuffs (the 2026-07-17 incident's Dazed
+    // landed in slot 32, the first debuff slot).
+    internal const int VanillaAuraSlotCount = 48;
+    internal const int VanillaFirstDebuffSlot = 32;
+
+    // Pure gate: the stunned flag with no debuff present cannot be a real stun — every vanilla
+    // MOD_STUN aura occupies a debuff slot in the same create block.
+    internal static bool IsArtificialLogoutStun(uint rawUnitFlags, int debuffAuraCount)
+    {
+        return (rawUnitFlags & (uint)UnitFlagsVanilla.Stunned) != 0 && debuffAuraCount == 0;
     }
 
     private bool ShouldClearMountDisplayOnDeadNonPlayerUnit(WowGuid128 guid, ObjectType objectType, ObjectUpdate updateData, Dictionary<int, UpdateField> updates, int mountDisplayField)
@@ -2278,6 +2535,9 @@ public partial class WorldClient
             // JimsProxy (observed-bow retract): health hitting 0 is a terminal stop edge — retract any observed shooter aimed at this unit, plus the unit itself if it was a shooter (fallback for deaths PARTY_KILL_LOG doesn't cover: DoTs, non-party kills, environment).
             if (healthUpdated && updates[UNIT_FIELD_HEALTH].Int32Value <= 0)
                 RetractObservedShootersOnUnitDeath(guid);
+            // MIRASU (mc-rune-dousing): track MC rune-boss life edges off creature health (creates carry health too).
+            if (healthUpdated && guid.GetHighType() == HighGuidType.Creature && McRuneEntryByBossEntry.ContainsKey(guid.GetEntry()))
+                UpdateMcBossLifeState(guid.GetEntry(), updates[UNIT_FIELD_HEALTH].Int32Value > 0);
             int UNIT_FIELD_LEVEL = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_LEVEL);
             if (UNIT_FIELD_LEVEL >= 0 && updateMaskArray[UNIT_FIELD_LEVEL])
             {
@@ -2503,6 +2763,21 @@ public partial class WorldClient
                 // set->clear edge. Done for ALL units, not only the local player, so groupmate FD/death is handled too.
                 GetSession().ThreatTracker.OnUnitCombatStateObserved(
                     guid, (updates[UNIT_FIELD_FLAGS].UInt32Value & (uint)UnitFlagsVanilla.InCombat) != 0);
+
+                // JimsProxy (stuck-logout-stun): adjudication breadcrumb — after a detection,
+                // the first self flags write WITHOUT the stunned bit is the server curing the
+                // artificial stun (canonically in response to our synthesized CMSG_LOGOUT_CANCEL).
+                // Also retires the raw CAST_RESULT capture in HandleCastFailed.
+                if (!isCreate && GetSession().GameState.StuckStunDetectedThisLogin &&
+                    guid == GetSession().GameState.CurrentPlayerGuid &&
+                    (updates[UNIT_FIELD_FLAGS].UInt32Value & (uint)UnitFlagsVanilla.Stunned) == 0)
+                {
+                    GetSession().GameState.StuckStunDetectedThisLogin = false;
+                    Log.Event("login.stuck_stun.cleared_by_server", new
+                    {
+                        raw_unit_flags = updates[UNIT_FIELD_FLAGS].UInt32Value,
+                    });
+                }
             }
             int UNIT_FIELD_FLAGS_2 = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_FLAGS_2);
             if (UNIT_FIELD_FLAGS_2 >= 0 && updateMaskArray[UNIT_FIELD_FLAGS_2])
@@ -2718,6 +2993,11 @@ public partial class WorldClient
                 else if (Session.GameState.KnownSwimmingMobs.Contains(guid))
                 {
                     updateData.UnitData.AnimTier = 1; // AnimTier.Swim
+                }
+                // MIRASU (onyxia-landed-still-hovering): vanilla never carries AnimTier, so repaint Ground(0) once no registry matches — else the client's cached Hover(2) survives landing.
+                else if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_4_0_8089))
+                {
+                    updateData.UnitData.AnimTier = 0;
                 }
             }
             int UNIT_FIELD_PETNUMBER = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_PETNUMBER);
@@ -4175,30 +4455,25 @@ public partial class WorldClient
                 var legacyFlags = (GameObjectFlagsLegacy)legacyRaw;
                 var modernFlags = legacyFlags.ToModern();
 
-                // MC Runes of Warding (176951-176957): vanilla GO_FLAG_NO_INTERACT did NOT block
-                // spell-cursor OPEN_LOCK targeting (Quintessence dousing). Modern NOT_SELECTABLE
-                // does. The Flames Circle linkedTrap GOs (178187-178193) handle gating instead —
-                // they cover the rune until the boss dies. Strip NOT_SELECTABLE so the modern
-                // client can acquire the rune as a Quintessence target. Static INTERACT_COND
-                // also blocks cursor acquisition (verified empirically), so we instead inject
-                // the dynamic LO_NO_INTERACT bit (modern 0x080) — which TrinityCore uses for
-                // depleted gathering nodes (visible-but-inert). Closest analog to vanilla
-                // NO_INTERACT semantics and our best chance to suppress hover/right-click
-                // target-frame acquisition while keeping the OPEN_LOCK cursor working.
-                // Without the NotSelectable strip the modern 1.14 client refuses cursor
-                // acquisition entirely and the cast fails as "Out of range" before any
-                // packet leaves the client. See HermesProxy issue #374.
-                int? entry = updateData.ObjectData.EntryID;
-                bool isMcRune = entry.HasValue && entry.Value >= 176951 && entry.Value <= 176957;
-                bool dynNoInteractInjected = false;
+                // MC Runes of Warding (176951-176957): vanilla GO_FLAG_NO_INTERACT only blocked
+                // right-click; modern NOT_SELECTABLE also blocks spell-cursor OPEN_LOCK targeting
+                // (Quintessence dousing fails "Out of range" client-side). Strip it — and ONLY it:
+                // injecting dyn LO_NO_INTERACT blocks the cast too, and any dynflags-only values
+                // update silently cleared it anyway (the May GM test that said otherwise was
+                // confounded by exactly that). See HermesProxy issue #374.
+                // ObjectData.EntryID is null on values updates (mask lacks OBJECT_FIELD_ENTRY) — derive from guid so the boss-death InUse toggle doesn't re-add NotSelectable.
+                uint entry = updateData.ObjectData.EntryID.HasValue ? (uint)updateData.ObjectData.EntryID.Value : guid.GetEntry();
+                // Transport guids pack different data into the entry bits — require a real GameObject guid so nothing outside the 7 MC runes can alias into the override.
+                bool isMcRune = entry >= 176951 && entry <= 176957 && guid.GetHighType() == HighGuidType.GameObject;
+                // Kronos rune flags are identical for boss-alive and boss-dead-undoused (raw 48); InUse (raw 49) means already doused. Targetability is gated on the paired boss's observed life state (see IsMcRuneDouseable) so a consumable Quintessence can't be wasted on a boss-alive rune.
+                bool mcRuneDouseable = false;
                 if (isMcRune)
                 {
-                    modernFlags &= ~GameObjectFlagsModern.NotSelectable;
-
-                    uint existingDynFlags = updateData.ObjectData.DynamicFlags ?? 0;
-                    updateData.ObjectData.DynamicFlags = existingDynFlags | (uint)GameObjectDynamicFlagsModern.NoInteract;
-                    dynNoInteractInjected = true;
+                    GetSession().GameState.McRunesSeen[entry] = (guid, legacyRaw);
+                    mcRuneDouseable = IsMcRuneDouseable(entry, legacyFlags);
                 }
+                if (mcRuneDouseable)
+                    modernFlags &= ~GameObjectFlagsModern.NotSelectable;
 
                 updateData.GameObjectData.Flags = (uint)modernFlags;
 
@@ -4209,8 +4484,8 @@ public partial class WorldClient
                     legacy_raw = legacyRaw,
                     legacy_flags = legacyFlags.ToString(),
                     modern_flags = modernFlags.ToString(),
-                    mc_rune_override_applied = isMcRune,
-                    dyn_no_interact_injected = dynNoInteractInjected,
+                    is_mc_rune = isMcRune,
+                    mc_rune_override_applied = mcRuneDouseable,
                 });
             }
             int GAMEOBJECT_ROTATION = LegacyVersion.GetUpdateField(GameObjectField.GAMEOBJECT_ROTATION);
@@ -4270,6 +4545,20 @@ public partial class WorldClient
             if (GAMEOBJECT_STATE >= 0 && updateMaskArray[GAMEOBJECT_STATE])
             {
                 updateData.GameObjectData.State = (sbyte)updates[GAMEOBJECT_STATE].Int32Value;
+
+                // MIRASU (mc-rune-dousing): GO state is the only remaining candidate for distinguishing boss-alive vs boss-dead-undoused on Kronos (flags are identical, circle GO respawns on reload).
+                uint goEntry = guid.GetEntry();
+                // MIRASU (mc-rune-dousing): circles carry no GAMEOBJECT_FLAGS, so register their guid here (state is always present on creates) for the doused-rune suppression flush.
+                if (goEntry >= 178187 && goEntry <= 178193)
+                    GetSession().GameState.McCirclesSeen[goEntry] = guid;
+                if ((goEntry >= 176951 && goEntry <= 176957) || (goEntry >= 178187 && goEntry <= 178193))
+                    Log.Event("gameobject.state.translated", new
+                    {
+                        guid = guid.ToString(),
+                        entry = goEntry,
+                        state = updateData.GameObjectData.State,
+                        is_create = updateData.CreateData != null,
+                    });
             }
             int GAMEOBJECT_DYN_FLAGS = LegacyVersion.GetUpdateField(GameObjectField.GAMEOBJECT_DYN_FLAGS);
             if (GAMEOBJECT_DYN_FLAGS >= 0 && updateMaskArray[GAMEOBJECT_DYN_FLAGS])
@@ -4282,6 +4571,18 @@ public partial class WorldClient
 
                 GameObjectDynamicFlagsLegacy flags = (GameObjectDynamicFlagsLegacy)(updates[GAMEOBJECT_DYN_FLAGS].UInt32Value);
                 updateData.ObjectData.DynamicFlags = (oldValue | (uint)flags.CastFlags<GameObjectDynamicFlagsModern>());
+
+                // MIRASU (mc-rune-dousing): MC entries only — Kronos re-sends GO dynflags ~2s per in-range GO, logging all of them bloats the JSONL.
+                uint dynEntry = guid.GetEntry();
+                if ((dynEntry >= 176951 && dynEntry <= 176957) || (dynEntry >= 178187 && dynEntry <= 178193))
+                    Log.Event("gameobject.dynflags.translated", new
+                    {
+                        guid = guid.ToString(),
+                        entry = dynEntry,
+                        legacy_raw = updates[GAMEOBJECT_DYN_FLAGS].UInt32Value,
+                        old_value = oldValue,
+                        new_value = updateData.ObjectData.DynamicFlags,
+                    });
             }
             int GAMEOBJECT_FACTION = LegacyVersion.GetUpdateField(GameObjectField.GAMEOBJECT_FACTION);
             if (GAMEOBJECT_FACTION >= 0 && updateMaskArray[GAMEOBJECT_FACTION])

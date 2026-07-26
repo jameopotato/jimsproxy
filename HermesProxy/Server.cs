@@ -203,17 +203,29 @@ partial class Server
     // input is ignored.
     private const string LauncherShutdownSentinel = "__LAUNCHER_SHUTDOWN__";
 
+    // JimsProxy: written to stdout (own line, flushed) the moment the sentinel is accepted,
+    // BEFORE any shutdown work, so the launcher upgrades its wait from the 250 ms
+    // silent-grace to the full 3 s window (token contract shared with HermesManager::stop).
+    private const string LauncherShutdownAck = "__PROXY_SHUTDOWN_ACK__";
+
     private static void ListenForLauncherShutdown()
+        => ListenForLauncherShutdown(Console.In, Console.Out, ShutdownHooks.TriggerGracefulExit);
+
+    // JimsProxy: testable core of the stdin listener. Production wires Console.In/Console.Out
+    // and ShutdownHooks.TriggerGracefulExit (which never returns); tests substitute all three.
+    internal static void ListenForLauncherShutdown(TextReader stdin, TextWriter stdout, Action<string> triggerGracefulExit)
     {
         try
         {
             string? line;
-            while ((line = Console.In.ReadLine()) != null)
+            while ((line = stdin.ReadLine()) != null)
             {
                 if (line.Trim() == LauncherShutdownSentinel)
                 {
                     Log.Event("process.shutdown_request", new { source = "stdin", sentinel = LauncherShutdownSentinel });
-                    ShutdownHooks.TriggerGracefulExit("stdin_launcher_shutdown");
+                    stdout.WriteLine(LauncherShutdownAck);
+                    stdout.Flush();
+                    triggerGracefulExit("stdin_launcher_shutdown");
                     return;
                 }
                 // Any other stdin line is ignored.

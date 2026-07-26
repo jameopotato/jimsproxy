@@ -113,7 +113,7 @@ public static partial class GameData
     // full QuestTemplate having been populated by CMSG_QUERY_QUEST_INFO. The 1.14
     // client doesn't always query quest info before clicking a reward, which left
     // item-reward-choice quest turn-ins failing on the first click ("quest template
-    // is missing. Try again."). See DIAGNOSTICS.md 2026-04-18 Block 2 findings.
+    // is missing. Try again.").
     public static Dictionary<uint /*questId*/, uint[] /*choiceItemIds, index-ordered*/> OfferedRewardChoiceItems = [];
 
     #region GettersAndSetters

@@ -95,7 +95,26 @@ public class AccountMetaDataManager
         if (!File.Exists(path))
             return new List<uint>();
 
-        var completedQuestIds = ParseCompletedQuestLines(File.ReadAllLines(path), out var compactLines, out var needsRewrite);
+        string[] rawLines;
+        try
+        {
+            rawLines = File.ReadAllLines(path);
+        }
+        catch (Exception ex)
+        {
+            // Degrade gracefully instead of crashing login: this runs on the login path
+            // (CompletedQuestTracker.Reload -> HandlePlayerLogin), so a transient IOException here
+            // -- an AV scan hold or sharing violation on the file -- would otherwise kill the login
+            // outright. Same crash class as #408, which only hardened the parse, not the read
+            // itself. Returning empty means the completed-quest bits aren't restored for this
+            // session; they re-populate as quests are turned in and the file self-heals on the next
+            // clean read.
+            Log.Print(LogType.Error, $"Failed to read completed_quests.csv for '{charName}@{realmName}' " +
+                                     $"({ex.GetType().Name}: {ex.Message}); treating as no completed quests this session.");
+            return new List<uint>();
+        }
+
+        var completedQuestIds = ParseCompletedQuestLines(rawLines, out var compactLines, out var needsRewrite);
 
         // Self-heal: the old code called uint.Parse on every line, so a single corrupt line (a
         // crash/kill mid-append can leave NUL bytes) threw FormatException and terminated the
@@ -165,8 +184,47 @@ public class AccountMetaDataManager
         var dir = GetAccountCharacterMetaDataDirectory(realmName, charName);
         var path = Path.Combine(dir, COMPLETED_QUESTS_FILE);
 
-        var when = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        File.AppendAllLines(path, new[]{$"{questId},{when}"}, Encoding.UTF8);
+        try
+        {
+            // Guard against a glued line: if a prior append was torn by a kill mid-write (the
+            // launcher force-kills the proxy on game close) the file can end without a newline. A
+            // plain AppendAllLines would then concatenate onto that partial last line, yielding a
+            // *parseable* wrong line whose first field is the OLD id -- silently dropping this quest
+            // and evading the corrupt-line self-heal (the glued line parses fine, so needsRewrite
+            // stays false). Normalise the trailing newline first.
+            EnsureTrailingNewline(path);
+
+            var when = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            File.AppendAllLines(path, new[]{$"{questId},{when}"}, Encoding.UTF8);
+        }
+        catch (Exception ex)
+        {
+            // A locked file (AV hold / sharing violation) must not crash the quest turn-in path.
+            // The in-memory CompletedQuestTracker set already reflects this completion for the
+            // session; only cross-restart persistence is lost until the next successful append.
+            Log.Print(LogType.Error, $"Failed to append completed_quests.csv (quest {questId}) for " +
+                                     $"'{charName}@{realmName}': {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    // Ensures the file ends with a newline so the next append starts on its own line. No-op when the
+    // file is absent (the append will create it) or already ends in '\n'. Reads only the final byte.
+    // Internal for unit-testing the torn-append (glued-line) guard.
+    internal static void EnsureTrailingNewline(string path)
+    {
+        if (!File.Exists(path))
+            return;
+
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        if (fs.Length == 0)
+            return;
+
+        fs.Seek(-1, SeekOrigin.End);
+        if (fs.ReadByte() != '\n')
+        {
+            fs.Seek(0, SeekOrigin.End);
+            fs.WriteByte((byte)'\n');
+        }
     }
 
     public void MarkQuestAsNotCompleted(string realmName, string charName, uint questId)
@@ -174,10 +232,31 @@ public class AccountMetaDataManager
         var dir = GetAccountCharacterMetaDataDirectory(realmName, charName);
         var path = Path.Combine(dir, COMPLETED_QUESTS_FILE);
 
-        string needle = questId.ToString();
-        List<string> lines = File.ReadAllLines(path).ToList();
-        lines.RemoveAll(l => l.Split(',').FirstOrDefault()?.Equals(needle) ?? false);
-        File.WriteAllLines(path, lines);
+        // Nothing persisted yet (e.g. a quest abandoned before any completion on a fresh character)
+        // -> nothing to remove. Without this guard File.ReadAllLines throws FileNotFoundException on
+        // the missing file.
+        if (!File.Exists(path))
+            return;
+
+        try
+        {
+            string needle = questId.ToString();
+            List<string> lines = File.ReadAllLines(path).ToList();
+            if (lines.RemoveAll(l => l.Split(',').FirstOrDefault()?.Equals(needle) ?? false) == 0)
+                return; // quest wasn't recorded -- don't rewrite the file needlessly
+
+            // Atomic rewrite (temp + move) so a kill mid-write (launcher force-kill on game close)
+            // can't truncate/corrupt the file -- matches GetAllCompletedQuests' self-heal and
+            // SaveQuestItemProgress. This was the last non-atomic writer of this file.
+            var tmp = path + ".tmp";
+            File.WriteAllLines(tmp, lines);
+            File.Move(tmp, path, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            Log.Print(LogType.Error, $"Failed to rewrite completed_quests.csv (unmark {questId}) for " +
+                                     $"'{charName}@{realmName}': {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     public void SaveCharacterSettingsStorage(string realmName, string charName, PlayerSettings.InternalStorage settings)

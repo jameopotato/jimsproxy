@@ -363,8 +363,10 @@ internal static class ThreatModules
             // Rogue Bloodfang 5-set: Feint x1.25). Returns 1.0 for spells
             // outside the gated list, so non-set-affected flats pass through
             // unchanged.
+            // This flat-ability handler is local-player-only (guarded above), so
+            // caster == CurrentPlayerGuid — pass it as the gear-read GUID.
             var playerClass = (Class)session.GameState.CurrentPlayerClass;
-            double gearMult = ThreatSetBonuses.GetGearSpellMultiplier(session.GameState, playerClass, spellId);
+            double gearMult = ThreatSetBonuses.GetGearSpellMultiplier(session.GameState, playerClass, caster, spellId);
             double finalAmount = amount * gearMult;
 
             var target = hitTargets[0];

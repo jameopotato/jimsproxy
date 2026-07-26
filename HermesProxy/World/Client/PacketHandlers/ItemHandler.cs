@@ -17,7 +17,33 @@ public partial class WorldClient
         SetProficiency proficiency = new SetProficiency();
         proficiency.ProficiencyClass = packet.ReadUInt8();
         proficiency.ProficiencyMask = packet.ReadUInt32();
-        SendPacketToClient(proficiency);
+
+        // #410 (item-proficiency tooltip): Kronos front-loads the whole proficiency burst BEFORE
+        // SMSG_LOGIN_VERIFY_WORLD -- confirmed 2026-07-15 in both the legacy JSONL and the modern
+        // .pkt (9/9 SMSG_SET_PROFICIENCY arrive pre-verify, 0 after), matching twinhead #13649
+        // "item proficiency packet is sent at incorrect time". The 1.14 client isn't in world yet,
+        // so it appears to drop them: items it can't use don't turn red and wearable armor shows a
+        // spurious "Requires <ArmorType>" line. Hold each packet until the client is in world (the
+        // delay queue flushes right after we forward login-verify) so it can actually apply it.
+        //
+        // The !IsInWorld gate is load-bearing: a MID-SESSION proficiency change (training a new
+        // weapon type at a trainer) arrives AFTER login-verify, and there is no future login-verify
+        // to flush a delayed copy against -- delaying it would strand it forever. Relogin is already
+        // safe: the client-bound delay queue is intentionally not migrated across a WorldClient
+        // recreate (#384), and proficiency is re-sent fresh on each login.
+        //
+        // VERIFIED 2026-07-15 (Kronos V, TooltipFix disabled, Mage + Rogue): delivered in world,
+        // the 1.14 client DOES apply proficiency -- unusable items go red and the spurious
+        // "Requires <ArmorType>" line disappears on wearable armor. The earlier "the client ignores
+        // this packet" belief was an artifact of the pre-verify timing. NOTE: this only holds with
+        // the forward-order flush in SendDelayedPacketsToClientOnOpcode -- SMSG_SET_PROFICIENCY is a
+        // cumulative absolute mask (only the last, full one is correct), and the queue's old reverse
+        // flush collapsed multi-proficiency classes to the smallest mask (a Rogue to Leather-only /
+        // Sword1H-only, wrongly reddening cloth/thrown). Both are needed together.
+        if (!GetSession().GameState.IsInWorld)
+            SendPacketToClient(proficiency, Opcode.SMSG_LOGIN_VERIFY_WORLD);
+        else
+            SendPacketToClient(proficiency);
     }
     [PacketHandler(Opcode.SMSG_BUY_SUCCEEDED)]
     void HandleBuySucceeded(WorldPacket packet)

@@ -345,6 +345,57 @@ public partial class WorldSocket
                         return;
                     }
 
+                    // JimsProxy (rtt-prefire, Timer): the single hold path LL re-admits. A press
+                    // landing inside the fixed RttPrefireTimerWindowMs (400 ms) tail of the GCD
+                    // parks in the existing
+                    // hold slot and the BeginGcd timer (already armed at instant GO even under LL,
+                    // C-SH:~1997) releases it at
+                    // (estimated expiry − adaptive/manual early-fire offset) — the same
+                    // #397-supersede-hardened machinery queue mode uses. Presses outside the
+                    // window still forward immediately; no other queue-mode guard is imported
+                    // (deliberately no ShouldDropLateSameSpell — LL philosophy stays
+                    // forward-everything outside the hold window). The held press is NOT enqueued
+                    // here — ForwardHeldGcdCast enqueues on release, so server responses pair
+                    // with the forwarded copy only.
+                    if (Settings.RttPrefireTimerActive && GetSession().GameState.IsInGcdQueueWindow())
+                    {
+                        WorldPacket heldLlPacket = BuildCastSpellPacket(cast);
+                        castRequest.HeldPacketForReplay = heldLlPacket;
+                        castRequest.HeldAtTickMs = Environment.TickCount64;
+                        long llGcdRemainingMs = GetSession().GameState.GetGcdRemainingMs();
+
+                        // Same-spell skip: the held press already yields this exact outcome — ack
+                        // the duplicate keypress and keep the earlier hold (mirrors queue mode).
+                        var llPeeked = GetSession().GameState.PeekHeldGcdCast();
+                        if (llPeeked != null && llPeeked.SpellId == cast.Cast.SpellID)
+                        {
+                            SendCastFailedWithoutPrepare(castRequest);
+                            return;
+                        }
+
+                        if (GetSession().GameState.TryHoldCastDuringGcd(castRequest, out var llDisplaced))
+                        {
+                            Log.Event("spell.held", new
+                            {
+                                spell_id = cast.Cast.SpellID,
+                                gcd_remaining_ms = llGcdRemainingMs,
+                                displaced_spell_id = llDisplaced?.SpellId ?? 0,
+                                client_cast_id = castRequest.ClientGUID.ToString(),
+                                source = "ll_prefire",
+                            });
+                            if (llDisplaced != null)
+                                SendCastFailedWithoutPrepare(llDisplaced);
+                            return;
+                        }
+                        // GCD expired between the window check and the hold (or the timer already
+                        // fired) — fall through and forward immediately, the LL default.
+                        Log.Event("spell.held_race_fallthrough", new
+                        {
+                            spell_id = cast.Cast.SpellID,
+                            gcd_remaining_ms_at_check = llGcdRemainingMs,
+                        });
+                    }
+
                     // DIAGNOSTIC (stuck-spell investigation): remove when closed
                     if (Framework.Settings.DebugOutput)
                         Log.Event("cast.forwarded", new
@@ -354,10 +405,7 @@ public partial class WorldSocket
                             queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
                             source = "low_latency",
                         });
-                    lock (GetSession().GameState.PendingCastsLock)
-                    {
-                        GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
-                    }
+                    GetSession().GameState.EnqueuePendingNormalCast(castRequest);
                     Log.Event("cast.low_latency_forward", new
                     {
                         spell_id = cast.Cast.SpellID,
@@ -365,6 +413,44 @@ public partial class WorldSocket
                     });
                     WorldPacket llPacket = BuildCastSpellPacket(cast);
                     SendPacketToServer(llPacket);
+
+                    // JimsProxy (rtt-prefire, Knocker): SugarProxy-parity resend loop (dev/
+                    // experimental — the launcher offers it only in Dev Mode). Skip while a
+                    // cast-time cast is in progress: every knock would just bounce
+                    // SpellInProgress (Sugar gates the same way via a session flag). See
+                    // GameSessionData.StartKnockLoop for the full mechanism + termination.
+                    if (Settings.RttPrefireKnockerActive && !GetSession().GameState.HasStartedNormalCast())
+                    {
+                        GetSession().GameState.StartKnockLoop((uint)cast.Cast.SpellID,
+                            () => SendPacketToServer(llPacket),
+                            abandonedSpellId =>
+                            {
+                                // The loop ended (superseded/exhausted) with the press still
+                                // unstarted — its bounces were swallowed as chaff and the final
+                                // one may have been swallowed inside the guard-teardown window,
+                                // so nothing else will pair the entry. Resolve it NOW, keyed to
+                                // the loop-exit event: dequeue the unstarted dup and ack it
+                                // silently, exactly like a displaced held press. If a concurrent
+                                // START won the race to the entry, put it back untouched — the
+                                // server owns started casts.
+                                var st = GetSession().GameState;
+                                if (st.TryDequeuePendingNormalCast(abandonedSpellId, out var abandoned, preferStarted: false) && abandoned != null)
+                                {
+                                    if (abandoned.HasStarted)
+                                    {
+                                        lock (st.PendingCastsLock)
+                                            st.PendingNormalCasts.Enqueue(abandoned);
+                                        return;
+                                    }
+                                    SendCastRequestFailed(abandoned, false, SpellCastResultClassic.DontReport);
+                                    Log.Event("cast.knock_abandoned_resolved", new
+                                    {
+                                        spell_id = abandonedSpellId,
+                                        client_cast_id = abandoned.ClientGUID.ToString(),
+                                    });
+                                }
+                            });
+                    }
                     return;
                 }
 
@@ -448,8 +534,9 @@ public partial class WorldSocket
                 // set up in SMSG_SPELL_GO will release it at (estimated GCD expiry - early offset).
                 // Mashing during GCD overwrites the held slot so only the most recent press fires.
                 //
-                // JimsProxy (1.14 SpellQueueWindow alignment): gate is the LAST 400 ms of the
-                // GCD, not the entire 1500 ms. Presses earlier than that are forwarded to the
+                // JimsProxy (1.14 SpellQueueWindow alignment): gate is the last
+                // SpellQueueWindowMs (default 400 ms) of the GCD, not the entire 1500 ms.
+                // Presses earlier than that are forwarded to the
                 // server, which returns NOT_READY; the client renders that as the standard
                 // "Spell is not ready yet" feedback. Matches what a real 1.14 server does with
                 // default SpellQueueWindow=400.
@@ -557,7 +644,7 @@ public partial class WorldSocket
                         queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
                         source = "immediate",
                     });
-                GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
+                GetSession().GameState.EnqueuePendingNormalCast(castRequest);
             }
             else
             {
@@ -596,7 +683,7 @@ public partial class WorldSocket
                         queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
                         source = "off_gcd",
                     });
-                GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
+                GetSession().GameState.EnqueuePendingNormalCast(castRequest);
 
                 // Off-GCD spells bypass the hold system, so SpellPrepare must be sent now
                 // (on-GCD casts defer SpellPrepare to SPELL_START/SPELL_GO time to avoid
@@ -789,10 +876,11 @@ public partial class WorldSocket
                 queue_depth_before = gameState.PendingNormalCasts.Count,
                 source = "held_gcd_release",
             });
-        lock (gameState.PendingCastsLock)
-        {
-            gameState.PendingNormalCasts.Enqueue(cast);
-        }
+        // JimsProxy (held-aware GCD anchoring): this press is being released from the hold
+        // slot — the proxy re-timed it. Mark it so the GCD-anchor packet gates (cooldown
+        // synth / GO.CastTime stamp) treat it as held even under LL (RttPrefire=Timer).
+        cast.WasHeld = true;
+        gameState.EnqueuePendingNormalCast(cast);
         // JimsProxy: spell.held_fire — captures total hold duration (press → server forward).
         // Compare against gcd_remaining_ms in the matching spell.held to reconstruct GCD timing.
         Log.Event("spell.held_fire", new
@@ -842,7 +930,7 @@ public partial class WorldSocket
                 queue_depth_before = GetSession().GameState.PendingPetCasts.Count,
                 source = "pet",
             });
-        GetSession().GameState.PendingPetCasts.Enqueue(castRequest);
+        GetSession().GameState.EnqueuePendingPetCast(castRequest);
 
         SpellCastTargetFlags targetFlags = ConvertSpellTargetFlags(cast.Cast.Target);
 
@@ -914,7 +1002,7 @@ public partial class WorldSocket
                 queue_depth_before = GetSession().GameState.PendingNormalCasts.Count,
                 source = "item",
             });
-        GetSession().GameState.PendingNormalCasts.Enqueue(castRequest);
+        GetSession().GameState.EnqueuePendingNormalCast(castRequest);
 
         // MIRASU (cast-while-moving-out-of-range 2026-05-23): sync server position
         // for reticle-targeted item uses (bombs, sapper charge, grenades). See

@@ -6,14 +6,14 @@ using Xunit;
 
 namespace HermesProxy.Tests.World;
 
-// JimsProxy (T1 identity-pinned cast correspondence): the 1.12 server strips the client's
-// CastID, so the proxy must re-derive which press a server event belongs to. T1 makes that
-// deterministic — every local-player terminating event (SPELL_GO / CAST_FAILED / SPELL_FAILURE)
-// and the watchdog's synthetic closure is stamped with the CastID recorded at SPELL_START,
-// drawn from a per-spell FIFO in START order, instead of depending on which queue entry the
-// dequeue heuristic picked. These tests pin the FIFO's ordering/lifecycle and the watchdog
-// data-path closure. The packet-handler wiring is gated behind Settings.IdentityPinnedCastIdsActive
-// (LowLatencyMode && IdentityPinnedCastIds); the last test guards that OFF can't activate it.
+// JimsProxy (cast-go-castid-recovery): the 1.12 server strips the client's CastID, so the proxy
+// must re-derive which press a server event belongs to. It makes that deterministic — every
+// local-player terminating event (SPELL_GO / CAST_FAILED / SPELL_FAILURE) and the watchdog's
+// synthetic closure is stamped with the CastID recorded at SPELL_START, drawn from a per-spell
+// FIFO in START order, instead of depending on which queue entry the dequeue heuristic picked.
+// The FIFO recovery is unconditional (the default path); the Settings.IdentityPinnedCastIdsActive
+// property survives only to gate the keepalive watchdog pump. These tests pin the FIFO's
+// ordering/lifecycle, the watchdog data-path closure, and that property's truth table.
 public class IdentityPinnedCastIdsTests
 {
     private static GameSessionData NewSession() => GameSessionData.CreateForTesting();
@@ -54,45 +54,53 @@ public class IdentityPinnedCastIdsTests
         Assert.False(session.TryPopForwardedStartCastId(13877, out _));
     }
 
-    // --- Divergence proof: the ONLY by-construction evidence T1 does something the pre-T1 path
-    //     cannot. T1's per-spell FIFO replaces #362's single-slot PlayerForwardedCastIds recovery
-    //     (spellId -> one CastID). Under a CONCURRENT same-spell double-START whose GOs both reach
-    //     the orphan-GO recovery, the single slot is OVERWRITTEN — it collapses both casts onto the
-    //     latest CastID and loses the first, so START 1's cast never gets a matching GO and loops.
-    //     The FIFO keeps both in START order and pairs each GO correctly.
-    //     SCOPE (honest): this proves T1 is strictly more correct *when that interleaving occurs*.
-    //     It does NOT prove the Blade Flurry loop reaches it — the documented BF mechanism (a single
-    //     keypress's off-GCD double-send: START -> CAST_FAILED(dup) -> GO) is resolved by #372's
-    //     off-GCD collapse + prefer-started dequeue WITHOUT reaching this recovery path. Whether a
-    //     genuine concurrent double-START occurs in the wild is a field/log question, not a unit one.
+    // --- Default-path fix: the FIFO now backs GO recovery UNCONDITIONALLY (no longer gated behind
+    //     LowLatencyMode + IdentityPinnedCastIds). The pre-fix default path used a single
+    //     spellId -> CastID slot; under a CONCURRENT same-spell double-START whose GOs both reach the
+    //     orphan-GO recovery, that slot was OVERWRITTEN — it collapsed both casts onto the latest
+    //     CastID and lost the first, so START 1's cast never got a matching GO and looped. The FIFO
+    //     keeps both in START order and pairs each GO correctly, and it does so with the identity-
+    //     pinned flag OFF (default), which is what this test proves.
+    //     SCOPE (honest): this proves the recovery is strictly more correct *when that interleaving
+    //     occurs*. It does NOT prove the Blade Flurry loop reaches it — the documented BF mechanism (a
+    //     single keypress's off-GCD double-send: START -> CAST_FAILED(dup) -> GO) is resolved by #372's
+    //     off-GCD collapse + prefer-started dequeue WITHOUT reaching this recovery path, and the primary
+    //     looping-cast bug is client-side. Whether a genuine concurrent double-START occurs in the wild
+    //     is a field/log question, not a unit one.
     [Fact]
-    public void Divergence_ConcurrentSameSpellStarts_PreT1SingleSlotCollapses_FifoPairsCorrectly()
+    public void ConcurrentSameSpellStarts_FlagOff_FifoPairsEachGoInStartOrder()
     {
-        var startA = CastId(0xA);
-        var startB = CastId(0xB);
+        bool savedLowLatency = global::Framework.Settings.LowLatencyMode;
+        bool savedSubToggle = global::Framework.Settings.IdentityPinnedCastIds;
+        try
+        {
+            // Default config: the identity-pinned flag is OFF. The FIFO recovery must still work —
+            // that's the whole point of making it unconditional.
+            global::Framework.Settings.LowLatencyMode = false;
+            global::Framework.Settings.IdentityPinnedCastIds = false;
+            Assert.False(global::Framework.Settings.IdentityPinnedCastIdsActive);
 
-        // PRE-T1 (#362 single-slot recovery): the second START overwrites the first — A is lost.
-        var preT1 = NewSession();
-        preT1.PlayerForwardedCastIds[13877] = startA;
-        preT1.PlayerForwardedCastIds[13877] = startB;   // overwrite
+            var startA = CastId(0xA);
+            var startB = CastId(0xB);
 
-        // GO 1's orphan recovery reads B (WRONG — it should pair with START A), and GO 2 finds
-        // nothing. START A's CastID is never recovered -> the client's cast A never closes -> loop.
-        Assert.True(preT1.PlayerForwardedCastIds.TryRemove(13877, out var preGo1));
-        Assert.Equal(startB, preGo1);                   // GO 1 mis-stamped with B
-        Assert.NotEqual(startA, preGo1);                // START A collapsed away
-        Assert.False(preT1.PlayerForwardedCastIds.TryRemove(13877, out _)); // nothing left for GO 2
+            var session = NewSession();
+            session.EnqueueForwardedStartCastId(13877, startA);
+            session.EnqueueForwardedStartCastId(13877, startB);
 
-        // T1 (per-spell FIFO): both retained in START order — GO 1 pops A, GO 2 pops B. No collapse.
-        var t1 = NewSession();
-        t1.EnqueueForwardedStartCastId(13877, startA);
-        t1.EnqueueForwardedStartCastId(13877, startB);
-
-        Assert.True(t1.TryPopForwardedStartCastId(13877, out var t1Go1));
-        Assert.Equal(startA, t1Go1);                    // GO 1 ↔ START A
-        Assert.True(t1.TryPopForwardedStartCastId(13877, out var t1Go2));
-        Assert.Equal(startB, t1Go2);                    // GO 2 ↔ START B
-        Assert.False(t1.TryPopForwardedStartCastId(13877, out _));
+            // GO 1 pops the OLDER CastID (A), not the newer (B): the single-slot overwrite bug is
+            // fixed on the default path. GO 2 pops B. Neither collapses onto the newest.
+            Assert.True(session.TryPopForwardedStartCastId(13877, out var go1));
+            Assert.Equal(startA, go1);                  // GO 1 ↔ START A (older)
+            Assert.NotEqual(startB, go1);               // NOT collapsed onto the newest
+            Assert.True(session.TryPopForwardedStartCastId(13877, out var go2));
+            Assert.Equal(startB, go2);                  // GO 2 ↔ START B
+            Assert.False(session.TryPopForwardedStartCastId(13877, out _));
+        }
+        finally
+        {
+            global::Framework.Settings.LowLatencyMode = savedLowLatency;
+            global::Framework.Settings.IdentityPinnedCastIds = savedSubToggle;
+        }
     }
 
     [Fact]
@@ -266,9 +274,9 @@ public class IdentityPinnedCastIdsTests
     [InlineData(true, true, true)]     // both — active
     public void IdentityPinnedCastIdsActive_RequiresBothToggles(bool lowLatency, bool subToggle, bool expectedActive)
     {
-        // The entire T1 mechanism (FIFO stamping + the keepalive watchdog pump + watchdog FIFO
-        // removal) is gated on this property. With it false, none of the new code paths run, so
-        // the Hold-and-Fire path stays byte-identical — the default-OFF regression guarantee.
+        // The property still exists but now gates ONLY the keepalive watchdog pump
+        // (WorldClient.cs) — the FIFO stamping and watchdog FIFO removal are unconditional. This
+        // pins the property's truth table (both toggles required) for that remaining consumer.
         bool savedLowLatency = global::Framework.Settings.LowLatencyMode;
         bool savedSubToggle = global::Framework.Settings.IdentityPinnedCastIds;
         try

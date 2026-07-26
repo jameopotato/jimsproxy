@@ -514,6 +514,14 @@ public partial class WorldClient
     void HandleLogoutCancelAck(WorldPacket packet)
     {
         GetSession().ClearLogoutIntentional();
+        // JimsProxy (stuck-logout-stun): this ack answers OUR synthesized CMSG_LOGOUT_CANCEL —
+        // the modern client never asked to cancel a logout, so don't surface the unsolicited ack.
+        if (GetSession().GameState.AwaitingSynthLogoutCancelAck)
+        {
+            GetSession().GameState.AwaitingSynthLogoutCancelAck = false;
+            Log.Event("login.stuck_stun.cancel_ack", null);
+            return;
+        }
         LogoutCancelAck logout = new LogoutCancelAck();
         SendPacketToClient(logout);
     }

@@ -27,6 +27,29 @@ public partial class WorldClient
         return GetSession().GameState.KnownSwimmingMobs.Contains(guid);
     }
 
+    // MIRASU (onyxia-parked-hover-anim): single entry point for hover registry transitions; real changes synth PlayHoverAnim + gravity (vanilla legacy only — later cores drive hover/gravity natively).
+    internal void SetHoverState(WowGuid128 guid, bool hovering, string source, bool synthesize = true)
+    {
+        if (guid == GetSession().GameState.CurrentPlayerGuid)
+            return;
+        bool changed = hovering
+            ? GetSession().GameState.KnownHoveringMobs.Add(guid)
+            : GetSession().GameState.KnownHoveringMobs.Remove(guid);
+        if (!changed)
+            return;
+        Framework.Logging.Log.Event(hovering ? "hover.registry.set" : "hover.registry.cleared", new { guid = guid.ToString(), source });
+        if (!synthesize || !LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+            return;
+        SetPlayHoverAnim hoverAnim = new SetPlayHoverAnim();
+        hoverAnim.UnitGUID = guid;
+        hoverAnim.PlayHoverAnim = hovering;
+        SendPacketToClient(hoverAnim);
+        MoveSplineSetFlag gravity = new MoveSplineSetFlag(hovering ? Opcode.SMSG_MOVE_SPLINE_DISABLE_GRAVITY : Opcode.SMSG_MOVE_SPLINE_ENABLE_GRAVITY);
+        gravity.MoverGUID = guid;
+        SendPacketToClient(gravity);
+        Framework.Logging.Log.Event("hover.anim_synth", new { guid = guid.ToString(), hovering });
+    }
+
     // Strips Falling/FallingFar and forces DisableGravity on a hovering mob's movement
     // flags. Call BEFORE casting WotLK flags to Modern. Vanilla servers don't have
     // AnimTier/HoverHeight in their movement protocol, so hovering mobs bleed Falling
@@ -717,9 +740,13 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_MOVE_SPLINE_UNSET_FLYING)]
     void HandleSplineMovementMessages(WorldPacket packet)
     {
-        MoveSplineSetFlag spline = new MoveSplineSetFlag(packet.GetUniversalOpcode(false));
+        Opcode universalOpcode = packet.GetUniversalOpcode(false);
+        MoveSplineSetFlag spline = new MoveSplineSetFlag(universalOpcode);
         spline.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
         SendPacketToClient(spline);
+        // MIRASU (onyxia-landed-still-hovering): explicit hover toggles drive the registry + anim/gravity synth, else a landed mob keeps hover anim forever and a parked flyer stands and bounces.
+        if (universalOpcode is Opcode.SMSG_MOVE_SPLINE_SET_HOVER or Opcode.SMSG_MOVE_SPLINE_UNSET_HOVER)
+            SetHoverState(spline.MoverGUID, universalOpcode == Opcode.SMSG_MOVE_SPLINE_SET_HOVER, "explicit_toggle");
     }
 
     [PacketHandler(Opcode.SMSG_MOVE_ROOT)]
@@ -871,16 +898,8 @@ public partial class WorldClient
             // Seed hover detection: any vanilla spline with Flying flag means this is a
             // hovering/flying mob. Mark it so all future packets (heartbeats, Stop, etc.)
             // for this guid carry hover state, even if HOVERHEIGHT field is never set.
-            if (splineFlags.HasAnyFlag(SplineFlagVanilla.Flying) && guid != GetSession().GameState.CurrentPlayerGuid)
-            {
-                if (GetSession().GameState.KnownHoveringMobs.Add(guid))
-                {
-                    Framework.Logging.Log.Event("hover.detect_flying_spline", new
-                    {
-                        guid = guid.ToString(),
-                    });
-                }
-            }
+            if (splineFlags.HasAnyFlag(SplineFlagVanilla.Flying))
+                SetHoverState(guid, true, "flying_spline");
 
             if (splineFlags == SplineFlagVanilla.Runmode) // Default spline flags used by Vanilla and TBC servers
             {

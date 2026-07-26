@@ -566,14 +566,23 @@ public partial class WorldClient
 
     private void SendDelayedPacketsToClientOnOpcode(Opcode opcode)
     {
-        if (_delayedPacketsToClient.ContainsKey(opcode))
+        // Flush in FORWARD (arrival) order. The old reverse loop sent last-queued first, which
+        // this queue's other users happen to tolerate -- the cooldown-histories delay
+        // (SMSG_SEND_UNLEARN_SPELLS key) is always a single packet per flush, and the
+        // collision-height delay (SMSG_UPDATE_OBJECT key) holds packets for distinct movers,
+        // so order across them is irrelevant. (The #384 name-query delay lives on the
+        // SERVER-bound queue, not this one.) But reverse order CORRUPTS an
+        // order-sensitive multi-packet burst. #410 delays SMSG_SET_PROFICIENCY here: it's an
+        // absolute cumulative mask -- the server emits one packet per proficiency carrying the
+        // running total, so only the LAST (full) mask is correct and the client keeps the last
+        // one it processes. Reversed, a Rogue collapsed to Leather-only armor / Sword1H-only
+        // weapons (final mask = the FIRST, smallest one), wrongly reddening cloth/thrown/misc
+        // items it can use. Detach the list before sending so a re-entrant flush can't double-send.
+        if (_delayedPacketsToClient.TryGetValue(opcode, out var packets))
         {
-            List<ServerPacket> packets = _delayedPacketsToClient[opcode];
-            for (int i = packets.Count - 1; i >= 0; i--)
-            {
-                SendPacketToClientDirect(packets[i]);
-                packets.RemoveAt(i);
-            }
+            _delayedPacketsToClient.Remove(opcode);
+            foreach (var packet in packets)
+                SendPacketToClientDirect(packet);
         }
     }
 
@@ -1003,8 +1012,9 @@ public partial class WorldClient
         // its synthetic closure when the player goes idle. The existing watchdog otherwise only
         // runs on the next inbound spell packet, so a truly idle orphan leaks until the next cast.
         // The 2.5s per-cast deadline and the eviction logic are unchanged — this only adds a pump
-        // cadence (≤ one keepalive interval late). Gated with the T1 bundle so OFF is byte-identical;
-        // RunWatchdogEviction is already invoked cross-thread and no-ops when nothing is overdue.
+        // cadence (≤ one keepalive interval late). Gated with the T1 bundle so OFF is byte-identical.
+        // RunWatchdogEviction is safe to call cross-thread: it takes PendingCastsLock, and returns
+        // without touching the queues when nothing is overdue.
         if (Framework.Settings.IdentityPinnedCastIdsActive)
             GetSession()?.RunWatchdogEviction();
 

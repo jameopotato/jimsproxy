@@ -89,6 +89,13 @@ public sealed class GameSessionData
     public bool ChannelDisplayList;
     public bool ShowPlayedTime;
     public bool IsInFarSight;
+    // JimsProxy (stuck-logout-stun): state for the artificial-logout-stun login fix; all four
+    // reset at CMSG_PLAYER_LOGIN so every world login runs exactly one fresh detection. See
+    // WorldClient.DetectStuckLogoutStunAtSelfCreate (UpdateHandler.cs) for the mechanism doc.
+    public bool StuckStunLoginCheckDone;        // first-self-create gate: one detection per login
+    public bool StuckStunDetectedThisLogin;     // enables raw CAST_RESULT logging + the server-clear breadcrumb
+    public bool StuckStunCancelArmed;           // detection → end-of-UPDATE_OBJECT synth handoff
+    public bool AwaitingSynthLogoutCancelAck;   // swallow the next SMSG_LOGOUT_CANCEL_ACK (client never asked)
     // JimsProxy (taxi-flight-robustness): IsInTaxiFlight is read on the dismount Task's
     // ThreadPool thread and written on the packet-handler thread. Always access via
     // Volatile.Read/Write so weak-memory-model reorderings can't deliver stale state to
@@ -331,19 +338,33 @@ public sealed class GameSessionData
     // subsequent same-cast failures add no new state.
     public Dictionary<(WowGuid128 Caster, uint SpellId), long> RecentlyForwardedSpellFailedOther = new();
 
-    // JimsProxy (out-of-range-ghost): guids just destroyed / out-of-ranged and not yet re-created. Vanilla broadcasts a moving unit's trailing MSG_MOVE_* at map-level distance AFTER the per-object-visibility destroy; relaying that stray movement re-ghosts the unit "running in place" on the modern client until re-approach. Movement for these guids is dropped until a CreateObject clears the mark.
+    // JimsProxy (out-of-range-ghost, #415): guids just destroyed / out-of-ranged and not yet
+    // re-created. Vanilla broadcasts a moving unit's trailing MSG_MOVE_* / monster-moves at
+    // map-level distance AFTER the per-object-visibility destroy; relaying that stray movement
+    // re-ghosts the unit "running in place" on the modern client until re-approach. Movement for
+    // these guids is dropped until a CreateObject clears the mark — suppression must NOT expire
+    // on a timer: movement for a destroyed-and-not-recreated guid is never legitimate (the modern
+    // client cannot render a unit before its create). The original 10s TTL leaked exactly there —
+    // units dwelling in the destroyed-but-still-broadcasting annulus past 10s (lateral
+    // boundary-skimming, patrol routes, trailing pets: 289 at-edge encounters across 67 field
+    // sessions) had their first post-TTL packet relayed and re-ghosted. The age constant below is
+    // pure dict hygiene for units that never return, far above any trailing-broadcast horizon —
+    // it is not a relay permission.
     private readonly ConcurrentDictionary<WowGuid128, long> _recentlyDestroyedObjects = new();
-    private const long RecentlyDestroyedTtlMs = 10000;
+    private const long RecentlyDestroyedSweepAgeMs = 600_000;
+    private const int RecentlyDestroyedSweepThreshold = 4096;
 
     public void MarkObjectRecentlyDestroyed(WowGuid128 guid)
     {
         if (guid.IsEmpty())
             return;
         _recentlyDestroyedObjects[guid] = Environment.TickCount64;
-        // Opportunistic sweep so a long session of spawns/despawns can't grow this unbounded.
-        if (_recentlyDestroyedObjects.Count > 4096)
+        // Opportunistic hygiene sweep so a long session of spawns/despawns can't grow this
+        // unbounded. Only long-stale entries go; recent marks are never evicted for size —
+        // evicting a live mark would reopen the leak in exactly the crowded scenes that grow it.
+        if (_recentlyDestroyedObjects.Count > RecentlyDestroyedSweepThreshold)
         {
-            long cutoff = Environment.TickCount64 - RecentlyDestroyedTtlMs;
+            long cutoff = Environment.TickCount64 - RecentlyDestroyedSweepAgeMs;
             foreach (var kvp in _recentlyDestroyedObjects)
                 if (kvp.Value < cutoff)
                     _recentlyDestroyedObjects.TryRemove(kvp.Key, out _);
@@ -352,15 +373,28 @@ public sealed class GameSessionData
 
     public void ClearRecentlyDestroyedObject(WowGuid128 guid) => _recentlyDestroyedObjects.TryRemove(guid, out _);
 
+    // Test seams (RecentlyDestroyedSuppressionTests): inject a mark with a chosen timestamp so
+    // age-dependent behavior is testable without wall-clock waits, and expose the entry count
+    // for the hygiene-sweep assertions.
+    internal void MarkObjectRecentlyDestroyedAtTick(WowGuid128 guid, long tickMs)
+    {
+        if (guid.IsEmpty())
+            return;
+        _recentlyDestroyedObjects[guid] = tickMs;
+    }
+
+    internal int RecentlyDestroyedCountForTest => _recentlyDestroyedObjects.Count;
+
     public bool WasObjectRecentlyDestroyed(WowGuid128 guid, out long agoMs)
     {
         agoMs = 0;
         if (_recentlyDestroyedObjects.TryGetValue(guid, out long when))
         {
+            // Suppress for as long as the mark stands — only a CreateObject (re-approach)
+            // clears it. agoMs feeds the drop diagnostics; values beyond the old 10s TTL are
+            // the packets that used to leak and re-ghost (#415).
             agoMs = Environment.TickCount64 - when;
-            if (agoMs < RecentlyDestroyedTtlMs)
-                return true;
-            _recentlyDestroyedObjects.TryRemove(guid, out _);
+            return true;
         }
         return false;
     }
@@ -414,19 +448,59 @@ public sealed class GameSessionData
     public ClientCastRequest? CurrentClientNextMeleeCast; // next melee spells (Raptor Strike, Heroic Strike, etc.)
     public ClientCastRequest? CurrentClientAutoRepeatCast; // auto repeat spells (Auto Shot, Shoot, etc.)
     public ConcurrentQueue<ClientCastRequest> PendingPetCasts = new();  // pet spell casts (queue for proper FIFO handling)
-    // JimsProxy (issue #43): serializes the drain-filter-rebuild helpers below with the
-    // ThreadPool-thread Enqueue in WorldSocket.ForwardHeldGcdCast. Without this, the timer
-    // thread can enqueue a held cast mid-drain, causing the drain to observe the new item
-    // out-of-order and possibly return it as a FIFO match for an unrelated SMSG_SPELL_GO.
-    // Pre-existing Enqueues from the network-thread CMSG handlers stay lock-free (same-thread
-    // semantics as before this PR); only the new cross-thread path takes the lock.
+    // JimsProxy (issue #43): serializes EVERY mutation of PendingNormalCasts / PendingPetCasts.
+    //
+    // Both queues are drained and rebuilt by compound "dequeue-all, filter, re-enqueue-survivors"
+    // helpers. ConcurrentQueue makes each individual Enqueue/TryDequeue atomic, but it cannot make
+    // a whole drain-rebuild atomic: a concurrent Enqueue lands in the middle of one, and two
+    // concurrent drain-rebuilds split the queue between their private survivor lists. Either way
+    // FIFO order — which START/GO/CAST_FAILED matching depends on — is not preserved.
+    //
+    // These mutations genuinely run in parallel. CMSG handlers (HandleCastSpell, and the
+    // RunWatchdogEviction it calls on every press) execute on the modern socket's IOCP receive
+    // thread; SMSG handlers (SPELL_START/GO/CAST_FAILED) execute on WorldClient's ReceiveLoop
+    // task; the GCD hold-release timer fires on a ThreadPool thread. Nothing serializes them.
+    //
+    // So: take this lock around any mutation, and prefer the EnqueuePending*Cast helpers below.
+    // Read walks (HasStartedNormalCast, TryMarkPendingNormalCastStarted, ...) take the lock
+    // too: a ConcurrentQueue enumeration IS a consistent snapshot, but a snapshot taken while
+    // another thread holds this lock mid drain-rebuild (every entry dequeued into a private
+    // survivor list, not yet re-enqueued) sees an EMPTY queue and false-misses a live entry —
+    // a SPELL_START landing in that window skips its match, START and GO then ship different
+    // CastIDs, and the client never closes the cast. The queue holds a handful of entries at
+    // most; the lock cost is noise. (This supersedes the earlier "read walks may stay
+    // lock-free" rule — that blessing was unsound during drain-rebuild windows.)
     internal readonly object PendingCastsLock = new();
 
+    /// <summary>
+    /// Enqueue a normal cast under <see cref="PendingCastsLock"/>. Always use this rather than
+    /// touching <see cref="PendingNormalCasts"/> directly — a lock-free Enqueue racing a
+    /// drain-rebuild reorders the FIFO the cast-correspondence machinery relies on.
+    /// </summary>
+    public void EnqueuePendingNormalCast(ClientCastRequest cast)
+    {
+        lock (PendingCastsLock)
+            PendingNormalCasts.Enqueue(cast);
+    }
+
+    /// <summary>
+    /// Enqueue a pet cast under <see cref="PendingCastsLock"/>. See
+    /// <see cref="EnqueuePendingNormalCast"/>.
+    /// </summary>
+    public void EnqueuePendingPetCast(ClientCastRequest cast)
+    {
+        lock (PendingCastsLock)
+            PendingPetCasts.Enqueue(cast);
+    }
+
     // JimsProxy (#313): the spell-queue hold-window width is configurable via
-    // Framework.Settings.SpellQueueWindowMs (400 retail-accurate / 1000 / 1300 smoothest;
-    // default 1300). The hold gates (IsInGcdQueueWindow / HasStartedCastInQueueWindow) read it
+    // Framework.Settings.SpellQueueWindowMs (default 400 retail-accurate / 1000 / 1300
+    // smoothest). The hold gates (IsInGcdQueueWindow / HasStartedCastInQueueWindow) read it
     // directly: a press in the last SpellQueueWindowMs of an active GCD or cast bar is held and
-    // fired at expiry; earlier presses are forwarded for the server to arbitrate.
+    // fired at expiry; earlier presses are forwarded for the server to arbitrate. Exception:
+    // under RTT Pre-Fire Timer the GCD gate ignores it and uses the fixed
+    // Settings.RttPrefireTimerWindowMs (the launcher greys the queue controls under LL, so
+    // their stored value must not govern Timer).
 
     // JimsProxy (issue #43): GCD hold-and-fire state. While the player is on a GCD (tracked
     // from SMSG_SPELL_GO), new CMSG_CAST_SPELL presses are held in _heldGcdCast instead of
@@ -441,6 +515,82 @@ public sealed class GameSessionData
     private uint _lastFiredSpellId;                     // spell ID forwarded by the timer; used to drop same-spell late presses
     public Action<ClientCastRequest>? OnGcdHeldCastFire; // set by WorldSocket at attach time; invoked on a ThreadPool thread at GCD expiry
     public Action<ClientCastRequest>? OnAutoRepeatRetry; // set by WorldSocket; refires Shoot/Auto Shot after retryable legacy failures
+
+    // JimsProxy (rtt-prefire, Knocker): SugarProxy-parity resend loop. The caller has already
+    // enqueued and forwarded the press once (LL forward-everything unchanged); this re-sends the
+    // SAME wire packet every 20ms, up to 10 knocks (Sugar's exact constants: time.Sleep(20ms),
+    // N=10 flat), so the first knock after the server-side GCD expires lands ≤~20ms late with
+    // zero GCD prediction — the server is the timing authority. Resends are wire-only: the FIFO
+    // entry is NOT re-enqueued (Sugar re-Adds into a per-spell map, which is idempotent; our
+    // FIFO is not). The loop self-terminates when the press starts/resolves (it leaves the
+    // non-started set — our equivalent of Sugar's per-entry cancel flag set at START/GO/FAILED),
+    // when ANY newer knock arms (global generation counter — Sugar's session-atomic semantics),
+    // or when knocks run out. Early-knock NOT_READY / SpellInProgress bounces are swallowed by
+    // HandleCastFailed's knock-chaff guard while IsKnockActiveForSpell is true; the final bounce
+    // (arriving after the guard drops) resolves the press through the normal transient path.
+    public const int KnockIntervalMs = 20;
+    public const int KnockCount = 10;
+    private long _knockGeneration;
+    public readonly ConcurrentDictionary<uint, long> ActiveKnocks = new();
+
+    public bool IsKnockActiveForSpell(uint spellId) => ActiveKnocks.ContainsKey(spellId);
+
+    // onAbandoned: invoked (once, on the loop's ThreadPool task) when the loop exits with the
+    // press still unstarted and enqueued — i.e. superseded by a newer press, or knocks exhausted
+    // while every bounce was swallowed as chaff. Nothing else reliably pairs that entry: the
+    // chaff guard ate its failures while the loop was live, and the final in-flight bounce can
+    // land inside the guard-teardown window and be swallowed too. The caller resolves the entry
+    // deterministically ON THIS EVENT (dequeue + DontReport ack) — never on a clock — otherwise
+    // it blocks the spell via the LL duplicate guard until the 2.5s watchdog (alpha review,
+    // knock-supersede leak).
+    public void StartKnockLoop(uint spellId, Action resendToServer, Action<uint>? onAbandoned = null)
+    {
+        long myGen = Interlocked.Increment(ref _knockGeneration);
+        ActiveKnocks[spellId] = myGen;
+        _ = System.Threading.Tasks.Task.Run(async () =>
+        {
+            int sent = 0;
+            bool entryLive = true;
+            try
+            {
+                for (int i = 0; i < KnockCount; i++)
+                {
+                    await System.Threading.Tasks.Task.Delay(KnockIntervalMs);
+                    if (!HasNonStartedPendingCastForSpell(spellId))
+                    {
+                        entryLive = false;
+                        break; // started or resolved — the cast landed (or terminally failed)
+                    }
+                    if (Interlocked.Read(ref _knockGeneration) != myGen)
+                        break; // a newer press armed its own loop — it owns the GCD boundary now
+                    resendToServer();
+                    sent++;
+                }
+            }
+            catch
+            {
+                // Session teardown mid-loop (socket gone) — the knock is moot; never surface an
+                // unhandled exception on the ThreadPool (would crash the process).
+            }
+            finally
+            {
+                // Drop the chaff guard FIRST: from here on arriving bounces resolve the entry
+                // through the normal transient paths; the abandonment re-check below fires only
+                // if the entry is still there after that ordering.
+                ActiveKnocks.TryRemove(new KeyValuePair<uint, long>(spellId, myGen));
+                if (entryLive && HasNonStartedPendingCastForSpell(spellId))
+                {
+                    try { onAbandoned?.Invoke(spellId); }
+                    catch
+                    {
+                        // Same teardown rationale as above — resolving on a dying session is moot.
+                    }
+                }
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("cast.knock_loop_done", new { spell_id = spellId, knocks_sent = sent });
+            }
+        });
+    }
 
     // JimsProxy (observed-bow retract): an observed (non-local) unit auto-repeating — Auto Shot 75 / wand Shoot 5019 — latches the 1.14 client's intrinsic ranged-aim the moment we forward its SPELL_START, and vanilla never broadcasts a stop for other units, so once the shooter quits nothing lowers the weapon (your own char is fine — SMSG_SPELL_FAILURE retracts the local aim). Hybrid retract: DETERMINISTIC stop edges — the target dies (PARTY_KILL_LOG / health->0), or the shooter itself dies, moves, or retargets — lower the bow instantly, AND a quiescence timer is the catch-all for the case no edge covers: the shooter stops with its target still alive and stands still (out of ammo, /stopattack, LoS, target dummy). Each latched shooter tracks its current target (for the death/retarget edges) and its last-shot time (for the sweep). The sweep fires SMSG_CANCEL_AUTO_REPEAT carrying THAT unit's GUID once it goes quiet past ObservedAutoRepeatQuietMs (the modern packet is per-GUID; the legacy handler only ever cancels the local player); the threshold sits above the slowest bow cadence + jitter so a steady shooter never flickers, and a premature retract self-heals — the next shot's START re-raises the aim.
     private readonly object _observedAutoRepeatLock = new();
@@ -498,13 +648,16 @@ public sealed class GameSessionData
 
     public bool HasNonStartedPendingCastForSpell(uint spellId)
     {
-        foreach (var item in PendingNormalCasts)
+        lock (PendingCastsLock)
         {
-            if (!item.HasStarted &&
-                (item.SpellId == spellId || (item.LegacySpellId != 0 && item.LegacySpellId == spellId)))
-                return true;
+            foreach (var item in PendingNormalCasts)
+            {
+                if (!item.HasStarted &&
+                    (item.SpellId == spellId || (item.LegacySpellId != 0 && item.LegacySpellId == spellId)))
+                    return true;
+            }
+            return false;
         }
-        return false;
     }
 
     // JimsProxy: proxy→server RTT measurement for adaptive GCD fire offset.
@@ -534,29 +687,24 @@ public sealed class GameSessionData
     // overridden with ServerGUID downstream → the auto-cast map entry is a harmless
     // orphan in that case.
     public ConcurrentDictionary<(WowGuid128 caster, uint spellId), WowGuid128> PetAutoCastActiveCastIds = new();
-    // JimsProxy (cast-go-castid-recovery): client-facing CastID forwarded for the LOCAL
-    // PLAYER's SMSG_SPELL_START, keyed by spellId. HandleSpellGo recalls it when no
-    // PendingNormalCast / melee / auto-repeat entry matches at SPELL_GO, so START and GO
-    // ship the SAME CastID. The 1.14 client pairs START↔GO by CastID; a mismatch leaves
-    // the cast un-terminated → stuck casting animation + looping cast sound. Covers
-    // server-initiated player casts with no CMSG (GO loot subspells e.g. Whipper Root
-    // "Create Whipper Root Tubers" 15343, weapon/trinket procs) and casts whose pending
-    // entry was consumed by an interleaved duplicate CAST_FAILED before the GO (Blade
-    // Flurry, re-clicked gathers). Fallback ONLY — never consulted when a real pending
-    // cast is dequeued at GO, so normal casts are wire-identical. Cleared on world
-    // transfer alongside the pet/other-caster cast-id maps.
-    public ConcurrentDictionary<uint, WowGuid128> PlayerForwardedCastIds = new();
-    // JimsProxy (T1 identity-pinned cast correspondence): per-spell FIFO of the CastIDs
-    // forwarded to the modern client at the LOCAL PLAYER's SMSG_SPELL_START. Supersedes the
-    // single-slot PlayerForwardedCastIds (above) when Settings.IdentityPinnedCastIdsActive.
-    // A single slot is overwritten when two same-spell casts are in flight at once (the
-    // immediate-forward / Low-Latency path), so a later GO recovers the wrong CastID; the
-    // FIFO preserves START order so each terminating event consumes the matching forwarded
-    // CastID and START↔GO/FAILED pair deterministically, independent of which queue entry
-    // the dequeue heuristic picks. Bounded per spell (oldest dropped past the cap) and
-    // cleared on reconnect so a missed pop can neither leak nor stale-head a future cast.
-    // Lock-guarded plain Dictionary/List (not Concurrent*) so enqueue+bound and the
-    // remove-by-value the watchdog needs are atomic; contention is negligible (cast events).
+    // JimsProxy (cast-go-castid-recovery): per-spell FIFO of the client-facing CastIDs
+    // forwarded to the modern client at the LOCAL PLAYER's SMSG_SPELL_START, keyed by spellId.
+    // HandleSpellGo recalls the oldest when no PendingNormalCast / melee / auto-repeat entry
+    // matches at SPELL_GO, so START and GO ship the SAME CastID. The 1.14 client pairs START↔GO
+    // by CastID; a mismatch leaves the cast un-terminated → stuck casting animation + looping
+    // cast sound. Covers server-initiated player casts with no CMSG (GO loot subspells e.g.
+    // Whipper Root "Create Whipper Root Tubers" 15343, weapon/trinket procs) and casts whose
+    // pending entry was consumed by an interleaved duplicate CAST_FAILED before the GO (Blade
+    // Flurry, re-clicked gathers). A single spellId->CastID slot would be overwritten when two
+    // same-spell casts are in flight at once (the immediate-forward / Low-Latency path), so a
+    // later GO recovers the wrong CastID; the FIFO preserves START order so each terminating
+    // event consumes the matching forwarded CastID and START↔GO/FAILED pair deterministically,
+    // independent of which queue entry the dequeue heuristic picks. Fallback ONLY — never
+    // consulted when a real pending cast is dequeued at GO, so normal casts are wire-identical.
+    // Bounded per spell (oldest dropped past the cap) and cleared on reconnect / world transfer
+    // so a missed pop can neither leak nor stale-head a future cast. Lock-guarded plain
+    // Dictionary/List (not Concurrent*) so enqueue+bound and the remove-by-value the watchdog
+    // needs are atomic; contention is negligible (cast events).
     private readonly Dictionary<uint, List<WowGuid128>> _playerForwardedStartCastIds = new();
     private readonly object _playerForwardedStartCastIdsLock = new();
     private const int MaxForwardedStartCastIdsPerSpell = 8;
@@ -723,6 +871,20 @@ public sealed class GameSessionData
     // without SmoothGroundPath for these — vanilla doesn't carry AnimTier so we
     // synthesize it. Same shape as KnownHoveringMobs above.
     public HashSet<WowGuid128> KnownSwimmingMobs = [];
+
+    // MIRASU (mc-rune-dousing): observed life state of the 7 MC rune bosses (entry -> alive). Kronos sends
+    // identical GO data for a rune before and after its boss dies (flags raw 48, circle GO present, state 1),
+    // so the only usable boss-dead signal is the boss NPC's own health. Never-seen bosses are absent here and
+    // treated as dead (rune targetable) — matching what a 1.12 client could do. WC-thread only.
+    public Dictionary<uint, bool> McBossAlive = new();
+
+    // MIRASU (mc-rune-dousing): last-seen guid + legacy GAMEOBJECT_FLAGS per MC rune entry, so a boss life-state
+    // flip can resynthesize the rune's targetability without waiting for the server to resend rune fields. WC only.
+    public Dictionary<uint, (WowGuid128 Guid, uint LegacyFlags)> McRunesSeen = new();
+
+    // MIRASU (mc-rune-dousing): last-seen guid per MC flame-circle entry (178187-178193). Kronos respawns the
+    // circle around already-doused runes on reload; the proxy destroys those client-side (paired rune has InUse). WC only.
+    public Dictionary<uint, WowGuid128> McCirclesSeen = new();
 
     // JimsProxy (#382 observer lockup): players we observe being CHARMED by another PLAYER
     // (Gnomish Mind Control Cap 13181 = vanilla MOD_CHARM on a player). NPC charmers (raid
@@ -1449,23 +1611,26 @@ public sealed class GameSessionData
     {
         cast = null;
 
-        foreach (var item in PendingNormalCasts)
+        lock (PendingCastsLock)
         {
-            if (CastMatchesSpellId(item, spellId) && !item.HasStarted)
+            foreach (var item in PendingNormalCasts)
             {
-                item.HasStarted = true;
-                item.StartedAtTickMs = Environment.TickCount64;
-                cast = item;
-                return true;
+                if (CastMatchesSpellId(item, spellId) && !item.HasStarted)
+                {
+                    item.HasStarted = true;
+                    item.StartedAtTickMs = Environment.TickCount64;
+                    cast = item;
+                    return true;
+                }
             }
-        }
 
-        return false;
+            return false;
+        }
     }
 
-    // JimsProxy (T1 identity-pinned cast correspondence) — per-spell forwarded-START CastID
-    // FIFO helpers. Active only when Settings.IdentityPinnedCastIdsActive; OFF path never
-    // calls these. See _playerForwardedStartCastIds.
+    // JimsProxy (cast-go-castid-recovery) — per-spell forwarded-START CastID FIFO helpers.
+    // The unconditional recovery mechanism for local-player START↔GO/CAST_FAILED pairing.
+    // See _playerForwardedStartCastIds.
 
     /// <summary>
     /// Record the CastID forwarded to the client at the local player's SMSG_SPELL_START.
@@ -1573,12 +1738,15 @@ public sealed class GameSessionData
     /// </summary>
     public bool HasStartedNormalCast()
     {
-        foreach (var item in PendingNormalCasts)
+        lock (PendingCastsLock)
         {
-            if (item.HasStarted)
-                return true;
+            foreach (var item in PendingNormalCasts)
+            {
+                if (item.HasStarted)
+                    return true;
+            }
+            return false;
         }
-        return false;
     }
 
     /// <summary>
@@ -1596,12 +1764,15 @@ public sealed class GameSessionData
             return false;
         if (gameObjectGuid.GetHighType() != HighGuidType.GameObject)
             return false;
-        foreach (var item in PendingNormalCasts)
+        lock (PendingCastsLock)
         {
-            if (item.HasStarted && item.TargetGuid == gameObjectGuid)
-                return true;
+            foreach (var item in PendingNormalCasts)
+            {
+                if (item.HasStarted && item.TargetGuid == gameObjectGuid)
+                    return true;
+            }
+            return false;
         }
-        return false;
     }
 
     /// <summary>
@@ -1617,16 +1788,19 @@ public sealed class GameSessionData
     public bool HasStartedCastInQueueWindow()
     {
         long now = Environment.TickCount64;
-        foreach (var item in PendingNormalCasts)
+        lock (PendingCastsLock)
         {
-            if (!item.HasStarted || item.StartedAtTickMs == 0 || item.StartedCastTimeMs == 0)
-                continue;
-            long castEnd = item.StartedAtTickMs + item.StartedCastTimeMs;
-            long remaining = castEnd - now;
-            if (remaining > 0 && remaining <= Framework.Settings.SpellQueueWindowMs)
-                return true;
+            foreach (var item in PendingNormalCasts)
+            {
+                if (!item.HasStarted || item.StartedAtTickMs == 0 || item.StartedCastTimeMs == 0)
+                    continue;
+                long castEnd = item.StartedAtTickMs + item.StartedCastTimeMs;
+                long remaining = castEnd - now;
+                if (remaining > 0 && remaining <= Framework.Settings.SpellQueueWindowMs)
+                    return true;
+            }
+            return false;
         }
-        return false;
     }
 
     /// <summary>
@@ -1676,24 +1850,27 @@ public sealed class GameSessionData
         long nowTick = Environment.TickCount64;
         // DIAGNOSTIC (stuck-spell investigation): hoist toggle read; remove with diagnostics
         bool debugEvents = Framework.Settings.DebugOutput;
-        foreach (var cast in PendingNormalCasts)
+        lock (PendingCastsLock)
         {
-            if (cast.HasStarted && cast.StartedCastTimeMs > 0
-                && !GameData.IsChanneledSpell(cast.SpellId))
+            foreach (var cast in PendingNormalCasts)
             {
-                cast.MovementCancelled = true;
-                cast.MarkedAtTickMs = nowTick;
-                if (cast.WatchdogDeadlineMs == 0)
-                    cast.WatchdogDeadlineMs = watchdogDeadlineMs;
-                marked++;
-                // DIAGNOSTIC (stuck-spell investigation): remove when closed
-                if (debugEvents)
-                    Log.Event("cast.movement_marked", new
-                    {
-                        spell_id = cast.SpellId,
-                        started_cast_time_ms = cast.StartedCastTimeMs,
-                        client_cast_id = cast.ClientGUID.ToString(),
-                    });
+                if (cast.HasStarted && cast.StartedCastTimeMs > 0
+                    && !GameData.IsChanneledSpell(cast.SpellId))
+                {
+                    cast.MovementCancelled = true;
+                    cast.MarkedAtTickMs = nowTick;
+                    if (cast.WatchdogDeadlineMs == 0)
+                        cast.WatchdogDeadlineMs = watchdogDeadlineMs;
+                    marked++;
+                    // DIAGNOSTIC (stuck-spell investigation): remove when closed
+                    if (debugEvents)
+                        Log.Event("cast.movement_marked", new
+                        {
+                            spell_id = cast.SpellId,
+                            started_cast_time_ms = cast.StartedCastTimeMs,
+                            client_cast_id = cast.ClientGUID.ToString(),
+                        });
+                }
             }
         }
         return marked;
@@ -1739,55 +1916,63 @@ public sealed class GameSessionData
         // DIAGNOSTIC (stuck-spell investigation): hoist toggle read; remove with diagnostics
         bool debugEvents = Framework.Settings.DebugOutput;
 
-        var keepNormal = new List<ClientCastRequest>();
-        while (PendingNormalCasts.TryDequeue(out var cast))
+        // The drain-rebuild is a compound mutation: hold the lock across it. Logging happens
+        // afterwards so no file I/O runs inside the critical section.
+        lock (PendingCastsLock)
         {
-            if (!cast.HasStarted && !cast.TargetGuid.IsEmpty() && cast.TargetGuid == destroyedGuid)
+            var keepNormal = new List<ClientCastRequest>();
+            while (PendingNormalCasts.TryDequeue(out var cast))
             {
-                normalEvicted.Add(cast);
-                // DIAGNOSTIC (stuck-spell investigation): remove when closed
-                if (debugEvents)
-                    Log.Event("cast.destroy_eviction", new
-                    {
-                        queue = "normal",
-                        spell_id = cast.SpellId,
-                        had_started = cast.HasStarted,
-                        is_channeled = GameData.IsChanneledSpell(cast.SpellId),
-                        destroyed_target_low = destroyedGuid.GetCounter(),
-                        client_cast_id = cast.ClientGUID.ToString(),
-                    });
+                if (!cast.HasStarted && !cast.TargetGuid.IsEmpty() && cast.TargetGuid == destroyedGuid)
+                    normalEvicted.Add(cast);
+                else
+                    keepNormal.Add(cast);
             }
-            else
-                keepNormal.Add(cast);
-        }
-        foreach (var c in keepNormal)
-            PendingNormalCasts.Enqueue(c);
+            foreach (var c in keepNormal)
+                PendingNormalCasts.Enqueue(c);
 
-        var keepPet = new List<ClientCastRequest>();
-        while (PendingPetCasts.TryDequeue(out var cast))
-        {
-            if (!cast.HasStarted && !cast.TargetGuid.IsEmpty() && cast.TargetGuid == destroyedGuid)
+            var keepPet = new List<ClientCastRequest>();
+            while (PendingPetCasts.TryDequeue(out var cast))
             {
-                petEvicted.Add(cast);
-                // DIAGNOSTIC (stuck-spell investigation): remove when closed
-                if (debugEvents)
-                    Log.Event("cast.destroy_eviction", new
-                    {
-                        queue = "pet",
-                        spell_id = cast.SpellId,
-                        had_started = cast.HasStarted,
-                        is_channeled = GameData.IsChanneledSpell(cast.SpellId),
-                        destroyed_target_low = destroyedGuid.GetCounter(),
-                        client_cast_id = cast.ClientGUID.ToString(),
-                    });
+                if (!cast.HasStarted && !cast.TargetGuid.IsEmpty() && cast.TargetGuid == destroyedGuid)
+                    petEvicted.Add(cast);
+                else
+                    keepPet.Add(cast);
             }
-            else
-                keepPet.Add(cast);
+            foreach (var c in keepPet)
+                PendingPetCasts.Enqueue(c);
         }
-        foreach (var c in keepPet)
-            PendingPetCasts.Enqueue(c);
+
+        // DIAGNOSTIC (stuck-spell investigation): remove when closed
+        if (debugEvents)
+        {
+            foreach (var cast in normalEvicted)
+                LogDestroyEviction("normal", cast, destroyedGuid);
+            foreach (var cast in petEvicted)
+                LogDestroyEviction("pet", cast, destroyedGuid);
+        }
     }
 
+    // DIAGNOSTIC (stuck-spell investigation): remove when closed
+    private static void LogDestroyEviction(string queue, ClientCastRequest cast, WowGuid128 destroyedGuid)
+    {
+        Log.Event("cast.destroy_eviction", new
+        {
+            queue,
+            spell_id = cast.SpellId,
+            had_started = cast.HasStarted,
+            is_channeled = GameData.IsChanneledSpell(cast.SpellId),
+            destroyed_target_low = destroyedGuid.GetCounter(),
+            client_cast_id = cast.ClientGUID.ToString(),
+        });
+    }
+
+    /// <summary>
+    /// Evict pending casts whose watchdog deadline has passed. Called from the top of every spell
+    /// event handler AND from CMSG_CAST_SPELL — i.e. on every single client cast press — so the
+    /// common case (nothing overdue) must not touch the queues at all: a drain-rebuild there would
+    /// churn the FIFO on the hot path and, worse, race the SMSG-thread dequeue.
+    /// </summary>
     public void DrainExpiredWatchdogCasts(long nowMs,
         out List<ClientCastRequest> normalEvicted,
         out List<ClientCastRequest> petEvicted)
@@ -1795,27 +1980,48 @@ public sealed class GameSessionData
         normalEvicted = new List<ClientCastRequest>();
         petEvicted = new List<ClientCastRequest>();
 
-        var keepNormal = new List<ClientCastRequest>();
-        while (PendingNormalCasts.TryDequeue(out var cast))
+        lock (PendingCastsLock)
         {
-            if (cast.WatchdogDeadlineMs > 0 && cast.WatchdogDeadlineMs < nowMs)
-                normalEvicted.Add(cast);
-            else
-                keepNormal.Add(cast);
-        }
-        foreach (var c in keepNormal)
-            PendingNormalCasts.Enqueue(c);
+            if (!HasOverdueWatchdogCast(PendingNormalCasts, nowMs) &&
+                !HasOverdueWatchdogCast(PendingPetCasts, nowMs))
+                return;   // hot path: nothing to evict, leave both queues untouched
 
-        var keepPet = new List<ClientCastRequest>();
-        while (PendingPetCasts.TryDequeue(out var cast))
-        {
-            if (cast.WatchdogDeadlineMs > 0 && cast.WatchdogDeadlineMs < nowMs)
-                petEvicted.Add(cast);
-            else
-                keepPet.Add(cast);
+            var keepNormal = new List<ClientCastRequest>();
+            while (PendingNormalCasts.TryDequeue(out var cast))
+            {
+                if (IsWatchdogOverdue(cast, nowMs))
+                    normalEvicted.Add(cast);
+                else
+                    keepNormal.Add(cast);
+            }
+            foreach (var c in keepNormal)
+                PendingNormalCasts.Enqueue(c);
+
+            var keepPet = new List<ClientCastRequest>();
+            while (PendingPetCasts.TryDequeue(out var cast))
+            {
+                if (IsWatchdogOverdue(cast, nowMs))
+                    petEvicted.Add(cast);
+                else
+                    keepPet.Add(cast);
+            }
+            foreach (var c in keepPet)
+                PendingPetCasts.Enqueue(c);
         }
-        foreach (var c in keepPet)
-            PendingPetCasts.Enqueue(c);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsWatchdogOverdue(ClientCastRequest cast, long nowMs)
+        => cast.WatchdogDeadlineMs > 0 && cast.WatchdogDeadlineMs < nowMs;
+
+    private static bool HasOverdueWatchdogCast(ConcurrentQueue<ClientCastRequest> queue, long nowMs)
+    {
+        foreach (var cast in queue)
+        {
+            if (IsWatchdogOverdue(cast, nowMs))
+                return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -1825,12 +2031,15 @@ public sealed class GameSessionData
     /// </summary>
     public bool HasInFlightNormalCastForSpell(uint spellId)
     {
-        foreach (var item in PendingNormalCasts)
+        lock (PendingCastsLock)
         {
-            if (CastMatchesSpellId(item, spellId))
-                return true;
+            foreach (var item in PendingNormalCasts)
+            {
+                if (CastMatchesSpellId(item, spellId))
+                    return true;
+            }
+            return false;
         }
-        return false;
     }
 
     /// <summary>
@@ -1840,12 +2049,15 @@ public sealed class GameSessionData
     /// </summary>
     public bool HasForwardedPendingCast()
     {
-        foreach (var item in PendingNormalCasts)
+        lock (PendingCastsLock)
         {
-            if (!item.HasStarted)
-                return true;
+            foreach (var item in PendingNormalCasts)
+            {
+                if (!item.HasStarted)
+                    return true;
+            }
+            return false;
         }
-        return false;
     }
 
     /// <summary>
@@ -2062,21 +2274,24 @@ public sealed class GameSessionData
         var pending = new List<ClientCastRequest>();
         cast = null;
 
-        while (PendingPetCasts.TryDequeue(out var current))
+        lock (PendingCastsLock)
         {
-            if (cast == null && CastMatchesSpellId(current, spellId))
+            while (PendingPetCasts.TryDequeue(out var current))
             {
-                cast = current;
+                if (cast == null && CastMatchesSpellId(current, spellId))
+                {
+                    cast = current;
+                }
+                else
+                {
+                    pending.Add(current);
+                }
             }
-            else
-            {
-                pending.Add(current);
-            }
-        }
 
-        foreach (var item in pending)
-        {
-            PendingPetCasts.Enqueue(item);
+            foreach (var item in pending)
+            {
+                PendingPetCasts.Enqueue(item);
+            }
         }
 
         return cast != null;
@@ -2108,7 +2323,10 @@ public sealed class GameSessionData
     /// </summary>
     public void ClearPendingPetCasts()
     {
-        while (PendingPetCasts.TryDequeue(out _)) { }
+        lock (PendingCastsLock)
+        {
+            while (PendingPetCasts.TryDequeue(out _)) { }
+        }
     }
 
     /// <summary>
@@ -2127,17 +2345,17 @@ public sealed class GameSessionData
     public (int normalCasts, int petCasts, int otherCasterIds) ResetInFlightCastState()
     {
         int normalCount;
+        int petCount;
         lock (PendingCastsLock)
         {
             normalCount = PendingNormalCasts.Count;
             while (PendingNormalCasts.TryDequeue(out _)) { }
+            petCount = PendingPetCasts.Count;
+            while (PendingPetCasts.TryDequeue(out _)) { }
         }
-        int petCount = PendingPetCasts.Count;
-        while (PendingPetCasts.TryDequeue(out _)) { }
         int otherCount = OtherCasterActiveCastIds.Count;
         OtherCasterActiveCastIds.Clear();
         PetAutoCastActiveCastIds.Clear();
-        PlayerForwardedCastIds.Clear();
         ClearForwardedStartCastIds();
         // Single-slot trackers for melee + auto-repeat (Auto Shot, Shoot Wand)
         // — same lifecycle as PendingNormalCasts; if a tracker was set when
@@ -2174,18 +2392,21 @@ public sealed class GameSessionData
         var cleared = new List<ClientCastRequest>();
         var keep = new List<ClientCastRequest>();
 
-        while (PendingPetCasts.TryDequeue(out var current))
+        lock (PendingCastsLock)
         {
-            if (current.HasStarted)
-                keep.Add(current);
-            else
-                cleared.Add(current);
-        }
+            while (PendingPetCasts.TryDequeue(out var current))
+            {
+                if (current.HasStarted)
+                    keep.Add(current);
+                else
+                    cleared.Add(current);
+            }
 
-        // Re-enqueue started casts
-        foreach (var item in keep)
-        {
-            PendingPetCasts.Enqueue(item);
+            // Re-enqueue started casts
+            foreach (var item in keep)
+            {
+                PendingPetCasts.Enqueue(item);
+            }
         }
 
         return cleared;
@@ -2233,11 +2454,14 @@ public sealed class GameSessionData
     }
 
     /// <summary>
-    /// JimsProxy: narrow variant of IsGcdHoldActive — returns true only when the GCD has
-    /// at most SpellQueueWindowMs remaining. Mirrors the 1.14 client's SpellQueueWindow
-    /// semantics for the GCD case (instants pressed in the last 400 ms of the previous cast's
-    /// GCD get queued and fire on GCD expiry; earlier presses are forwarded and receive the
-    /// server's NOT_READY). Used by the HandleCastSpell GCD hold gate. The wider
+    /// JimsProxy: narrow variant of IsGcdHoldActive — returns true only when the GCD is inside
+    /// its hold-admission tail. Mirrors the 1.14 client's SpellQueueWindow semantics for the
+    /// GCD case (instants pressed in the tail of the previous cast's GCD get queued and fire
+    /// on GCD expiry; earlier presses are forwarded and receive the server's NOT_READY).
+    /// Queue mode reads the configurable Framework.Settings.SpellQueueWindowMs; under RTT
+    /// Pre-Fire Timer the width is the fixed Settings.RttPrefireTimerWindowMs (400 ms) so the
+    /// launcher's greyed-out spell-queue dropdown can't silently govern Timer holds.
+    /// Used by the HandleCastSpell GCD hold gate. The wider
     /// IsGcdHoldActive() remains for callers that need "is any GCD active at all"
     /// (e.g. the held-cast-on-failure release path in Client/SpellHandler.cs).
     /// </summary>
@@ -2246,7 +2470,10 @@ public sealed class GameSessionData
         lock (_gcdLock)
         {
             long remaining = _gcdExpireTimestampMs - Environment.TickCount64;
-            return remaining > 0 && remaining <= Framework.Settings.SpellQueueWindowMs;
+            long window = Framework.Settings.RttPrefireTimerActive
+                ? Framework.Settings.RttPrefireTimerWindowMs
+                : Framework.Settings.SpellQueueWindowMs;
+            return remaining > 0 && remaining <= window;
         }
     }
 
@@ -2803,6 +3030,14 @@ public class ClientCastRequest
 
     public bool HasSentPrepare;
 
+    // JimsProxy (held-aware GCD anchoring): true once this press was released from the GCD
+    // hold slot by the release timer (ForwardHeldGcdCast) — i.e. the proxy RE-TIMED it.
+    // The synthetic GCD-anchor packets (#124 cooldown synth, bb4bb18 GO.CastTime stamp) exist
+    // to correct drift the client accrues across re-timed casts; their LL gates key on this
+    // flag rather than on mode alone, so a hold path re-admitted under LL (RttPrefire=Timer)
+    // keeps its anchors while never-held LL casts stay packet-trimmed.
+    public bool WasHeld;
+
     // JimsProxy: cast time (ms) reported by SMSG_SPELL_START. 0 means instant.
     // Distinguishes truly cast-time spells (Frostbolt, Polymorph) from instants that
     // *also* emit SMSG_SPELL_START on Kronos 1.12 (Arcane Explosion, Counterspell, etc.).
@@ -2950,12 +3185,18 @@ public class GlobalSessionData
     // (vanilla 1.12), so mixed-population raids see each other's predictions.
     public HealCommBridge HealCommBridge = null!;
 
+    // JimsProxy KTM originator: broadcasts our engine's threat on the 1.12 KLHTM
+    // channel for KLHThreatMeter raiders when the local client has no KTM addon
+    // of its own (the addon case is handled by KtmThreatBridge.RewriteOutbound).
+    public KtmThreatOriginator KtmThreatOriginator = null!;
+
     public GlobalSessionData()
     {
         GameState = GameSessionData.CreateNewGameSessionData(this);
         AuthClient = new AuthClient(this);
         ThreatTracker = new ThreatTracker(this);
         HealCommBridge = new HealCommBridge(this);
+        KtmThreatOriginator = new KtmThreatOriginator(this);
     }
 
     /// <summary>
@@ -3053,7 +3294,7 @@ public class GlobalSessionData
             // terminating event — release its forwarded-START CastID so a later same-spell cast
             // can't pop this evicted cast's stale CastID. Remove by value (it may not be the FIFO
             // head). The synthetic CastFailed below already carries cast.ServerGUID == that CastID.
-            if (Framework.Settings.IdentityPinnedCastIdsActive && cast.HasStarted)
+            if (cast.HasStarted)
                 GameState.RemoveForwardedStartCastId(cast.SpellId, cast.ServerGUID);
             if (!cast.HasStarted)
             {
@@ -3755,6 +3996,7 @@ public class GlobalSessionData
         // Threat lists are tied to the previous character's mob/unit GUIDs;
         // wipe so the new login starts clean.
         ThreatTracker.Reset();
+        KtmThreatOriginator.Reset();
     }
 
     public void SendHermesTextMessage(string message, bool isError = false)

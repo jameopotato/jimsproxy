@@ -18,13 +18,19 @@ namespace HermesProxy.World;
 // default UI target frame) get nothing to display.
 //
 // This class observes combat events forwarded from the legacy server, computes
-// threat per LibThreatClassic2 rules (port-in-progress, see ClassModules/), and
-// emits modern SMSG threat opcodes to the client.
+// threat per LibThreatClassic2 rules (LTC2 is the community model + what the
+// 1.12 KTM meters in the raid compute, so we align to it for raid consistency;
+// the server never emits threat, so live aggro behaviour is the final oracle),
+// and emits modern SMSG threat opcodes to the client.
 //
-// Phase 2 scope: track damage threat for the local player and their pet. Other
-// group members' threat is not yet shown (Phase 6 group sync). Class-specific
-// abilities (Distracting Shot, Feign Death, Sunder Armor flat threat, defensive
-// stance multipliers, etc.) ship in Phase 3+.
+// Scope: tracks threat for the WHOLE in-range group (local player, every party/
+// raid member, and their pets/guardians — see IsRelevantThreater), fed from the
+// combat log which the proxy observes for all units in range. For non-local
+// raiders we read every modifier that's observable on the wire — base damage/
+// heal, class, stance/form, threat auras (Salvation/Tranquil Air), gear set
+// bonuses + threat enchants (public visible-item fields). Only talent-derived
+// modifiers stay local-player-only, because vanilla 1.12 has no talent-inspect
+// opcode; an addon broadcast is the way to recover those (a follow-up).
 //
 // Threading: methods are called from the WorldClient thread (which dispatches
 // SMSG packet handlers). Emission goes back via WorldClient.SendPacketToClient
@@ -44,6 +50,17 @@ public sealed class ThreatTracker
     // Last-emitted highest threater per mob — so we only emit
     // SMSG_HIGHEST_THREAT_UPDATE when the top actually changes.
     private readonly Dictionary<WowGuid128, WowGuid128> _lastHighest = new();
+
+    // Ground-truth calibration: per mob, the last (server-target, model-top)
+    // pairing we logged as an UNEXPECTED aggro — the server is hitting someone
+    // our model ranked below its predicted top. The server never emits threat,
+    // so its actual UNIT_FIELD_TARGET is the only oracle; Kronos is a custom
+    // vmangos fork with its own threat bugs, so LTC2's numbers can't be trusted
+    // at face value. Logging every such disagreement (once per episode, not per
+    // event) both calibrates our model against Kronos reality over time AND
+    // gives a paper trail if a player disputes a threat reading. Cleared when
+    // the mob's target and our top agree again.
+    private readonly Dictionary<WowGuid128, (WowGuid128 server, WowGuid128 model)> _lastUnexpectedAggro = new();
 
     // Last-observed UNIT_FLAG_IN_COMBAT per unit (any unit whose flags we see).
     // Lets OnUnitCombatStateObserved detect the in-combat -> out-of-combat edge
@@ -71,6 +88,13 @@ public sealed class ThreatTracker
     {
         _session = session;
     }
+
+    // Threat is a PvE-only stat. Computing it in battlegrounds / arenas spends
+    // per-event work (roster scans, aura reads, list building) on a metric no
+    // PvP encounter needs — AV NPC bosses included, by design. Every threat
+    // entry point gates on this instead of on Settings.ThreatEngine alone.
+    private bool ThreatDisabled =>
+        !Settings.ThreatEngine || _session.GameState.IsInBattleground();
 
     // Adds threat with the local player's stance / form / class passive
     // modifier applied. Use for ability-driven flat threat (Sunder, Distracting
@@ -173,6 +197,7 @@ public sealed class ThreatTracker
 
         list.Clear();
         _lastHighest.Remove(mob);
+        _lastUnexpectedAggro.Remove(mob);
         _dirty.Add(mob);
     }
 
@@ -235,6 +260,7 @@ public sealed class ThreatTracker
         if (!_threatLists.Remove(mob))
             return;
         _lastHighest.Remove(mob);
+        _lastUnexpectedAggro.Remove(mob);
         _dirty.Remove(mob);
 
         var pkt = new ThreatClearPkt { UnitGUID = mob };
@@ -270,6 +296,7 @@ public sealed class ThreatTracker
         {
             _threatLists.Remove(mob);
             _lastHighest.Remove(mob);
+            _lastUnexpectedAggro.Remove(mob);
         }
     }
 
@@ -367,8 +394,45 @@ public sealed class ThreatTracker
             if (serverTarget != default && serverTarget != newHighest &&
                 list.TryGetValue(serverTarget, out var serverTargetValue))
             {
+                // Ground-truth calibration + complaint paper trail: the server is
+                // aggroed on serverTarget, but our model ranked them BELOW its
+                // predicted top (newHighest) — i.e. our threat numbers disagree
+                // with what Kronos actually did. Log it once per distinct episode
+                // (dedup on the pairing) with the ratio so systematic model error
+                // (e.g. a class/pet we over- or under-credit on this fork) shows
+                // up as a repeated signature across fights. Always on: aggro
+                // disagreements are infrequent and this is the audit trail.
+                if (serverTargetValue < highestValue)
+                {
+                    var pairing = (serverTarget, newHighest);
+                    if (!_lastUnexpectedAggro.TryGetValue(mob, out var last) || last != pairing)
+                    {
+                        _lastUnexpectedAggro[mob] = pairing;
+                        Log.Event("threat.aggro_unexpected", new
+                        {
+                            mob_low = mob.GetCounter(),
+                            mob_guid = mob.ToString(),
+                            server_target_low = serverTarget.GetCounter(),
+                            server_target_threat = serverTargetValue,
+                            model_top_low = newHighest.GetCounter(),
+                            model_top_threat = highestValue,
+                            // >1 = how much more threat our model gave its top than the
+                            // raider the server actually chose. Large / recurring =
+                            // a value we're getting wrong on Kronos.
+                            model_overcredit_ratio = serverTargetValue > 0 ? highestValue / serverTargetValue : 0.0,
+                            threaters = list.Count,
+                        });
+                    }
+                }
+
                 newHighest = serverTarget;
                 highestValue = serverTargetValue;
+            }
+            else
+            {
+                // Server target and our top agree (or the server target isn't in
+                // our list) — any prior disagreement for this mob is resolved.
+                _lastUnexpectedAggro.Remove(mob);
             }
 
             var update = new ThreatUpdatePkt { UnitGUID = mob };
@@ -419,6 +483,15 @@ public sealed class ThreatTracker
                 SendToClient(highest);
             }
         }
+
+        // JimsProxy KTM origination: after pushing SMSG threat to our own client,
+        // consider broadcasting our current-target threat on the 1.12 "KLHTM"
+        // channel so KLHThreatMeter raiders see it too. No-op unless grouped, the
+        // local client isn't already emitting its own KLHTM (that stream is
+        // handled by KtmThreatBridge.RewriteOutbound), and the value changed since
+        // the last throttled emit. Event-driven off this flush — no heartbeat
+        // timer — which reproduces KTMClassic's change-gated cadence.
+        _session.KtmThreatOriginator.MaybeBroadcast();
     }
 
     // Wipe everything — used on session disconnect / character switch. Doesn't
@@ -427,8 +500,63 @@ public sealed class ThreatTracker
     {
         _threatLists.Clear();
         _lastHighest.Clear();
+        _lastUnexpectedAggro.Clear();
         _dirty.Clear();
         _lastInCombat.Clear();
+    }
+
+    // KTM (KLHThreatMeter) interop: the local player's current-target threat,
+    // floored to an integer, for broadcast on the 1.12 "KLHTM" addon channel.
+    // KTMClassic's getThreatStringKTM emits floor(threat-on-current-target) as
+    // "t <n>"; we mirror that exactly so our engine's number can REPLACE the
+    // addon's LibThreatClassic2 estimate on the wire — see
+    // KtmThreatBridge.RewriteOutbound. Note we return the RAW floored threat,
+    // NOT ToWireThreat's ×100 modern packing: KTM's wire is the plain integer.
+    //
+    // Returns 0 when the engine is disabled or we're in a battleground (via
+    // ThreatDisabled), when the player has no current target, or when we aren't
+    // tracking threat on that target. The rewrite treats 0 as "no data — leave
+    // the addon's own number alone", so a 0 here never blanks a raider's meter
+    // during the observation gap.
+    //
+    // Target = the player's CurrentSelection. In the common case (no KTM master
+    // target set) that matches the addon's own current-target notion. If an
+    // officer has set a KTM master target that differs from the player's
+    // selection, the addon would report master-target threat while we report
+    // selection threat — a bounded, self-correcting mismatch we accept until
+    // the origination path tracks officer master-target state.
+    public long GetKtmBroadcastThreat()
+    {
+        if (ThreatDisabled)
+            return 0;
+
+        return ComputeKtmBroadcastThreat(
+            _threatLists,
+            _session.GameState.CurrentSelection,
+            _session.GameState.CurrentPlayerGuid);
+    }
+
+    // Pure lookup half of GetKtmBroadcastThreat, split out so the target /
+    // floor / untracked-pair logic is unit-testable with a hand-built threat
+    // list, without standing up a full GlobalSessionData graph (its RealmManager
+    // field initializer needs version config a bare test doesn't have). The
+    // ThreatDisabled gate — shared engine infrastructure — stays in the caller.
+    // Returns the player's floored threat on the mob, or 0 when either GUID is
+    // empty (no current target / no player) or we hold no positive threat for
+    // that pair.
+    internal static long ComputeKtmBroadcastThreat(
+        Dictionary<WowGuid128, Dictionary<WowGuid128, double>> lists,
+        WowGuid128 mob, WowGuid128 player)
+    {
+        if (mob.IsEmpty() || player.IsEmpty())
+            return 0;
+
+        if (!lists.TryGetValue(mob, out var list) ||
+            !list.TryGetValue(player, out double threat) ||
+            threat <= 0)
+            return 0;
+
+        return (long)Math.Floor(threat);
     }
 
     // Called from SMSG_CANCEL_COMBAT — the legacy server told the local player
@@ -469,7 +597,7 @@ public sealed class ThreatTracker
     // field cache in place, so the pre-update value can't be read back.
     public void OnUnitCombatStateObserved(WowGuid128 guid, bool inCombat)
     {
-        if (!Settings.ThreatEngine) return;
+        if (ThreatDisabled) return;
         if (guid == default) return;
 
         _lastInCombat.TryGetValue(guid, out bool wasInCombat);
@@ -581,7 +709,7 @@ public sealed class ThreatTracker
 
     public void OnDamage(WowGuid128 attacker, WowGuid128 victim, int spellId, double rawDamage)
     {
-        if (!Settings.ThreatEngine) return;
+        if (ThreatDisabled) return;
         if (rawDamage <= 0) return;
         if (!IsRelevantThreater(attacker))
         {
@@ -621,16 +749,17 @@ public sealed class ThreatTracker
 
         // Set-bonus gear adjustments (Mage Arcanist x0.85, Warlock Nemesis x0.8
         // on Destruction, Warlock Plagueheart x0.75, Rogue Bonescythe x0.92,
-        // Mage Netherwind -100/-20 flat). Player-only; pets / guardians don't
-        // carry sets. Layered on top of ability/passive/talent multipliers.
-        double gearMultiplier = 1.0;
-        double gearFlat = 0.0;
-        if (attacker == _session.GameState.CurrentPlayerGuid)
-        {
-            var playerClass = (Class)_session.GameState.CurrentPlayerClass;
-            gearMultiplier = ThreatSetBonuses.GetGearDamageMultiplier(_session.GameState, playerClass, spellId);
-            gearFlat = ThreatSetBonuses.GetGearDamageFlatAdjust(_session.GameState, playerClass, spellId);
-        }
+        // Mage Netherwind -100/-20 flat) + threat enchants (cloak Subtlety -2%,
+        // gloves Threat +2%). Applied for EVERY raider, not just the local
+        // player: the local player's gear comes from the private inventory
+        // slots (iMorph-immune), every groupmate's from their public visible-item
+        // fields + the per-GUID enchant cache. Pets / guardians (class == None)
+        // carry no sets, so their gear/enchant lookups no-op. Layered on top of
+        // ability/passive/talent multipliers.
+        Class attackerClass = GetThreaterClass(attacker);
+        double gearMultiplier = ThreatSetBonuses.GetGearDamageMultiplier(_session.GameState, attackerClass, attacker, spellId);
+        double gearFlat = ThreatSetBonuses.GetGearDamageFlatAdjust(_session.GameState, attackerClass, attacker, spellId);
+        double enchantMultiplier = ThreatSetBonuses.GetGearEnchantMultiplier(_session.GameState, attacker);
 
         // Aura-based threat multiplier (Blessing of Salvation x0.7, Greater
         // Bless of Salvation x0.7, Tranquil Air totem x0.8). Stacks
@@ -639,7 +768,7 @@ public sealed class ThreatTracker
         // we'd otherwise compute it.
         double auraMultiplier = ScanThreatMultiplierAuras(attacker);
 
-        double scaledThreat = (rawDamage * abilityMultiplier * gearMultiplier + gearFlat) * passiveModifier * talentMultiplier * auraMultiplier;
+        double scaledThreat = (rawDamage * abilityMultiplier * gearMultiplier + gearFlat) * passiveModifier * talentMultiplier * auraMultiplier * enchantMultiplier;
         if (scaledThreat < 0) scaledThreat = 0;
         AddThreat(victim, attacker, scaledThreat);
 
@@ -658,7 +787,7 @@ public sealed class ThreatTracker
     // off-healers who DPS, and self-heals while in combat.
     public void OnHeal(WowGuid128 healer, WowGuid128 healTarget, int spellId, double effectiveHeal)
     {
-        if (!Settings.ThreatEngine) return;
+        if (ThreatDisabled) return;
         if (effectiveHeal <= 0) return;
         if (!IsRelevantThreater(healer)) return;
         if (healTarget == default) return;
@@ -700,20 +829,20 @@ public sealed class ThreatTracker
         // heal threat when RF aura is active. Other classes' heals are no-op.
         double talentMultiplier = GetSpellTalentMultiplier(healer, spellId);
 
-        // Set-bonus heal-threat scalar (Priest Vestments of Faith 8-set: x0.9).
-        double gearHealMultiplier = 1.0;
-        if (healer == _session.GameState.CurrentPlayerGuid)
-        {
-            var playerClass = (Class)_session.GameState.CurrentPlayerClass;
-            gearHealMultiplier = ThreatSetBonuses.GetGearHealMultiplier(_session.GameState, playerClass);
-        }
+        // Set-bonus heal-threat scalar (Priest Vestments of Faith 8-set: x0.9) +
+        // threat enchants. Applied for every healer, not just the local player —
+        // groupmate gear from public visible items, enchants from the per-GUID
+        // cache (see OnDamage).
+        Class healerClass = GetThreaterClass(healer);
+        double gearHealMultiplier = ThreatSetBonuses.GetGearHealMultiplier(_session.GameState, healerClass, healer);
+        double enchantMultiplier = ThreatSetBonuses.GetGearEnchantMultiplier(_session.GameState, healer);
 
         // Aura-based threat multiplier (Salvation x0.7 etc.) applies to heal
         // threat just like damage threat — LTC2 puts it in threatMods() which
         // wraps all threat output regardless of source event.
         double auraMultiplier = ScanThreatMultiplierAuras(healer);
 
-        double totalThreat = effectiveHeal * 0.5 * passiveModifier * talentMultiplier * gearHealMultiplier * auraMultiplier;
+        double totalThreat = effectiveHeal * 0.5 * passiveModifier * talentMultiplier * gearHealMultiplier * auraMultiplier * enchantMultiplier;
         // LTC2 divides by EncounterMobs() — total mobs in the encounter, not
         // just the caster's combat list. We approximate with the caster's mob
         // count (close enough for solo/small-group; full encounter sync is a
@@ -726,11 +855,25 @@ public sealed class ThreatTracker
         EmitDirty();
     }
 
-    // LTC2 ExemptGains: spells that should NOT generate energize threat.
+    // Spells whose power gain must NOT generate threat.
+    //   Warlock Life Tap (all ranks) — converts HP to mana; its threat was
+    //     removed in patch 0.8 (2004), so 0 is correct blizzlike, and both KTM
+    //     and LibThreatClassic2 exempt every rank. We were fabricating threat
+    //     from every tap — the one over-credit all three sources agree on
+    //     (Kronos research 2026-07-13). CAVEAT: vmangos-lineage cores have had
+    //     gain-threat bugs (vmangos #2589, Atlantiss #4978); if THIS fork
+    //     regenerates Life Tap threat, the threat.aggro_unexpected logger will
+    //     show warlocks over-credited and we revisit — but 0 is the grounded
+    //     default.
     //   34299 — Improved Leader of the Pack (heal-side, no threat)
     //   33778 — Lifebloom final bloom (overheal-like effect)
+    private static readonly HashSet<int> LifeTapRanks = new()
+    {
+        1454, 1455, 1456, 11687, 11688, 11689,
+    };
+
     private static bool IsEnergizeExempt(int spellId) =>
-        spellId == 34299 || spellId == 33778;
+        spellId == 34299 || spellId == 33778 || LifeTapRanks.Contains(spellId);
 
     // Per-challenger aggro flip margin, matching LibThreatClassic2's
     // GetPullAggroRangeModifier (LibThreatClassic2.lua line 1679-1713).
@@ -770,7 +913,7 @@ public sealed class ThreatTracker
     // math needed proxy-side.
     public void OnEnergize(WowGuid128 caster, WowGuid128 recipient, int spellId, PowerType powerType, double amount)
     {
-        if (!Settings.ThreatEngine) return;
+        if (ThreatDisabled) return;
         if (amount <= 0) return;
         if (!IsRelevantThreater(caster)) return;
         if (IsEnergizeExempt(spellId)) return;
@@ -792,7 +935,7 @@ public sealed class ThreatTracker
     // set so the threat-update SMSG goes out alongside the SpellGo packet.
     public void OnSpellCast(WowGuid128 caster, int spellId, IList<WowGuid128> hitTargets)
     {
-        if (!Settings.ThreatEngine) return;
+        if (ThreatDisabled) return;
         if (caster == default) return;
 
         // First try player/pet handlers. If matched, flush + return.
@@ -1064,7 +1207,7 @@ public sealed class ThreatTracker
     // uses the table amount instead of effective-heal × 0.5.
     public void OnPowerWordShield(WowGuid128 caster, WowGuid128 shieldTarget, int spellId, double baseAmount)
     {
-        if (!Settings.ThreatEngine) return;
+        if (ThreatDisabled) return;
         if (baseAmount <= 0) return;
         if (caster != _session.GameState.CurrentPlayerGuid) return;
         if (shieldTarget == default) return;
