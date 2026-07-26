@@ -366,19 +366,23 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
 
                 break;
             case Opcode.CMSG_ENABLE_NAGLE:
-                // CORRECTED 2026-07-25: the previous comment here ("the proxy always needs
-                // TCP_NODELAY=true") described configuration that had been dead since upstream
-                // 55e9fca8 (2022-11) — these sockets actually ran at the .NET default (Nagle ON), so
-                // "ignoring" this request was a client-side no-op. With NoDelay genuinely restored
-                // (ClientTcpNoDelay, applied in the ctor), we now HONOR the request like SugarProxy
-                // and a real 1.14 server do: the client explicitly asked for batched delivery
-                // ("Optimize Network for Speed" unchecked, sent coalesced with AUTH_SESSION —
-                // Xian55 2960e779), so flip THIS client socket back to Nagle. The LEGACY socket is
-                // deliberately NOT touched (the real lesson of 73ba505d: Nagling proxy->server
-                // forwarding adds genuine latency). The packet is still processed either way so the
-                // AES-GCM nonce counter stays in sync.
-                SetNoDelay(false);
-                Log.Event("client_socket.nagle_honored", new { connection = _connectType.ToString() });
+                // Deliberately process-without-obeying — with the CORRECT rationale this time
+                // (2026-07-25). The old comment claimed "the proxy always needs TCP_NODELAY=true",
+                // which described configuration dead since upstream 55e9fca8 (2022-11); ignoring was
+                // then a no-op. But ignore IS the right policy for this leg: the checkbox's intent
+                // ("Optimize Network for Speed" unchecked = trade latency for less traffic on MY
+                // internet link) maps to the WAN leg in our topology — proxy->server, which keeps
+                // its own pinned NODELAY (WorldClient; the preserved half of 73ba505d). This socket
+                // is the LOOPBACK leg: Nagle conserves nothing on 127.0.0.1 and only re-enters the
+                // kernel-batched delivery regime that shipped the 2022-2026 bad era — silently, for
+                // exactly the users fiddling with network settings because something already feels
+                // off. The opcode is advisory (TCP options are not negotiated on the wire), so the
+                // client cannot observe non-compliance. The legitimate "I want batched delivery"
+                // escape hatch is ClientTcpNoDelay=false — explicit and logged — not a client
+                // checkbox that means something else in a proxied setup. The packet still flows
+                // through decryption so the AES-GCM nonce counter stays in sync (Xian55 2960e779),
+                // and receipt is logged for visibility into how many users actually uncheck the box.
+                Log.Event("client_socket.nagle_requested", new { honored = false, connection = _connectType.ToString() });
                 break;
             case Opcode.CMSG_CONNECT_TO_FAILED:
                 ConnectToFailed connectToFailed = new(packet);
