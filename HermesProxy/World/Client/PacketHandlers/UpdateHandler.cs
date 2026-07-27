@@ -2482,42 +2482,15 @@ public partial class WorldClient
             int UNIT_FIELD_CHARMEDBY = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_CHARMEDBY);
             if (UNIT_FIELD_CHARMEDBY >= 0 && updateMaskArray[UNIT_FIELD_CHARMEDBY])
             {
-                WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To128(GetSession().GameState);
+WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To128(GetSession().GameState);
                 updateData.UnitData.CharmedBy = charmedBy;
 
-                // JimsProxy (#382 observer lockup): track players charmed by ANOTHER PLAYER,
-                // so the flags translation below can present them as possessed (see
-                // GameSessionData.ObservedCharmedPlayers). Excludes the charmer (needs the real
-                // charm/pet bar) and the local player as target (lives the real charm), so the
-                // charm-vs-possess control difference is preserved for the participants.
-                // NPC charmers (Lucifron's Dominate Mind et al.) are deliberately excluded:
-                // years of raid MCs have produced no observer-lockup reports, so that
-                // long-stable content stays untouched.
-                var gameState = GetSession().GameState;
-                bool observedCharmedPlayer = guid.IsPlayer() &&
-                    charmedBy.IsPlayer() &&
-                    guid != gameState.CurrentPlayerGuid &&
-                    charmedBy != gameState.CurrentPlayerGuid;
-                if (observedCharmedPlayer)
-                {
-                    if (gameState.ObservedCharmedPlayers.Add(guid))
-                        Log.Event("charm.observed_player.possess_shim", new
-                        {
-                            guid_low = guid.GetCounter(),
-                            charmed_by_low = charmedBy.GetCounter(),
-                        });
-                }
-                else if (gameState.ObservedCharmedPlayers.Remove(guid))
-                {
-                    Log.Event("charm.observed_player.possess_shim_cleared", new
-                    {
-                        guid_low = guid.GetCounter(),
-                    });
-                }
-
                 // JimsProxy (#382 PetInCombat charm strip): all-perspective tracking (no
-                // self/charmer exclusion, unlike the shim set above) — the strip applies to
-                // the victim's own view and the charmer's view too.
+                // self/charmer exclusion — the victim's own client drops too, and the
+                // charm+0x800 hybrid is wrong from every viewpoint). NPC charmers
+                // (Lucifron's Dominate Mind et al.) are excluded by the predicate:
+                // long-stable raid content stays untouched.
+                var gameState = GetSession().GameState;
                 if (IsPlayerCharmedByPlayer(guid, charmedBy))
                 {
                     if (gameState.PlayerCharmedByPlayer.Add(guid))
@@ -2542,10 +2515,9 @@ public partial class WorldClient
             else if (isCreate)
             {
                 // A create block without CHARMEDBY means the unit is not charmed — drop any
-                // stale shim entry from a charm that ended while the unit was out of range.
-                // (Same lifecycle for the strip set: creates always carry flags, so the
-                // normal forwarding below restores the un-stripped value in this block.)
-                GetSession().GameState.ObservedCharmedPlayers.Remove(guid);
+                // stale strip entry from a charm that ended while the unit was out of range.
+                // (Creates always carry flags, so the normal forwarding below restores the
+                // un-stripped value in this block.)
                 GetSession().GameState.PlayerCharmedByPlayer.Remove(guid);
             }
             int UNIT_FIELD_SUMMONEDBY = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_SUMMONEDBY);
@@ -2802,16 +2774,7 @@ public partial class WorldClient
                 if (Session.GameState.KnownSwimmingMobs.Contains(guid))
                     updateData.UnitData.Flags |= (uint)UnitFlags.CanSwim;
 
-                // JimsProxy (#382 observer lockup): present an observed charmed PLAYER as
-                // possessed. Vanilla MOD_CHARM (Gnomish MC Cap 13181) emits PLAYER_CONTROLLED
-                // + CHARMEDBY without POSSESSED; a charmed player is unrepresentable to the
-                // 1.14 client (BG bystanders FPS-lock rendering it), while possess (priest
-                // MC 605) renders fine. CHARMEDBY is processed above before this flags block,
-                // so apply/clear ordering within a single update is already correct.
-                if (Session.GameState.ObservedCharmedPlayers.Contains(guid))
-                    updateData.UnitData.Flags |= (uint)UnitFlags.Possessed;
-
-                // JimsProxy (#382 PetInCombat charm strip): cache the RAW server flags for
+// JimsProxy (#382 PetInCombat charm strip): cache the RAW server flags for
                 // players (never the stripped presentation — the charm-edge re-sync below
                 // needs the server truth to strip from and restore from), then remove the
                 // vanilla-only charm+0x800 hybrid from the forwarded value while the unit
@@ -2868,12 +2831,8 @@ public partial class WorldClient
                 // include PET_IN_COMBAT (e.g. a warlock whose pet was fighting before the
                 // cap landed). Re-send the last-known flags so the held state never combines
                 // charm + 0x800: stripped while the charm is tracked (apply edge), restored
-                // verbatim once it isn't (clear edge). Same name-map as the real path; the
-                // possess shim's OR is kept consistent while that shim exists so the bit
-                // doesn't flap mid-charm.
+                // verbatim once it isn't (clear edge). Same name-map as the real path.
                 uint synthFlags = (uint)((UnitFlagsVanilla)lastRawUnitFlags).CastFlags<UnitFlags>();
-                if (Session.GameState.ObservedCharmedPlayers.Contains(guid))
-                    synthFlags |= (uint)UnitFlags.Possessed;
                 synthFlags = ApplyPetInCombatCharmStrip(synthFlags,
                     Settings.Charm382StripPetInCombat,
                     Session.GameState.PlayerCharmedByPlayer.Contains(guid));
