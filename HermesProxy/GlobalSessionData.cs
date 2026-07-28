@@ -2132,6 +2132,17 @@ public sealed class GameSessionData
     /// Returns true if any pending normal cast has been forwarded to the legacy server but
     /// hasn't received SMSG_SPELL_START yet. Covers the post-GCD-expiry window where
     /// IsGcdHoldActive() returns false but the server hasn't confirmed the forwarded cast.
+    ///
+    /// JimsProxy (#442): off-GCD entries are NOT counted — since #345 that includes every
+    /// item-use cast. An in-flight off-GCD cast has no ordering claim over an on-GCD spell
+    /// (the legacy server casts both independently, verified on the wire), so gating on one
+    /// buys nothing. It costs a great deal: off-GCD entries are already exempt from the
+    /// ClearNonStartedNormalCasts sweep (:2291) and never get a WatchdogDeadlineMs, so a
+    /// leaked one is unreapable — and because this gate is not keyed by spell, it then parks
+    /// EVERY subsequent on-GCD press in ForceHoldCast (Server/SpellHandler.cs:619), silently
+    /// (no SpellPrepare, DontReport on the displaced press) until relog. Observed in a live
+    /// Ragnaros raid log: a Mana Ruby + Robe of the Archmage pair 499ms apart, then 96
+    /// seconds of spell.held_pending with no cast reaching the server.
     /// </summary>
     public bool HasForwardedPendingCast()
     {
@@ -2139,7 +2150,7 @@ public sealed class GameSessionData
         {
             foreach (var item in PendingNormalCasts)
             {
-                if (!item.HasStarted)
+                if (!item.HasStarted && !item.IsOffGcd)
                     return true;
             }
             return false;
