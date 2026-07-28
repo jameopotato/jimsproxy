@@ -121,4 +121,21 @@ public class ForwardedPendingCastGateTests
 
         Assert.False(s.HasForwardedPendingCast());
     }
+
+    [Fact]
+    public void LeakedItemUseCast_StillBlocksThatSameItem_KnownResidual()
+    {
+        // Documents the boundary of this fix. Spell casting recovers, but the leaked entry
+        // still satisfies HasInFlightNormalCastForSpell(), which gates HandleUseItem at
+        // Server/SpellHandler.cs:962 — so THAT item stays silently unusable for the rest of
+        // the session (cast.dropped.duplicate, reason "in_flight_same_spell_use_item").
+        // The symptom degrades from "no casting at all" to "one dead item"; the underlying
+        // leak is still the thing to fix. If a later change reaps leaked item entries, this
+        // assertion should flip and the residual note in #442 can be closed out.
+        var s = NewSession();
+        s.PendingNormalCasts.Enqueue(ItemUseCast(10058)); // leaked Mana Ruby
+
+        Assert.False(s.HasForwardedPendingCast());              // spells flow again
+        Assert.True(s.HasInFlightNormalCastForSpell(10058));    // but the gem stays blocked
+    }
 }
