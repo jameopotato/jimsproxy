@@ -304,6 +304,32 @@ public partial class WorldClient
         if (GetSession().GameState.TryDequeueItemCast(failure.Item[0], out var pendingCast))
         {
             GetSession().InstanceSocket.SendCastRequestFailed(pendingCast!, false);
+            Log.Event("cast.item_use_rejected_by_inventory", new
+            {
+                result = (uint)failure.BagResult,
+                dequeued_via = "guid",
+                evicted_spell_id = pendingCast!.SpellId,
+            });
+        }
+        // JimsProxy (#442): Kronos also rejects USE_ITEM itself this way — with EMPTY item GUIDs
+        // (observed live 2026-07-29: a duplicate use straddling its predecessor's SPELL_GO,
+        // rejected with result 23/ItemNotFound, both GUIDs zero). The GUID dequeue above can't
+        // match those, and the orphaned entry then jams HasForwardedPendingCast (every on-GCD
+        // press silently parked until relog/map change) and keeps that item unusable via
+        // HasInFlightNormalCastForSpell. Pair the anonymous rejection with the oldest unresolved
+        // item-use entry instead and release its button silently. See
+        // TryDequeueOldestUnstartedItemCast for the FIFO rationale and the two-items edge.
+        else if (failure.Item[0].IsEmpty() &&
+                 GetSession().GameState.TryDequeueOldestUnstartedItemCast(out var orphanedItemCast))
+        {
+            GetSession().InstanceSocket.SendCastRequestFailed(orphanedItemCast!, false, SpellCastResultClassic.DontReport);
+            Log.Event("cast.item_use_rejected_by_inventory", new
+            {
+                result = (uint)failure.BagResult,
+                dequeued_via = "fifo_fallback",
+                evicted_spell_id = orphanedItemCast!.SpellId,
+                evicted_item_guid = orphanedItemCast.ItemGUID.ToString(),
+            });
         }
     }
     [PacketHandler(Opcode.SMSG_INVENTORY_CHANGE_FAILURE, ClientVersionBuild.V2_0_1_6180)]
@@ -341,6 +367,25 @@ public partial class WorldClient
         if (GetSession().GameState.TryDequeueItemCast(failure.Item[0], out var pendingCast))
         {
             GetSession().InstanceSocket.SendCastRequestFailed(pendingCast!, false);
+            Log.Event("cast.item_use_rejected_by_inventory", new
+            {
+                result = (uint)failure.BagResult,
+                dequeued_via = "guid",
+                evicted_spell_id = pendingCast!.SpellId,
+            });
+        }
+        // JimsProxy (#442): same empty-GUID rejection fallback as the vanilla handler above.
+        else if (failure.Item[0].IsEmpty() &&
+                 GetSession().GameState.TryDequeueOldestUnstartedItemCast(out var orphanedItemCast))
+        {
+            GetSession().InstanceSocket.SendCastRequestFailed(orphanedItemCast!, false, SpellCastResultClassic.DontReport);
+            Log.Event("cast.item_use_rejected_by_inventory", new
+            {
+                result = (uint)failure.BagResult,
+                dequeued_via = "fifo_fallback",
+                evicted_spell_id = orphanedItemCast!.SpellId,
+                evicted_item_guid = orphanedItemCast.ItemGUID.ToString(),
+            });
         }
     }
     [PacketHandler(Opcode.SMSG_DURABILITY_DAMAGE_DEATH)]
