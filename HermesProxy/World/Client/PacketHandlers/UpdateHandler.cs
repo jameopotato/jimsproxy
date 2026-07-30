@@ -746,11 +746,19 @@ public partial class WorldClient
     {
         BitArray? updateMaskArray = null;
         var updates = ReadValuesUpdateBlock(packet, ref type, index, true, null, out updateMaskArray, out var actuallyChangedValuesMaskArray);
-        StoreObjectUpdate(guid, type, updateMaskArray, updates, auraUpdate, null, true, updateData, actuallyChangedValuesMaskArray);
+        // JimsProxy (collision-visual-parity #359): publish the field cache BEFORE the store
+        // hook runs, matching the values-update path (which mutates the cached dictionary in
+        // place, so its hook always sees current values). The old write-after order made every
+        // GetLegacyFieldValue* read inside AfterStoreObjectUpdateHook miss on creates — the
+        // player collision-height block hit its rawScaleX==0 guard and silently skipped, so
+        // login/teleport-arrival creates never emitted a collision packet while later value
+        // updates did, splitting the client between two height sources (#359's
+        // fits-at-login-stuck-after-shift asymmetry).
         lock (GetSession().GameState.ObjectCacheLock)
         {
             GetSession().GameState.ObjectCacheLegacy[guid] = updates;
         }
+        StoreObjectUpdate(guid, type, updateMaskArray, updates, auraUpdate, null, true, updateData, actuallyChangedValuesMaskArray);
     }
 
     public void ReadValuesUpdateBlock(WorldPacket packet, WowGuid128 guid, ObjectUpdate updateData, AuraUpdate auraUpdate, PowerUpdate powerUpdate, int index)
@@ -1985,38 +1993,18 @@ public partial class WorldClient
                 if (!changedValuesMask.Get(UNIT_FIELD_NATIVEDISPLAYID) && !changedValuesMask.Get(UNIT_FIELD_MOUNTDISPLAYID) && !changedValuesMask.Get(OBJECT_FIELD_SCALE_X))
                     return; // No need for an update
 
-                int nativeDisplayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
+                // Reads UNIT_FIELD_DISPLAYID (the currently rendered, form-aware model), not
+                // NATIVEDISPLAYID — the collision cylinder must track what is on screen (#359).
+                int currentDisplayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
                 int mountDisplayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_MOUNTDISPLAYID);
                 float rawScaleX = Session.GameState.GetLegacyFieldValueFloat(guid, ObjectField.OBJECT_FIELD_SCALE_X);
 
                 if (rawScaleX == 0.0f)
                     return;
 
-                var regularNativeDisplaySize = GameData.GetUnitCompleteDisplayScale((uint)nativeDisplayId);
-                var scale = rawScaleX / regularNativeDisplaySize;
-
-                var ourDisplayInfo = GameData.GetDisplayInfo((uint)nativeDisplayId);
-                var ourModel = GameData.GetModelData(ourDisplayInfo.ModelId);
-
-                float calculatedBaseHeight;
-                if (mountDisplayId != 0 && LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
-                { // in vanilla there were no mount collisions
-                    var mountDisplayInfo = GameData.GetDisplayInfo((uint)mountDisplayId);
-                    var mountModel = GameData.GetModelData(mountDisplayInfo.ModelId);
-                    calculatedBaseHeight = mountModel.MountHeight * mountDisplayInfo.DisplayScale + (ourModel.Height * ourModel.ModelScale * ourDisplayInfo.DisplayScale * 0.5f);
-                }
-                else
-                {
-                    calculatedBaseHeight = ourDisplayInfo.DisplayScale * ourModel.Height * ourModel.ModelScale;
-                }
-
-                if (calculatedBaseHeight == 0)
-                    calculatedBaseHeight = mountDisplayId != 0 ? PlayerHeight.Mounted : PlayerHeight.Normal;
-
-                var heightScale = Math.Max(scale, regularNativeDisplaySize); // you HitBox cannot be smaller than displaySize in legacy clients
-                var scaledHeight = heightScale * calculatedBaseHeight;
-
-                var displayScale = regularNativeDisplaySize * scale;
+                float scaledHeight = ComputeVisualCollisionHeight(currentDisplayId, mountDisplayId, rawScaleX);
+                if (scaledHeight == 0)
+                    scaledHeight = mountDisplayId != 0 ? PlayerHeight.Mounted : PlayerHeight.Normal;
 
                 var reason = changedValuesMask.Get(UNIT_FIELD_MOUNTDISPLAYID)
                     ? MoveSetCollisionHeight.UpdateCollisionHeightReason.Mount
@@ -2026,13 +2014,60 @@ public partial class WorldClient
                 {
                     MoverGUID = guid,
                     Height = scaledHeight,
-                    Scale = displayScale,
+                    Scale = rawScaleX,
                     Reason = reason,
                     MountDisplayID = (uint) mountDisplayId,
                 };
                 SendPacketToClient(height, Opcode.SMSG_UPDATE_OBJECT);
+                // JimsProxy (collision-visual-parity #359): field-verifiable without a .pkt.
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("unit.collision_height.sent", new
+                    {
+                        guid = guid.ToString(),
+                        display_id = currentDisplayId,
+                        mount_display_id = mountDisplayId,
+                        raw_scale = rawScaleX,
+                        height = scaledHeight,
+                        reason = reason.ToString(),
+                    });
             }
         }
+    }
+
+    // JimsProxy (collision-visual-parity #359): the height the modern client's collision
+    // cylinder must have to agree with the model it is rendering. The invariant is
+    // collision ≡ visible height in every state, before and after any form/mount change:
+    //
+    //     height = CollisionHeight(model) × ModelScale(model) × CMS_effective(display) × wire scale
+    //
+    // CreatureModelData.CollisionHeight is Blizzard's authored collision for the mesh at
+    // scale 1.0, and (wire × CMS × ModelScale) is exactly the render scale the 1.14 client
+    // applies (established by direct DB2 parse, 52ab6f88). CMS_effective is hotfix-aware:
+    // when we push a CreatureDisplayInfo CMS override (tauren K=0.75), the client renders
+    // with it, so collision must use it too — the May 2026 render hotfix without this was
+    // the root of #359 (♀ tauren sent 3.299 while rendering at 2.474; Tarren Mill doorway
+    // measured in (3.012, 3.299) — 1.12-native-sized geometry that the inflated cylinder
+    // failed while the visibly taller dire bear at a truthful 3.000 passed).
+    //
+    // Deliberately NOT ported from the upstream formula (_BLU 2023): the
+    // Max(scale, displaySize) hitbox floor — it inflated every CMS<1 form (travel/NE cat/
+    // NE moonkin) above its visible size — and the displayId-keyed GetModelData lookup.
+    // Zero-height models fall back to PlayerHeight at the call site.
+    public static float ComputeVisualCollisionHeight(int displayId, int mountDisplayId, float rawScaleX)
+    {
+        var displayInfo = GameData.GetDisplayInfo((uint)displayId);
+        var model = GameData.GetModelData(displayInfo.ModelId);
+        float cms = GameData.GetClientEffectiveDisplayScale((uint)displayId);
+
+        if (mountDisplayId != 0 && LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
+        { // in vanilla there were no mount collisions
+            var mountDisplayInfo = GameData.GetDisplayInfo((uint)mountDisplayId);
+            var mountModel = GameData.GetModelData(mountDisplayInfo.ModelId);
+            float mountCms = GameData.GetClientEffectiveDisplayScale((uint)mountDisplayId);
+            return rawScaleX * (mountModel.MountHeight * mountCms + model.Height * model.ModelScale * cms * 0.5f);
+        }
+
+        return rawScaleX * cms * model.Height * model.ModelScale;
     }
 
     // JimsProxy (stuck-logout-stun 2026-07-17): vanilla cores implement the logout countdown by
