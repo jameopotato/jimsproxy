@@ -3391,6 +3391,13 @@ public partial class WorldClient
         channel.SpellID = packet.ReadUInt32();
         channel.SpellXSpellVisualID = GameData.GetSpellVisual(channel.SpellID);
         channel.Duration = packet.ReadUInt32();
+        // JimsProxy (#244 emote channel guard): record our own channel window
+        // so text-emote forwards hold off while it is open.
+        if (channel.CasterGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            GetSession().GameState.LocalChannelSpellId = channel.Duration > 0 ? channel.SpellID : 0;
+            GetSession().GameState.LocalChannelEndTickMs = Environment.TickCount64 + channel.Duration;
+        }
         SendPacketToClient(channel);
     }
 
@@ -3403,6 +3410,10 @@ public partial class WorldClient
         else
             channel.CasterGUID = GetSession().GameState.CurrentPlayerGuid;
         channel.TimeRemaining = packet.ReadInt32();
+        // JimsProxy (#244 emote channel guard): the server ends a channel by
+        // sending an update with no time remaining — close our window early.
+        if (channel.TimeRemaining <= 0 && channel.CasterGUID == GetSession().GameState.CurrentPlayerGuid)
+            GetSession().GameState.LocalChannelSpellId = 0;
         SendPacketToClient(channel);
     }
 

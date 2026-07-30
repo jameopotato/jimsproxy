@@ -113,3 +113,11 @@ Guard ordering in HandleCastSpell:
 - **Diagnostics:** `rtt.sample` events log each measurement. `gcd.begin` events now emit `fire_offset_ms` (adaptive) and `smoothed_rtt_ms` for post-session analysis.
 
 **Verification:** After 2+ minutes of play, `gcd.begin` events should show `fire_offset_ms > 0`. Arcane Explosion GCD intervals should decrease from ~1700ms to ~1600ms. Zero or near-zero `NOT_READY` failures expected.
+
+## 2026-07-30 — Text emotes no longer cancel channels (#244)
+
+**Issue:** /clap (any anim-bearing text emote) mid-bandage canceled the channel (#244). Vanilla's `HandleTextEmoteOpcode` (vmangos ChatHandler.cpp) interrupts channels + strips ANIM_CANCELS-flagged auras for every anim-bearing text emote; the 1.14 client happily sends the emote mid-channel and Kronos killed the bandage. Wire-proven on PTR 2026-07-30: channel death arrives one RTT (220ms) after `CMSG_SEND_TEXT_EMOTE`, vs natural 8.06s completion on the `/e` chat-emote control.
+
+**Change:** `Server/ChatHandler.HandleSendTextEmote` drops text emotes while the local channel window is open; window tracked in `GameSessionData` from `MSG_CHANNEL_START/UPDATE` (duration-bounded + 2s grace, closed early on zero-time update). Event: `emote.text.dropped_channeling`. NOTE: the emote is silently dropped, not queued — whether true 1.14 wants queue-and-release is an open question on #244 (Blizzard Classic Era test requested); extracted as a single-concern slice from the #433 batch per the new one-by-one process.
+
+**Verification:** PTR both phases wire-verified 2026-07-30 — unfixed: /clap and /dance each kill the channel in one RTT, `/e` control completes; fixed: both held (`dropped_channeling` events, ids 24/34), channel runs full 8s, post-channel /clap forwards normally with SMSG_EMOTE echo.
