@@ -684,6 +684,21 @@ public class QuestGiverCompleteQuest : ClientPacket
     public bool FromScript; // 0 - standart complete quest mode with npc, 1 - auto-complete mode
 }
 
+// JimsProxy: "Your quest log is full." error notification. Empty body on both
+// sides (vanilla SMSG_QUEST_LOG_FULL and TC master QuestLogFull, size 0);
+// without the forward, accepting a quest with a full log silently does
+// nothing on the modern client.
+class QuestLogFull : ServerPacket, ISpanWritable
+{
+    public QuestLogFull() : base(Opcode.SMSG_QUEST_LOG_FULL, ConnectionType.Instance) { }
+
+    public override void Write() { }
+
+    public int MaxSize => 0;
+
+    public int WriteToSpan(Span<byte> buffer) => 0;
+}
+
 class QuestGiverQuestFailed : ServerPacket, ISpanWritable
 {
     public QuestGiverQuestFailed() : base(Opcode.SMSG_QUEST_GIVER_QUEST_FAILED) { }
