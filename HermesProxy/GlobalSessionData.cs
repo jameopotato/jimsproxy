@@ -1679,47 +1679,6 @@ public sealed class GameSessionData
     }
 
     /// <summary>
-    /// JimsProxy (#442): drop unstarted ITEM-USE duplicates of a spell whose started entry was
-    /// just consumed by SMSG_SPELL_GO, returning them so the caller can release their button state.
-    ///
-    /// The 1.14 client double-sends a keypress, so two entries can coexist for one press (H7 — see
-    /// TryDequeuePendingNormalCast). For a SPELL that is harmless: the server bounces the duplicate
-    /// with NOT_READY/SpellInProgress and that CAST_FAILED consumes the unstarted entry via
-    /// preferStarted:false. The two halves pair by design.
-    ///
-    /// For an ITEM use the second half never arrives — the legacy server either ignores the
-    /// duplicate CMSG_USE_ITEM or acks it with a status-0 SMSG_CAST_FAILED, which HandleCastFailed
-    /// discards outright. The duplicate is therefore orphaned permanently: it is unstarted (so it
-    /// jams HasForwardedPendingCast), IsOffGcd (so ClearNonStartedNormalCasts spares it), never
-    /// peeked by SPELL_FAILURE (so no WatchdogDeadlineMs is armed), and matches the item's spell id
-    /// forever (so HasInFlightNormalCastForSpell keeps that item unusable). Observed live: a
-    /// Ragnaros raid log where the started entry's GO left an unstarted twin behind, after which
-    /// every on-GCD press was silently parked for 96 seconds until the player restarted.
-    ///
-    /// Item-use entries only (ItemGUID non-empty) — spell duplicates keep H7's pairing untouched.
-    /// </summary>
-    public List<ClientCastRequest> DropUnstartedItemUseDuplicates(uint spellId)
-    {
-        var dropped = new List<ClientCastRequest>();
-        var keep = new List<ClientCastRequest>();
-
-        lock (PendingCastsLock)
-        {
-            while (PendingNormalCasts.TryDequeue(out var current))
-            {
-                if (!current.HasStarted && !current.ItemGUID.IsEmpty() && CastMatchesSpellId(current, spellId))
-                    dropped.Add(current);
-                else
-                    keep.Add(current);
-            }
-            foreach (var item in keep)
-                PendingNormalCasts.Enqueue(item);
-        }
-
-        return dropped;
-    }
-
-    /// <summary>
     /// Match a pending cast against an incoming server spellId, accepting either
     /// the modern (client-sent) SpellId or the LegacySpellId we resolved at item-use time.
     /// Needed for SoM 1.14.1+ items where Blizzard renumbered the on-use spell id

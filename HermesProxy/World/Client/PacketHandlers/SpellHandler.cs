@@ -1993,32 +1993,6 @@ public partial class WorldClient
             GetSession().GameState.TryDequeuePendingNormalCast((uint)spell.Cast.SpellID, out var pendingCast))
         {
             spell.Cast.CastID = pendingCast!.ServerGUID;
-
-            // JimsProxy (#442): this GO consumed the STARTED entry (preferStarted:true). For an
-            // item use the client's double-send can have left an unstarted twin behind, and unlike
-            // a spell duplicate it will never be consumed — the legacy server doesn't answer the
-            // second CMSG_USE_ITEM in a form this proxy acts on (silence, or a status-0 CAST_FAILED
-            // that HandleCastFailed discards). Left in place it is unreapable: unstarted so it jams
-            // HasForwardedPendingCast (parking every on-GCD press until relog), IsOffGcd so the
-            // ClearNonStartedNormalCasts sweep spares it, never SPELL_FAILURE-peeked so no watchdog
-            // deadline is armed, and a permanent HasInFlightNormalCastForSpell match so the item
-            // itself stays unusable. Collapse it here, keyed to the GO that resolved the press it
-            // duplicated — deterministic packet pairing, no timer. Spell duplicates are untouched:
-            // their NOT_READY/SpellInProgress CAST_FAILED still consumes them (H7).
-            if (pendingCast.HasStarted && !pendingCast.ItemGUID.IsEmpty())
-            {
-                foreach (var duplicate in GetSession().GameState.DropUnstartedItemUseDuplicates(pendingCast.SpellId))
-                {
-                    GetSession().InstanceSocket.SendCastRequestFailed(duplicate, false, SpellCastResultClassic.DontReport);
-                    Log.Event("cast.item_use_duplicate_collapsed", new
-                    {
-                        spell_id = duplicate.SpellId,
-                        client_cast_id = duplicate.ClientGUID.ToString(),
-                        item_guid = duplicate.ItemGUID.ToString(),
-                    });
-                }
-            }
-
             // T1 (identity-pinned): for a STARTED cast, stamp GO with the CastID recorded at
             // SPELL_START (popped from the per-spell FIFO) instead of the dequeued entry's
             // ServerGUID, so START↔GO pair even if the dequeue resolved a different concurrent
