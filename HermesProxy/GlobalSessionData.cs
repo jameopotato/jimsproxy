@@ -2829,12 +2829,21 @@ public sealed class GameSessionData
 
     /// <summary>
     /// Try to find and dequeue a pending cast by ItemGUID (for item use failures).
-    /// Only matches casts that haven't started yet.
+    /// Only matches casts that haven't started yet. An empty GUID matches nothing —
+    /// anonymous rejections pair via <see cref="TryDequeueOldestUnstartedItemCast"/>.
     /// </summary>
     public bool TryDequeueItemCast(WowGuid128 itemGuid, out ClientCastRequest? cast)
     {
         var pending = new List<ClientCastRequest>();
         cast = null;
+
+        // JimsProxy (#442 review, Issue A): an empty failure GUID must match NOTHING. Normal
+        // CMSG_CAST_SPELL entries leave ItemGUID at default (WowGuid128 is a struct), so the
+        // == below would pair `empty == empty` with the oldest unstarted SPELL entry — a
+        // spurious visible CastFailed for a healthy cast, and the real item orphan surviving
+        // behind the handler's else-if (the #442 lockout, in exactly the raid shape).
+        if (itemGuid.IsEmpty())
+            return false;
 
         lock (PendingCastsLock)
         {

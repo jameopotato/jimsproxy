@@ -127,4 +127,39 @@ public class ItemUseInventoryRejectionTests
         Assert.False(s.TryDequeueOldestUnstartedItemCast(out var cast));
         Assert.Null(cast);
     }
+
+    [Fact]
+    public void GuidDequeue_EmptyGuid_MatchesNothing()
+    {
+        // Issue A (review): spell entries leave ItemGUID at default (struct), so without the
+        // empty-GUID guard TryDequeueItemCast(empty) would pair `empty == empty` with the
+        // unstarted Frostbolt — a spurious visible CastFailed for a healthy cast, and the real
+        // orphan surviving behind the handler's else-if.
+        var s = NewSession();
+        s.PendingNormalCasts.Enqueue(SpellCast(10181));             // forwarded Frostbolt
+        s.PendingNormalCasts.Enqueue(ItemUse(10058, itemLow: 11));  // the gem orphan
+
+        Assert.False(s.TryDequeueItemCast(WowGuid128.Empty, out var cast));
+        Assert.Null(cast);
+        Assert.Equal(2, s.PendingNormalCasts.Count);
+    }
+
+    [Fact]
+    public void RaidShape_FallbackTakesTheItem_NotTheSpell()
+    {
+        // The composed raid shape end-to-end at the state layer: guid dequeue declines the
+        // anonymous rejection, the FIFO fallback then evicts the ITEM orphan and the healthy
+        // spell entry survives untouched.
+        var s = NewSession();
+        s.PendingNormalCasts.Enqueue(SpellCast(10181));             // forwarded Frostbolt, older
+        s.PendingNormalCasts.Enqueue(ItemUse(10058, itemLow: 11));  // the gem orphan, newer
+
+        Assert.False(s.TryDequeueItemCast(WowGuid128.Empty, out _));
+        Assert.True(s.TryDequeueOldestUnstartedItemCast(out var cast));
+        Assert.Equal(10058u, cast!.SpellId);
+
+        Assert.True(s.PendingNormalCasts.TryDequeue(out var survivor));
+        Assert.Equal(10181u, survivor!.SpellId);
+        Assert.Empty(s.PendingNormalCasts);
+    }
 }
