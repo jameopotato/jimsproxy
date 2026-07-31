@@ -34,6 +34,11 @@ public partial class WorldClient
         var state = GetSession().GameState;
         if (attack.Attacker == state.CurrentPlayerGuid)
         {
+            // JimsProxy (#450): the server's own player stop arrived while our preemptive stop
+            // was still armed. This packet forwards below — consume the armed one so the drain
+            // flush can't follow it with a duplicate.
+            state.TryConsumePreemptAttackStop(attack.Attacker, attack.Victim);
+
             if (state.DeferredAttackStop)
             {
                 state.DeferredAttackStop = false;
@@ -137,6 +142,13 @@ public partial class WorldClient
         }
 
         SendPacketToClient(attack);
+
+        // JimsProxy (#450): if this hit is the local player's killing blow on the victim whose
+        // preemptive stop is armed (Kronos sends the blow AFTER PARTY_KILL_LOG), release the
+        // stop now — hit first, then stop — so the modern client folds the blow into the swing
+        // it's already playing instead of re-swinging at the corpse seconds later.
+        if (GetSession().GameState.TryConsumePreemptAttackStop(attack.AttackerGUID, attack.VictimGUID))
+            SendPreemptAttackStop(attack.VictimGUID, "asu");
 
         // JimsProxy (#320): on a real swing for the local player, record the swing time
         // and flush any deferred BASEATTACKTIME so the speed change reaches the addon at
@@ -306,27 +318,51 @@ public partial class WorldClient
         // attack state so a swing-start handshake / target-switch (owned by PR #321's
         // SMSG_ATTACK_STOP handling) is never disturbed; the real stop ~200ms later is a no-op.
         // Same shape as the movement-cancel preempt (Server/PacketHandlers/MovementHandler.cs).
+        //
+        // JimsProxy (#450): the stop is ARMED here, not emitted. Kronos sends the melee killing
+        // blow's SMSG_ATTACKER_STATE_UPDATE *after* PARTY_KILL_LOG in the same burst, and a stop
+        // emitted between the kill and that hit makes the modern client re-play the hit as a
+        // fresh swing on the corpse — floating text + swing sound seconds late, after the loot
+        // window is already open. HandleAttackerStateUpdate flushes the armed stop right after
+        // forwarding the trailing hit; the receive loop flushes at socket drain when no hit trails.
         if (state.TryClearSettledAttackTargetOnDeath(rawVictim))
         {
-            SAttackStop stop = new();
-            stop.Attacker = state.CurrentPlayerGuid;
-            stop.Victim = log.Victim;
-            stop.NowDead = true; // proven by PARTY_KILL_LOG
-            SendPacketToClient(stop);
-
-            Framework.Logging.Log.Event("combat.attack_stop_preempted", new
-            {
-                victim_low = log.Victim.GetCounter(),
-                trigger = "party_kill_log",
-            });
+            var priorArmed = state.ArmPreemptAttackStop(log.Victim);
+            if (priorArmed != default)
+                SendPreemptAttackStop(priorArmed, "rearm"); // multi-kill burst: flush the older stop before re-arming
         }
 
         // Mob just died — drop its threat list immediately so the modern
         // client's threat APIs go quiet on this unit instead of waiting for
-        // the corpse-despawn SMSG_DESTROY_OBJECT.
-        GetSession().ThreatTracker.ClearMob(log.Victim);
+        // the corpse-despawn SMSG_DESTROY_OBJECT. OnMobKilled also tombstones
+        // the guid so the trailing killing-blow ASU can't resurrect the dead
+        // mob's threat list (#450).
+        GetSession().ThreatTracker.OnMobKilled(log.Victim);
 
         // JimsProxy (observed-bow retract): the victim's death is a terminal stop edge — lower the bow of any observed shooter aimed at it (a corpse can't be shot, so this can't be contradicted).
         RetractObservedShootersOnUnitDeath(log.Victim);
+    }
+
+    // JimsProxy (#450): emit the armed preemptive player SMSG_ATTACK_STOP (see
+    // HandlePartyKillLog for why it's held). flush names the trigger that released it:
+    //   "asu"   — right after forwarding the trailing killing-blow ATTACKER_STATE_UPDATE
+    //             (the common Kronos melee-kill shape)
+    //   "drain" — legacy socket had no more buffered packets (no trailing hit, e.g. a
+    //             spell killing blow)
+    //   "rearm" — a second kill armed before the first flushed (multi-kill burst)
+    internal void SendPreemptAttackStop(WowGuid128 victim, string flush)
+    {
+        SAttackStop stop = new();
+        stop.Attacker = GetSession().GameState.CurrentPlayerGuid;
+        stop.Victim = victim;
+        stop.NowDead = true; // proven by PARTY_KILL_LOG
+        SendPacketToClient(stop);
+
+        Framework.Logging.Log.Event("combat.attack_stop_preempted", new
+        {
+            victim_low = victim.GetCounter(),
+            trigger = "party_kill_log",
+            flush,
+        });
     }
 }

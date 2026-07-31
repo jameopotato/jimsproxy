@@ -485,6 +485,7 @@ public sealed class GameSessionData
     public WowGuid64 CurrentAttackTarget;        // active CMSG_ATTACK_SWING victim, cleared on ATTACK_STOP/CANCEL_COMBAT
     public bool WaitingForAttackStart;           // true between CMSG_ATTACK_SWING and SMSG_ATTACK_START
     public bool DeferredAttackStop;              // CMSG_ATTACK_STOP received while waiting for SMSG_ATTACK_START
+    public WowGuid128 PendingPreemptAttackStopVictim; // #450: preempt stop armed by SMSG_PARTY_KILL_LOG, flushed after the trailing killing-blow ASU or at socket drain
     public uint[] CurrentArenaTeamIds = new uint[3];
     public ConcurrentQueue<ClientCastRequest> PendingNormalCasts = new();  // regular spell casts (queue for proper FIFO handling)
     public ClientCastRequest? CurrentClientNextMeleeCast; // next melee spells (Raptor Strike, Heroic Strike, etc.)
@@ -1956,6 +1957,55 @@ public sealed class GameSessionData
 
         CurrentAttackTarget = default;
         return true;
+    }
+
+    /// <summary>
+    /// JimsProxy (#450 — killing-blow ordering): arm the preemptive SMSG_ATTACK_STOP instead of
+    /// emitting it inline from the SMSG_PARTY_KILL_LOG handler. Kronos sends the melee killing
+    /// blow's SMSG_ATTACKER_STATE_UPDATE *after* PARTY_KILL_LOG in the same burst (6 of 12 kills
+    /// in the #450 capture); an inline stop lands between the kill and the hit, and the modern
+    /// client then re-plays the hit as a fresh swing on the corpse — floating text + swing sound
+    /// seconds late, after the loot window is already open. The armed stop is flushed by
+    /// WorldClient right after the trailing ASU for this victim is forwarded, or at socket drain
+    /// when no ASU trails (spell killing blows). Returns the previously armed victim so a
+    /// multi-kill burst can flush the older stop immediately — default when none was armed.
+    /// Pure data operation — no socket dependency, easy to unit-test.
+    /// </summary>
+    public WowGuid128 ArmPreemptAttackStop(WowGuid128 victim)
+    {
+        var prior = PendingPreemptAttackStopVictim;
+        PendingPreemptAttackStopVictim = victim;
+        return prior;
+    }
+
+    /// <summary>
+    /// JimsProxy (#450): pairing trigger for the armed preempt stop. Clears and returns true when
+    /// (attacker, victim) is the local player's hit on the armed victim. Two call sites: the
+    /// SMSG_ATTACKER_STATE_UPDATE handler (emit the stop right after forwarding the killing blow)
+    /// and the SMSG_ATTACK_STOP handler (the server's own player stop was just forwarded — cancel
+    /// the armed one so the drain flush can't send a duplicate). Pure data operation.
+    /// </summary>
+    public bool TryConsumePreemptAttackStop(WowGuid128 attacker, WowGuid128 victim)
+    {
+        if (PendingPreemptAttackStopVictim == default)
+            return false;
+        if (attacker != CurrentPlayerGuid || victim != PendingPreemptAttackStopVictim)
+            return false;
+
+        PendingPreemptAttackStopVictim = default;
+        return true;
+    }
+
+    /// <summary>
+    /// JimsProxy (#450): drain trigger — returns the armed victim (default if none) and clears it.
+    /// Called by WorldClient's receive loop once the legacy socket has no more buffered packets,
+    /// i.e. no killing-blow ASU trailed the kill log in this burst. Pure data operation.
+    /// </summary>
+    public WowGuid128 TakePreemptAttackStopForFlush()
+    {
+        var victim = PendingPreemptAttackStopVictim;
+        PendingPreemptAttackStopVictim = default;
+        return victim;
     }
 
     /// <summary>

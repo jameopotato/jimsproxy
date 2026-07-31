@@ -329,6 +329,36 @@ public partial class WorldClient
         }
     }
 
+    // JimsProxy (#450): a preemptive player attack stop armed by SMSG_PARTY_KILL_LOG is
+    // normally released by the trailing killing-blow ATTACKER_STATE_UPDATE in the same
+    // burst (see CombatHandler.HandlePartyKillLog). When no hit trails — spell killing
+    // blows — release it as soon as the socket has no more buffered packets: same read
+    // pass, sub-ms later than the old inline emit, and never before a hit that is
+    // already sitting in the buffer. A mid-burst TCP segment boundary can drain early;
+    // that only reproduces the old inline ordering, never anything worse.
+    private void FlushPreemptAttackStopAtDrain()
+    {
+        var state = GetSession()?.GameState;
+        if (state == null || state.PendingPreemptAttackStopVictim == default)
+            return;
+
+        bool drained;
+        try
+        {
+            drained = _clientSocket.Available == 0;
+        }
+        catch
+        {
+            drained = true; // socket torn down — flush rather than leak the armed stop
+        }
+        if (!drained)
+            return;
+
+        var victim = state.TakePreemptAttackStopForFlush();
+        if (victim != default)
+            SendPreemptAttackStop(victim, "drain");
+    }
+
     private async Task ReceiveLoop()
     {
         try
@@ -368,6 +398,7 @@ public partial class WorldClient
                 WorldPacket packet = new WorldPacket(buffer);
                 packet.SetReceiveTime(Environment.TickCount);
                 HandlePacket(packet);
+                FlushPreemptAttackStopAtDrain();
             }
         }
         catch(Exception e)

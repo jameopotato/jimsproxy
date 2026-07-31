@@ -69,6 +69,15 @@ public sealed class ThreatTracker
     // that cache in place before we'd get to compare. Pruned on destroy / reset.
     private readonly Dictionary<WowGuid128, bool> _lastInCombat = new();
 
+    // JimsProxy (#450): mobs cleared by their own SMSG_PARTY_KILL_LOG. Kronos sends the
+    // melee killing blow's ATTACKER_STATE_UPDATE *after* the kill log, so without this
+    // the trailing hit re-creates the dead mob's threat list and emits THREAT_UPDATE +
+    // HIGHEST_THREAT_UPDATE for a corpse until the death values-update clears it again
+    // ~20ms later. Armed by OnMobKilled, disarmed by the next lifecycle signal for the
+    // guid (combat-state observation, destroy, leave-combat wipe, reset) so a respawn
+    // reusing the same creature guid is never blocked.
+    private readonly HashSet<WowGuid128> _killClearedMobs = new();
+
     // Vanilla aggro hysteresis: a challenger must exceed the current tank's
     // threat by N% before aggro flips. LibThreatClassic2 picks the margin
     // per challenger class:
@@ -118,6 +127,16 @@ public sealed class ThreatTracker
         if (mob == default || threater == default || amount == 0)
             return;
 
+        // JimsProxy (#450): damage trailing the mob's own kill log (Kronos's
+        // killing-blow ASU ordering) must not resurrect the dead mob's list.
+        if (_killClearedMobs.Contains(mob))
+        {
+            // Threat emit-side diagnostics: a post-kill event tried to re-add threat on a corpse.
+            if (Settings.DebugOutput)
+                Log.Event("threat.dead_mob_add_ignored", new { mob_low = mob.GetCounter(), amount });
+            return;
+        }
+
         if (!_threatLists.TryGetValue(mob, out var list))
         {
             list = new Dictionary<WowGuid128, double>();
@@ -140,6 +159,7 @@ public sealed class ThreatTracker
     {
         if (mob == default || threater == default)
             return;
+        if (_killClearedMobs.Contains(mob)) return; // #450: no threat on a kill-cleared corpse
 
         if (!_threatLists.TryGetValue(mob, out var list))
         {
@@ -208,6 +228,7 @@ public sealed class ThreatTracker
     public void SetToTop(WowGuid128 mob, WowGuid128 threater)
     {
         if (mob == default || threater == default) return;
+        if (_killClearedMobs.Contains(mob)) return; // #450: no threat on a kill-cleared corpse
         if (!_threatLists.TryGetValue(mob, out var list))
         {
             list = new Dictionary<WowGuid128, double>();
@@ -250,6 +271,22 @@ public sealed class ThreatTracker
             _dirty.Add(mob);
         }
     }
+
+    // JimsProxy (#450): kill-log clear — ClearMob plus a tombstone so combat events
+    // trailing the kill in the same burst (Kronos's killing-blow ASU) can't re-create
+    // the dead mob's threat list. Only the SMSG_PARTY_KILL_LOG path uses this: evade /
+    // despawn / combat-drop clears must stay plain ClearMob, because those mobs can
+    // legitimately re-enter combat immediately.
+    public void OnMobKilled(WowGuid128 mob)
+    {
+        if (mob == default) return;
+        _killClearedMobs.Add(mob);
+        ClearMob(mob);
+    }
+
+    // Test seams for the #450 tombstone (InternalsVisibleTo: HermesProxy.Tests).
+    internal bool IsMobKillTombstoned(WowGuid128 mob) => _killClearedMobs.Contains(mob);
+    internal bool HasThreatList(WowGuid128 mob) => _threatLists.ContainsKey(mob);
 
     // Mob died, ran far away, evaded, etc. Remove its threat list entirely
     // and emit SMSG_THREAT_CLEAR so the modern client knows to drop it from
@@ -503,6 +540,7 @@ public sealed class ThreatTracker
         _lastUnexpectedAggro.Clear();
         _dirty.Clear();
         _lastInCombat.Clear();
+        _killClearedMobs.Clear();
     }
 
     // KTM (KLHThreatMeter) interop: the local player's current-target threat,
@@ -570,6 +608,8 @@ public sealed class ThreatTracker
     // own subsequent damage events will re-populate the relevant mob's list.
     public void OnLocalPlayerLeftCombat()
     {
+        _killClearedMobs.Clear(); // #450: our fight is over — every kill tombstone is done
+
         if (_threatLists.Count == 0) return;
 
         var mobsToClear = new List<WowGuid128>(_threatLists.Keys);
@@ -597,8 +637,15 @@ public sealed class ThreatTracker
     // field cache in place, so the pre-update value can't be read back.
     public void OnUnitCombatStateObserved(WowGuid128 guid, bool inCombat)
     {
-        if (ThreatDisabled) return;
         if (guid == default) return;
+
+        // JimsProxy (#450): any combat-state observation for the guid ends its kill
+        // tombstone — the death values-update (flag drop) is the natural expiry, a
+        // respawned mob re-engaging (flag set) the safety net. Before the ThreatDisabled
+        // gate on purpose: this is state hygiene, not threat computation.
+        _killClearedMobs.Remove(guid);
+
+        if (ThreatDisabled) return;
 
         _lastInCombat.TryGetValue(guid, out bool wasInCombat);
         _lastInCombat[guid] = inCombat;
@@ -667,6 +714,7 @@ public sealed class ThreatTracker
         // Drop the combat-state snapshot for this guid so it can't go stale and
         // so the dictionary stays bounded to currently-visible units.
         _lastInCombat.Remove(guid);
+        _killClearedMobs.Remove(guid); // #450: corpse despawned — tombstone done
 
         // Case 1: this guid was a mob in our tracked set.
         if (_threatLists.ContainsKey(guid))
