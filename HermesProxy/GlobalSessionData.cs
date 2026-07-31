@@ -136,6 +136,26 @@ public sealed class GameSessionData
     // a stop SMSG_EMOTE on the first movement-start packet.
     public uint LastLoopingEmoteId; // 0 means no active loop
     public long LastLoopingEmoteTickMs;
+    // JimsProxy (#244 emote channel guard): the local player's active channel
+    // window, tracked from MSG_CHANNEL_START / MSG_CHANNEL_UPDATE (vanilla
+    // sends both only to the caster). Text-emote forwards are dropped while it
+    // is open — vanilla's HandleTextEmoteOpcode interrupts channels and strips
+    // auras flagged ANIM_CANCELS for every anim-bearing text emote (vmangos
+    // ChatHandler.cpp), which is how /clap killed bandages. End-time bounded by
+    // the start's own duration so a missed 0-update can never wedge the guard
+    // permanently.
+    public uint LocalChannelSpellId; // 0 means not channeling
+    public long LocalChannelEndTickMs;
+
+    /// <summary>True while the local player's channel window (tracked from
+    /// MSG_CHANNEL_START/UPDATE) is open, with a small grace margin. Used to
+    /// drop c2s text-emote forwards — mangos-family emote handlers interrupt
+    /// channels and strip auras flagged ANIM_CANCELS (#244).</summary>
+    public bool IsLocalChannelWindowOpen()
+    {
+        return LocalChannelSpellId != 0 &&
+               Environment.TickCount64 < LocalChannelEndTickMs + 2000;
+    }
     public string? TaxiAttemptId;
     public bool IsWaitingForNewWorld;
     public bool IsWaitingForWorldPortAck;

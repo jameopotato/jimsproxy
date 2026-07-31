@@ -50,6 +50,7 @@ public static partial class GameData
     public static FrozenDictionary<uint, uint> Gems = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, CreatureDisplayInfo> CreatureDisplayInfos = FrozenDictionary<uint, CreatureDisplayInfo>.Empty;
     public static FrozenDictionary<uint, CreatureModelCollisionHeight> CreatureModelCollisionHeights = FrozenDictionary<uint, CreatureModelCollisionHeight>.Empty;
+    public static FrozenDictionary<uint, float> HotfixCreatureDisplayScales = FrozenDictionary<uint, float>.Empty;
     public static FrozenDictionary<int, CreatureFamilyData> CreatureFamilies = FrozenDictionary<int, CreatureFamilyData>.Empty;
     public static FrozenDictionary<uint, float> VanillaCreatureModelScales = FrozenDictionary<uint, float>.Empty;
     public static FrozenDictionary<uint, uint[]> TalentRankPredecessors = FrozenDictionary<uint, uint[]>.Empty;
@@ -727,6 +728,18 @@ public static partial class GameData
         if (CreatureDisplayInfos.TryGetValue(displayId, out var info))
             return info;
         return new CreatureDisplayInfo(0, 1.0f);
+    }
+
+    // JimsProxy (collision-visual-parity #359): the CMS the modern client actually renders
+    // with — the hotfix override when we push one (CSV/Hotfix/CreatureDisplayInfo*.csv,
+    // e.g. tauren 59/60 carry the K=0.75 render correction), else the stock DB2 value.
+    // Proxy math that must agree with the on-screen model (synthesized collision height)
+    // reads this, never the stock table alone.
+    public static float GetClientEffectiveDisplayScale(uint displayId)
+    {
+        if (HotfixCreatureDisplayScales.TryGetValue(displayId, out var hotfixScale))
+            return hotfixScale;
+        return GetDisplayInfo(displayId).DisplayScale;
     }
 
     public static CreatureModelCollisionHeight GetModelData(uint modelId)
@@ -1481,7 +1494,11 @@ public static partial class GameData
 
     public static void LoadCreatureModelCollisionHeights()
     {
-        var path = Path.Combine("CSV", $"CreatureModelCollisionHeightsModern{LegacyVersion.ExpansionVersion}.csv");
+        LoadCreatureModelCollisionHeights(Path.Combine("CSV", $"CreatureModelCollisionHeightsModern{LegacyVersion.ExpansionVersion}.csv"));
+    }
+
+    public static void LoadCreatureModelCollisionHeights(string path)
+    {
         using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
         var dict = new Dictionary<uint, CreatureModelCollisionHeight>(EstimateRowCount<CreatureModelCollisionHeight>(path));
 
@@ -5060,8 +5077,17 @@ public static partial class GameData
 
     public static void LoadCreatureDisplayInfoHotfixes()
     {
-        var path = Path.Combine("CSV", "Hotfix", $"CreatureDisplayInfo{ModernVersion.ExpansionVersion}.csv");
+        LoadCreatureDisplayInfoHotfixes(Path.Combine("CSV", "Hotfix", $"CreatureDisplayInfo{ModernVersion.ExpansionVersion}.csv"));
+    }
+
+    public static void LoadCreatureDisplayInfoHotfixes(string path)
+    {
         using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+        // JimsProxy (collision-visual-parity #359): retain the hotfixed CMS values in parsed
+        // form. The client renders with these (the hotfix overrides its DB2), so any proxy
+        // math that must agree with what is on screen — the synthesized player collision
+        // height — has to read the same values, not the stock CreatureDisplayInfo.csv ones.
+        var displayScales = new Dictionary<uint, float>();
         uint counter = 0;
         foreach (var row in reader)
         {
@@ -5094,6 +5120,8 @@ public static partial class GameData
             int textureVariationFileDataId1 = row[24].Parse<int>();
             int textureVariationFileDataId2 = row[25].Parse<int>();
             int textureVariationFileDataId3 = row[26].Parse<int>();
+
+            displayScales[id] = creatureModelScale;
 
             HotfixRecord record = new HotfixRecord();
             record.TableHash = DB2Hash.CreatureDisplayInfo;
@@ -5130,6 +5158,8 @@ public static partial class GameData
             record.HotfixContent.WriteInt32(textureVariationFileDataId3);
             Hotfixes.Add(record.HotfixId, record);
         }
+
+        HotfixCreatureDisplayScales = displayScales.ToFrozenDictionary();
     }
     public static void LoadCreatureDisplayInfoExtraHotfixes()
     {
