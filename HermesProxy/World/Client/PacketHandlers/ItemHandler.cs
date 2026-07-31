@@ -284,6 +284,11 @@ public partial class WorldClient
         failure.Item[1] = packet.ReadGuid().To128(GetSession().GameState);
         failure.ContainerBSlot = packet.ReadUInt8();
 
+        // JimsProxy (#442): the fallback pairing below must see whether the WIRE carried an empty
+        // GUID — the move-backfill next rewrites failure.Item[0], and gating on the rewritten
+        // value would silently disable the fallback for 2 s after every forwarded bag move.
+        bool wireItem0Empty = failure.Item[0].IsEmpty();
+
         // JimsProxy: Kronos sends invalid-slot rejections (e.g. the modern client's phantom
         // keyring slots 13-32 that the server lacks) with empty item GUIDs, so the client
         // can't unlock the item the player picked up and it stays stuck until relog. Backfill
@@ -319,7 +324,8 @@ public partial class WorldClient
         // HasInFlightNormalCastForSpell. Pair the anonymous rejection with the oldest unresolved
         // item-use entry instead and release its button silently. See
         // TryDequeueOldestUnstartedItemCast for the FIFO rationale and the two-items edge.
-        else if (failure.Item[0].IsEmpty() &&
+        // Gated on the pre-backfill wire GUID (wireItem0Empty), NOT failure.Item[0] — see above.
+        else if (wireItem0Empty &&
                  GetSession().GameState.TryDequeueOldestUnstartedItemCast(out var orphanedItemCast))
         {
             GetSession().InstanceSocket.SendCastRequestFailed(orphanedItemCast!, false, SpellCastResultClassic.DontReport);
