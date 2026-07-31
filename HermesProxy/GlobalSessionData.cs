@@ -136,6 +136,26 @@ public sealed class GameSessionData
     // a stop SMSG_EMOTE on the first movement-start packet.
     public uint LastLoopingEmoteId; // 0 means no active loop
     public long LastLoopingEmoteTickMs;
+    // JimsProxy (#244 emote channel guard): the local player's active channel
+    // window, tracked from MSG_CHANNEL_START / MSG_CHANNEL_UPDATE (vanilla
+    // sends both only to the caster). Text-emote forwards are dropped while it
+    // is open — vanilla's HandleTextEmoteOpcode interrupts channels and strips
+    // auras flagged ANIM_CANCELS for every anim-bearing text emote (vmangos
+    // ChatHandler.cpp), which is how /clap killed bandages. End-time bounded by
+    // the start's own duration so a missed 0-update can never wedge the guard
+    // permanently.
+    public uint LocalChannelSpellId; // 0 means not channeling
+    public long LocalChannelEndTickMs;
+
+    /// <summary>True while the local player's channel window (tracked from
+    /// MSG_CHANNEL_START/UPDATE) is open, with a small grace margin. Used to
+    /// drop c2s text-emote forwards — mangos-family emote handlers interrupt
+    /// channels and strip auras flagged ANIM_CANCELS (#244).</summary>
+    public bool IsLocalChannelWindowOpen()
+    {
+        return LocalChannelSpellId != 0 &&
+               Environment.TickCount64 < LocalChannelEndTickMs + 2000;
+    }
     public string? TaxiAttemptId;
     public bool IsWaitingForNewWorld;
     public bool IsWaitingForWorldPortAck;
@@ -885,6 +905,32 @@ public sealed class GameSessionData
     // JimsProxy (Kronos Chronoboon): item GUIDs presented as aliased Chronoboons this session, so
     // HandleShowBank can repaint their cooldown without scanning the global (all-players) alias map. WC only.
     public HashSet<WowGuid128> ChronoboonItemGuids = new();
+
+    // JimsProxy (Kronos Chronoboon): boon GUIDs whose login-time tooltip refresh already ran this login,
+    // so re-creates of the same item (same real entry) can't re-trigger an infinite refresh loop. WC only.
+    public HashSet<WowGuid128> ChronoboonLoginRefreshFired = new();
+
+    // JimsProxy (Kronos Chronoboon): the per-player boon template Kronos PUSHES unsolicited during login
+    // (a solicited entry query answers with the BASE template — 2026-07-30 log — so this push is the only
+    // correct login-time source). Latest push wins; per-login. WC only.
+    // Known edge (latest-wins): a solicited BASE-template reply landing while ChronoboonLoginBoonGuids
+    // are parked would re-mint from the base (empty tooltip). Nothing solicits the real entry in the
+    // normal login flow (the client only ever sees alias ids) and a wrong mint self-heals on the next
+    // use/relog — accepted.
+    public ItemTemplate? ChronoboonLoginPushTemplate = null;
+
+    // JimsProxy (Kronos Chronoboon): boon GUIDs created before the login push arrived, awaiting refresh
+    // when it does (ordering fallback — observed order is push first, creates after). WC only.
+    public HashSet<WowGuid128> ChronoboonLoginBoonGuids = new();
+
+    // JimsProxy (Kronos Chronoboon): SEND_KNOWN_SPELLS item cooldowns keyed by ITEM entry — store and
+    // restore are different spells, so a spell-keyed lookup misses when the boon's current on-use isn't
+    // the spell that's cooling down. WC only.
+    public Dictionary<uint, (uint SpellId, long EndMs)> LoginItemCooldownByItemEntry = new();
+
+    // JimsProxy (Kronos Chronoboon): boon GUID whose remaining-cooldown repaint must go out AFTER the
+    // current update packet (carrying its aliased create) is forwarded. WC only.
+    public WowGuid128? ChronoboonRepaintPendingGuid = null;
 
     // Mobs we've seen send Flying spline or FixedZ movement flags. Vanilla servers
     // don't populate UNIT_FIELD_HOVERHEIGHT consistently (Twinstar e.g. leaves it at 0),

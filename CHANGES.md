@@ -113,3 +113,41 @@ Guard ordering in HandleCastSpell:
 - **Diagnostics:** `rtt.sample` events log each measurement. `gcd.begin` events now emit `fire_offset_ms` (adaptive) and `smoothed_rtt_ms` for post-session analysis.
 
 **Verification:** After 2+ minutes of play, `gcd.begin` events should show `fire_offset_ms > 0`. Arcane Explosion GCD intervals should decrease from ~1700ms to ~1600ms. Zero or near-zero `NOT_READY` failures expected.
+
+## 2026-07-30 — Text emotes no longer cancel channels (#244)
+
+**Issue:** /clap (any anim-bearing text emote) mid-bandage canceled the channel (#244). Vanilla's `HandleTextEmoteOpcode` (vmangos ChatHandler.cpp) interrupts channels + strips ANIM_CANCELS-flagged auras for every anim-bearing text emote; the 1.14 client happily sends the emote mid-channel and Kronos killed the bandage. Wire-proven on PTR 2026-07-30: channel death arrives one RTT (220ms) after `CMSG_SEND_TEXT_EMOTE`, vs natural 8.06s completion on the `/e` chat-emote control.
+
+**Change:** `Server/ChatHandler.HandleSendTextEmote` drops text emotes while the local channel window is open; window tracked in `GameSessionData` from `MSG_CHANNEL_START/UPDATE` (duration-bounded + 2s grace, closed early on zero-time update). Event: `emote.text.dropped_channeling`. NOTE: the emote is silently dropped, not queued — whether true 1.14 wants queue-and-release is an open question on #244 (Blizzard Classic Era test requested); extracted as a single-concern slice from the #433 batch per the new one-by-one process.
+
+**Verification:** PTR both phases wire-verified 2026-07-30 — unfixed: /clap and /dance each kill the channel in one RTT, `/e` control completes; fixed: both held (`dropped_channeling` events, ids 24/34), channel runs full 8s, post-channel /clap forwards normally with SMSG_EMOTE echo.
+
+## 2026-07-30 — Player collision height matches the rendered model (#359)
+
+**Issue:** Female tauren stuck in doorways they visibly cleared (Tarren Mill, #359) — fit at fresh login, permanently stuck after any shapeshift/unshift, mount/dismount, or cross-map teleport; relog cured it. Wire evidence (`.pkt` decode, 2026-07-29/30 PTR sessions): the proxy's synthesized `SMSG_MOVE_SET_COLLISION_HEIGHT` sent 3.29861 for ♀ tauren while the client rendered her at 2.47396-equivalent scale — the May 2026 tauren render fix (52ab6f88, CMS hotfix K=0.75) changed what the client renders but the collision math kept reading stock CMS, a 4/3 inflation. Fresh login only "worked" because a cache-ordering accident meant creates never emitted the packet at all (two competing height sources). The doorway was measured to sit in (3.012, 3.299): a visibly *taller* dire bear at a truthful 3.000 fit while the ♀ humanoid at an inflated 3.299 did not. Same inflation existed for ♂ tauren (3.012, sub-threshold on this door). The upstream `Math.Max` hitbox floor (_BLU 2023) also inflated CMS<1 forms (travel/NE cat/NE moonkin) above their visible size.
+
+**Change:** collision ≡ visible model, one formula, every state (`HermesProxy/World/Client/PacketHandlers/UpdateHandler.cs`):
+- `ComputeVisualCollisionHeight` (new, pure static): `CollisionHeight × ModelScale × CMS_effective × wire scale` — exactly the render pipeline established by 52ab6f88's DB2 parse. Drops the upstream Max() floor and the displayId-keyed `GetModelData` lookup.
+- `GameData.GetClientEffectiveDisplayScale` + parsed `HotfixCreatureDisplayScales` (`GameData.cs`): the CMS the client actually renders with — hotfix override when pushed, else stock; auto-gated by which hotfix file the client build loads.
+- Create-path cache publish reordered (`ReadValuesUpdateBlockOnCreate`): field cache now written before the store hook, matching values-path semantics, so login/teleport creates emit the same collision packet as every later update — one height source in all states. Side effect: the `unit.mount.changed`/`unit.dynamic_flags.changed`/`unit.npc_flags.changed` DebugOutput diagnostics stop firing their create-noise (0→X on create); note their genuine-transition logging was already dead (values path mutates the cache in place before the comparison) — pre-existing, not addressed here.
+- New DebugOutput diagnostic `unit.collision_height.sent` (guid, display, mount, raw scale, height, reason).
+
+Value deltas (vanilla): ♀ tauren humanoid 3.29861→2.47396, ♂ 3.01219→2.25914, travel 1.66667→1.33333, NE cat 1.875→1.6875, NE moonkin 2.125→1.9125, scale-buffed players now uniform; bear/dire bear/tauren cat/aquatic/ghost wolf/gnomes/all CMS=1 races byte-identical.
+
+**Verification:** truth-table unit tests (`CollisionHeightTests`, 12 cases incl. field-observed corpus values) — red-run against the extracted upstream formula reproduced the wire values exactly (3.29861/1.66667/1.875) proving faithful extraction, green with the parity formula; full suite 771/771. Field: PTR ♀+♂ tauren at the Tarren Mill door — login/shift/unshift/mount/teleport must all produce identical packets (2.47396 ♀) and identical door behavior; forms and a non-tauren control unchanged on the wire.
+
+## 2026-07-30 — Forward the "quest log is full" error (SMSG_QUEST_LOG_FULL)
+
+**Issue:** Accepting a quest with a full log silently did nothing — vanilla answers with SMSG_QUEST_LOG_FULL (0x195, empty body) and the proxy dropped it (11 corpus sessions in DROPPED-S2C-AUDIT.md, #433; also personally observed — the error simply never appears through the proxy).
+
+**Change:** Forward as modern `QuestLogFull` (0x2A87, empty body, TC-master-sourced) — `QuestPackets.cs` class + `QuestHandler.HandleQuestLogFull`. First s2c translation extracted from the #433 batch under the one-fix-one-PR process.
+
+**Verification:** empty-body layout test; field gate (audit question U4): fill the quest log on PTR, accept one more — the red "Your quest log is full." error must appear. If the 1.14 client turns out to only render this via SMSG_DISPLAY_GAME_ERROR, this slice gets reworked before merge rather than shipping a silent no-op.
+
+## 2026-07-30 — Chronoboon tooltip refreshes at every login from the server's own template push (#446, Mirasu)
+
+**Issue:** The boon's server-rewritten tooltip (the stored world-buff list) went stale on the 1.14 client whenever the state changed where the proxy couldn't see it (e.g. store/restore in a native 1.12 session, then a proxied login) — the client caches item templates per id and never re-queries, worst case a supercharged boon rendering the default empty tooltip until the next proxied use.
+
+**Change:** Kronos-gated, keyed on the boon entry (`GameData.KronosChronoboonEntry` 25007). Kronos PUSHES the per-player rebuilt boon template unsolicited during login (a solicited entry query answers with the BASE template — 2026-07-30 log — so the push is the only correct login-time source); `HandleItemQueryResponse` remembers it, and `StoreObjectUpdateInternal` mints a fresh alias from it before the entry substitution on the boon's create — the natural create carries the never-seen alias id, no destroy+recreate in the normal path. Unchanged relogs skip the re-mint (Name/Description compare). Ordering fallback parks the GUID until the push lands (then mint + destroy/recreate, the validated use-path flow). Cooldown correctness: `SMSG_SEND_KNOWN_SPELLS` item cooldowns now also captured keyed by item entry (store and restore are different spells), and the true remaining sweep is repainted after the aliased create forwards. Events: `item.chronoboon.login_refresh_at_create` / `_waiting_push` / `_after_push` / `login_cooldown_repaint`.
+
+**Verification:** Kronos PTR 2026-07-30 — native-1.12-stored buffs show correctly at 1.14 login first try; a pre-fix stale alias was detected and self-healed; restore and re-store through the proxy each re-minted from the post-use push; bag clink intact; no parse failures in session JSONL.

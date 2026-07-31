@@ -736,6 +736,12 @@ public partial class WorldClient
         if (item.Name[0]?.Contains("Chronoboon Displacer") == true)
         {
             item.ItemGroupSoundsId = 24;
+
+            // JimsProxy (Kronos Chronoboon): remember the latest boon template seen this login. Kronos
+            // pushes the per-player rebuilt template UNSOLICITED during login processing — the only
+            // login-time source with the current stored-buff state (a solicited entry query returns the
+            // base template). StoreObjectUpdateInternal mints the login alias from this.
+            GetSession().GameState.ChronoboonLoginPushTemplate = item;
         }
 
         // JimsProxy (Kronos Chronoboon): this answers the proxy-issued re-query fired from
@@ -800,8 +806,86 @@ public partial class WorldClient
             return;
         }
 
+        // JimsProxy (Kronos Chronoboon): the login push arrived AFTER the boon's item create (ordering
+        // fallback — observed order is push first). Refresh the parked GUIDs now via the validated
+        // use-path flow: mint from this template, destroy+recreate, repaint the remaining sweep.
+        if (item.Name[0]?.Contains("Chronoboon Displacer") == true &&
+            GetSession().GameState.ChronoboonLoginBoonGuids.Count != 0)
+        {
+            foreach (var boonGuid in GetSession().GameState.ChronoboonLoginBoonGuids)
+            {
+                if (!GetSession().GameState.ChronoboonLoginRefreshFired.Add(boonGuid))
+                    continue;
+                bool reminted = ChronoboonAliasNeedsRefresh(boonGuid, item);
+                if (reminted)
+                {
+                    MintChronoboonAlias(boonGuid, item);
+                    RecreateItemObjectForClient(boonGuid);
+                    SendChronoboonRemainingCooldown(boonGuid);
+                }
+                Log.Event("item.chronoboon.login_refresh_after_push", new
+                {
+                    guid = boonGuid.ToString(),
+                    name = item.Name[0],
+                    reminted = reminted,
+                });
+            }
+            GetSession().GameState.ChronoboonLoginBoonGuids.Clear();
+        }
+
         SendItemUpdatesIfNeeded(item);
         GameData.StoreItemTemplate((uint)entry.Key, item);
+    }
+
+    // JimsProxy (Kronos Chronoboon): true when no alias is presented for this GUID yet, or the presented
+    // alias's template no longer matches the server's current Name/Description (the dynamic tooltip bits).
+    private bool ChronoboonAliasNeedsRefresh(WowGuid128 guid, ItemTemplate current)
+    {
+        if (!GameData.ItemEntryAlias.TryGetValue(guid, out var aliasEntry))
+            return true;
+        var aliasTemplate = GameData.GetItemTemplate(aliasEntry);
+        return aliasTemplate == null ||
+               aliasTemplate.Name[0] != current.Name[0] ||
+               aliasTemplate.Description != current.Description;
+    }
+
+    // JimsProxy (Kronos Chronoboon): repaint the on-use sweep with the TRUE remaining captured at login —
+    // a full re-assert would restart the 40min sweep on every relog. Prefer the item-entry-keyed capture
+    // (store/restore are different spells, so the current template's on-use may not be the spell cooling
+    // down); no SpellCooldownPkt — the client already holds the spell cooldown from SEND_KNOWN_SPELLS.
+    private void SendChronoboonRemainingCooldown(WowGuid128 guid)
+    {
+        uint spellId = 0;
+        long endMs = 0;
+        if (GetSession().GameState.LoginItemCooldownByItemEntry.TryGetValue(GameData.KronosChronoboonEntry, out var byItem))
+        {
+            spellId = byItem.SpellId;
+            endMs = byItem.EndMs;
+        }
+        else if (GameData.ItemEntryAlias.TryGetValue(guid, out var aliasEntry) &&
+                 GameData.GetItemTemplate(aliasEntry) is { } aliasTemplate &&
+                 aliasTemplate.TriggeredSpellIds[0] > 0 &&
+                 GetSession().GameState.ChronoboonOnUseCooldownEndMs.TryGetValue((uint)aliasTemplate.TriggeredSpellIds[0], out var endBySpell))
+        {
+            spellId = (uint)aliasTemplate.TriggeredSpellIds[0];
+            endMs = endBySpell;
+        }
+
+        long remaining = endMs - Environment.TickCount64;
+        if (spellId == 0 || remaining <= 0)
+            return;
+
+        ItemCooldown itemCooldownPkt = new();
+        itemCooldownPkt.ItemGuid = guid;
+        itemCooldownPkt.SpellID = spellId;
+        itemCooldownPkt.Cooldown = (uint)remaining;
+        SendPacketToClient(itemCooldownPkt);
+        Log.Event("item.chronoboon.login_cooldown_repaint", new
+        {
+            guid = guid.ToString(),
+            spell_id = spellId,
+            remaining_ms = remaining,
+        });
     }
 
     void SendItemUpdatesIfNeeded(ItemTemplate item)

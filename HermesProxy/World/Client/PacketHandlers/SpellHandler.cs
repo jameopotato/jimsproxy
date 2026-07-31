@@ -109,7 +109,13 @@ public partial class WorldClient
                 // a banked boon's sweep — the client gets the spell cooldown now but won't bind it to a bank
                 // item that only becomes visible when the bank opens. Keyed by on-use spell; endTick = now+left.
                 if (history.ItemID != 0 && history.RecoveryTime > 0)
+                {
                     GetSession().GameState.ChronoboonOnUseCooldownEndMs[history.SpellID] = Environment.TickCount64 + history.RecoveryTime;
+                    // JimsProxy (Kronos Chronoboon): also keyed by item entry — the boon's store and restore are
+                    // DIFFERENT spells, so a lookup via the current template's on-use spell misses the cooldown
+                    // left by the other state's use. Item-entry key finds it regardless.
+                    GetSession().GameState.LoginItemCooldownByItemEntry[history.ItemID] = (history.SpellID, Environment.TickCount64 + history.RecoveryTime);
+                }
             }
             SendPacketToClient(histories, Opcode.SMSG_SEND_UNLEARN_SPELLS);
         }
@@ -3404,6 +3410,13 @@ public partial class WorldClient
         channel.SpellID = packet.ReadUInt32();
         channel.SpellXSpellVisualID = GameData.GetSpellVisual(channel.SpellID);
         channel.Duration = packet.ReadUInt32();
+        // JimsProxy (#244 emote channel guard): record our own channel window
+        // so text-emote forwards hold off while it is open.
+        if (channel.CasterGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            GetSession().GameState.LocalChannelSpellId = channel.Duration > 0 ? channel.SpellID : 0;
+            GetSession().GameState.LocalChannelEndTickMs = Environment.TickCount64 + channel.Duration;
+        }
         SendPacketToClient(channel);
     }
 
@@ -3416,6 +3429,10 @@ public partial class WorldClient
         else
             channel.CasterGUID = GetSession().GameState.CurrentPlayerGuid;
         channel.TimeRemaining = packet.ReadInt32();
+        // JimsProxy (#244 emote channel guard): the server ends a channel by
+        // sending an update with no time remaining — close our window early.
+        if (channel.TimeRemaining <= 0 && channel.CasterGUID == GetSession().GameState.CurrentPlayerGuid)
+            GetSession().GameState.LocalChannelSpellId = 0;
         SendPacketToClient(channel);
     }
 
