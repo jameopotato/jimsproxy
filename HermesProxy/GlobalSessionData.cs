@@ -159,6 +159,20 @@ public sealed class GameSessionData
     public string? TaxiAttemptId;
     public bool IsWaitingForNewWorld;
     public bool IsWaitingForWorldPortAck;
+    // JimsProxy (worldentry stage-0 tripwire 2026-08-02): telemetry anchors for the
+    // world-transfer loading-screen window (SMSG_TRANSFER_PENDING → SMSG_NEW_WORLD →
+    // CMSG_WORLD_PORT_RESPONSE). Everything forwarded to the modern client inside
+    // this window is suspected of being silently discarded for movers the client has
+    // not created yet (documented precedent: the stuck-logout-stun create-baked root,
+    // UpdateHandler.cs). The tripwire in WorldSocket.SendPacket records the window's
+    // contents; these anchors give every line a phase-relative timestamp and a
+    // per-transfer correlation id. Anchors are maintained unconditionally (two long
+    // writes per transfer); all Log.Event emission is DebugOutput-gated. See
+    // WORLD-ENTRY-CONTRACT-INVESTIGATION.md.
+    public int WorldEntryWindowSeq;            // increments at each SMSG_TRANSFER_PENDING
+    public long WorldEntryTransferPendingTick; // TickCount64 at transfer-pending; 0 = no window open
+    public long WorldEntryNewWorldTick;        // TickCount64 at NEW_WORLD forward; 0 = not reached
+    public int WorldEntryWindowForwardCount;   // packets sent to the modern client in-window (DebugOutput only)
     // JimsProxy (zep-stuck-no-move 2026-05-14): set to a sentinel MoveCounter when
     // HandleNewWorld emits a synthesized SMSG_MOVE_TELEPORT to clear the modern
     // client's stale MOVEMENTFLAG_ONTRANSPORT after a cross-continent transport

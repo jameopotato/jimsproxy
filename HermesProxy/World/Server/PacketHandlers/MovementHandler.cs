@@ -190,6 +190,33 @@ public partial class WorldSocket
     void HandleWorldPortResponse(WorldPortResponse teleport)
     {
         GetSession().GameState.IsWaitingForWorldPortAck = false;
+
+        // JimsProxy (worldentry stage-0 tripwire): this ack is the client saying it
+        // finished loading — close the window telemetry. duration_ms (NEW_WORLD →
+        // ack) is the machine-dependent variable the investigation is after.
+        var gameState = GetSession().GameState;
+        if (gameState.WorldEntryNewWorldTick != 0)
+        {
+            if (Framework.Settings.DebugOutput)
+            {
+                int forwarded = gameState.WorldEntryWindowForwardCount;
+                Framework.Logging.Log.Event("worldentry.window.closed", new
+                {
+                    seq = gameState.WorldEntryWindowSeq,
+                    duration_ms = Environment.TickCount64 - gameState.WorldEntryNewWorldTick,
+                    total_ms = gameState.WorldEntryTransferPendingTick != 0
+                        ? Environment.TickCount64 - gameState.WorldEntryTransferPendingTick
+                        : -1,
+                    forwarded_in_window = forwarded,
+                    forward_lines_suppressed = forwarded > WorldEntryForwardLineCap
+                        ? forwarded - WorldEntryForwardLineCap
+                        : 0,
+                });
+            }
+            gameState.WorldEntryNewWorldTick = 0;
+            gameState.WorldEntryTransferPendingTick = 0;
+        }
+
         // JimsProxy (speed-stuck-after-bg-end-while-mounted): arm post-teleport reassert; see memory.
         GetSession().GameState.PendingPostTeleportRunSpeedReassert = true;
         WorldPacket packet = new WorldPacket(Opcode.MSG_MOVE_WORLDPORT_ACK);
@@ -312,6 +339,11 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_SET_ACTIVE_MOVER)]
     void HandleMoveSetActiveMover(SetActiveMover move)
     {
+        LogWorldEntryClientSignal("set_active_mover", new
+        {
+            mover_low = move.MoverGUID.GetCounter(),
+            is_self = move.MoverGUID == GetSession().GameState.CurrentPlayerGuid,
+        });
         WorldPacket packet = new WorldPacket(Opcode.CMSG_SET_ACTIVE_MOVER);
         packet.WriteGuid(move.MoverGUID.To64());
         SendPacketToServer(packet);
@@ -320,6 +352,7 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MOVE_INIT_ACTIVE_MOVER_COMPLETE)]
     void HandleMoveInitActiveMoverComplete(InitActiveMoverComplete move)
     {
+        LogWorldEntryClientSignal("init_active_mover_complete");
         WorldPacket packet = new WorldPacket(Opcode.CMSG_SET_ACTIVE_MOVER);
         packet.WriteGuid(GetSession().GameState.CurrentPlayerGuid.To64());
         SendPacketToServer(packet);

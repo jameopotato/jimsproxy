@@ -100,6 +100,12 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_LOADING_SCREEN_NOTIFY)]
     void HandleLoadScreen(LoadingScreenNotify loadingScreenNotify)
     {
+        LogWorldEntryClientSignal("loading_screen_notify", new
+        {
+            showing = loadingScreenNotify.Showing,
+            map_id = loadingScreenNotify.MapID,
+        });
+
         if (loadingScreenNotify.MapID >= 0)
             GetSession().GameState.CurrentMapId = loadingScreenNotify.MapID;
 

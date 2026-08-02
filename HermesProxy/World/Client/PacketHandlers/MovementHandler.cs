@@ -442,6 +442,24 @@ public partial class WorldClient
         transfer.OldMapPosition = Vector3.Zero;
         SendPacketToClient(transfer);
         GetSession().GameState.IsFirstEnterWorld = false;
+
+        // JimsProxy (worldentry stage-0 tripwire): open the window telemetry BEFORE
+        // raising the flag so every in-window forward line has a non-zero anchor.
+        var gameState = GetSession().GameState;
+        gameState.WorldEntryWindowSeq++;
+        gameState.WorldEntryTransferPendingTick = Environment.TickCount64;
+        gameState.WorldEntryNewWorldTick = 0;
+        gameState.WorldEntryWindowForwardCount = 0;
+        if (Framework.Settings.DebugOutput)
+        {
+            Log.Event("worldentry.window.opened", new
+            {
+                seq = gameState.WorldEntryWindowSeq,
+                old_map = gameState.CurrentMapId,
+                new_map = transfer.MapID,
+            });
+        }
+
         GetSession().GameState.IsWaitingForNewWorld = true;
 
         SuspendToken suspend = new();
@@ -474,6 +492,27 @@ public partial class WorldClient
         SendPacketToClient(transfer);
         GetSession().GameState.IsWaitingForNewWorld = false;
 
+        // JimsProxy (worldentry stage-0 tripwire): a transfer that aborts never gets
+        // its CMSG_WORLD_PORT_RESPONSE — close out the telemetry anchors here so a
+        // stale anchor can't leak into the next window's timing.
+        var trackedState = GetSession().GameState;
+        if (trackedState.WorldEntryTransferPendingTick != 0)
+        {
+            if (Framework.Settings.DebugOutput)
+            {
+                Log.Event("worldentry.window.aborted", new
+                {
+                    seq = trackedState.WorldEntryWindowSeq,
+                    aborted_map_id = transfer.MapID,
+                    reason = transfer.Reason.ToString(),
+                    ms_since_transfer_pending = Environment.TickCount64 - trackedState.WorldEntryTransferPendingTick,
+                    forwarded_in_window = trackedState.WorldEntryWindowForwardCount,
+                });
+            }
+            trackedState.WorldEntryTransferPendingTick = 0;
+            trackedState.WorldEntryNewWorldTick = 0;
+        }
+
         var clearedCounts = GetSession().GameState.ResetInFlightCastState();
         var droppedGcdHold = GetSession().GameState.CancelGcdHold();
         var droppedCastTimeHold = GetSession().GameState.ClearHeldCastTimeCast();
@@ -504,6 +543,7 @@ public partial class WorldClient
         GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
 
         NewWorld teleport = new NewWorld();
+        var previousMapId = GetSession().GameState.CurrentMapId;
         GetSession().GameState.CurrentMapId = teleport.MapID = packet.ReadUInt32();
         teleport.Position = packet.ReadVector3();
         teleport.Orientation = packet.ReadFloat();
@@ -514,6 +554,24 @@ public partial class WorldClient
         {
             GetSession().GameState.IsWaitingForNewWorld = false;
             GetSession().GameState.IsWaitingForWorldPortAck = true;
+
+            // JimsProxy (worldentry stage-0 tripwire): anchor the ack-wait phase.
+            // NEW_WORLD itself is forwarded ~50ms later (scheduling breath below), so
+            // window durations measured from here include that fixed offset.
+            var trackedState = GetSession().GameState;
+            trackedState.WorldEntryNewWorldTick = Environment.TickCount64;
+            if (Framework.Settings.DebugOutput)
+            {
+                Log.Event("worldentry.window.new_world", new
+                {
+                    seq = trackedState.WorldEntryWindowSeq,
+                    old_map = previousMapId,
+                    new_map = teleport.MapID,
+                    ms_since_transfer_pending = trackedState.WorldEntryTransferPendingTick != 0
+                        ? Environment.TickCount64 - trackedState.WorldEntryTransferPendingTick
+                        : -1,
+                });
+            }
 
             // JimsProxy (zone-transfer cast-state cleanup): the source map's server
             // state is torn down on transition (BG entry, instance change, zep arrival,
