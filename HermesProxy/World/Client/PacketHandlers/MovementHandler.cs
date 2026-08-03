@@ -5,6 +5,7 @@ using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
 using System;
+using System.Collections.Generic;
 
 namespace HermesProxy.World.Client;
 
@@ -437,6 +438,10 @@ public partial class WorldClient
             return;
         }
 
+        // JimsProxy (worldentry root-ceremony breadcrumb): the previous arrival's
+        // ceremony accounting ends where the next transition begins.
+        FlushWorldEntryCeremony("transfer_pending");
+
         TransferPending transfer = new TransferPending();
         transfer.MapID = GetSession().GameState.PendingTransferMapId = packet.ReadUInt32();
         transfer.OldMapPosition = Vector3.Zero;
@@ -613,6 +618,13 @@ public partial class WorldClient
             // --- END FIX ---
 
             SendPacketToClient(teleport);
+
+            // JimsProxy (worldentry root-ceremony breadcrumb): the arrival ceremony
+            // (ROOT ×2 + UNROOT, wire-verified on every Kronos arrival) begins after
+            // the worldport ack; open the accounting here and arm the init-mover
+            // phase marker the dev harness keys on.
+            GetSession().GameState.WorldEntryCeremony.Begin("new_world", Environment.TickCount64);
+            GetSession().GameState.WorldEntryAwaitingInitMoverComplete = true;
 
             // JimsProxy (zep-stuck-low-latency-race 2026-05-17): defer the
             // transport-clear synth until the player's first post-NEW_WORLD
@@ -861,10 +873,134 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_MOVE_SET_NORMAL_FALL)]
     void HandleMoveForceFlagChange(WorldPacket packet)
     {
-        MoveSetFlag flag = new MoveSetFlag(packet.GetUniversalOpcode(false));
+        Opcode universalOpcode = packet.GetUniversalOpcode(false);
+        MoveSetFlag flag = new MoveSetFlag(universalOpcode);
         flag.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
         flag.MoveCounter = packet.ReadUInt32();
+
+        // JimsProxy (worldentry root-ceremony instrumentation 2026-08-03): count the
+        // player's arrival ROOT/UNROOT ceremony legs for the always-on unclosed-
+        // ceremony breadcrumb, and give the dev harness its interception point.
+        // Everything below is a no-op for non-self movers and for the other force
+        // flags in this handler; the harness paths are additionally inert unless
+        // WorldEntryHarnessMode / WorldEntryMintMoveCounters are set (never in
+        // shipped configs). See WorldEntryCeremony.cs.
+        bool selfRoot = universalOpcode == Opcode.SMSG_MOVE_ROOT &&
+                        flag.MoverGUID == GetSession().GameState.CurrentPlayerGuid;
+        bool selfUnroot = universalOpcode == Opcode.SMSG_MOVE_UNROOT &&
+                          flag.MoverGUID == GetSession().GameState.CurrentPlayerGuid;
+        var ceremony = GetSession().GameState.WorldEntryCeremony;
+        if (ceremony.Active && selfRoot)
+            System.Threading.Interlocked.Increment(ref ceremony.RootsForwarded);
+        if (ceremony.Active && selfUnroot)
+            System.Threading.Interlocked.Increment(ref ceremony.UnrootsForwarded);
+
+        if (selfUnroot && ShouldHarnessDropUnroot())
+        {
+            // NOTE: the legacy server sent this unroot and awaits the matching
+            // CMSG_FORCE_MOVE_UNROOT_ACK, which the client will now never produce.
+            // Kronos is not known to enforce force-op acks; if it does, the kick is
+            // itself an informative result. Dev harness only.
+            Framework.Logging.Log.Event("worldentry.harness.unroot_dropped", new
+            {
+                move_counter = flag.MoveCounter,
+                remaining = GetSession().GameState.WorldEntryHarnessDropRemaining,
+            });
+            return;
+        }
+
+        if ((selfRoot || selfUnroot) && Framework.Settings.WorldEntryMintMoveCounters)
+            flag.MoveCounter = GetSession().GameState.WorldEntryCounterMint.Mint(flag.MoveCounter);
+
+        if ((selfRoot || selfUnroot) &&
+            GetSession().GameState.WorldEntryAwaitingInitMoverComplete &&
+            Framework.Settings.WorldEntryHarnessMode.Equals("hold_until_init", StringComparison.OrdinalIgnoreCase))
+        {
+            lock (GetSession().GameState.WorldEntryHeldForceOpsLock)
+                GetSession().GameState.WorldEntryHeldForceOps.Add(flag);
+            Framework.Logging.Log.Event("worldentry.harness.force_op_held", new
+            {
+                opcode = universalOpcode.ToString(),
+                move_counter = flag.MoveCounter,
+            });
+            return;
+        }
+
         SendPacketToClient(flag);
+    }
+
+    // JimsProxy (worldentry root-ceremony harness): arm/decrement the drop_unroot
+    // counter. Seeded lazily from Settings so a session picks up --set overrides.
+    private bool ShouldHarnessDropUnroot()
+    {
+        if (!Framework.Settings.WorldEntryHarnessMode.Equals("drop_unroot", StringComparison.OrdinalIgnoreCase))
+            return false;
+        var gameState = GetSession().GameState;
+        if (gameState.WorldEntryHarnessDropRemaining < 0)
+            gameState.WorldEntryHarnessDropRemaining = Framework.Settings.WorldEntryHarnessCount;
+        if (gameState.WorldEntryHarnessDropRemaining == 0)
+            return false;
+        gameState.WorldEntryHarnessDropRemaining--;
+        return true;
+    }
+
+    // JimsProxy (worldentry root-ceremony breadcrumb 2026-08-03): close out the
+    // previous arrival's ceremony accounting. An opened-but-not-observably-closed
+    // ceremony logs ONE always-on line (worldentry.ceremony.unclosed) so any field
+    // Export Diagnostics carries the movement-lockup discriminator: missing unroot =
+    // server never sent it; unroot forwarded but never acked = the client rejected
+    // or could not apply it (the stuck-stun golden capture's discard fingerprint);
+    // root acks short = a root leg was discarded. Healthy ceremonies log only under
+    // DebugOutput. Also fail-opens any harness-held force-ops so hold_until_init can
+    // never leak ops across a transition.
+    internal void FlushWorldEntryCeremony(string reason)
+    {
+        var gameState = GetSession().GameState;
+
+        List<MoveSetFlag>? leftovers = null;
+        lock (gameState.WorldEntryHeldForceOpsLock)
+        {
+            if (gameState.WorldEntryHeldForceOps.Count > 0)
+            {
+                leftovers = new List<MoveSetFlag>(gameState.WorldEntryHeldForceOps);
+                gameState.WorldEntryHeldForceOps.Clear();
+            }
+        }
+        if (leftovers != null)
+        {
+            foreach (var heldOp in leftovers)
+                SendPacketToClient(heldOp);
+            Framework.Logging.Log.Event("worldentry.harness.held_ops_released", new
+            {
+                count = leftovers.Count,
+                trigger = "flush_" + reason,
+            });
+        }
+
+        var ceremony = gameState.WorldEntryCeremony;
+        if (!ceremony.Active)
+            return;
+
+        bool unclosed = WorldEntryCeremonyTracker.IsUnclosed(
+            ceremony.RootsForwarded, ceremony.RootAcks,
+            ceremony.UnrootsForwarded, ceremony.UnrootAcks);
+        if (unclosed || Framework.Settings.DebugOutput)
+        {
+            Framework.Logging.Log.Event(
+                unclosed ? "worldentry.ceremony.unclosed" : "worldentry.ceremony.closed",
+                new
+                {
+                    anchor = ceremony.Anchor,
+                    flush_reason = reason,
+                    ms_since_anchor = Environment.TickCount64 - ceremony.AnchorTickMs,
+                    roots_forwarded = ceremony.RootsForwarded,
+                    root_acks = ceremony.RootAcks,
+                    unroots_forwarded = ceremony.UnrootsForwarded,
+                    unroot_acks = ceremony.UnrootAcks,
+                    init_mover_complete_seen = ceremony.InitMoverCompleteSeen,
+                });
+        }
+        ceremony.Reset();
     }
 
     [PacketHandler(Opcode.SMSG_COMPRESSED_MOVES)]

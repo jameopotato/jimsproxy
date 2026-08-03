@@ -118,6 +118,26 @@ public static class Settings
     // the client doesn't show red error text during rapid spam. Independent of
     // LowLatencyMode — useful as a companion setting but not required.
     public static bool SuppressSpellCastErrors;
+    // JimsProxy (worldentry root-ceremony harness 2026-08-03): dev-only delivery
+    // manipulation for the arrival ROOT/ROOT/UNROOT ceremony, used to force the
+    // suspected movement-lockup race on demand (see WorldEntryCeremony.cs). Never
+    // set in shipped configs; the launcher does not expose these.
+    //   off             — no manipulation (default; zero behavior change).
+    //   drop_unroot     — swallow the player's next WorldEntryHarnessCount arrival
+    //                     SMSG_MOVE_UNROOTs (validates that a stranded force-root
+    //                     reproduces the reported symptom table incl. /reload cure).
+    //   hold_until_init — queue the player's arrival ROOT/UNROOT force-ops while the
+    //                     client is still loading and release them only after
+    //                     CMSG_MOVE_INIT_ACTIVE_MOVER_COMPLETE (+ optional delay) —
+    //                     walks the delivery through the never-captured quadrant.
+    public static string WorldEntryHarnessMode = "off";
+    public static int WorldEntryHarnessCount;
+    public static int WorldEntryHarnessDelayMs;
+    // JimsProxy (worldentry counter minting): replace the legacy server's
+    // constant-zero force-op MoveCounters with session-monotonic values toward the
+    // modern client (restored on the ack path). A/B lever for the counter-collision
+    // theory; dev-only, default off.
+    public static bool WorldEntryMintMoveCounters;
     // JimsProxy (T1 identity-pinned cast correspondence): make the START↔terminating
     // CastID pairing deterministic. Every local-player terminating event
     // (SPELL_GO / CAST_FAILED / SPELL_FAILURE) and the watchdog's synthetic closure
@@ -223,6 +243,10 @@ public static class Settings
         ClientTcpNoDelay = config.GetBoolean("ClientTcpNoDelay", true);
         LowLatencyMode = config.GetBoolean("LowLatencyMode", false);
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);
+        WorldEntryHarnessMode = config.GetString("WorldEntryHarnessMode", "off");
+        WorldEntryHarnessCount = Math.Clamp(config.GetInt("WorldEntryHarnessCount", 1), 1, 100);
+        WorldEntryHarnessDelayMs = Math.Clamp(config.GetInt("WorldEntryHarnessDelayMs", 0), 0, 10000);
+        WorldEntryMintMoveCounters = config.GetBoolean("WorldEntryMintMoveCounters", false);
         IdentityPinnedCastIds = config.GetBoolean("IdentityPinnedCastIds", false);
         RefireSpellGo = config.GetBoolean("RefireSpellGo", false);
         var rttPrefireStr = config.GetString("RttPrefire", "off");

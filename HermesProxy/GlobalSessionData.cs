@@ -173,6 +173,16 @@ public sealed class GameSessionData
     public long WorldEntryTransferPendingTick; // TickCount64 at transfer-pending; 0 = no window open
     public long WorldEntryNewWorldTick;        // TickCount64 at NEW_WORLD forward; 0 = not reached
     public int WorldEntryWindowForwardCount;   // packets sent to the modern client in-window (DebugOutput only)
+    // JimsProxy (worldentry root-ceremony instrumentation 2026-08-03): per-arrival
+    // ROOT/UNROOT ceremony leg + ack counting (always-on breadcrumb) and dev-harness
+    // state (all inert unless Settings.WorldEntryHarness* / WorldEntryMintMoveCounters
+    // are set). See World/Client/WorldEntryCeremony.cs for the model and evidence.
+    public readonly WorldEntryCeremonyTracker WorldEntryCeremony = new();
+    public readonly MoveCounterMint WorldEntryCounterMint = new();
+    public bool WorldEntryAwaitingInitMoverComplete; // NEW_WORLD/login → cleared at CMSG_MOVE_INIT_ACTIVE_MOVER_COMPLETE
+    public int WorldEntryHarnessDropRemaining = -1;  // -1 = lazily seeded from Settings.WorldEntryHarnessCount
+    public readonly List<MoveSetFlag> WorldEntryHeldForceOps = new();
+    public readonly Lock WorldEntryHeldForceOpsLock = new();
     // JimsProxy (zep-stuck-no-move 2026-05-14): set to a sentinel MoveCounter when
     // HandleNewWorld emits a synthesized SMSG_MOVE_TELEPORT to clear the modern
     // client's stale MOVEMENTFLAG_ONTRANSPORT after a cross-continent transport

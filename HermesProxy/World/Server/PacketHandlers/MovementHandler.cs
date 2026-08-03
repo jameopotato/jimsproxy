@@ -305,6 +305,30 @@ public partial class WorldSocket
     void HandleMoveForceAck2(MovementAckMessage movementAck)
     {
         var universalOpcode = movementAck.GetUniversalOpcode();
+
+        // JimsProxy (worldentry root-ceremony instrumentation 2026-08-03): the ack
+        // legs of the arrival ROOT/UNROOT ceremony. A forwarded-but-never-acked leg
+        // is the discard fingerprint (stuck-stun golden capture) the always-on
+        // breadcrumb keys on; see WorldEntryCeremony.cs.
+        var ceremony = GetSession().GameState.WorldEntryCeremony;
+        if (ceremony.Active && movementAck.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            if (universalOpcode == Opcode.CMSG_MOVE_FORCE_ROOT_ACK)
+                System.Threading.Interlocked.Increment(ref ceremony.RootAcks);
+            else if (universalOpcode == Opcode.CMSG_MOVE_FORCE_UNROOT_ACK)
+                System.Threading.Interlocked.Increment(ref ceremony.UnrootAcks);
+        }
+
+        // JimsProxy (worldentry counter minting, dev harness): the client echoes the
+        // minted counter; restore the legacy server's original value before the ack
+        // crosses back. Unknown counters (pre-toggle ops, other ack kinds) pass
+        // through untouched.
+        if (Framework.Settings.WorldEntryMintMoveCounters &&
+            GetSession().GameState.WorldEntryCounterMint.TryResolve(movementAck.Ack.MoveCounter, out uint originalCounter))
+        {
+            movementAck.Ack.MoveCounter = originalCounter;
+        }
+
         uint legacyOpcode = LegacyVersion.GetCurrentOpcode(universalOpcode);
         if (legacyOpcode == 0)
         {
@@ -353,9 +377,56 @@ public partial class WorldSocket
     void HandleMoveInitActiveMoverComplete(InitActiveMoverComplete move)
     {
         LogWorldEntryClientSignal("init_active_mover_complete");
+
+        // JimsProxy (worldentry root-ceremony instrumentation 2026-08-03): the
+        // client's mover re-init completion — the phase boundary the arrival
+        // ceremony races (wire-verified: ROOT#1 lands at this boundary on nearly
+        // every arrival). Stamp the breadcrumb, close the harness hold phase, and
+        // release any held force-ops in arrival order.
+        var gameState = GetSession().GameState;
+        gameState.WorldEntryCeremony.InitMoverCompleteSeen = true;
+        gameState.WorldEntryAwaitingInitMoverComplete = false;
+        ReleaseHeldWorldEntryForceOps(gameState);
+
         WorldPacket packet = new WorldPacket(Opcode.CMSG_SET_ACTIVE_MOVER);
         packet.WriteGuid(GetSession().GameState.CurrentPlayerGuid.To64());
         SendPacketToServer(packet);
+    }
+
+    // JimsProxy (worldentry hold_until_init harness): deliver the held ceremony legs
+    // now that the client's mover exists, after the configured offset. The delay is
+    // a WALL-CLOCK timer, banned in shipped fix logic — this path is reachable only
+    // under the dev-only WorldEntryHarnessMode config and exists to schedule
+    // deliveries against the init boundary in race experiments.
+    void ReleaseHeldWorldEntryForceOps(GameSessionData gameState)
+    {
+        System.Collections.Generic.List<MoveSetFlag>? released = null;
+        lock (gameState.WorldEntryHeldForceOpsLock)
+        {
+            if (gameState.WorldEntryHeldForceOps.Count > 0)
+            {
+                released = new System.Collections.Generic.List<MoveSetFlag>(gameState.WorldEntryHeldForceOps);
+                gameState.WorldEntryHeldForceOps.Clear();
+            }
+        }
+        if (released == null)
+            return;
+
+        int delayMs = Framework.Settings.WorldEntryHarnessDelayMs;
+        if (delayMs <= 0)
+        {
+            foreach (var heldOp in released)
+                SendPacket(heldOp);
+            Log.Event("worldentry.harness.held_ops_released", new { count = released.Count, trigger = "init_mover_complete", delay_ms = 0 });
+            return;
+        }
+        _ = System.Threading.Tasks.Task.Run(async () =>
+        {
+            await System.Threading.Tasks.Task.Delay(delayMs);
+            foreach (var heldOp in released)
+                SendPacket(heldOp);
+            Log.Event("worldentry.harness.held_ops_released", new { count = released.Count, trigger = "init_mover_complete", delay_ms = delayMs });
+        });
     }
 
     [PacketHandler(Opcode.CMSG_MOVE_SPLINE_DONE)]
