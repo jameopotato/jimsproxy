@@ -3591,9 +3591,36 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                                 // Slot occupant swapped spells without passing through 0 (Y→X in
                                 // one tick) — Y's decayed duration must not be served, or worse
                                 // persisted, under X.
+                                //
+                                // JimsProxy (res-sickness-swap-race): EXCEPT when a server duration
+                                // push for this exact slot arrived within the last second — vanilla
+                                // cores send SMSG_UPDATE_AURA_DURATION immediately at apply while the
+                                // field update batches at end of tick, so on a direct swap the NEW
+                                // occupant's duration precedes the swap by a few ms. Canonical case:
+                                // Ghost → Resurrection Sickness at a spirit-healer res; wiping here
+                                // left the sickness debuff with no timer for the whole session
+                                // (jimsproxy-20260802-182258.jsonl, duration stored then cleared 8 ms
+                                // later). Only push-path stores arm this window, so stale-Y durations
+                                // (stored at Y's cast/emit, always older than a second at swap time)
+                                // are still wiped.
                                 var prevEmitted = GetSession().GameState.GetLastEmittedAura(guid, i);
                                 if (prevEmitted != null && prevEmitted.SpellID != aura.AuraData.SpellID)
-                                    GetSession().GameState.ClearAuraDuration(guid, i);
+                                {
+                                    if (GetSession().GameState.HasFreshAuraDurationPush(guid, i, Environment.TickCount))
+                                    {
+                                        Framework.Logging.Log.Event("aura.duration.preserved_on_swap", new
+                                        {
+                                            target_low = guid.GetCounter(),
+                                            slot = i,
+                                            prev_spell_id = prevEmitted.SpellID,
+                                            spell_id = aura.AuraData.SpellID,
+                                        });
+                                    }
+                                    else
+                                    {
+                                        GetSession().GameState.ClearAuraDuration(guid, i);
+                                    }
+                                }
                                 GetSession().GameState.GetAuraDuration(guid, i, out durationLeft, out durationFull);
                                 // JimsProxy (Cheap-Shot-aura-duration 2026-05-07): mirror the
                                 // SpellHandler refresh path's CSV fallback. On a cold cache (fresh

@@ -802,6 +802,14 @@ public sealed class GameSessionData
     public Dictionary<WowGuid128, Dictionary<byte, int>> UnitAuraDurationUpdateTime = [];
     public Dictionary<WowGuid128, Dictionary<byte, int>> UnitAuraDurationLeft = [];
     public Dictionary<WowGuid128, Dictionary<byte, int>> UnitAuraDurationFull = [];
+    // JimsProxy (res-sickness-swap-race): TickCount of the most recent server duration
+    // PUSH per (unit, slot) — written ONLY by the SMSG_UPDATE_AURA_DURATION /
+    // SMSG_SET_EXTRA_AURA_INFO handlers, never by emit-path stores (finisher snapshot,
+    // expiry restore). Distinguishes "a server-authoritative duration for this slot just
+    // raced ahead of its field update" from "stale duration left by the slot's previous
+    // occupant", which the swap-wipe guard in the UpdateHandler aura loop cannot tell
+    // apart by spell ID alone.
+    public Dictionary<WowGuid128, Dictionary<byte, int>> UnitAuraDurationPushTime = [];
     public Dictionary<WowGuid128, Dictionary<byte, WowGuid128>> UnitAuraCaster = [];
     // Wall-clock aura expiry per (unit, spell). Unlike the per-slot caches above this
     // survives unit destroys AND relogs (carried over in CreateNewGameSessionData), so a
@@ -1467,6 +1475,30 @@ public sealed class GameSessionData
         dict ??= [];
         dict[slot] = duration;
     }
+    // JimsProxy (res-sickness-swap-race): vanilla cores send SMSG_UPDATE_AURA_DURATION
+    // immediately at aura apply, while the field update installing the aura is batched
+    // to the end of the server tick. On a direct slot swap (Ghost → Resurrection
+    // Sickness at a spirit-healer res: same tick, no empty pass) the new occupant's
+    // duration therefore lands a few ms BEFORE the swap. Recording the push time lets
+    // the swap-wipe guard keep that fresh value instead of discarding it as the previous
+    // occupant's leftover.
+    public const int AuraDurationPushFreshnessMs = 1000;
+    public void StoreAuraDurationPushTime(WowGuid128 guid, byte slot, int currentTime)
+    {
+        ref var dict = ref CollectionsMarshal.GetValueRefOrAddDefault(UnitAuraDurationPushTime, guid, out _);
+        dict ??= [];
+        dict[slot] = currentTime;
+    }
+    public bool HasFreshAuraDurationPush(WowGuid128 guid, byte slot, int currentTime)
+    {
+        if (UnitAuraDurationPushTime.TryGetValue(guid, out var dict) &&
+            dict.TryGetValue(slot, out var pushedAt))
+        {
+            int age = unchecked(currentTime - pushedAt);
+            return age >= 0 && age <= AuraDurationPushFreshnessMs;
+        }
+        return false;
+    }
     public void ClearAuraDuration(WowGuid128 guid, byte slot)
     {
         if (UnitAuraDurationUpdateTime.TryGetValue(guid, out var timeDict))
@@ -1477,6 +1509,9 @@ public sealed class GameSessionData
 
         if (UnitAuraDurationFull.TryGetValue(guid, out var fullDict))
             fullDict.Remove(slot);
+
+        if (UnitAuraDurationPushTime.TryGetValue(guid, out var pushDict))
+            pushDict.Remove(slot);
     }
     public void GetAuraDuration(WowGuid128 guid, byte slot, out int left, out int full)
     {
@@ -1518,6 +1553,7 @@ public sealed class GameSessionData
         UnitAuraDurationUpdateTime.Remove(guid);
         UnitAuraDurationLeft.Remove(guid);
         UnitAuraDurationFull.Remove(guid);
+        UnitAuraDurationPushTime.Remove(guid);
         UnitAuraCaster.Remove(guid);
         UnitAuraLastEmitted.Remove(guid);
         // UnitAuraExpiryTick deliberately survives — it restores remaining buff time
