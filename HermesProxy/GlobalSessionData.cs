@@ -180,6 +180,7 @@ public sealed class GameSessionData
     public readonly WorldEntryCeremonyTracker WorldEntryCeremony = new();
     public readonly MoveCounterMint WorldEntryCounterMint = new();
     public bool WorldEntryAwaitingInitMoverComplete; // NEW_WORLD/login → cleared at CMSG_MOVE_INIT_ACTIVE_MOVER_COMPLETE
+    public long WorldEntryInitAmcTick;               // TickCount64 at the last CMSG_MOVE_INIT_ACTIVE_MOVER_COMPLETE
     public int WorldEntryHarnessDropRemaining = -1;  // -1 = lazily seeded from Settings.WorldEntryHarnessCount
     public readonly List<MoveSetFlag> WorldEntryHeldForceOps = new();
     public readonly Lock WorldEntryHeldForceOpsLock = new();

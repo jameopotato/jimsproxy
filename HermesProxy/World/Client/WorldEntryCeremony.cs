@@ -33,6 +33,15 @@ public class WorldEntryCeremonyTracker
     public int RootAcks;
     public int UnrootsForwarded;
     public int UnrootAcks;
+    // Mirasu R40 branch (c): when the 1.12 unit has CLIENT_CONTROL_LOST (set by
+    // BattleGround::BlockMovement at BG end — the exact window an instant
+    // "Leave Battleground" click races), the server emits SPLINE_MOVE_ROOT/UNROOT
+    // instead of the FORCE family. Unacked, and applied to a different slot than a
+    // force-root — a force-root + spline-unroot pair strands the root with no
+    // packet dropped anywhere. Healthy corpus has ZERO self spline root legs
+    // (0/18 arrivals), so ANY occurrence is capture-worthy.
+    public int SplineRootsForwarded;
+    public int SplineUnrootsForwarded;
     public bool InitMoverCompleteSeen;
 
     public void Begin(string anchor, long nowMs)
@@ -43,6 +52,8 @@ public class WorldEntryCeremonyTracker
         RootAcks = 0;
         UnrootsForwarded = 0;
         UnrootAcks = 0;
+        SplineRootsForwarded = 0;
+        SplineUnrootsForwarded = 0;
         InitMoverCompleteSeen = false;
         Active = true;
     }
@@ -65,6 +76,29 @@ public class WorldEntryCeremonyTracker
     public static bool IsUnclosed(int rootsForwarded, int rootAcks, int unrootsForwarded, int unrootAcks)
         => rootsForwarded > 0
            && (unrootsForwarded == 0 || unrootAcks == 0 || rootAcks < rootsForwarded);
+
+    /// <summary>
+    /// The always-on emission gate: an unclosed force ceremony, OR any self
+    /// spline-family root leg at all (zero occurrences across the entire healthy
+    /// corpus — any appearance is the R40 branch-(c) wrong-family signature and
+    /// must be captured).
+    /// </summary>
+    public static bool IsAnomalous(int rootsForwarded, int rootAcks, int unrootsForwarded, int unrootAcks,
+                                   int splineRoots, int splineUnroots)
+        => IsUnclosed(rootsForwarded, rootAcks, unrootsForwarded, unrootAcks)
+           || splineRoots > 0 || splineUnroots > 0;
+
+    /// <summary>
+    /// Dev-harness synthetic force-op counters (synth_root_preinit mode). The
+    /// range is recognizable in captures, disjoint from both the legacy server's
+    /// constant 0 and the mint range (which grows upward from 1001), and below the
+    /// 0xFFFFFFFF transport-clear teleport sentinel. Acks bearing these counters
+    /// are swallowed by the proxy (logged, never forwarded to the legacy server,
+    /// which never sent the op).
+    /// </summary>
+    public const uint SynthCounterRoot = 0xFFFFFF01;
+    public const uint SynthCounterUnroot = 0xFFFFFF02;
+    public static bool IsSynthCounter(uint counter) => counter >= 0xFFFFFF00 && counter < 0xFFFFFFFF;
 }
 
 /// <summary>

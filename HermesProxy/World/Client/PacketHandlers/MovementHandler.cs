@@ -626,6 +626,26 @@ public partial class WorldClient
             GetSession().GameState.WorldEntryCeremony.Begin("new_world", Environment.TickCount64);
             GetSession().GameState.WorldEntryAwaitingInitMoverComplete = true;
 
+            // JimsProxy (worldentry synth_root_preinit harness, Mirasu R40 §6.3):
+            // deliver a synthetic self force-root immediately after NEW_WORLD —
+            // guaranteed pre-mover-init while the client is loading. The ack's
+            // timing answers the force-op lifecycle trichotomy (acked immediately
+            // = applied; acked at init = queued+replayed; never acked = discarded).
+            // Sentinel counter: the ack is swallowed server-side (the legacy server
+            // never sent this op); the paired synth unroot fires after init.
+            if (Framework.Settings.WorldEntryHarnessMode.Equals("synth_root_preinit", StringComparison.OrdinalIgnoreCase))
+            {
+                MoveSetFlag synthRoot = new MoveSetFlag(Opcode.SMSG_MOVE_ROOT);
+                synthRoot.MoverGUID = GetSession().GameState.CurrentPlayerGuid;
+                synthRoot.MoveCounter = WorldEntryCeremonyTracker.SynthCounterRoot;
+                SendPacketToClient(synthRoot);
+                Framework.Logging.Log.Event("worldentry.harness.synth_root_sent", new
+                {
+                    move_counter = synthRoot.MoveCounter,
+                    new_map = teleport.MapID,
+                });
+            }
+
             // JimsProxy (zep-stuck-low-latency-race 2026-05-17): defer the
             // transport-clear synth until the player's first post-NEW_WORLD
             // UpdateObject lands. Firing inline here at NEW_WORLD time worked at
@@ -851,6 +871,22 @@ public partial class WorldClient
         Opcode universalOpcode = packet.GetUniversalOpcode(false);
         MoveSplineSetFlag spline = new MoveSplineSetFlag(universalOpcode);
         spline.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
+
+        // JimsProxy (worldentry root-ceremony breadcrumb, R40 branch (c)): a
+        // spline-family root leg addressed to the PLAYER is the wrong-family
+        // signature (server emits it instead of the force op while
+        // CLIENT_CONTROL_LOST is up — e.g. the BG-end window an instant Leave
+        // click races). Zero occurrences in the healthy corpus; count them so the
+        // ceremony breadcrumb can name the family, not just the absence.
+        var splineCeremony = GetSession().GameState.WorldEntryCeremony;
+        if (splineCeremony.Active && spline.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            if (universalOpcode == Opcode.SMSG_MOVE_SPLINE_ROOT)
+                System.Threading.Interlocked.Increment(ref splineCeremony.SplineRootsForwarded);
+            else if (universalOpcode == Opcode.SMSG_MOVE_SPLINE_UNROOT)
+                System.Threading.Interlocked.Increment(ref splineCeremony.SplineUnrootsForwarded);
+        }
+
         SendPacketToClient(spline);
         // MIRASU (onyxia-landed-still-hovering): explicit hover toggles drive the registry + anim/gravity synth, else a landed mob keeps hover anim forever and a parked flyer stands and bounces.
         if (universalOpcode is Opcode.SMSG_MOVE_SPLINE_SET_HOVER or Opcode.SMSG_MOVE_SPLINE_UNSET_HOVER)
@@ -981,13 +1017,14 @@ public partial class WorldClient
         if (!ceremony.Active)
             return;
 
-        bool unclosed = WorldEntryCeremonyTracker.IsUnclosed(
+        bool anomalous = WorldEntryCeremonyTracker.IsAnomalous(
             ceremony.RootsForwarded, ceremony.RootAcks,
-            ceremony.UnrootsForwarded, ceremony.UnrootAcks);
-        if (unclosed || Framework.Settings.DebugOutput)
+            ceremony.UnrootsForwarded, ceremony.UnrootAcks,
+            ceremony.SplineRootsForwarded, ceremony.SplineUnrootsForwarded);
+        if (anomalous || Framework.Settings.DebugOutput)
         {
             Framework.Logging.Log.Event(
-                unclosed ? "worldentry.ceremony.unclosed" : "worldentry.ceremony.closed",
+                anomalous ? "worldentry.ceremony.unclosed" : "worldentry.ceremony.closed",
                 new
                 {
                     anchor = ceremony.Anchor,
@@ -997,6 +1034,8 @@ public partial class WorldClient
                     root_acks = ceremony.RootAcks,
                     unroots_forwarded = ceremony.UnrootsForwarded,
                     unroot_acks = ceremony.UnrootAcks,
+                    spline_roots_forwarded = ceremony.SplineRootsForwarded,
+                    spline_unroots_forwarded = ceremony.SplineUnrootsForwarded,
                     init_mover_complete_seen = ceremony.InitMoverCompleteSeen,
                 });
         }

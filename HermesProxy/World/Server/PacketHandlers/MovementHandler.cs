@@ -306,6 +306,25 @@ public partial class WorldSocket
     {
         var universalOpcode = movementAck.GetUniversalOpcode();
 
+        // JimsProxy (worldentry synth_root_preinit harness): acks for proxy-
+        // synthesized force-ops carry sentinel counters. The legacy server never
+        // sent those ops, so the ack must not cross; its TIMING is the experiment's
+        // whole payload (immediate = applied; at init = queued; absent = discarded).
+        if (World.Client.WorldEntryCeremonyTracker.IsSynthCounter(movementAck.Ack.MoveCounter))
+        {
+            var gs = GetSession().GameState;
+            Log.Event("worldentry.harness.synth_ack", new
+            {
+                opcode = universalOpcode.ToString(),
+                move_counter = movementAck.Ack.MoveCounter,
+                ms_since_new_world = gs.WorldEntryNewWorldTick != 0
+                    ? Environment.TickCount64 - gs.WorldEntryNewWorldTick : -1,
+                ms_since_init_amc = gs.WorldEntryInitAmcTick != 0
+                    ? Environment.TickCount64 - gs.WorldEntryInitAmcTick : -1,
+            });
+            return;
+        }
+
         // JimsProxy (worldentry root-ceremony instrumentation 2026-08-03): the ack
         // legs of the arrival ROOT/UNROOT ceremony. A forwarded-but-never-acked leg
         // is the discard fingerprint (stuck-stun golden capture) the always-on
@@ -386,7 +405,27 @@ public partial class WorldSocket
         var gameState = GetSession().GameState;
         gameState.WorldEntryCeremony.InitMoverCompleteSeen = true;
         gameState.WorldEntryAwaitingInitMoverComplete = false;
+        gameState.WorldEntryInitAmcTick = Environment.TickCount64;
         ReleaseHeldWorldEntryForceOps(gameState);
+
+        // JimsProxy (worldentry synth_root_preinit harness): pair the pre-init
+        // synth root with a delayed synth unroot so the experiment cleans up after
+        // itself (the legacy server knows nothing of either op). Wall-clock timer —
+        // dev-only mode, same waiver as ReleaseHeldWorldEntryForceOps.
+        if (Framework.Settings.WorldEntryHarnessMode.Equals("synth_root_preinit", StringComparison.OrdinalIgnoreCase))
+        {
+            int unrootDelayMs = Framework.Settings.WorldEntryHarnessDelayMs > 0
+                ? Framework.Settings.WorldEntryHarnessDelayMs : 3000;
+            _ = System.Threading.Tasks.Task.Run(async () =>
+            {
+                await System.Threading.Tasks.Task.Delay(unrootDelayMs);
+                MoveSetFlag synthUnroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
+                synthUnroot.MoverGUID = gameState.CurrentPlayerGuid;
+                synthUnroot.MoveCounter = World.Client.WorldEntryCeremonyTracker.SynthCounterUnroot;
+                SendPacket(synthUnroot);
+                Log.Event("worldentry.harness.synth_unroot_sent", new { delay_ms = unrootDelayMs });
+            });
+        }
 
         WorldPacket packet = new WorldPacket(Opcode.CMSG_SET_ACTIVE_MOVER);
         packet.WriteGuid(GetSession().GameState.CurrentPlayerGuid.To64());

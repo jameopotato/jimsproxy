@@ -110,4 +110,38 @@ public class WorldEntryCeremonyTests
         Assert.False(mint.TryResolve(0, out _));
         Assert.False(mint.TryResolve(999999, out _));
     }
+
+    // R40 branch (c): ANY self spline-family root leg is anomalous — zero occur in
+    // the healthy corpus, and a spline unroot after a force root is the stranded-
+    // root wrong-family signature.
+    [Fact]
+    public void IsAnomalous_SplineLegPresent_True()
+    {
+        // Force ceremony healthy but the unroot came as spline too — capture it.
+        Assert.True(WorldEntryCeremonyTracker.IsAnomalous(2, 2, 1, 1, 0, 1));
+        // Root arrived spline-family (control lost at arrival).
+        Assert.True(WorldEntryCeremonyTracker.IsAnomalous(0, 0, 0, 0, 1, 0));
+    }
+
+    [Fact]
+    public void IsAnomalous_NoSplineLegs_MatchesIsUnclosed()
+    {
+        Assert.False(WorldEntryCeremonyTracker.IsAnomalous(2, 2, 1, 1, 0, 0));
+        Assert.True(WorldEntryCeremonyTracker.IsAnomalous(2, 2, 0, 0, 0, 0));
+    }
+
+    // Sentinel counters (synth harness ops) must be disjoint from the legacy
+    // constant 0, the mint range, and the 0xFFFFFFFF transport-clear sentinel.
+    [Fact]
+    public void SynthCounters_DisjointFromMintAndLegacyValues()
+    {
+        Assert.True(WorldEntryCeremonyTracker.IsSynthCounter(WorldEntryCeremonyTracker.SynthCounterRoot));
+        Assert.True(WorldEntryCeremonyTracker.IsSynthCounter(WorldEntryCeremonyTracker.SynthCounterUnroot));
+        Assert.False(WorldEntryCeremonyTracker.IsSynthCounter(0));
+        Assert.False(WorldEntryCeremonyTracker.IsSynthCounter(0xFFFFFFFF));
+
+        var mint = new MoveCounterMint();
+        for (int i = 0; i < 1000; i++)
+            Assert.False(WorldEntryCeremonyTracker.IsSynthCounter(mint.Mint(0)));
+    }
 }

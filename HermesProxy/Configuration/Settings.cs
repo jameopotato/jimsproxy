@@ -130,6 +130,12 @@ public static class Settings
     //                     client is still loading and release them only after
     //                     CMSG_MOVE_INIT_ACTIVE_MOVER_COMPLETE (+ optional delay) —
     //                     walks the delivery through the never-captured quadrant.
+    //   synth_root_preinit — send a synthetic self force-root (sentinel counter)
+    //                     immediately after NEW_WORLD (guaranteed pre-mover-init);
+    //                     the ack's timing answers the force-op lifecycle trichotomy
+    //                     (immediate=applied / at-init=queued / absent=discarded);
+    //                     a paired synth unroot fires DelayMs (default 3000) after
+    //                     init. Sentinel acks are swallowed, never forwarded.
     public static string WorldEntryHarnessMode = "off";
     public static int WorldEntryHarnessCount;
     public static int WorldEntryHarnessDelayMs;
