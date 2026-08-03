@@ -925,12 +925,6 @@ public partial class WorldClient
                         flag.MoverGUID == GetSession().GameState.CurrentPlayerGuid;
         bool selfUnroot = universalOpcode == Opcode.SMSG_MOVE_UNROOT &&
                           flag.MoverGUID == GetSession().GameState.CurrentPlayerGuid;
-        var ceremony = GetSession().GameState.WorldEntryCeremony;
-        if (ceremony.Active && selfRoot)
-            System.Threading.Interlocked.Increment(ref ceremony.RootsForwarded);
-        if (ceremony.Active && selfUnroot)
-            System.Threading.Interlocked.Increment(ref ceremony.UnrootsForwarded);
-
         if (selfUnroot && ShouldHarnessDropUnroot())
         {
             // NOTE: the legacy server sent this unroot and awaits the matching
@@ -945,8 +939,39 @@ public partial class WorldClient
             return;
         }
 
+        // JimsProxy (worldentry convert_unroot_to_spline harness, R5): re-dialect the
+        // force-unroot into the spline family — byte-for-byte what the client would
+        // receive if the server's SendMoveRoot took the CLIENT_CONTROL_LOST branch
+        // (R40 (c)) for this leg. If a spline-unroot fails to lift the force-root
+        // (player stuck exactly like drop_unroot), the (c) premise is proven on the
+        // client half; if it frees the player, (c) collapses. Uses the same
+        // drop-counter arming as drop_unroot (WorldEntryHarnessCount applications).
+        if (selfUnroot && ShouldHarnessConvertUnrootToSpline())
+        {
+            MoveSplineSetFlag splineUnroot = new MoveSplineSetFlag(Opcode.SMSG_MOVE_SPLINE_UNROOT);
+            splineUnroot.MoverGUID = flag.MoverGUID;
+            var convCeremony = GetSession().GameState.WorldEntryCeremony;
+            if (convCeremony.Active)
+                System.Threading.Interlocked.Increment(ref convCeremony.SplineUnrootsForwarded);
+            SendPacketToClient(splineUnroot);
+            Framework.Logging.Log.Event("worldentry.harness.unroot_converted_to_spline", new
+            {
+                original_move_counter = flag.MoveCounter,
+                remaining = GetSession().GameState.WorldEntryHarnessDropRemaining,
+            });
+            return;
+        }
+
         if ((selfRoot || selfUnroot) && Framework.Settings.WorldEntryMintMoveCounters)
             flag.MoveCounter = GetSession().GameState.WorldEntryCounterMint.Mint(flag.MoveCounter);
+
+        // Count only what is actually delivered toward the client (dropped/converted
+        // legs are excluded above; held legs below are delivered later, fail-open).
+        var ceremony = GetSession().GameState.WorldEntryCeremony;
+        if (ceremony.Active && selfRoot)
+            System.Threading.Interlocked.Increment(ref ceremony.RootsForwarded);
+        if (ceremony.Active && selfUnroot)
+            System.Threading.Interlocked.Increment(ref ceremony.UnrootsForwarded);
 
         if ((selfRoot || selfUnroot) &&
             GetSession().GameState.WorldEntryAwaitingInitMoverComplete &&
@@ -965,11 +990,16 @@ public partial class WorldClient
         SendPacketToClient(flag);
     }
 
-    // JimsProxy (worldentry root-ceremony harness): arm/decrement the drop_unroot
-    // counter. Seeded lazily from Settings so a session picks up --set overrides.
-    private bool ShouldHarnessDropUnroot()
+    // JimsProxy (worldentry root-ceremony harness): arm/decrement the drop_unroot /
+    // convert_unroot_to_spline counter. Seeded lazily from Settings so a session
+    // picks up --set overrides.
+    private bool ShouldHarnessDropUnroot() => ArmHarnessUnrootInterception("drop_unroot");
+
+    private bool ShouldHarnessConvertUnrootToSpline() => ArmHarnessUnrootInterception("convert_unroot_to_spline");
+
+    private bool ArmHarnessUnrootInterception(string mode)
     {
-        if (!Framework.Settings.WorldEntryHarnessMode.Equals("drop_unroot", StringComparison.OrdinalIgnoreCase))
+        if (!Framework.Settings.WorldEntryHarnessMode.Equals(mode, StringComparison.OrdinalIgnoreCase))
             return false;
         var gameState = GetSession().GameState;
         if (gameState.WorldEntryHarnessDropRemaining < 0)

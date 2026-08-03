@@ -136,6 +136,10 @@ public static class Settings
     //                     (immediate=applied / at-init=queued / absent=discarded);
     //                     a paired synth unroot fires DelayMs (default 3000) after
     //                     init. Sentinel acks are swallowed, never forwarded.
+    //   convert_unroot_to_spline — re-dialect the player's next WorldEntryHarnessCount
+    //                     arrival force-unroots into SMSG_MOVE_SPLINE_UNROOT — the
+    //                     exact wire the R40 CLIENT_CONTROL_LOST branch produces.
+    //                     Stuck = (c) premise proven; freed = (c) collapses.
     public static string WorldEntryHarnessMode = "off";
     public static int WorldEntryHarnessCount;
     public static int WorldEntryHarnessDelayMs;
