@@ -655,6 +655,25 @@ public partial class WorldClient
             SendPacketToServer(cancel);
             Log.Event("login.stuck_stun.cancel_synthesized", null);
         }
+
+        // JimsProxy (carried-root cure): deliver the missing unroot after the whole
+        // destination update has forwarded (never ahead of the create). Sentinel
+        // counter — the legacy server never sent this op; its ack is swallowed in
+        // HandleMoveForceAck2. Always-on event: this firing means a player would
+        // otherwise have arrived movement-locked.
+        if (GetSession().GameState.WorldEntryCarriedRootCureArmed)
+        {
+            GetSession().GameState.WorldEntryCarriedRootCureArmed = false;
+            GetSession().GameState.ClientBelievesRooted = false;
+            MoveSetFlag cureUnroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
+            cureUnroot.MoverGUID = GetSession().GameState.CurrentPlayerGuid;
+            cureUnroot.MoveCounter = WorldEntryCeremonyTracker.SynthCounterUnroot;
+            SendPacketToClient(cureUnroot);
+            Log.Event("worldentry.carried_root_cured", new
+            {
+                map_id = GetSession().GameState.CurrentMapId,
+            });
+        }
     }
 
     public void ReadNearObjectsBlock(WorldPacket packet, object index)
@@ -1337,6 +1356,35 @@ public partial class WorldClient
                             destination_transport_guid = moveInfo.TransportGuid.ToString(),
                             mode = pendingMode.ToString(),
                             reason = moveInfo.TransportGuid.IsEmpty() ? "source_off_transport" : "destination_on_transport",
+                        });
+                    }
+                }
+
+                // JimsProxy (carried-root cure 2026-08-03, THE FIX for the BG-exit
+                // movement lockup): a spam-clicked Leave departs while the BG-end
+                // root is being removed; the server's unroot fires between maps and
+                // is silently discarded (cmangos Unit.cpp:751, deterministic — R40
+                // (a)), so the client arrives still force-rooted while the server
+                // considers it mobile. Harness-proven equivalence: root minus unroot
+                // = the exact reported symptom incl. /reload cure (R2). Decide here
+                // on the server's authoritative destination movement state; deliver
+                // at end-of-UPDATE_OBJECT (stuck-stun pattern) so the unroot can
+                // never race ahead of the create it cures.
+                if (GetSession().GameState.WorldEntryPendingCarriedRootCheck)
+                {
+                    GetSession().GameState.WorldEntryPendingCarriedRootCheck = false;
+                    bool destinationRooted = ((MovementFlagWotLK)moveInfo.Flags).HasAnyFlag(MovementFlagWotLK.Root);
+                    if (WorldEntryCeremonyTracker.ShouldCureCarriedRoot(
+                            GetSession().GameState.ClientBelievesRooted, destinationRooted))
+                    {
+                        GetSession().GameState.WorldEntryCarriedRootCureArmed = true;
+                    }
+                    else if (destinationRooted && Framework.Settings.DebugOutput)
+                    {
+                        Framework.Logging.Log.Event("worldentry.carried_root.destination_rooted", new
+                        {
+                            map_id = GetSession().GameState.CurrentMapId,
+                            client_believes_rooted = GetSession().GameState.ClientBelievesRooted,
                         });
                     }
                 }

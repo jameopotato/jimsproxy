@@ -181,6 +181,16 @@ public sealed class GameSessionData
     public readonly MoveCounterMint WorldEntryCounterMint = new();
     public bool WorldEntryAwaitingInitMoverComplete; // NEW_WORLD/login → cleared at CMSG_MOVE_INIT_ACTIVE_MOVER_COMPLETE
     public long WorldEntryInitAmcTick;               // TickCount64 at the last CMSG_MOVE_INIT_ACTIVE_MOVER_COMPLETE
+    // JimsProxy (carried-root cure 2026-08-03): the proxy's model of whether the
+    // MODERN CLIENT currently believes it is rooted — set when a self root
+    // (force/spline family or a create carrying the root flag) is forwarded,
+    // cleared when any self unroot is forwarded (R5 proved the client accepts
+    // either family as clearing). A /reload clears the client without our
+    // knowledge; the resulting stale-true only ever costs one harmless no-op
+    // synth unroot at the next arrival (fail-safe direction).
+    public bool ClientBelievesRooted;
+    public bool WorldEntryPendingCarriedRootCheck;   // set at NEW_WORLD; consumed at the player's first destination update
+    public bool WorldEntryCarriedRootCureArmed;      // dispatcher → end-of-UPDATE_OBJECT synth handoff (stuck-stun pattern)
     public int WorldEntryHarnessDropRemaining = -1;  // -1 = lazily seeded from Settings.WorldEntryHarnessCount
     public readonly List<MoveSetFlag> WorldEntryHeldForceOps = new();
     public readonly Lock WorldEntryHeldForceOpsLock = new();

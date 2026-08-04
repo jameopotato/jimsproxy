@@ -626,6 +626,11 @@ public partial class WorldClient
             GetSession().GameState.WorldEntryCeremony.Begin("new_world", Environment.TickCount64);
             GetSession().GameState.WorldEntryAwaitingInitMoverComplete = true;
 
+            // JimsProxy (carried-root cure): arm the destination-side check. If the
+            // client crosses this boundary believing itself rooted, the player's
+            // first destination update decides whether the server agrees.
+            GetSession().GameState.WorldEntryPendingCarriedRootCheck = true;
+
             // JimsProxy (worldentry synth_root_preinit harness, Mirasu R40 §6.3):
             // deliver a synthetic self force-root immediately after NEW_WORLD —
             // guaranteed pre-mover-init while the client is loading. The ack's
@@ -879,12 +884,24 @@ public partial class WorldClient
         // click races). Zero occurrences in the healthy corpus; count them so the
         // ceremony breadcrumb can name the family, not just the absence.
         var splineCeremony = GetSession().GameState.WorldEntryCeremony;
-        if (splineCeremony.Active && spline.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        if (spline.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
         {
             if (universalOpcode == Opcode.SMSG_MOVE_SPLINE_ROOT)
-                System.Threading.Interlocked.Increment(ref splineCeremony.SplineRootsForwarded);
+            {
+                if (splineCeremony.Active)
+                    System.Threading.Interlocked.Increment(ref splineCeremony.SplineRootsForwarded);
+                // Carried-root belief: conservative — treat a self spline-root as
+                // rooting (if the client ignores it, the stale belief only costs a
+                // harmless no-op unroot at the next arrival).
+                GetSession().GameState.ClientBelievesRooted = true;
+            }
             else if (universalOpcode == Opcode.SMSG_MOVE_SPLINE_UNROOT)
-                System.Threading.Interlocked.Increment(ref splineCeremony.SplineUnrootsForwarded);
+            {
+                if (splineCeremony.Active)
+                    System.Threading.Interlocked.Increment(ref splineCeremony.SplineUnrootsForwarded);
+                // R5-proven: the client accepts a spline-family unroot as clearing.
+                GetSession().GameState.ClientBelievesRooted = false;
+            }
         }
 
         SendPacketToClient(spline);
@@ -972,6 +989,14 @@ public partial class WorldClient
             System.Threading.Interlocked.Increment(ref ceremony.RootsForwarded);
         if (ceremony.Active && selfUnroot)
             System.Threading.Interlocked.Increment(ref ceremony.UnrootsForwarded);
+
+        // JimsProxy (carried-root cure): maintain the client-root belief model on
+        // what actually reaches the client (a harness-dropped unroot above leaves
+        // the belief rooted — which is what lets the cure catch the strand).
+        if (selfRoot)
+            GetSession().GameState.ClientBelievesRooted = true;
+        else if (selfUnroot)
+            GetSession().GameState.ClientBelievesRooted = false;
 
         if ((selfRoot || selfUnroot) &&
             GetSession().GameState.WorldEntryAwaitingInitMoverComplete &&

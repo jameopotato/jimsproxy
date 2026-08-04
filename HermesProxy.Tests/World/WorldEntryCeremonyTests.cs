@@ -130,6 +130,22 @@ public class WorldEntryCeremonyTests
         Assert.True(WorldEntryCeremonyTracker.IsAnomalous(2, 2, 0, 0, 0, 0));
     }
 
+    // THE FIX's gate: cure exactly when the client crossed the boundary rooted
+    // while the destination's authoritative state says mobile.
+    [Fact]
+    public void ShouldCureCarriedRoot_TruthTable()
+    {
+        // The wedge: client rooted, server says mobile -> cure.
+        Assert.True(WorldEntryCeremonyTracker.ShouldCureCarriedRoot(clientBelievesRooted: true, destinationRooted: false));
+        // Legitimate root carried across a zone (destination confirms) -> hands off.
+        Assert.False(WorldEntryCeremonyTracker.ShouldCureCarriedRoot(clientBelievesRooted: true, destinationRooted: true));
+        // Healthy arrival (18/18 field captures) -> never fires.
+        Assert.False(WorldEntryCeremonyTracker.ShouldCureCarriedRoot(clientBelievesRooted: false, destinationRooted: false));
+        // Client clean but server roots at destination: the server's own force-op
+        // will arrive; nothing for the cure to do.
+        Assert.False(WorldEntryCeremonyTracker.ShouldCureCarriedRoot(clientBelievesRooted: false, destinationRooted: true));
+    }
+
     // Sentinel counters (synth harness ops) must be disjoint from the legacy
     // constant 0, the mint range, and the 0xFFFFFFFF transport-clear sentinel.
     [Fact]

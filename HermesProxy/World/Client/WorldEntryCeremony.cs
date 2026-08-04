@@ -99,6 +99,22 @@ public class WorldEntryCeremonyTracker
     public const uint SynthCounterRoot = 0xFFFFFF01;
     public const uint SynthCounterUnroot = 0xFFFFFF02;
     public static bool IsSynthCounter(uint counter) => counter >= 0xFFFFFF00 && counter < 0xFFFFFFFF;
+
+    /// <summary>
+    /// The carried-root cure gate (THE FIX). A spam-clicked "Leave Battleground"
+    /// departs while the BG-end root is being removed; the server's unroot fires in
+    /// the between-maps window and is silently discarded (cmangos Unit.cpp:751
+    /// `!IsInWorld()` — deterministic, Mirasu R40 (a)). The client then arrives
+    /// carrying a force-root the server no longer knows about — the exact reported
+    /// lockup (harness-proven: R2 drop_unroot reproduced symptom + /reload cure).
+    /// Cure: at the player's own destination update, if the client crossed the
+    /// boundary believing itself rooted while the server's authoritative movement
+    /// state says mobile, synthesize the missing unroot. Fires zero times across
+    /// all 18 healthy field captures (nobody crosses a boundary rooted); a
+    /// legitimately-rooted crossing keeps the gate closed via the destination flag.
+    /// </summary>
+    public static bool ShouldCureCarriedRoot(bool clientBelievesRooted, bool destinationRooted)
+        => clientBelievesRooted && !destinationRooted;
 }
 
 /// <summary>
