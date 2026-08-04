@@ -277,6 +277,14 @@ public partial class WorldClient
 
         GetSession().GameState.IsInWorld = true;
 
+        // JimsProxy (worldentry root-ceremony breadcrumb 2026-08-03): logins get the
+        // same arrival ROOT/UNROOT ceremony as world transfers (wire-verified, incl.
+        // the stuck-stun golden capture where the broken login shows the missing
+        // root-ack fingerprint). Flush any stale accounting, then open the login
+        // ceremony and arm the init-mover phase marker.
+        FlushWorldEntryCeremony("login_verify");
+        GetSession().GameState.WorldEntryCeremony.Begin("login", System.Environment.TickCount64);
+
         WorldServerInfo info = new();
         if (verify.MapID > 1)
         {

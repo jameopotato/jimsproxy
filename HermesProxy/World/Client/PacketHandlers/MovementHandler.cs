@@ -5,6 +5,7 @@ using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
 using System;
+using System.Collections.Generic;
 
 namespace HermesProxy.World.Client;
 
@@ -424,6 +425,20 @@ public partial class WorldClient
         if (guid == GetSession().GameState.CurrentPlayerGuid)
         {
             GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
+
+            // JimsProxy (carried-root cure, same-map variant): hearth/tele/portal
+            // within a map is a MoveTeleport, not a NEW_WORLD — a stranded root
+            // crosses this loading screen too. Belief-only gate (the teleport's
+            // MovementInfo flags are an echo of the client's own stuck state — see
+            // ShouldCureCarriedRoot); deliver only once the client ACKS the
+            // teleport (proof it processed it — an unroot delivered while the
+            // teleport is pending could be lost).
+            if (WorldEntryCeremonyTracker.ShouldCureCarriedRoot(GetSession().GameState.ClientBelievesRooted))
+            {
+                GetSession().GameState.WorldEntryCureAfterTeleportAck = true;
+                if (Framework.Settings.DebugOutput)
+                    Framework.Logging.Log.Event("worldentry.carried_root.armed", new { path = "move_teleport" });
+            }
         }
         SendPacketToClient(teleport);
     }
@@ -436,6 +451,10 @@ public partial class WorldClient
             Log.Print(LogType.Error, "Skipping SMSG_TRANSFER_PENDING, client is already being teleported.");
             return;
         }
+
+        // JimsProxy (worldentry root-ceremony breadcrumb): the previous arrival's
+        // ceremony accounting ends where the next transition begins.
+        FlushWorldEntryCeremony("transfer_pending");
 
         TransferPending transfer = new TransferPending();
         transfer.MapID = GetSession().GameState.PendingTransferMapId = packet.ReadUInt32();
@@ -613,6 +632,16 @@ public partial class WorldClient
             // --- END FIX ---
 
             SendPacketToClient(teleport);
+
+            // JimsProxy (worldentry root-ceremony breadcrumb): the arrival ceremony
+            // (ROOT ×2 + UNROOT, wire-verified on every Kronos arrival) begins after
+            // the worldport ack; open the accounting here.
+            GetSession().GameState.WorldEntryCeremony.Begin("new_world", Environment.TickCount64);
+
+            // JimsProxy (carried-root cure): arm the destination-side check. If the
+            // client crosses this boundary believing itself rooted, the missing
+            // unroot is synthesized at the player's first destination update.
+            GetSession().GameState.WorldEntryPendingCarriedRootCheck = true;
 
             // JimsProxy (zep-stuck-low-latency-race 2026-05-17): defer the
             // transport-clear synth until the player's first post-NEW_WORLD
@@ -839,6 +868,34 @@ public partial class WorldClient
         Opcode universalOpcode = packet.GetUniversalOpcode(false);
         MoveSplineSetFlag spline = new MoveSplineSetFlag(universalOpcode);
         spline.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
+
+        // JimsProxy (worldentry root-ceremony breadcrumb, R40 branch (c)): a
+        // spline-family root leg addressed to the PLAYER is the wrong-family
+        // signature (server emits it instead of the force op while
+        // CLIENT_CONTROL_LOST is up — e.g. the BG-end window an instant Leave
+        // click races). Zero occurrences in the healthy corpus; count them so the
+        // ceremony breadcrumb can name the family, not just the absence.
+        var splineCeremony = GetSession().GameState.WorldEntryCeremony;
+        if (spline.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            if (universalOpcode == Opcode.SMSG_MOVE_SPLINE_ROOT)
+            {
+                if (splineCeremony.Active)
+                    System.Threading.Interlocked.Increment(ref splineCeremony.SplineRootsForwarded);
+                // Carried-root belief: conservative — treat a self spline-root as
+                // rooting (if the client ignores it, the stale belief only costs a
+                // harmless no-op unroot at the next arrival).
+                GetSession().GameState.ClientBelievesRooted = true;
+            }
+            else if (universalOpcode == Opcode.SMSG_MOVE_SPLINE_UNROOT)
+            {
+                if (splineCeremony.Active)
+                    System.Threading.Interlocked.Increment(ref splineCeremony.SplineUnrootsForwarded);
+                // R5-proven: the client accepts a spline-family unroot as clearing.
+                GetSession().GameState.ClientBelievesRooted = false;
+            }
+        }
+
         SendPacketToClient(spline);
         // MIRASU (onyxia-landed-still-hovering): explicit hover toggles drive the registry + anim/gravity synth, else a landed mob keeps hover anim forever and a parked flyer stands and bounces.
         if (universalOpcode is Opcode.SMSG_MOVE_SPLINE_SET_HOVER or Opcode.SMSG_MOVE_SPLINE_UNSET_HOVER)
@@ -861,10 +918,73 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_MOVE_SET_NORMAL_FALL)]
     void HandleMoveForceFlagChange(WorldPacket packet)
     {
-        MoveSetFlag flag = new MoveSetFlag(packet.GetUniversalOpcode(false));
+        Opcode universalOpcode = packet.GetUniversalOpcode(false);
+        MoveSetFlag flag = new MoveSetFlag(universalOpcode);
         flag.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
         flag.MoveCounter = packet.ReadUInt32();
+
+        // JimsProxy (worldentry root-ceremony breadcrumb + carried-root cure
+        // 2026-08-03): count the player's arrival ROOT/UNROOT ceremony legs for the
+        // always-on unclosed-ceremony breadcrumb, and maintain the client-root
+        // belief model — the proxy's record of what the client was last told about
+        // its root state, which the carried-root cure gates on. No-op for non-self
+        // movers and for the other force flags in this handler. See
+        // WorldEntryCeremony.cs.
+        bool selfRoot = universalOpcode == Opcode.SMSG_MOVE_ROOT &&
+                        flag.MoverGUID == GetSession().GameState.CurrentPlayerGuid;
+        bool selfUnroot = universalOpcode == Opcode.SMSG_MOVE_UNROOT &&
+                          flag.MoverGUID == GetSession().GameState.CurrentPlayerGuid;
+        var ceremony = GetSession().GameState.WorldEntryCeremony;
+        if (ceremony.Active && selfRoot)
+            System.Threading.Interlocked.Increment(ref ceremony.RootsForwarded);
+        if (ceremony.Active && selfUnroot)
+            System.Threading.Interlocked.Increment(ref ceremony.UnrootsForwarded);
+        if (selfRoot)
+            GetSession().GameState.ClientBelievesRooted = true;
+        else if (selfUnroot)
+            GetSession().GameState.ClientBelievesRooted = false;
+
         SendPacketToClient(flag);
+    }
+
+    // JimsProxy (worldentry root-ceremony breadcrumb 2026-08-03): close out the
+    // previous arrival's ceremony accounting. An opened-but-not-observably-closed
+    // ceremony logs ONE always-on line (worldentry.ceremony.unclosed) so any field
+    // Export Diagnostics carries the movement-lockup discriminator: missing unroot =
+    // server never sent it; unroot forwarded but never acked = the client rejected
+    // or could not apply it (the stuck-stun golden capture's discard fingerprint);
+    // root acks short = a root leg was discarded; spline legs = the wrong-family
+    // dialect. Healthy ceremonies log only under DebugOutput.
+    internal void FlushWorldEntryCeremony(string reason)
+    {
+        var gameState = GetSession().GameState;
+        var ceremony = gameState.WorldEntryCeremony;
+        if (!ceremony.Active)
+            return;
+
+        bool anomalous = WorldEntryCeremonyTracker.IsAnomalous(
+            ceremony.RootsForwarded, ceremony.RootAcks,
+            ceremony.UnrootsForwarded, ceremony.UnrootAcks,
+            ceremony.SplineRootsForwarded, ceremony.SplineUnrootsForwarded);
+        if (anomalous || Framework.Settings.DebugOutput)
+        {
+            Framework.Logging.Log.Event(
+                anomalous ? "worldentry.ceremony.unclosed" : "worldentry.ceremony.closed",
+                new
+                {
+                    anchor = ceremony.Anchor,
+                    flush_reason = reason,
+                    ms_since_anchor = Environment.TickCount64 - ceremony.AnchorTickMs,
+                    roots_forwarded = ceremony.RootsForwarded,
+                    root_acks = ceremony.RootAcks,
+                    unroots_forwarded = ceremony.UnrootsForwarded,
+                    unroot_acks = ceremony.UnrootAcks,
+                    spline_roots_forwarded = ceremony.SplineRootsForwarded,
+                    spline_unroots_forwarded = ceremony.SplineUnrootsForwarded,
+                    init_mover_complete_seen = ceremony.InitMoverCompleteSeen,
+                });
+        }
+        ceremony.Reset();
     }
 
     [PacketHandler(Opcode.SMSG_COMPRESSED_MOVES)]

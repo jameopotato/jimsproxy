@@ -173,6 +173,21 @@ public sealed class GameSessionData
     public long WorldEntryTransferPendingTick; // TickCount64 at transfer-pending; 0 = no window open
     public long WorldEntryNewWorldTick;        // TickCount64 at NEW_WORLD forward; 0 = not reached
     public int WorldEntryWindowForwardCount;   // packets sent to the modern client in-window (DebugOutput only)
+    // JimsProxy (worldentry root-ceremony breadcrumb 2026-08-03): per-arrival
+    // ROOT/UNROOT ceremony leg + ack counting (always-on unclosed breadcrumb).
+    // See World/Client/WorldEntryCeremony.cs for the model and evidence.
+    public readonly WorldEntryCeremonyTracker WorldEntryCeremony = new();
+    // JimsProxy (carried-root cure 2026-08-03): the proxy's model of whether the
+    // MODERN CLIENT currently believes it is rooted — set when a self root
+    // (either family) is forwarded, cleared when any self unroot is forwarded
+    // (live-verified: the client accepts either family as clearing). A /reload
+    // clears the client without our knowledge; the resulting stale-true only ever
+    // costs one harmless no-op synth unroot at the next arrival (fail-safe
+    // direction).
+    public bool ClientBelievesRooted;
+    public bool WorldEntryPendingCarriedRootCheck;   // set at NEW_WORLD; consumed at the player's first destination update
+    public bool WorldEntryCarriedRootCureArmed;      // dispatcher → end-of-UPDATE_OBJECT synth handoff (stuck-stun pattern)
+    public bool WorldEntryCureAfterTeleportAck;      // same-map teleport variant: armed at the self MoveTeleport, fired at its CMSG_MOVE_TELEPORT_ACK
     // JimsProxy (zep-stuck-no-move 2026-05-14): set to a sentinel MoveCounter when
     // HandleNewWorld emits a synthesized SMSG_MOVE_TELEPORT to clear the modern
     // client's stale MOVEMENTFLAG_ONTRANSPORT after a cross-continent transport
