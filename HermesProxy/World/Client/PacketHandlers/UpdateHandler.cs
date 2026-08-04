@@ -1373,19 +1373,18 @@ public partial class WorldClient
                 if (GetSession().GameState.WorldEntryPendingCarriedRootCheck)
                 {
                     GetSession().GameState.WorldEntryPendingCarriedRootCheck = false;
-                    bool destinationRooted = ((MovementFlagWotLK)moveInfo.Flags).HasAnyFlag(MovementFlagWotLK.Root);
-                    if (WorldEntryCeremonyTracker.ShouldCureCarriedRoot(
-                            GetSession().GameState.ClientBelievesRooted, destinationRooted))
+                    if (WorldEntryCeremonyTracker.ShouldCureCarriedRoot(GetSession().GameState.ClientBelievesRooted))
                     {
                         GetSession().GameState.WorldEntryCarriedRootCureArmed = true;
-                    }
-                    else if (destinationRooted && Framework.Settings.DebugOutput)
-                    {
-                        Framework.Logging.Log.Event("worldentry.carried_root.destination_rooted", new
+                        if (Framework.Settings.DebugOutput)
                         {
-                            map_id = GetSession().GameState.CurrentMapId,
-                            client_believes_rooted = GetSession().GameState.ClientBelievesRooted,
-                        });
+                            Framework.Logging.Log.Event("worldentry.carried_root.armed", new
+                            {
+                                path = "new_world",
+                                // echo of the client's own state, telemetry only
+                                destination_flags_rooted = ((MovementFlagWotLK)moveInfo.Flags).HasAnyFlag(MovementFlagWotLK.Root),
+                            });
+                        }
                     }
                 }
             }

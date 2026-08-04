@@ -107,14 +107,22 @@ public class WorldEntryCeremonyTracker
     /// `!IsInWorld()` — deterministic, Mirasu R40 (a)). The client then arrives
     /// carrying a force-root the server no longer knows about — the exact reported
     /// lockup (harness-proven: R2 drop_unroot reproduced symptom + /reload cure).
-    /// Cure: at the player's own destination update, if the client crossed the
-    /// boundary believing itself rooted while the server's authoritative movement
-    /// state says mobile, synthesize the missing unroot. Fires zero times across
-    /// all 18 healthy field captures (nobody crosses a boundary rooted); a
-    /// legitimately-rooted crossing keeps the gate closed via the destination flag.
+    /// Cure: if the client crosses a loading boundary (NEW_WORLD or a same-map
+    /// teleport) believing itself rooted, synthesize the missing unroot.
+    ///
+    /// Deliberately NOT gated on the destination's movement flags: a player's
+    /// server-side m_movementInfo is an ECHO of the client's own reported state
+    /// (the root-ack the client sent when it got rooted), so a stranded client
+    /// poisons that evidence — the first verification run proved the flag-gated
+    /// version can never fire. Belief-only is safe: a legitimately rooted arrival
+    /// is re-rooted by the server's own arrival ceremony (ROOT ×2 fires on every
+    /// cross-map arrival, 18/18 field captures) right after our unroot; the
+    /// same-map residue (hearthing away during the last seconds of a live root
+    /// aura) is cosmetic. Fires zero times across all healthy captures (nobody
+    /// crosses a boundary rooted).
     /// </summary>
-    public static bool ShouldCureCarriedRoot(bool clientBelievesRooted, bool destinationRooted)
-        => clientBelievesRooted && !destinationRooted;
+    public static bool ShouldCureCarriedRoot(bool clientBelievesRooted)
+        => clientBelievesRooted;
 }
 
 /// <summary>
