@@ -425,6 +425,20 @@ public partial class WorldClient
         if (guid == GetSession().GameState.CurrentPlayerGuid)
         {
             GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
+
+            // JimsProxy (carried-root cure, same-map variant): hearth/tele/portal
+            // within a map is a MoveTeleport, not a NEW_WORLD — a stranded root
+            // crosses this loading screen too. The teleport's own MovementInfo is
+            // the server's authoritative state (flags already cast to Modern
+            // above); decide here, deliver only once the client ACKS the teleport
+            // (proof it processed it — an unroot delivered while the teleport is
+            // pending could be lost).
+            if (WorldEntryCeremonyTracker.ShouldCureCarriedRoot(
+                    GetSession().GameState.ClientBelievesRooted,
+                    ((MovementFlagModern)moveInfo.Flags).HasAnyFlag(MovementFlagModern.Root)))
+            {
+                GetSession().GameState.WorldEntryCureAfterTeleportAck = true;
+            }
         }
         SendPacketToClient(teleport);
     }

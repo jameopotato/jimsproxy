@@ -157,6 +157,25 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MOVE_TELEPORT_ACK)]
     void HandleMoveTeleportAck(MoveTeleportAck teleport)
     {
+        // JimsProxy (carried-root cure, same-map variant): the client just proved it
+        // processed the teleport — deliver the missing unroot armed at the self
+        // MoveTeleport. Sentinel counter; its ack is swallowed in HandleMoveForceAck2.
+        if (GetSession().GameState.WorldEntryCureAfterTeleportAck &&
+            teleport.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            GetSession().GameState.WorldEntryCureAfterTeleportAck = false;
+            GetSession().GameState.ClientBelievesRooted = false;
+            MoveSetFlag cureUnroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
+            cureUnroot.MoverGUID = GetSession().GameState.CurrentPlayerGuid;
+            cureUnroot.MoveCounter = World.Client.WorldEntryCeremonyTracker.SynthCounterUnroot;
+            SendPacket(cureUnroot);
+            Log.Event("worldentry.carried_root_cured", new
+            {
+                map_id = GetSession().GameState.CurrentMapId,
+                path = "teleport_ack",
+            });
+        }
+
         // JimsProxy (zep-stuck-no-move 2026-05-14): if this ack corresponds to the
         // synthesized SMSG_MOVE_TELEPORT emitted by HandleNewWorld to clear stale
         // MOVEMENTFLAG_ONTRANSPORT, drop it — the legacy server never sent the

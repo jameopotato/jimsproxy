@@ -191,6 +191,7 @@ public sealed class GameSessionData
     public bool ClientBelievesRooted;
     public bool WorldEntryPendingCarriedRootCheck;   // set at NEW_WORLD; consumed at the player's first destination update
     public bool WorldEntryCarriedRootCureArmed;      // dispatcher → end-of-UPDATE_OBJECT synth handoff (stuck-stun pattern)
+    public bool WorldEntryCureAfterTeleportAck;      // same-map teleport variant: armed at the self MoveTeleport, fired at its CMSG_MOVE_TELEPORT_ACK
     public int WorldEntryHarnessDropRemaining = -1;  // -1 = lazily seeded from Settings.WorldEntryHarnessCount
     public readonly List<MoveSetFlag> WorldEntryHeldForceOps = new();
     public readonly Lock WorldEntryHeldForceOpsLock = new();
