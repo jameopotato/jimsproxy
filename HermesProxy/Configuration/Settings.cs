@@ -63,6 +63,17 @@ public static class Settings
     // block so input isn't locked client-side even if the server ignores the cancel.
     public static bool StuckLogoutStunCancelFix;
     public static bool StuckLogoutStunClientStrip;
+    // JimsProxy (camp instance-reset bad login): merge a login-time server eviction
+    // (LOGIN_VERIFY_WORLD into an instanced map immediately followed by
+    // TRANSFER_PENDING + NEW_WORLD out of it — Kronos's over-cap instance-reset
+    // denial) into ONE clean client-facing login to the eviction destination. The
+    // raw two-step permanently hangs the 1.14 client's loading screen (the aborted
+    // login-load's loading-screen enable is never unwound). Instanced-map logins
+    // only; no timers — release is packet-driven (transfer, first UPDATE_OBJECT,
+    // or legacy disconnect fail-open). See World/Client/LoginEvictionHold.cs.
+    // Key = kill switch. Default-init true so paths that bypass LoadAndVerifyFrom
+    // (tests) get the fix.
+    public static bool LoginEvictionMerge = true;
     // JimsProxy (#382 MC-cap BG FPS drop): strip UNIT_FLAG_PET_IN_COMBAT (0x800) from a
     // PLAYER for exactly the duration of a player-on-player charm (Gnomish MC Cap 13181,
     // priest MC 605). Vanilla cores set that flag on the charmed unit itself; modern
@@ -217,6 +228,7 @@ public static class Settings
         UnplannedReconnectTimeoutMs = Math.Clamp(config.GetInt("UnplannedReconnectTimeoutMs", 5000), 1000, 30000);
         StuckLogoutStunCancelFix = config.GetBoolean("StuckLogoutStunCancelFix", true);
         StuckLogoutStunClientStrip = config.GetBoolean("StuckLogoutStunClientStrip", true);
+        LoginEvictionMerge = config.GetBoolean("LoginEvictionMerge", true);
         Charm382StripPetInCombat = config.GetBoolean("Charm382StripPetInCombat", true);
         AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);

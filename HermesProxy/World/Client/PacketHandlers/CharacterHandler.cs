@@ -260,6 +260,29 @@ public partial class WorldClient
         verify.Pos.Y = packet.ReadFloat();
         verify.Pos.Z = packet.ReadFloat();
         verify.Pos.Orientation = packet.ReadFloat();
+
+        // JimsProxy (camp login-eviction merge): an instanced-map login can be the
+        // doomed half of Kronos's over-cap eviction two-step — LOGIN_VERIFY into the
+        // instance, then TRANSFER_PENDING + NEW_WORLD out to the continent ~10ms
+        // later — which permanently hangs the 1.14 client's loading screen. Arm the
+        // hold BEFORE forwarding the verify so it heads the queue: the transfer
+        // arriving merges into it (MovementHandler.HandleNewWorld rewrites this
+        // packet's destination in place), the first UPDATE_OBJECT releases it as a
+        // healthy login. IsInWorld is read before the assignment below, so a
+        // seamless-reconnect verify (client already in world) never arms this.
+        var evictionHold = GetSession().GameState.LoginEvictionHold;
+        if (LoginEvictionHold.ShouldBegin(Framework.Settings.LoginEvictionMerge,
+                GetSession().GameState.IsInWorld, verify.MapID))
+        {
+            evictionHold.Begin(verify, Environment.TickCount64);
+            if (Framework.Settings.DebugOutput)
+            {
+                Framework.Logging.Log.Event("login.eviction_hold.started", new
+                {
+                    map_id = verify.MapID,
+                });
+            }
+        }
         SendPacketToClient(verify);
 
         // JimsProxy (zep-relog-diag 2026-05-15): emit the server-issued login
@@ -283,6 +306,9 @@ public partial class WorldClient
             info.DifficultyID = 1;
             info.InstanceGroupSize = 5;
         }
+        // JimsProxy (camp login-eviction merge): a merge rewrites these difficulty
+        // fields to match the eviction destination. No-op when the hold isn't armed.
+        evictionHold.RegisterWorldServerInfo(info);
         SendPacketToClient(info);
 
         SetAllTaskProgress tasks = new();

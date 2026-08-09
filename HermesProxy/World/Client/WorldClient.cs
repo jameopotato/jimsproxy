@@ -179,6 +179,28 @@ public partial class WorldClient
 
     public void Disconnect()
     {
+        // JimsProxy (camp login-eviction merge): fail-open. A legacy disconnect
+        // while the login stream is held must not strand the client with nothing —
+        // flush whatever was captured, unmodified. Sends go straight to the
+        // instance socket (not SendPacketToClientDirect): Disconnect can run on
+        // teardown threads where that path's wait-for-instance-socket loop could
+        // block, and if the modern side is already gone there is nobody to flush to.
+        var heldOnDisconnect = GetSession()?.GameState?.LoginEvictionHold.TryReleaseAll();
+        if (heldOnDisconnect != null)
+        {
+            var instanceSocket = GetSession()?.InstanceSocket;
+            if (instanceSocket != null)
+            {
+                foreach (var held in heldOnDisconnect)
+                    instanceSocket.SendPacket(held);
+            }
+            Log.Event("login.eviction_hold.flushed_fail_open", new
+            {
+                held_packets = heldOnDisconnect.Count,
+                sent_to_client = instanceSocket != null,
+            });
+        }
+
         StopKeepAliveTimer();
 
         if (!IsConnected())
@@ -479,6 +501,14 @@ public partial class WorldClient
 
     private void SendPacketToClientDirect(ServerPacket packet)
     {
+        // JimsProxy (camp login-eviction merge): while an instanced login-verify is
+        // held, every world packet queues behind it in arrival order (flushed by the
+        // release sites in MovementHandler/UpdateHandler/Disconnect). Realm packets
+        // are char-select traffic outside the world stream and pass through.
+        if (packet.GetConnection() != ConnectionType.Realm &&
+            GetSession().GameState.LoginEvictionHold.TryEnqueue(packet))
+            return;
+
         var gameState = GetSession().GameState;
         var pendingPackets = gameState.PendingUninstancedPackets;
         var pendingLock = gameState.PendingUninstancedPacketsLock;

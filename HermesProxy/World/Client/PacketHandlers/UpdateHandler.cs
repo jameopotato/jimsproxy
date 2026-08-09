@@ -377,6 +377,26 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_UPDATE_OBJECT)]
     void HandleUpdateObject(WorldPacket packet)
     {
+        // JimsProxy (camp login-eviction merge): the first object update after a
+        // held instanced login-verify means no eviction is coming — healthy login.
+        // Flush the held stream in arrival order ahead of this update's own
+        // translation. Cost on healthy instanced logins = the create-arrival delay
+        // the hold added (~4-200ms observed). No-op (null) when nothing is held.
+        var evictionHoldReleased = GetSession().GameState.LoginEvictionHold.TryReleaseOnFirstUpdateObject();
+        if (evictionHoldReleased != null)
+        {
+            foreach (var held in evictionHoldReleased)
+                SendPacketToClientDirect(held);
+            if (Settings.DebugOutput)
+            {
+                Log.Event("login.eviction_hold.released_healthy", new
+                {
+                    held_packets = evictionHoldReleased.Count,
+                    hold_ms = Environment.TickCount64 - GetSession().GameState.LoginEvictionHold.StartTick,
+                });
+            }
+        }
+
         var count = packet.ReadUInt32();
         PrintString($"Updates Count = {count}");
 
