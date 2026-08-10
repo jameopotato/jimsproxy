@@ -201,6 +201,24 @@ public partial class WorldClient
             });
         }
 
+        // JimsProxy (camp stun lock, step 2): same fail-open for control ops held by
+        // the pre-create op hold.
+        var heldOpsOnDisconnect = GetSession()?.GameState?.PreCreateOpHold.ReleaseAll();
+        if (heldOpsOnDisconnect != null && heldOpsOnDisconnect.Count > 0)
+        {
+            var opsSocket = GetSession()?.InstanceSocket;
+            if (opsSocket != null)
+            {
+                foreach (var heldOp in heldOpsOnDisconnect)
+                    opsSocket.SendPacket(heldOp);
+            }
+            Log.Event("login.precreate_op_hold.flushed_fail_open", new
+            {
+                op_count = heldOpsOnDisconnect.Count,
+                sent_to_client = opsSocket != null,
+            });
+        }
+
         StopKeepAliveTimer();
 
         if (!IsConnected())

@@ -255,7 +255,16 @@ public partial class WorldClient
         ControlUpdate control = new ControlUpdate();
         control.Guid = packet.ReadPackedGuid().To128(GetSession().GameState);
         control.HasControl = packet.ReadBool();
-        SendPacketToClient(control);
+
+        // JimsProxy (camp stun lock, step 2): a self control-update arriving before
+        // the login's first self create block is part of the wedge's lock recipe —
+        // hold it (and the walk-fix speed reassert below, so the pair stays in its
+        // emission order) for release right after the create forwards. Proxy-side
+        // bookkeeping below runs at translate time regardless.
+        bool heldPreCreate = control.Guid == GetSession().GameState.CurrentPlayerGuid &&
+            GetSession().GameState.PreCreateOpHold.TryCapture(control);
+        if (!heldPreCreate)
+            SendPacketToClient(control);
 
         // --- Mirasu RP Walk Bug Fix ---
         // The 1.14 client forgets to un-toggle Walk mode after CC wears off.
@@ -312,7 +321,9 @@ public partial class WorldClient
             runFix.MoverGUID = control.Guid;
             runFix.MoveCounter = 0;
             runFix.Speed = GetSession().GameState.LastKnownPlayerRunSpeed;
-            SendPacketToClient(runFix);
+            // step-2 hold: ride behind the held control-update in emission order.
+            if (!heldPreCreate || !GetSession().GameState.PreCreateOpHold.TryCapture(runFix))
+                SendPacketToClient(runFix);
         }
     }
 
@@ -424,6 +435,14 @@ public partial class WorldClient
         if (guid == GetSession().GameState.CurrentPlayerGuid)
         {
             GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
+
+            // JimsProxy (camp stun lock, step 2): a SERVER-originated self teleport
+            // before the login's first self create block joins the pre-create hold
+            // (R56 op set). Our own transport-clear synth doesn't route through this
+            // handler and stays unheld — it is present on every healthy login and
+            // provably not part of the lock recipe.
+            if (GetSession().GameState.PreCreateOpHold.TryCapture(teleport))
+                return;
         }
         SendPacketToClient(teleport);
     }
@@ -944,9 +963,20 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_MOVE_SET_NORMAL_FALL)]
     void HandleMoveForceFlagChange(WorldPacket packet)
     {
-        MoveSetFlag flag = new MoveSetFlag(packet.GetUniversalOpcode(false));
+        Opcode flagOpcode = packet.GetUniversalOpcode(false);
+        MoveSetFlag flag = new MoveSetFlag(flagOpcode);
         flag.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
         flag.MoveCounter = packet.ReadUInt32();
+
+        // JimsProxy (camp stun lock, step 2): a self root/unroot arriving before the
+        // login's first self create block is the wedge's lock recipe — hold it for
+        // in-order release right after the create forwards (PreCreateOpHold; the
+        // other force flags are not part of the arrival control ceremony and pass).
+        if ((flagOpcode == Opcode.SMSG_MOVE_ROOT || flagOpcode == Opcode.SMSG_MOVE_UNROOT) &&
+            flag.MoverGUID == GetSession().GameState.CurrentPlayerGuid &&
+            GetSession().GameState.PreCreateOpHold.TryCapture(flag))
+            return;
+
         SendPacketToClient(flag);
     }
 

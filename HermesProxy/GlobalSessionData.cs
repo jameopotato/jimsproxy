@@ -222,6 +222,9 @@ public sealed class GameSessionData
     // hold can never survive a relogin (fresh instance per login), and is NOT
     // carried over by CarryOverRealmScopedCaches by design.
     public readonly LoginEvictionHold LoginEvictionHold = new();
+    // JimsProxy (camp stun lock, step 2): pre-create self-op hold — see
+    // World/Client/PreCreateOpHold.cs. Same lifetime rules as LoginEvictionHold.
+    public readonly PreCreateOpHold PreCreateOpHold = new();
     public uint? CurrentMapId;
     public uint CurrentZoneId;
     public uint CurrentTaxiNode;

@@ -652,6 +652,25 @@ public partial class WorldClient
         foreach (var auraUpdate in auraUpdates)
             SendPacketToClient(auraUpdate);
 
+        // JimsProxy (camp stun lock, step 2): this update carried the login's first
+        // self create block (marked in DetectStuckLogoutStunAtSelfCreate) — release
+        // any control ops held from before it, in arrival order, now that the create
+        // and its aura updates are out. On healthy logins the list is empty (their
+        // ops arrive after the create); a non-empty release IS the wedge signature,
+        // so the event is always-on.
+        var preCreateOpsReleased = GetSession().GameState.PreCreateOpHold.TakeForRelease();
+        if (preCreateOpsReleased != null && preCreateOpsReleased.Count > 0)
+        {
+            foreach (var heldOp in preCreateOpsReleased)
+                SendPacketToClient(heldOp);
+            Log.Event("login.precreate_op_hold.released", new
+            {
+                op_count = preCreateOpsReleased.Count,
+                ops = preCreateOpsReleased.ConvertAll(p => p.GetUniversalOpcode().ToString()),
+                held_ms = Environment.TickCount64 - GetSession().GameState.PreCreateOpHold.ArmTick,
+            });
+        }
+
         // MIRASU (mc-rune-dousing): after the packet's own updates are out, push rune targetability for any boss life-state edges seen in it, and hide respawned circles around doused runes.
         FlushPendingMcRuneResyncs();
         SuppressMcCirclesOnDousedRunes();
@@ -2135,6 +2154,14 @@ public partial class WorldClient
             return;
         if (guid != GetSession().GameState.CurrentPlayerGuid)
             return;
+
+        // JimsProxy (camp stun lock, step 2): the first self create block this login
+        // is the pre-create op hold's release trigger. Mark here (mid-translation,
+        // before any legacy-version gate — the hold must release on every server
+        // flavor); the actual flush runs at the end of HandleUpdateObject, after the
+        // create and its aura updates have been sent.
+        GetSession().GameState.PreCreateOpHold.NoteSelfCreateForwarding();
+
         // Vanilla-only: the slot layout and the incomplete-reconnect behavior are 1.12 facts.
         if (!LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
             return;
