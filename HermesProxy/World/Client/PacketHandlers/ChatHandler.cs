@@ -527,7 +527,8 @@ public partial class WorldClient
         {
             return; // was handled by us
         }
-        Log.Print(LogType.Debug, "RAW CHAT INTERCEPTED: " + msg);
+        // Don't log `msg` here — it's whisper bodies verbatim, and addon bodies are raw
+        // DEFLATE bytes. Trace specific concerns with Log.Event instead (see below).
         // JimsProxy (chat-link-suffix 2026-05-07): preserve enchant + random-suffix when
         // collapsing modern item-link inner fields to vanilla format. The original fix
         // (f667118) replaced everything between :itemID and |h with :0:0:0, dropping the
