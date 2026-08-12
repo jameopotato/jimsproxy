@@ -63,6 +63,30 @@ public static class Settings
     // block so input isn't locked client-side even if the server ignores the cancel.
     public static bool StuckLogoutStunCancelFix;
     public static bool StuckLogoutStunClientStrip;
+    // JimsProxy (camp instance-reset bad login): merge a login-time server eviction
+    // (LOGIN_VERIFY_WORLD into an instanced map immediately followed by
+    // TRANSFER_PENDING + NEW_WORLD out of it — Kronos's over-cap instance-reset
+    // denial) into ONE clean client-facing login to the eviction destination. The
+    // raw two-step permanently hangs the 1.14 client's loading screen (the aborted
+    // login-load's loading-screen enable is never unwound). Instanced-map logins
+    // only; no timers — release is packet-driven (transfer, first UPDATE_OBJECT,
+    // or legacy disconnect fail-open). See World/Client/LoginEvictionHold.cs.
+    // Key = kill switch. Default-init true so paths that bypass LoadAndVerifyFrom
+    // (tests) get the fix.
+    public static bool LoginEvictionMerge = true;
+    // JimsProxy (camp instance-reset stun lock, step 2): hold self-addressed control
+    // ops (MOVE_ROOT/MOVE_UNROOT/CONTROL_UPDATE/MOVE_TELEPORT) that arrive between
+    // login-verify and the first self create block, and release them right after the
+    // create forwards. The wedge login's create is server-stalled ~600-800ms, so
+    // those ops otherwise reach the client BEFORE the player object exists and the
+    // client constructs it input-locked (turn/cast dead until relog — no later flag
+    // value clears it). Wire-proven ordering: every healthy login/transfer delivers
+    // creates before control ops; the wedge login is the sole exception. General
+    // per-login rule (the wedge is only detectable AT the create, after the ops
+    // passed); zero-cost on healthy logins (nothing is ever held). See
+    // World/Client/PreCreateOpHold.cs. Key = kill switch. Default-init true so paths
+    // that bypass LoadAndVerifyFrom (tests) get the fix.
+    public static bool LoginPreCreateOpHold = true;
     // JimsProxy (#382 MC-cap BG FPS drop): strip UNIT_FLAG_PET_IN_COMBAT (0x800) from a
     // PLAYER for exactly the duration of a player-on-player charm (Gnomish MC Cap 13181,
     // priest MC 605). Vanilla cores set that flag on the charmed unit itself; modern
@@ -217,6 +241,8 @@ public static class Settings
         UnplannedReconnectTimeoutMs = Math.Clamp(config.GetInt("UnplannedReconnectTimeoutMs", 5000), 1000, 30000);
         StuckLogoutStunCancelFix = config.GetBoolean("StuckLogoutStunCancelFix", true);
         StuckLogoutStunClientStrip = config.GetBoolean("StuckLogoutStunClientStrip", true);
+        LoginEvictionMerge = config.GetBoolean("LoginEvictionMerge", true);
+        LoginPreCreateOpHold = config.GetBoolean("LoginPreCreateOpHold", true);
         Charm382StripPetInCombat = config.GetBoolean("Charm382StripPetInCombat", true);
         AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);

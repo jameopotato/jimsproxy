@@ -179,6 +179,46 @@ public partial class WorldClient
 
     public void Disconnect()
     {
+        // JimsProxy (camp login-eviction merge): fail-open. A legacy disconnect
+        // while the login stream is held must not strand the client with nothing —
+        // flush whatever was captured, unmodified. Sends go straight to the
+        // instance socket (not SendPacketToClientDirect): Disconnect can run on
+        // teardown threads where that path's wait-for-instance-socket loop could
+        // block, and if the modern side is already gone there is nobody to flush to.
+        var heldOnDisconnect = GetSession()?.GameState?.LoginEvictionHold.TryReleaseAll();
+        if (heldOnDisconnect != null)
+        {
+            var instanceSocket = GetSession()?.InstanceSocket;
+            if (instanceSocket != null)
+            {
+                foreach (var held in heldOnDisconnect)
+                    instanceSocket.SendPacket(held);
+            }
+            Log.Event("login.eviction_hold.flushed_fail_open", new
+            {
+                held_packets = heldOnDisconnect.Count,
+                sent_to_client = instanceSocket != null,
+            });
+        }
+
+        // JimsProxy (camp stun lock, step 2): same fail-open for control ops held by
+        // the pre-create op hold.
+        var heldOpsOnDisconnect = GetSession()?.GameState?.PreCreateOpHold.ReleaseAll();
+        if (heldOpsOnDisconnect != null && heldOpsOnDisconnect.Count > 0)
+        {
+            var opsSocket = GetSession()?.InstanceSocket;
+            if (opsSocket != null)
+            {
+                foreach (var heldOp in heldOpsOnDisconnect)
+                    opsSocket.SendPacket(heldOp);
+            }
+            Log.Event("login.precreate_op_hold.flushed_fail_open", new
+            {
+                op_count = heldOpsOnDisconnect.Count,
+                sent_to_client = opsSocket != null,
+            });
+        }
+
         StopKeepAliveTimer();
 
         if (!IsConnected())
@@ -479,6 +519,14 @@ public partial class WorldClient
 
     private void SendPacketToClientDirect(ServerPacket packet)
     {
+        // JimsProxy (camp login-eviction merge): while an instanced login-verify is
+        // held, every world packet queues behind it in arrival order (flushed by the
+        // release sites in MovementHandler/UpdateHandler/Disconnect). Realm packets
+        // are char-select traffic outside the world stream and pass through.
+        if (packet.GetConnection() != ConnectionType.Realm &&
+            GetSession().GameState.LoginEvictionHold.TryEnqueue(packet))
+            return;
+
         var gameState = GetSession().GameState;
         var pendingPackets = gameState.PendingUninstancedPackets;
         var pendingLock = gameState.PendingUninstancedPacketsLock;

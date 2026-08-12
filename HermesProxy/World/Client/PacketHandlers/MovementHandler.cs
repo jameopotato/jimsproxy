@@ -256,7 +256,16 @@ public partial class WorldClient
         ControlUpdate control = new ControlUpdate();
         control.Guid = packet.ReadPackedGuid().To128(GetSession().GameState);
         control.HasControl = packet.ReadBool();
-        SendPacketToClient(control);
+
+        // JimsProxy (camp stun lock, step 2): a self control-update arriving before
+        // the login's first self create block is part of the wedge's lock recipe —
+        // hold it (and the walk-fix speed reassert below, so the pair stays in its
+        // emission order) for release right after the create forwards. Proxy-side
+        // bookkeeping below runs at translate time regardless.
+        bool heldPreCreate = control.Guid == GetSession().GameState.CurrentPlayerGuid &&
+            GetSession().GameState.PreCreateOpHold.TryCapture(control);
+        if (!heldPreCreate)
+            SendPacketToClient(control);
 
         // --- Mirasu RP Walk Bug Fix ---
         // The 1.14 client forgets to un-toggle Walk mode after CC wears off.
@@ -313,7 +322,9 @@ public partial class WorldClient
             runFix.MoverGUID = control.Guid;
             runFix.MoveCounter = 0;
             runFix.Speed = GetSession().GameState.LastKnownPlayerRunSpeed;
-            SendPacketToClient(runFix);
+            // step-2 hold: ride behind the held control-update in emission order.
+            if (!heldPreCreate || !GetSession().GameState.PreCreateOpHold.TryCapture(runFix))
+                SendPacketToClient(runFix);
         }
     }
 
@@ -432,13 +443,23 @@ public partial class WorldClient
             // MovementInfo flags are an echo of the client's own stuck state — see
             // ShouldCureCarriedRoot); deliver only once the client ACKS the
             // teleport (proof it processed it — an unroot delivered while the
-            // teleport is pending could be lost).
+            // teleport is pending could be lost). Armed BEFORE the pre-create hold
+            // below: a held teleport is still delivered post-create, so its
+            // eventual client ack — the cure's trigger — still comes.
             if (WorldEntryCeremonyTracker.ShouldCureCarriedRoot(GetSession().GameState.ClientBelievesRooted))
             {
                 GetSession().GameState.WorldEntryCureAfterTeleportAck = true;
                 if (Framework.Settings.DebugOutput)
                     Framework.Logging.Log.Event("worldentry.carried_root.armed", new { path = "move_teleport" });
             }
+
+            // JimsProxy (camp stun lock, step 2): a SERVER-originated self teleport
+            // before the login's first self create block joins the pre-create hold
+            // (R56 op set). Our own transport-clear synth doesn't route through this
+            // handler and stays unheld — it is present on every healthy login and
+            // provably not part of the lock recipe.
+            if (GetSession().GameState.PreCreateOpHold.TryCapture(teleport))
+                return;
         }
         SendPacketToClient(teleport);
     }
@@ -446,6 +467,26 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_TRANSFER_PENDING)]
     void HandleTransferPending(WorldPacket packet)
     {
+        uint transferMapId = packet.ReadUInt32();
+
+        // JimsProxy (camp login-eviction merge): a transfer arriving while the login
+        // stream is held is the over-cap eviction announcing itself. Swallow it
+        // client-side (no TransferPending, no SuspendToken, no transfer flags) — the
+        // NEW_WORLD that follows is merged into the held login-verify in
+        // HandleNewWorld. Always-on event: this only fires on the bug.
+        var evictionHold = GetSession().GameState.LoginEvictionHold;
+        if (evictionHold.OnTransferPending(transferMapId))
+        {
+            GetSession().GameState.PendingTransferMapId = transferMapId;
+            Log.Event("login.eviction_hold.transfer_pending", new
+            {
+                login_map_id = evictionHold.LoginMapId,
+                transfer_map_id = transferMapId,
+                ms_since_login_verify = Environment.TickCount64 - evictionHold.StartTick,
+            });
+            return;
+        }
+
         if (GetSession().GameState.IsWaitingForWorldPortAck)
         {
             Log.Print(LogType.Error, "Skipping SMSG_TRANSFER_PENDING, client is already being teleported.");
@@ -457,7 +498,7 @@ public partial class WorldClient
         FlushWorldEntryCeremony("transfer_pending");
 
         TransferPending transfer = new TransferPending();
-        transfer.MapID = GetSession().GameState.PendingTransferMapId = packet.ReadUInt32();
+        transfer.MapID = GetSession().GameState.PendingTransferMapId = transferMapId;
         transfer.OldMapPosition = Vector3.Zero;
         SendPacketToClient(transfer);
         GetSession().GameState.IsFirstEnterWorld = false;
@@ -507,6 +548,20 @@ public partial class WorldClient
 
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
             transfer.Arg = packet.ReadUInt8();
+
+        // JimsProxy (camp login-eviction merge): the client never saw the swallowed
+        // TRANSFER_PENDING, so its abort must be swallowed too. The hold drops back
+        // to plain holding — the original login stands, and the first UPDATE_OBJECT
+        // releases the held stream as a healthy login. Always-on: rare anomaly.
+        if (GetSession().GameState.LoginEvictionHold.OnTransferAborted())
+        {
+            Log.Event("login.eviction_hold.transfer_aborted", new
+            {
+                aborted_map_id = transfer.MapID,
+                reason = transfer.Reason.ToString(),
+            });
+            return;
+        }
 
         SendPacketToClient(transfer);
         GetSession().GameState.IsWaitingForNewWorld = false;
@@ -567,6 +622,55 @@ public partial class WorldClient
         teleport.Position = packet.ReadVector3();
         teleport.Orientation = packet.ReadFloat();
         teleport.Reason = 4;
+
+        // JimsProxy (camp login-eviction merge): the eviction's NEW_WORLD while the
+        // login stream is held — merge instead of forwarding. The held login-verify
+        // is rewritten to this destination (from the payload — different dungeons
+        // evict to map 0 or 1) and the held stream flushed, so the client does ONE
+        // clean load: exactly the shape the healthy post-eviction login proves
+        // works. The client never sees a transfer, so the MSG_MOVE_WORLDPORT_ACK
+        // its CMSG_WORLD_PORT_RESPONSE would normally produce (Server-side
+        // MovementHandler.HandleWorldPortResponse) is synthesized here instead.
+        // IsFirstEnterWorld deliberately stays TRUE — the client is still doing its
+        // first world entry, and the login-initial handlers gated on it (the
+        // SMSG_INITIALIZE_FACTIONS TimeSyncRequest synth the client needs to be
+        // able to move, SMSG_LOGIN_SET_TIME_SPEED) may run after the merge. The
+        // deferred transport synth likewise stays in Login mode. No
+        // IsWaitingForWorldPortAck: the client will never ack a transfer it never
+        // saw.
+        var evictionHold = GetSession().GameState.LoginEvictionHold;
+        var mergedHold = evictionHold.TryMergeOnNewWorld(teleport.MapID, teleport.Position, teleport.Orientation);
+        if (mergedHold != null)
+        {
+            // Same cast-state sweep a real transfer performs. A fresh login should
+            // have nothing in flight; parity keeps the two paths equivalent.
+            var mergeClearedCounts = GetSession().GameState.ResetInFlightCastState();
+            var mergeDroppedGcdHold = GetSession().GameState.CancelGcdHold();
+            var mergeDroppedCastTimeHold = GetSession().GameState.ClearHeldCastTimeCast();
+
+            foreach (var held in mergedHold)
+                SendPacketToClientDirect(held);
+
+            SendPacketToServer(new WorldPacket(Opcode.MSG_MOVE_WORLDPORT_ACK));
+
+            // Always-on: fires only on the bug — the field signature that the merge ran.
+            Log.Event("login.eviction_merge.merged", new
+            {
+                login_map_id = evictionHold.LoginMapId,
+                new_map_id = teleport.MapID,
+                x = teleport.Position.X,
+                y = teleport.Position.Y,
+                z = teleport.Position.Z,
+                held_packets = mergedHold.Count,
+                hold_ms = Environment.TickCount64 - evictionHold.StartTick,
+                normal_casts_cleared = mergeClearedCounts.normalCasts,
+                pet_casts_cleared = mergeClearedCounts.petCasts,
+                gcd_hold_dropped_spell_id = mergeDroppedGcdHold?.SpellId ?? 0,
+                cast_time_hold_dropped_spell_id = mergeDroppedCastTimeHold?.SpellId ?? 0,
+            });
+            return;
+        }
+
         GetSession().GameState.IsFirstEnterWorld = false;
 
         if (GetSession().GameState.IsWaitingForNewWorld)
@@ -929,7 +1033,11 @@ public partial class WorldClient
         // belief model — the proxy's record of what the client was last told about
         // its root state, which the carried-root cure gates on. No-op for non-self
         // movers and for the other force flags in this handler. See
-        // WorldEntryCeremony.cs.
+        // WorldEntryCeremony.cs. Runs BEFORE the pre-create op hold below: a held
+        // op is still delivered to the client (post-create), and on the rare
+        // login-failure discard the stale belief errs fail-safe (one no-op synth
+        // unroot at the next boundary; the next login's fresh GameSessionData
+        // clears it).
         bool selfRoot = universalOpcode == Opcode.SMSG_MOVE_ROOT &&
                         flag.MoverGUID == GetSession().GameState.CurrentPlayerGuid;
         bool selfUnroot = universalOpcode == Opcode.SMSG_MOVE_UNROOT &&
@@ -943,6 +1051,14 @@ public partial class WorldClient
             GetSession().GameState.ClientBelievesRooted = true;
         else if (selfUnroot)
             GetSession().GameState.ClientBelievesRooted = false;
+
+        // JimsProxy (camp stun lock, step 2): a self root/unroot arriving before the
+        // login's first self create block is the wedge's lock recipe — hold it for
+        // in-order release right after the create forwards (PreCreateOpHold; the
+        // other force flags are not part of the arrival control ceremony and pass).
+        if ((selfRoot || selfUnroot) &&
+            GetSession().GameState.PreCreateOpHold.TryCapture(flag))
+            return;
 
         SendPacketToClient(flag);
     }

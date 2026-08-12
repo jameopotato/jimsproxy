@@ -232,6 +232,14 @@ public sealed class GameSessionData
     public Queue<ServerPacket> PendingUninstancedPackets = new(); // Here packets are queued while IsConnectedToInstance = false;
     public readonly Lock PendingUninstancedPacketsLock = new();
     public bool IsInWorld;
+    // JimsProxy (camp login-eviction merge): hold-and-merge state for instanced-map
+    // logins — see World/Client/LoginEvictionHold.cs. Lives on GameSessionData so a
+    // hold can never survive a relogin (fresh instance per login), and is NOT
+    // carried over by CarryOverRealmScopedCaches by design.
+    public readonly LoginEvictionHold LoginEvictionHold = new();
+    // JimsProxy (camp stun lock, step 2): pre-create self-op hold — see
+    // World/Client/PreCreateOpHold.cs. Same lifetime rules as LoginEvictionHold.
+    public readonly PreCreateOpHold PreCreateOpHold = new();
     public uint? CurrentMapId;
     public uint CurrentZoneId;
     public uint CurrentTaxiNode;
