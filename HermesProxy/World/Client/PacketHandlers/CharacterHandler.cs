@@ -260,6 +260,43 @@ public partial class WorldClient
         verify.Pos.Y = packet.ReadFloat();
         verify.Pos.Z = packet.ReadFloat();
         verify.Pos.Orientation = packet.ReadFloat();
+
+        // JimsProxy (camp stun lock, step 2): arm the pre-create self-op hold for
+        // this login — self control ops (root/unroot/control-update/teleport) that
+        // arrive before the first self create block are held and released right
+        // after it forwards, restoring the healthy creates-before-ops order the
+        // wedge login violates (its create is server-stalled; the client otherwise
+        // constructs the player input-locked). Map-agnostic: direct wedge logins
+        // land on continents too. Read IsInWorld before the assignment below so a
+        // seamless-reconnect verify never arms this.
+        if (PreCreateOpHold.ShouldArm(Framework.Settings.LoginPreCreateOpHold,
+                GetSession().GameState.IsInWorld))
+        {
+            GetSession().GameState.PreCreateOpHold.Arm(Environment.TickCount64);
+        }
+
+        // JimsProxy (camp login-eviction merge): an instanced-map login can be the
+        // doomed half of Kronos's over-cap eviction two-step — LOGIN_VERIFY into the
+        // instance, then TRANSFER_PENDING + NEW_WORLD out to the continent ~10ms
+        // later — which permanently hangs the 1.14 client's loading screen. Arm the
+        // hold BEFORE forwarding the verify so it heads the queue: the transfer
+        // arriving merges into it (MovementHandler.HandleNewWorld rewrites this
+        // packet's destination in place), the first UPDATE_OBJECT releases it as a
+        // healthy login. IsInWorld is read before the assignment below, so a
+        // seamless-reconnect verify (client already in world) never arms this.
+        var evictionHold = GetSession().GameState.LoginEvictionHold;
+        if (LoginEvictionHold.ShouldBegin(Framework.Settings.LoginEvictionMerge,
+                GetSession().GameState.IsInWorld, verify.MapID))
+        {
+            evictionHold.Begin(verify, Environment.TickCount64);
+            if (Framework.Settings.DebugOutput)
+            {
+                Framework.Logging.Log.Event("login.eviction_hold.started", new
+                {
+                    map_id = verify.MapID,
+                });
+            }
+        }
         SendPacketToClient(verify);
 
         // JimsProxy (zep-relog-diag 2026-05-15): emit the server-issued login
@@ -277,12 +314,23 @@ public partial class WorldClient
 
         GetSession().GameState.IsInWorld = true;
 
+        // JimsProxy (worldentry root-ceremony breadcrumb 2026-08-03): logins get the
+        // same arrival ROOT/UNROOT ceremony as world transfers (wire-verified, incl.
+        // the stuck-stun golden capture where the broken login shows the missing
+        // root-ack fingerprint). Flush any stale accounting, then open the login
+        // ceremony and arm the init-mover phase marker.
+        FlushWorldEntryCeremony("login_verify");
+        GetSession().GameState.WorldEntryCeremony.Begin("login", System.Environment.TickCount64);
+
         WorldServerInfo info = new();
         if (verify.MapID > 1)
         {
             info.DifficultyID = 1;
             info.InstanceGroupSize = 5;
         }
+        // JimsProxy (camp login-eviction merge): a merge rewrites these difficulty
+        // fields to match the eviction destination. No-op when the hold isn't armed.
+        evictionHold.RegisterWorldServerInfo(info);
         SendPacketToClient(info);
 
         SetAllTaskProgress tasks = new();
@@ -336,6 +384,17 @@ public partial class WorldClient
         SendPacketToClient(failed);
 
         GetSession().GameState.IsInWorld = false;
+
+        // JimsProxy (camp stun lock, step 2): the login died — there is no world for
+        // held control ops to land in. Discard rather than flush.
+        var discardedOps = GetSession().GameState.PreCreateOpHold.ReleaseAll();
+        if (discardedOps != null && discardedOps.Count > 0)
+        {
+            Framework.Logging.Log.Event("login.precreate_op_hold.discarded_login_failed", new
+            {
+                op_count = discardedOps.Count,
+            });
+        }
     }
 
     [PacketHandler(Opcode.SMSG_UPDATE_ACTION_BUTTONS)]
