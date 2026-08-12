@@ -159,6 +159,35 @@ public sealed class GameSessionData
     public string? TaxiAttemptId;
     public bool IsWaitingForNewWorld;
     public bool IsWaitingForWorldPortAck;
+    // JimsProxy (worldentry stage-0 tripwire 2026-08-02): telemetry anchors for the
+    // world-transfer loading-screen window (SMSG_TRANSFER_PENDING → SMSG_NEW_WORLD →
+    // CMSG_WORLD_PORT_RESPONSE). Everything forwarded to the modern client inside
+    // this window is suspected of being silently discarded for movers the client has
+    // not created yet (documented precedent: the stuck-logout-stun create-baked root,
+    // UpdateHandler.cs). The tripwire in WorldSocket.SendPacket records the window's
+    // contents; these anchors give every line a phase-relative timestamp and a
+    // per-transfer correlation id. Anchors are maintained unconditionally (two long
+    // writes per transfer); all Log.Event emission is DebugOutput-gated. See
+    // WORLD-ENTRY-CONTRACT-INVESTIGATION.md.
+    public int WorldEntryWindowSeq;            // increments at each SMSG_TRANSFER_PENDING
+    public long WorldEntryTransferPendingTick; // TickCount64 at transfer-pending; 0 = no window open
+    public long WorldEntryNewWorldTick;        // TickCount64 at NEW_WORLD forward; 0 = not reached
+    public int WorldEntryWindowForwardCount;   // packets sent to the modern client in-window (DebugOutput only)
+    // JimsProxy (worldentry root-ceremony breadcrumb 2026-08-03): per-arrival
+    // ROOT/UNROOT ceremony leg + ack counting (always-on unclosed breadcrumb).
+    // See World/Client/WorldEntryCeremony.cs for the model and evidence.
+    public readonly WorldEntryCeremonyTracker WorldEntryCeremony = new();
+    // JimsProxy (carried-root cure 2026-08-03): the proxy's model of whether the
+    // MODERN CLIENT currently believes it is rooted — set when a self root
+    // (either family) is forwarded, cleared when any self unroot is forwarded
+    // (live-verified: the client accepts either family as clearing). A /reload
+    // clears the client without our knowledge; the resulting stale-true only ever
+    // costs one harmless no-op synth unroot at the next arrival (fail-safe
+    // direction).
+    public bool ClientBelievesRooted;
+    public bool WorldEntryPendingCarriedRootCheck;   // set at NEW_WORLD; consumed at the player's first destination update
+    public bool WorldEntryCarriedRootCureArmed;      // dispatcher → end-of-UPDATE_OBJECT synth handoff (stuck-stun pattern)
+    public bool WorldEntryCureAfterTeleportAck;      // same-map teleport variant: armed at the self MoveTeleport, fired at its CMSG_MOVE_TELEPORT_ACK
     // JimsProxy (zep-stuck-no-move 2026-05-14): set to a sentinel MoveCounter when
     // HandleNewWorld emits a synthesized SMSG_MOVE_TELEPORT to clear the modern
     // client's stale MOVEMENTFLAG_ONTRANSPORT after a cross-continent transport
@@ -203,6 +232,14 @@ public sealed class GameSessionData
     public Queue<ServerPacket> PendingUninstancedPackets = new(); // Here packets are queued while IsConnectedToInstance = false;
     public readonly Lock PendingUninstancedPacketsLock = new();
     public bool IsInWorld;
+    // JimsProxy (camp login-eviction merge): hold-and-merge state for instanced-map
+    // logins — see World/Client/LoginEvictionHold.cs. Lives on GameSessionData so a
+    // hold can never survive a relogin (fresh instance per login), and is NOT
+    // carried over by CarryOverRealmScopedCaches by design.
+    public readonly LoginEvictionHold LoginEvictionHold = new();
+    // JimsProxy (camp stun lock, step 2): pre-create self-op hold — see
+    // World/Client/PreCreateOpHold.cs. Same lifetime rules as LoginEvictionHold.
+    public readonly PreCreateOpHold PreCreateOpHold = new();
     public uint? CurrentMapId;
     public uint CurrentZoneId;
     public uint CurrentTaxiNode;
@@ -789,6 +826,14 @@ public sealed class GameSessionData
     public Dictionary<WowGuid128, Dictionary<byte, int>> UnitAuraDurationUpdateTime = [];
     public Dictionary<WowGuid128, Dictionary<byte, int>> UnitAuraDurationLeft = [];
     public Dictionary<WowGuid128, Dictionary<byte, int>> UnitAuraDurationFull = [];
+    // JimsProxy (res-sickness-swap-race): TickCount of the most recent server duration
+    // PUSH per (unit, slot) — written ONLY by the SMSG_UPDATE_AURA_DURATION /
+    // SMSG_SET_EXTRA_AURA_INFO handlers, never by emit-path stores (finisher snapshot,
+    // expiry restore). Distinguishes "a server-authoritative duration for this slot just
+    // raced ahead of its field update" from "stale duration left by the slot's previous
+    // occupant", which the swap-wipe guard in the UpdateHandler aura loop cannot tell
+    // apart by spell ID alone.
+    public Dictionary<WowGuid128, Dictionary<byte, int>> UnitAuraDurationPushTime = [];
     public Dictionary<WowGuid128, Dictionary<byte, WowGuid128>> UnitAuraCaster = [];
     // Wall-clock aura expiry per (unit, spell). Unlike the per-slot caches above this
     // survives unit destroys AND relogs (carried over in CreateNewGameSessionData), so a
@@ -1454,6 +1499,30 @@ public sealed class GameSessionData
         dict ??= [];
         dict[slot] = duration;
     }
+    // JimsProxy (res-sickness-swap-race): vanilla cores send SMSG_UPDATE_AURA_DURATION
+    // immediately at aura apply, while the field update installing the aura is batched
+    // to the end of the server tick. On a direct slot swap (Ghost → Resurrection
+    // Sickness at a spirit-healer res: same tick, no empty pass) the new occupant's
+    // duration therefore lands a few ms BEFORE the swap. Recording the push time lets
+    // the swap-wipe guard keep that fresh value instead of discarding it as the previous
+    // occupant's leftover.
+    public const int AuraDurationPushFreshnessMs = 1000;
+    public void StoreAuraDurationPushTime(WowGuid128 guid, byte slot, int currentTime)
+    {
+        ref var dict = ref CollectionsMarshal.GetValueRefOrAddDefault(UnitAuraDurationPushTime, guid, out _);
+        dict ??= [];
+        dict[slot] = currentTime;
+    }
+    public bool HasFreshAuraDurationPush(WowGuid128 guid, byte slot, int currentTime)
+    {
+        if (UnitAuraDurationPushTime.TryGetValue(guid, out var dict) &&
+            dict.TryGetValue(slot, out var pushedAt))
+        {
+            int age = unchecked(currentTime - pushedAt);
+            return age >= 0 && age <= AuraDurationPushFreshnessMs;
+        }
+        return false;
+    }
     public void ClearAuraDuration(WowGuid128 guid, byte slot)
     {
         if (UnitAuraDurationUpdateTime.TryGetValue(guid, out var timeDict))
@@ -1464,6 +1533,9 @@ public sealed class GameSessionData
 
         if (UnitAuraDurationFull.TryGetValue(guid, out var fullDict))
             fullDict.Remove(slot);
+
+        if (UnitAuraDurationPushTime.TryGetValue(guid, out var pushDict))
+            pushDict.Remove(slot);
     }
     public void GetAuraDuration(WowGuid128 guid, byte slot, out int left, out int full)
     {
@@ -1505,6 +1577,7 @@ public sealed class GameSessionData
         UnitAuraDurationUpdateTime.Remove(guid);
         UnitAuraDurationLeft.Remove(guid);
         UnitAuraDurationFull.Remove(guid);
+        UnitAuraDurationPushTime.Remove(guid);
         UnitAuraCaster.Remove(guid);
         UnitAuraLastEmitted.Remove(guid);
         // UnitAuraExpiryTick deliberately survives — it restores remaining buff time

@@ -100,7 +100,21 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_LOADING_SCREEN_NOTIFY)]
     void HandleLoadScreen(LoadingScreenNotify loadingScreenNotify)
     {
-        if (loadingScreenNotify.MapID >= 0)
+        LogWorldEntryClientSignal("loading_screen_notify", new
+        {
+            showing = loadingScreenNotify.Showing,
+            map_id = loadingScreenNotify.MapID,
+        });
+
+        // JimsProxy (camp login-eviction merge follow-up): only take the client's
+        // word for the map when we have nothing better. The notify echoes the map
+        // the client OPENED its loading screen with (char-list map at login), not
+        // where the server actually put it — on a merged eviction login (map 36
+        // login rewritten to the map 0 destination) this write was clobbering the
+        // correct server-derived CurrentMapId with the stale instance map. Server
+        // sources (LOGIN_VERIFY_WORLD / NEW_WORLD / INIT_WORLD_STATES) are
+        // authoritative and always follow.
+        if (loadingScreenNotify.MapID >= 0 && GetSession().GameState.CurrentMapId == null)
             GetSession().GameState.CurrentMapId = loadingScreenNotify.MapID;
 
         //MIRASU: /reload on the 1.14.2 client fires CMSG_LOADING_SCREEN_NOTIFY(Showing=true)

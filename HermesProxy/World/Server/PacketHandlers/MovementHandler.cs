@@ -157,6 +157,25 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MOVE_TELEPORT_ACK)]
     void HandleMoveTeleportAck(MoveTeleportAck teleport)
     {
+        // JimsProxy (carried-root cure, same-map variant): the client just proved it
+        // processed the teleport — deliver the missing unroot armed at the self
+        // MoveTeleport. Sentinel counter; its ack is swallowed in HandleMoveForceAck2.
+        if (GetSession().GameState.WorldEntryCureAfterTeleportAck &&
+            teleport.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            GetSession().GameState.WorldEntryCureAfterTeleportAck = false;
+            GetSession().GameState.ClientBelievesRooted = false;
+            MoveSetFlag cureUnroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
+            cureUnroot.MoverGUID = GetSession().GameState.CurrentPlayerGuid;
+            cureUnroot.MoveCounter = World.Client.WorldEntryCeremonyTracker.SynthCounterUnroot;
+            SendPacket(cureUnroot);
+            Log.Event("worldentry.carried_root_cured", new
+            {
+                map_id = GetSession().GameState.CurrentMapId,
+                path = "teleport_ack",
+            });
+        }
+
         // JimsProxy (zep-stuck-no-move 2026-05-14): if this ack corresponds to the
         // synthesized SMSG_MOVE_TELEPORT emitted by HandleNewWorld to clear stale
         // MOVEMENTFLAG_ONTRANSPORT, drop it — the legacy server never sent the
@@ -190,6 +209,33 @@ public partial class WorldSocket
     void HandleWorldPortResponse(WorldPortResponse teleport)
     {
         GetSession().GameState.IsWaitingForWorldPortAck = false;
+
+        // JimsProxy (worldentry stage-0 tripwire): this ack is the client saying it
+        // finished loading — close the window telemetry. duration_ms (NEW_WORLD →
+        // ack) is the machine-dependent variable the investigation is after.
+        var gameState = GetSession().GameState;
+        if (gameState.WorldEntryNewWorldTick != 0)
+        {
+            if (Framework.Settings.DebugOutput)
+            {
+                int forwarded = gameState.WorldEntryWindowForwardCount;
+                Framework.Logging.Log.Event("worldentry.window.closed", new
+                {
+                    seq = gameState.WorldEntryWindowSeq,
+                    duration_ms = Environment.TickCount64 - gameState.WorldEntryNewWorldTick,
+                    total_ms = gameState.WorldEntryTransferPendingTick != 0
+                        ? Environment.TickCount64 - gameState.WorldEntryTransferPendingTick
+                        : -1,
+                    forwarded_in_window = forwarded,
+                    forward_lines_suppressed = forwarded > WorldEntryForwardLineCap
+                        ? forwarded - WorldEntryForwardLineCap
+                        : 0,
+                });
+            }
+            gameState.WorldEntryNewWorldTick = 0;
+            gameState.WorldEntryTransferPendingTick = 0;
+        }
+
         // JimsProxy (speed-stuck-after-bg-end-while-mounted): arm post-teleport reassert; see memory.
         GetSession().GameState.PendingPostTeleportRunSpeedReassert = true;
         WorldPacket packet = new WorldPacket(Opcode.MSG_MOVE_WORLDPORT_ACK);
@@ -278,6 +324,35 @@ public partial class WorldSocket
     void HandleMoveForceAck2(MovementAckMessage movementAck)
     {
         var universalOpcode = movementAck.GetUniversalOpcode();
+
+        // JimsProxy (carried-root cure): the ack for the proxy-synthesized cure
+        // unroot carries a sentinel counter. The legacy server never sent that op,
+        // so the ack must not cross (a spurious force-ack can feed Kronos's
+        // malformed-input kick counters). The ack's presence is also the proof the
+        // client APPLIED the cure — log it always-on.
+        if (World.Client.WorldEntryCeremonyTracker.IsSynthCounter(movementAck.Ack.MoveCounter))
+        {
+            Log.Event("worldentry.carried_root.cure_acked", new
+            {
+                opcode = universalOpcode.ToString(),
+                move_counter = movementAck.Ack.MoveCounter,
+            });
+            return;
+        }
+
+        // JimsProxy (worldentry root-ceremony instrumentation 2026-08-03): the ack
+        // legs of the arrival ROOT/UNROOT ceremony. A forwarded-but-never-acked leg
+        // is the discard fingerprint (stuck-stun golden capture) the always-on
+        // breadcrumb keys on; see WorldEntryCeremony.cs.
+        var ceremony = GetSession().GameState.WorldEntryCeremony;
+        if (ceremony.Active && movementAck.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            if (universalOpcode == Opcode.CMSG_MOVE_FORCE_ROOT_ACK)
+                System.Threading.Interlocked.Increment(ref ceremony.RootAcks);
+            else if (universalOpcode == Opcode.CMSG_MOVE_FORCE_UNROOT_ACK)
+                System.Threading.Interlocked.Increment(ref ceremony.UnrootAcks);
+        }
+
         uint legacyOpcode = LegacyVersion.GetCurrentOpcode(universalOpcode);
         if (legacyOpcode == 0)
         {
@@ -312,6 +387,11 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_SET_ACTIVE_MOVER)]
     void HandleMoveSetActiveMover(SetActiveMover move)
     {
+        LogWorldEntryClientSignal("set_active_mover", new
+        {
+            mover_low = move.MoverGUID.GetCounter(),
+            is_self = move.MoverGUID == GetSession().GameState.CurrentPlayerGuid,
+        });
         WorldPacket packet = new WorldPacket(Opcode.CMSG_SET_ACTIVE_MOVER);
         packet.WriteGuid(move.MoverGUID.To64());
         SendPacketToServer(packet);
@@ -320,6 +400,14 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MOVE_INIT_ACTIVE_MOVER_COMPLETE)]
     void HandleMoveInitActiveMoverComplete(InitActiveMoverComplete move)
     {
+        LogWorldEntryClientSignal("init_active_mover_complete");
+
+        // JimsProxy (worldentry root-ceremony instrumentation 2026-08-03): the
+        // client's mover re-init completion — the phase boundary the arrival
+        // ceremony races (wire-verified: ROOT#1 lands at this boundary on nearly
+        // every arrival). Stamp the breadcrumb.
+        GetSession().GameState.WorldEntryCeremony.InitMoverCompleteSeen = true;
+
         WorldPacket packet = new WorldPacket(Opcode.CMSG_SET_ACTIVE_MOVER);
         packet.WriteGuid(GetSession().GameState.CurrentPlayerGuid.To64());
         SendPacketToServer(packet);

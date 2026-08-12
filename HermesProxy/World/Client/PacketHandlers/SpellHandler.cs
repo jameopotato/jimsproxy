@@ -3574,6 +3574,7 @@ public partial class WorldClient
 
         GetSession().GameState.StoreAuraDurationLeft(guid, slot, duration, (int)packet.GetReceivedTime());
         GetSession().GameState.StoreAuraDurationFull(guid, slot, duration);
+        GetSession().GameState.StoreAuraDurationPushTime(guid, slot, (int)packet.GetReceivedTime());
         if (duration <= 0)
             return;
 
@@ -3629,6 +3630,7 @@ public partial class WorldClient
 
         GetSession().GameState.StoreAuraDurationFull(guid, slot, durationFull);
         GetSession().GameState.StoreAuraDurationLeft(guid, slot, durationLeft, (int)packet.GetReceivedTime());
+        GetSession().GameState.StoreAuraDurationPushTime(guid, slot, (int)packet.GetReceivedTime());
 
         if (packet.GetUniversalOpcode(false) == Opcode.SMSG_SET_EXTRA_AURA_INFO_NEED_UPDATE)
             GetSession().GameState.StoreAuraCaster(guid, slot, GetSession().GameState.CurrentPlayerGuid);
