@@ -377,6 +377,26 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_UPDATE_OBJECT)]
     void HandleUpdateObject(WorldPacket packet)
     {
+        // JimsProxy (camp login-eviction merge): the first object update after a
+        // held instanced login-verify means no eviction is coming — healthy login.
+        // Flush the held stream in arrival order ahead of this update's own
+        // translation. Cost on healthy instanced logins = the create-arrival delay
+        // the hold added (~4-200ms observed). No-op (null) when nothing is held.
+        var evictionHoldReleased = GetSession().GameState.LoginEvictionHold.TryReleaseOnFirstUpdateObject();
+        if (evictionHoldReleased != null)
+        {
+            foreach (var held in evictionHoldReleased)
+                SendPacketToClientDirect(held);
+            if (Settings.DebugOutput)
+            {
+                Log.Event("login.eviction_hold.released_healthy", new
+                {
+                    held_packets = evictionHoldReleased.Count,
+                    hold_ms = Environment.TickCount64 - GetSession().GameState.LoginEvictionHold.StartTick,
+                });
+            }
+        }
+
         var count = packet.ReadUInt32();
         PrintString($"Updates Count = {count}");
 
@@ -632,6 +652,25 @@ public partial class WorldClient
         foreach (var auraUpdate in auraUpdates)
             SendPacketToClient(auraUpdate);
 
+        // JimsProxy (camp stun lock, step 2): this update carried the login's first
+        // self create block (marked in DetectStuckLogoutStunAtSelfCreate) — release
+        // any control ops held from before it, in arrival order, now that the create
+        // and its aura updates are out. On healthy logins the list is empty (their
+        // ops arrive after the create); a non-empty release IS the wedge signature,
+        // so the event is always-on.
+        var preCreateOpsReleased = GetSession().GameState.PreCreateOpHold.TakeForRelease();
+        if (preCreateOpsReleased != null && preCreateOpsReleased.Count > 0)
+        {
+            foreach (var heldOp in preCreateOpsReleased)
+                SendPacketToClient(heldOp);
+            Log.Event("login.precreate_op_hold.released", new
+            {
+                op_count = preCreateOpsReleased.Count,
+                ops = preCreateOpsReleased.ConvertAll(p => p.GetUniversalOpcode().ToString()),
+                held_ms = Environment.TickCount64 - GetSession().GameState.PreCreateOpHold.ArmTick,
+            });
+        }
+
         // MIRASU (mc-rune-dousing): after the packet's own updates are out, push rune targetability for any boss life-state edges seen in it, and hide respawned circles around doused runes.
         FlushPendingMcRuneResyncs();
         SuppressMcCirclesOnDousedRunes();
@@ -654,6 +693,25 @@ public partial class WorldClient
             WorldPacket cancel = new WorldPacket(Opcode.CMSG_LOGOUT_CANCEL);
             SendPacketToServer(cancel);
             Log.Event("login.stuck_stun.cancel_synthesized", null);
+        }
+
+        // JimsProxy (carried-root cure): deliver the missing unroot after the whole
+        // destination update has forwarded (never ahead of the create). Sentinel
+        // counter — the legacy server never sent this op; its ack is swallowed in
+        // HandleMoveForceAck2. Always-on event: this firing means a player would
+        // otherwise have arrived movement-locked.
+        if (GetSession().GameState.WorldEntryCarriedRootCureArmed)
+        {
+            GetSession().GameState.WorldEntryCarriedRootCureArmed = false;
+            GetSession().GameState.ClientBelievesRooted = false;
+            MoveSetFlag cureUnroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
+            cureUnroot.MoverGUID = GetSession().GameState.CurrentPlayerGuid;
+            cureUnroot.MoveCounter = WorldEntryCeremonyTracker.SynthCounterUnroot;
+            SendPacketToClient(cureUnroot);
+            Log.Event("worldentry.carried_root_cured", new
+            {
+                map_id = GetSession().GameState.CurrentMapId,
+            });
         }
     }
 
@@ -1338,6 +1396,35 @@ public partial class WorldClient
                             mode = pendingMode.ToString(),
                             reason = moveInfo.TransportGuid.IsEmpty() ? "source_off_transport" : "destination_on_transport",
                         });
+                    }
+                }
+
+                // JimsProxy (carried-root cure 2026-08-03, THE FIX for the BG-exit
+                // movement lockup): a spam-clicked Leave departs while the BG-end
+                // root is being removed; the server's unroot fires between maps and
+                // is silently discarded (cmangos Unit.cpp:751, deterministic — R40
+                // (a)), so the client arrives still force-rooted while the server
+                // considers it mobile. Harness-proven equivalence: root minus unroot
+                // = the exact reported symptom incl. /reload cure (R2). Decide here
+                // on the server's authoritative destination movement state; deliver
+                // at end-of-UPDATE_OBJECT (stuck-stun pattern) so the unroot can
+                // never race ahead of the create it cures.
+                if (GetSession().GameState.WorldEntryPendingCarriedRootCheck)
+                {
+                    GetSession().GameState.WorldEntryPendingCarriedRootCheck = false;
+                    if (Framework.Settings.WorldEntryCarriedRootCure &&
+                        WorldEntryCeremonyTracker.ShouldCureCarriedRoot(GetSession().GameState.ClientBelievesRooted))
+                    {
+                        GetSession().GameState.WorldEntryCarriedRootCureArmed = true;
+                        if (Framework.Settings.DebugOutput)
+                        {
+                            Framework.Logging.Log.Event("worldentry.carried_root.armed", new
+                            {
+                                path = "new_world",
+                                // echo of the client's own state, telemetry only
+                                destination_flags_rooted = ((MovementFlagWotLK)moveInfo.Flags).HasAnyFlag(MovementFlagWotLK.Root),
+                            });
+                        }
                     }
                 }
             }
@@ -2115,6 +2202,14 @@ public partial class WorldClient
             return;
         if (guid != GetSession().GameState.CurrentPlayerGuid)
             return;
+
+        // JimsProxy (camp stun lock, step 2): the first self create block this login
+        // is the pre-create op hold's release trigger. Mark here (mid-translation,
+        // before any legacy-version gate — the hold must release on every server
+        // flavor); the actual flush runs at the end of HandleUpdateObject, after the
+        // create and its aura updates have been sent.
+        GetSession().GameState.PreCreateOpHold.NoteSelfCreateForwarding();
+
         // Vanilla-only: the slot layout and the incomplete-reconnect behavior are 1.12 facts.
         if (!LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
             return;
