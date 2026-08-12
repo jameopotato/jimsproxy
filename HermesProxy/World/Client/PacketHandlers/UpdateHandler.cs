@@ -1412,7 +1412,8 @@ public partial class WorldClient
                 if (GetSession().GameState.WorldEntryPendingCarriedRootCheck)
                 {
                     GetSession().GameState.WorldEntryPendingCarriedRootCheck = false;
-                    if (WorldEntryCeremonyTracker.ShouldCureCarriedRoot(GetSession().GameState.ClientBelievesRooted))
+                    if (Framework.Settings.WorldEntryCarriedRootCure &&
+                        WorldEntryCeremonyTracker.ShouldCureCarriedRoot(GetSession().GameState.ClientBelievesRooted))
                     {
                         GetSession().GameState.WorldEntryCarriedRootCureArmed = true;
                         if (Framework.Settings.DebugOutput)

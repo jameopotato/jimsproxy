@@ -446,7 +446,8 @@ public partial class WorldClient
             // teleport is pending could be lost). Armed BEFORE the pre-create hold
             // below: a held teleport is still delivered post-create, so its
             // eventual client ack — the cure's trigger — still comes.
-            if (WorldEntryCeremonyTracker.ShouldCureCarriedRoot(GetSession().GameState.ClientBelievesRooted))
+            if (Framework.Settings.WorldEntryCarriedRootCure &&
+                WorldEntryCeremonyTracker.ShouldCureCarriedRoot(GetSession().GameState.ClientBelievesRooted))
             {
                 GetSession().GameState.WorldEntryCureAfterTeleportAck = true;
                 if (Framework.Settings.DebugOutput)

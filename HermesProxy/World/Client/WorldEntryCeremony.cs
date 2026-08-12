@@ -35,10 +35,14 @@ public class WorldEntryCeremonyTracker
     // Mirasu R40 branch (c): when the 1.12 unit has CLIENT_CONTROL_LOST (set by
     // BattleGround::BlockMovement at BG end — the exact window an instant
     // "Leave Battleground" click races), the server emits SPLINE_MOVE_ROOT/UNROOT
-    // instead of the FORCE family. Unacked, and applied to a different slot than a
-    // force-root — a force-root + spline-unroot pair strands the root with no
-    // packet dropped anywhere. Healthy corpus has ZERO self spline root legs
-    // (0/18 arrivals), so ANY occurrence is capture-worthy.
+    // instead of the FORCE family (unacked). R40's "wrong slot" theory — that a
+    // spline-unroot cannot clear a force-root — was DISPROVEN live (R5 run,
+    // 2026-08-03: a force-unroot re-dialected to the spline family still freed the
+    // player), so a mixed-family pair is NOT itself a strand at normal post-init
+    // timing; only mid-load spline delivery remains untested. Healthy corpus has
+    // ZERO self spline root legs (0/18 arrivals), so ANY occurrence is still
+    // capture-worthy — it marks the CONTROL_LOST emission window even though the
+    // family itself is not the lock.
     public int SplineRootsForwarded;
     public int SplineUnrootsForwarded;
     public bool InitMoverCompleteSeen;

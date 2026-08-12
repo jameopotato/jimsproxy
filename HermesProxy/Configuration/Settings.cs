@@ -87,6 +87,16 @@ public static class Settings
     // World/Client/PreCreateOpHold.cs. Key = kill switch. Default-init true so paths
     // that bypass LoadAndVerifyFrom (tests) get the fix.
     public static bool LoginPreCreateOpHold = true;
+    // JimsProxy (BG-exit movement lockup #328): synthesize the missing unroot for a
+    // player who crosses a loading boundary (NEW_WORLD or same-map teleport) still
+    // believing itself force-rooted — the departure-side unroot is dropped
+    // server-side for out-of-world players (cmangos Unit.cpp:751), stranding the
+    // root client-side. Belief-gated and no-op when wrong (a legitimately rooted
+    // cross-map arrival is re-rooted by the server's own arrival ceremony). Key =
+    // kill switch for the cure synth only; the always-on ceremony breadcrumb stays
+    // active regardless (instrument, not cure). See World/Client/WorldEntryCeremony.cs.
+    // Default-init true so paths that bypass LoadAndVerifyFrom (tests) get the fix.
+    public static bool WorldEntryCarriedRootCure = true;
     // JimsProxy (#382 MC-cap BG FPS drop): strip UNIT_FLAG_PET_IN_COMBAT (0x800) from a
     // PLAYER for exactly the duration of a player-on-player charm (Gnomish MC Cap 13181,
     // priest MC 605). Vanilla cores set that flag on the charmed unit itself; modern
@@ -243,6 +253,7 @@ public static class Settings
         StuckLogoutStunClientStrip = config.GetBoolean("StuckLogoutStunClientStrip", true);
         LoginEvictionMerge = config.GetBoolean("LoginEvictionMerge", true);
         LoginPreCreateOpHold = config.GetBoolean("LoginPreCreateOpHold", true);
+        WorldEntryCarriedRootCure = config.GetBoolean("WorldEntryCarriedRootCure", true);
         Charm382StripPetInCombat = config.GetBoolean("Charm382StripPetInCombat", true);
         AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);

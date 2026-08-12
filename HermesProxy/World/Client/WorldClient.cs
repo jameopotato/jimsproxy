@@ -219,6 +219,15 @@ public partial class WorldClient
             });
         }
 
+        // JimsProxy (worldentry root-ceremony breadcrumb): a client close is the
+        // most common reaction to a movement lockup — flush the ceremony accounting
+        // here so the final arrival's breadcrumb isn't lost with the session (the
+        // other flush anchors are the NEXT login-verify / transfer, which never
+        // come). Read-and-log only, no sends; idempotent (tracker resets on flush),
+        // so racing Disconnect calls are safe.
+        if (GetSession()?.GameState != null)
+            FlushWorldEntryCeremony("disconnect");
+
         StopKeepAliveTimer();
 
         if (!IsConnected())
