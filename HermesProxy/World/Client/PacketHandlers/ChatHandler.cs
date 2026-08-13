@@ -261,7 +261,9 @@ public partial class WorldClient
             // and the tooltip renders the base item without "of the X" stats.
             // Skip for addon messages — those carry binary payloads that look nothing like
             // item links and must not be passed through the link parser.
-            text = ExpandVanillaItemLinkToModern(text);
+            // JimsProxy (chronoboon-chat-link): the boon alias rewrite must only touch the echo of OUR OWN link — others' boon links must resolve to the sender's boon, not our alias.
+            bool selfMessage = sender != null && sender == GetSession().GameState.CurrentPlayerGuid;
+            text = ExpandVanillaItemLinkToModern(text, selfMessage);
         }
 
         text = MaybeScrambleForeignLanguage(text, language);
@@ -280,18 +282,39 @@ public partial class WorldClient
     /// DBC ID. Items with no suffix (randomProperty == 0) still get expanded so the modern
     /// client always sees a consistent format.
     /// </summary>
-    private static string ExpandVanillaItemLinkToModern(string text)
+    private static string ExpandVanillaItemLinkToModern(string text, bool selfMessage)
     {
         if (string.IsNullOrEmpty(text) || !text.Contains("|Hitem:"))
             return text;
         return System.Text.RegularExpressions.Regex.Replace(text,
-            @"\|Hitem:(\d+):(-?\d+):(-?\d+):(-?\d+)\|h",
+            @"\|Hitem:(\d+):(-?\d+):(-?\d+):(-?\d+)\|h(\[[^\]]*\])?",
             match =>
             {
                 string itemId = match.Groups[1].Value;
                 int enchant = int.TryParse(match.Groups[2].Value, out var e) ? e : 0;
                 int randomProp = int.TryParse(match.Groups[3].Value, out var r) ? r : 0;
                 int suffixModern = randomProp < 0 ? -randomProp : randomProp;
+                string nameTag = match.Groups[5].Value; // the [name] after |h, if present (else "")
+                // JimsProxy (chronoboon-chat-link): the client never re-queries 25007 (renders stale login-pushed data = dead link) — rewrite our echoed boon link to the already-resolved alias.
+                if (selfMessage &&
+                    uint.TryParse(itemId, out var incomingId) && incomingId == GameData.KronosChronoboonEntry &&
+                    GameData.CurrentChronoboonAlias != 0 &&
+                    GameData.GetItemTemplate(GameData.CurrentChronoboonAlias) is { } aliasTemplate)
+                {
+                    itemId = GameData.CurrentChronoboonAlias.ToString();
+                    // JimsProxy (chronoboon-chat-link): outbound carried the static base name for anti-hack; restore the real filled/empty display name from the alias template.
+                    if (aliasTemplate.Name != null && aliasTemplate.Name.Length > 0 && !string.IsNullOrEmpty(aliasTemplate.Name[0]))
+                        nameTag = $"[{aliasTemplate.Name[0]}]";
+                    if (Framework.Settings.DebugOutput)
+                    {
+                        Framework.Logging.Log.Event("chat.item_link.chronoboon_to_alias", new
+                        {
+                            real_entry = incomingId,
+                            alias = GameData.CurrentChronoboonAlias,
+                            display_name = nameTag,
+                        });
+                    }
+                }
                 Framework.Logging.Log.Event("chat.item_link.expanded", new
                 {
                     item_id = itemId,
@@ -299,7 +322,7 @@ public partial class WorldClient
                     random_property_signed = randomProp,
                     suffix_modern_positive = suffixModern,
                 });
-                return $"|Hitem:{itemId}:{enchant}:0:0:0:0:{suffixModern}:0:60:0:0:0|h";
+                return $"|Hitem:{itemId}:{enchant}:0:0:0:0:{suffixModern}:0:60:0:0:0|h{nameTag}";
             });
     }
 
@@ -540,11 +563,34 @@ public partial class WorldClient
         //   [0] enchantID, [1-4] gem1-4, [5] suffixID, [6] uniqueID, [7] linkLevel, ...
         // Vanilla 1.12 itemString fields after itemID:
         //   [0] enchantID, [1] randomProperty (signed; matches modern suffixID), [2] creator
+        bool hadChronoboonLink = false;
+        string? lastChronoboonLink = null; // gated diagnostic below logs the LINK only, never the message body (#463 privacy class)
         if (!isAddon) msg = System.Text.RegularExpressions.Regex.Replace(msg, @"\|Hitem:(\d+)([^|]*)\|h(\[[^\]]*\])?", match =>
         {
             string itemId = match.Groups[1].Value;
             string raw = match.Groups[2].Value;
             string nameTag = match.Groups[3].Value;
+            uint.TryParse(itemId, out uint idNum); // 0 if non-numeric; updated below if the alias is resolved
+            // JimsProxy (chronoboon-chat-link): rewrite the proxy's throwaway alias entry back to real 25007 the legacy server knows (range check so even an evicted alias resolves).
+            if (idNum != 0 && GameData.IsItemEntryAlias(idNum))
+            {
+                if (Framework.Settings.DebugOutput)
+                {
+                    Framework.Logging.Log.Event("chat.item_link.alias_resolved", new
+                    {
+                        alias_id = itemId,
+                        real_entry = GameData.KronosChronoboonEntry,
+                    });
+                }
+                itemId = GameData.KronosChronoboonEntry.ToString();
+                idNum = GameData.KronosChronoboonEntry;
+            }
+            // JimsProxy (chronoboon-chat-link): force the static base name on any boon link — Kronos V's anti-hack silently drops the whole message when [name] mismatches the proto name; the s2c echo path restores the state-correct display name.
+            if (idNum == GameData.KronosChronoboonEntry)
+            {
+                nameTag = $"[{GameData.KronosChronoboonBaseName}]";
+                hadChronoboonLink = true;
+            }
             // The captured group starts with ':' (the separator after itemID). Substring(1)
             // skips that leading separator so Split(':') preserves empty positions correctly
             // — earlier TrimStart(':') was eating leading-empty fields and shifting indices.
@@ -582,8 +628,24 @@ public partial class WorldClient
                 suffix_id = suffix,
                 display_name = nameTag,
             });
-            return $"|Hitem:{itemId}:{enchant}:{suffix}:0|h{nameTag}";
+            string rewritten = $"|Hitem:{itemId}:{enchant}:{suffix}:0|h{nameTag}";
+            if (idNum == GameData.KronosChronoboonEntry)
+                lastChronoboonLink = rewritten;
+            return rewritten;
         });
+        // JimsProxy (chronoboon-chat-link): boon-links-only diagnostic — the exact outbound link Kronos's validation must accept.
+        // Gated at merge (diagnostics policy) and trimmed to the LINK substring — the full outbound
+        // message is player chat and must never reach the JSONL that Export Diagnostics ships (#463).
+        if (hadChronoboonLink && Framework.Settings.DebugOutput)
+        {
+            var baseTemplate = GameData.GetItemTemplate(GameData.KronosChronoboonEntry);
+            Framework.Logging.Log.Event("chat.item_link.chronoboon_outbound", new
+            {
+                outbound_link = lastChronoboonLink,
+                kronos_25007_name = baseTemplate?.Name != null && baseTemplate.Name.Length > 0 ? baseTemplate.Name[0] : null,
+                kronos_25007_quality = baseTemplate?.Quality,
+            });
+        }
         WorldPacket packet = new WorldPacket(Opcode.CMSG_MESSAGECHAT);
         packet.WriteUInt32((uint)type);
         packet.WriteUInt32(lang);

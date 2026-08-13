@@ -471,7 +471,13 @@ public partial class WorldClient
         // SpellInProgress = cast bar active). Useful with Low Latency Mode where mid-GCD
         // presses reach the server and bounce back. The 1.14 client's "Suppress Error Speech"
         // setting covers audio but not the red error text; this covers both.
-        if (Settings.SuppressSpellCastErrors && isTransientReason)
+        // JimsProxy (raptor-strike-wedge): a suppressed transient failure matching a special slot must fall through to the special-cast branch below — returning early leaves the slot occupied forever and HandleCastSpell locally rejects every later press until relog.
+        bool suppressTransient = Settings.SuppressSpellCastErrors && isTransientReason;
+        bool matchesSpecialSlot =
+            GetSession().GameState.CurrentClientNextMeleeCast?.SpellId == spellId ||
+            GetSession().GameState.CurrentClientAutoRepeatCast?.SpellId == spellId;
+
+        if (suppressTransient && !matchesSpecialSlot)
         {
             // JimsProxy (suppress-ack-stuck-button): suppress the red error text, but STILL ack
             // the client so the action-button pending/lit state clears. Under LowLatencyMode the
@@ -520,7 +526,10 @@ public partial class WorldClient
             CastFailed failed = new();
             failed.SpellID = specialCast.SpellId;
             failed.SpellXSpellVisualID = specialCast.SpellXSpellVisualId;
-            failed.Reason = LegacyVersion.ConvertSpellCastResult(reason);
+            // JimsProxy (raptor-strike-wedge): keep the error text suppressed for transient bounces.
+            failed.Reason = suppressTransient
+                ? (uint)SpellCastResultClassic.DontReport
+                : LegacyVersion.ConvertSpellCastResult(reason);
             failed.CastID = specialCast.ServerGUID;
             failed.FailedArg1 = arg1;
             failed.FailedArg2 = arg2;
@@ -536,6 +545,21 @@ public partial class WorldClient
             }
             else
                 GetSession().GameState.CurrentClientNextMeleeCast = null;
+
+            // JimsProxy (gated at merge, diagnostics policy): fires on EVERY special-slot
+            // failure — including each Auto Shot out-of-range bounce while kiting — so it
+            // must not reach DebugOutput-off field logs.
+            if (Framework.Settings.DebugOutput)
+            {
+                Log.Event("cast.special_slot_failure_resolved", new
+                {
+                    spell_id = spellId,
+                    reason_id = reason,
+                    slot = isAutoRepeat ? "auto_repeat" : "next_melee",
+                    suppressed = suppressTransient,
+                    retry_scheduled = isAutoRepeat && IsRetryableAutoRepeatFailure(reason),
+                });
+            }
         }
         // Look up pending normal cast by SpellId (queue-based, FIFO order). A transient
         // duplicate-rejection (NotReady/SpellInProgress reaching here with suppression off)

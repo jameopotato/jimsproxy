@@ -677,6 +677,8 @@ public partial class WorldClient
         ItemTemplate aliasTemplate = template.CloneWithEntry(alias);
         GameData.StoreItemTemplate(alias, aliasTemplate);
         GameData.ItemEntryAlias[guid] = alias;
+        // JimsProxy (chronoboon-chat-link): newest fully-resolved alias — our own echoed 25007 chat link rewrites to it.
+        GameData.CurrentChronoboonAlias = alias;
 
         var aliasPackets = new List<ServerPacket>();
         var aliasItemMsg = GameData.GenerateItemUpdateIfNeeded(aliasTemplate);

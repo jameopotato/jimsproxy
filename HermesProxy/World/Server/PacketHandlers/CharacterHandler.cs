@@ -325,6 +325,8 @@ public partial class WorldSocket
         GetSession().GameState.StuckStunCancelArmed = false;
         GetSession().GameState.AwaitingSynthLogoutCancelAck = false;
         GetSession().GameState.CurrentPlayerGuid = playerLogin.Guid;
+        // JimsProxy (chronoboon-chat-link): static global survives char switches — reset so no char inherits the previous char's boon alias; this char's boon re-mints and re-sets it at login item-create.
+        GameData.CurrentChronoboonAlias = 0;
         GetSession().GameState.CurrentPlayerInfo = GetSession().GameState.OwnCharacters.Single(x => x.CharacterGuid == playerLogin.Guid);
         GetSession().GameState.CurrentPlayerStorage.LoadCurrentPlayer();
 

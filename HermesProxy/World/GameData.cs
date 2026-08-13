@@ -2501,12 +2501,18 @@ public static partial class GameData
     // JimsProxy (Kronos Chronoboon): Kronos's custom Chronoboon Displacer item entry (dynamic server-side tooltip).
     public const uint KronosChronoboonEntry = 25007;
 
+    // JimsProxy (chronoboon-chat-link): 25007's static proto name — Kronos V's chat anti-hack silently drops any boon link whose [name] doesn't match it, so outbound links must carry this, not the dynamic charged name.
+    public const string KronosChronoboonBaseName = "Chronoboon Displacer";
+
     // JimsProxy (Kronos Chronoboon): item GUID -> current alias entry, applied to the outgoing
     // OBJECT_FIELD_ENTRY in StoreObjectUpdateInternal. STATIC (not per-session GameState) so it SURVIVES
     // a relogin — else the alias map is wiped, the item reverts to base 25007, and the client renders its
     // stale empty-Chronoboon cache (the reported bank+relog "bugged out"). Keyed by the stable item GUID;
     // the alias records it points at also live in static stores, so the client's cached alias still renders.
     public static System.Collections.Concurrent.ConcurrentDictionary<WowGuid128, uint> ItemEntryAlias = new();
+
+    // JimsProxy (chronoboon-chat-link): latest alias minted for the local player's boon — our own echoed 25007 link rewrites to it so it renders (the client never re-queries 25007). 0 = none.
+    public static uint CurrentChronoboonAlias;
 
     // JimsProxy (Kronos Chronoboon): free a no-longer-presented alias's records so they don't accumulate
     // forever (these stores are static — across all players + whole proxy uptime). Called on the WC thread
