@@ -19,6 +19,11 @@ public partial class WorldSocket
         if (!state.TryBeginLocalPlayerAttackSwing(victim64))
             return;
 
+        // TEMP-DIAG (#464 follow-up) — REMOVE with the breadcrumb in Client/PacketHandlers/CombatHandler.cs.
+        // Diagnostics only: lets the empty-victim breadcrumb report how long
+        // after our swing the server's refusal arrived (219ms in the capture that found the bug).
+        state.LastAttackSwingSentTick = System.Environment.TickCount64;
+
         WorldPacket packet = new WorldPacket(Opcode.CMSG_ATTACK_SWING);
         packet.WriteGuid(victim64);
         SendPacketToServer(packet);

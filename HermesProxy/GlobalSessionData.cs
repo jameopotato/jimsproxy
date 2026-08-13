@@ -537,6 +537,7 @@ public sealed class GameSessionData
     public WowGuid64 CurrentAttackTarget;        // active CMSG_ATTACK_SWING victim, cleared on ATTACK_STOP/CANCEL_COMBAT
     public bool WaitingForAttackStart;           // true between CMSG_ATTACK_SWING and SMSG_ATTACK_START
     public bool DeferredAttackStop;              // CMSG_ATTACK_STOP received while waiting for SMSG_ATTACK_START
+    public long LastAttackSwingSentTick;         // TEMP-DIAG (#464 follow-up, REMOVE with the breadcrumb): TickCount64 when we last forwarded CMSG_ATTACK_SWING — feeds ms_since_swing
     public WowGuid128 PendingPreemptAttackStopVictim; // #450: preempt stop armed by SMSG_PARTY_KILL_LOG, flushed after the trailing killing-blow ASU or at socket drain
     public uint[] CurrentArenaTeamIds = new uint[3];
     public ConcurrentQueue<ClientCastRequest> PendingNormalCasts = new();  // regular spell casts (queue for proper FIFO handling)

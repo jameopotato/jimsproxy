@@ -42,10 +42,43 @@ public partial class WorldClient
             // All handshake bookkeeping lives in GameSessionData.ApplyLocalPlayerAttackStop
             // (pure, unit-tested). We only own the socket side: forwarding a stop that was
             // deferred behind an in-flight swing handshake.
-            if (state.ApplyLocalPlayerAttackStop(rawVictim) == PlayerAttackStopOutcome.FlushDeferredStop)
+            var pinnedBefore = state.CurrentAttackTarget;
+            var outcome = state.ApplyLocalPlayerAttackStop(rawVictim);
+
+            if (outcome == PlayerAttackStopOutcome.FlushDeferredStop)
             {
                 WorldPacket stopPacket = new WorldPacket(Opcode.CMSG_ATTACK_STOP);
                 SendPacketToServer(stopPacket, Opcode.MSG_NULL_ACTION);
+            }
+            else if (outcome == PlayerAttackStopOutcome.ClearRejectedHandshake &&
+                     rawVictim == WowGuid64.Empty)
+            {
+                // TEMP-DIAG (#464 follow-up) — REMOVE once the trigger has a clean repro.
+                // Until then this is the only way to learn how often the condition fires for
+                // players; delete this block, LastAttackSwingSentTick, and its stamp in
+                // Server/PacketHandlers/CombatHandler.cs together.
+                //
+                // JimsProxy (#464 follow-up): the exact condition #464 fixes — the legacy server
+                // refused our swing with a victim-less SMSG_ATTACKSTOP while the swing handshake
+                // was still in flight. Before #464 this pinned CurrentAttackTarget forever and the
+                // de-dupe guard ate every retry, so the player could never auto-attack that unit
+                // again (wire-confirmed 2026-08-12: a full fight with zero player swings).
+                //
+                // ALWAYS-ON, deliberately not gated behind Settings.DebugOutput: the trigger has
+                // no known on-demand repro, and reporters run with DebugOutput off, so a gated
+                // event would only ever fire for us and never in the field. It is rare by
+                // construction (once per refused engage — twice in a 23-minute session, and that
+                // was the session that surfaced the bug), so there is no log-volume or hot-path
+                // cost. Cheap enough to keep permanently; this is the signal that tells us how
+                // often the condition actually occurs for players.
+                Framework.Logging.Log.Event("combat.attack_stop_empty_victim_cleared", new
+                {
+                    pinned_victim_low = pinnedBefore.GetCounter(),
+                    ms_since_swing = state.LastAttackSwingSentTick != 0
+                        ? Environment.TickCount64 - state.LastAttackSwingSentTick
+                        : -1,
+                    now_dead = attack.NowDead,
+                });
             }
         }
 
