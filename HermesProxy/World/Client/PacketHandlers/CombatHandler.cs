@@ -54,8 +54,8 @@ public partial class WorldClient
                      rawVictim == WowGuid64.Empty)
             {
                 // TEMP-DIAG (#464 follow-up) — REMOVE once the trigger has a clean repro.
-                // Until then this is the only way to learn how often the condition fires for
-                // players; delete this block, LastAttackSwingSentTick, and its stamp in
+                // Until then this measures how often the condition fires during DEV testing;
+                // delete this block, LastAttackSwingSentTick, and its stamp in
                 // Server/PacketHandlers/CombatHandler.cs together.
                 //
                 // JimsProxy (#464 follow-up): the exact condition #464 fixes — the legacy server
@@ -64,21 +64,20 @@ public partial class WorldClient
                 // de-dupe guard ate every retry, so the player could never auto-attack that unit
                 // again (wire-confirmed 2026-08-12: a full fight with zero player swings).
                 //
-                // ALWAYS-ON, deliberately not gated behind Settings.DebugOutput: the trigger has
-                // no known on-demand repro, and reporters run with DebugOutput off, so a gated
-                // event would only ever fire for us and never in the field. It is rare by
-                // construction (once per refused engage — twice in a 23-minute session, and that
-                // was the session that surfaced the bug), so there is no log-volume or hot-path
-                // cost. Cheap enough to keep permanently; this is the signal that tells us how
-                // often the condition actually occurs for players.
-                Framework.Logging.Log.Event("combat.attack_stop_empty_victim_cleared", new
+                // DebugOutput-gated per the diagnostics policy: this is a dev-testing
+                // instrument (devs run DebugOutput on), not field telemetry. ms_since_swing
+                // ~200ms = the charge race; a large value would be a different animal.
+                if (Framework.Settings.DebugOutput)
                 {
-                    pinned_victim_low = pinnedBefore.GetCounter(),
-                    ms_since_swing = state.LastAttackSwingSentTick != 0
-                        ? Environment.TickCount64 - state.LastAttackSwingSentTick
-                        : -1,
-                    now_dead = attack.NowDead,
-                });
+                    Framework.Logging.Log.Event("combat.attack_stop_empty_victim_cleared", new
+                    {
+                        pinned_victim_low = pinnedBefore.GetCounter(),
+                        ms_since_swing = state.LastAttackSwingSentTick != 0
+                            ? Environment.TickCount64 - state.LastAttackSwingSentTick
+                            : -1,
+                        now_dead = attack.NowDead,
+                    });
+                }
             }
         }
 
