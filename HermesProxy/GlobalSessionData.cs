@@ -69,6 +69,21 @@ public enum DeferredTransportSynthMode
     Login = 2,
 }
 
+// JimsProxy (empty-victim wedge): what an SMSG_ATTACK_STOP naming the local player did to the
+// auto-attack handshake state. Returned by GameSessionData.ApplyLocalPlayerAttackStop so the
+// socket layer only has to decide whether to forward a CMSG_ATTACK_STOP.
+public enum PlayerAttackStopOutcome
+{
+    /// A CMSG_ATTACK_STOP was deferred behind an in-flight swing handshake — caller forwards it now.
+    FlushDeferredStop = 0,
+    /// Settled auto-attack stopped by the server (Gouge, Blind, Vanish, ...) — target cleared.
+    ClearSettledTarget = 1,
+    /// The server rejected our swing (matching victim, or an empty victim) — handshake cleared.
+    ClearRejectedHandshake = 2,
+    /// Stop for the OLD target mid target-switch — the newer swing's target is preserved.
+    PreserveTargetSwitch = 3,
+}
+
 public sealed class GameSessionData
 {
     public bool HasWsgHordeFlagCarrier;
@@ -2030,6 +2045,78 @@ public sealed class GameSessionData
 
         CurrentAttackTarget = default;
         return true;
+    }
+
+    /// <summary>
+    /// JimsProxy (empty-victim wedge): the modern client sent CMSG_ATTACK_SWING. Returns false when
+    /// the de-dupe guard should swallow it — we already believe we are auto-attacking that exact
+    /// victim, so forwarding again would be redundant. Otherwise records the new handshake and
+    /// returns true so the caller forwards the swing to the legacy server.
+    /// Pure data operation — no socket dependency, easy to unit-test.
+    /// </summary>
+    public bool TryBeginLocalPlayerAttackSwing(WowGuid64 victim)
+    {
+        if (CurrentAttackTarget == victim)
+            return false;
+
+        // A pending stop (STOP→SWING target switch) is cancelled by the new swing — the legacy
+        // server handles the switch inside CMSG_ATTACK_SWING without an explicit stop.
+        DeferredAttackStop = false;
+        CurrentAttackTarget = victim;
+        WaitingForAttackStart = true;
+        return true;
+    }
+
+    /// <summary>
+    /// JimsProxy (empty-victim wedge): apply an SMSG_ATTACK_STOP that names the LOCAL PLAYER as
+    /// attacker to the auto-attack handshake state, and tell the caller whether it must forward a
+    /// CMSG_ATTACK_STOP to the legacy server. Pure data operation — no socket dependency.
+    /// </summary>
+    public PlayerAttackStopOutcome ApplyLocalPlayerAttackStop(WowGuid64 stopVictim)
+    {
+        if (DeferredAttackStop)
+        {
+            DeferredAttackStop = false;
+            CurrentAttackTarget = default;
+            return PlayerAttackStopOutcome.FlushDeferredStop;
+        }
+
+        if (!WaitingForAttackStart)
+        {
+            // Server-initiated stop without our SWING: Gouge / Cheap Shot / Blind /
+            // Feign Death / stealth / Vanish. Must clear CurrentAttackTarget here or
+            // the next CMSG_ATTACK_SWING gets eaten by the de-dupe guard.
+            CurrentAttackTarget = default;
+            return PlayerAttackStopOutcome.ClearSettledTarget;
+        }
+
+        // Server rejected our SWING with ATTACK_STOP (no prior ATTACK_START): target died or
+        // became invalid between our SWING and server processing.
+        //
+        // An EMPTY victim counts as a rejection too. A stop naming NO victim cannot be a stale
+        // stop for the OLD target of a switch — it is "you have no attack target at all". Kronos
+        // sends exactly this form when it refuses the engage, e.g. Charge at a mob that is
+        // evading/leashing back from another fight: the Charge lands, the server answers
+        // SMSG_ATTACKSTOP(player, 0) instead of SMSG_ATTACKSTART, and the client immediately
+        // re-sends CMSG_ATTACK_SWING. Before this branch covered the empty case that retry fell
+        // through, CurrentAttackTarget stayed pinned to the mob forever, and the de-dupe guard in
+        // TryBeginLocalPlayerAttackSwing ate every subsequent swing — auto-attack never recovered
+        // for the rest of the session (wire-confirmed 2026-08-12: zero player swings across the
+        // whole fight, plus a second occurrence 386s earlier in the same capture that only
+        // recovered because a second Charge produced a real ATTACK_START).
+        //
+        // Over-clearing is the safe direction: the worst case is one redundant CMSG_ATTACK_SWING
+        // forwarded, which is precisely what the client asked for.
+        if (stopVictim == CurrentAttackTarget || stopVictim == WowGuid64.Empty)
+        {
+            WaitingForAttackStart = false;
+            CurrentAttackTarget = default;
+            return PlayerAttackStopOutcome.ClearRejectedHandshake;
+        }
+
+        // WaitingForAttackStart is true but the stop names a different, non-empty victim —
+        // target-switch sequence, the new SWING already set CurrentAttackTarget. Keep it.
+        return PlayerAttackStopOutcome.PreserveTargetSwitch;
     }
 
     /// <summary>

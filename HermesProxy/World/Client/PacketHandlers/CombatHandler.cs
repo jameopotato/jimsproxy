@@ -39,30 +39,14 @@ public partial class WorldClient
             // flush can't follow it with a duplicate.
             state.TryConsumePreemptAttackStop(attack.Attacker, attack.Victim);
 
-            if (state.DeferredAttackStop)
+            // All handshake bookkeeping lives in GameSessionData.ApplyLocalPlayerAttackStop
+            // (pure, unit-tested). We only own the socket side: forwarding a stop that was
+            // deferred behind an in-flight swing handshake.
+            if (state.ApplyLocalPlayerAttackStop(rawVictim) == PlayerAttackStopOutcome.FlushDeferredStop)
             {
-                state.DeferredAttackStop = false;
-                state.CurrentAttackTarget = default;
                 WorldPacket stopPacket = new WorldPacket(Opcode.CMSG_ATTACK_STOP);
                 SendPacketToServer(stopPacket, Opcode.MSG_NULL_ACTION);
             }
-            else if (!state.WaitingForAttackStart)
-            {
-                // Server-initiated stop without our SWING: Gouge / Cheap Shot / Blind /
-                // Feign Death / stealth / Vanish. Must clear CurrentAttackTarget here or
-                // the next CMSG_ATTACK_SWING gets eaten by the dedupe guard at Server/CombatHandler.cs:16.
-                state.CurrentAttackTarget = default;
-            }
-            else if (rawVictim == state.CurrentAttackTarget)
-            {
-                // Server rejected our SWING with ATTACK_STOP (no prior ATTACK_START):
-                // target died or became invalid between our SWING and server processing.
-                // Clear the state so the de-dupe guard doesn't eat future attacks.
-                state.WaitingForAttackStart = false;
-                state.CurrentAttackTarget = default;
-            }
-            // else: WaitingForAttackStart is true but victim != CurrentAttackTarget —
-            // target-switch sequence, the new SWING already set CurrentAttackTarget.
         }
 
         SendPacketToClient(attack);
