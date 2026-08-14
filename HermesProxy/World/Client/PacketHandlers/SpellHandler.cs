@@ -922,12 +922,15 @@ public partial class WorldClient
         // SMSG_SPELL_FAILED_OTHER 5+/sec while a target is out of range / dying;
         // forwarding each one chains CancelSpellVisuals into a stuck cast sound on
         // the 1.14.2 client. The first failure carries all the state the client
-        // needs; subsequent same-(caster, spell) failures within 500ms add nothing.
+        // needs; subsequent same-(caster, spell) failures within 500ms add nothing —
+        // UNLESS the failure terminates a live tracked cast instance
+        // (GameSessionData.ShouldDedupSpellFailedOther): that one is the instance's
+        // only terminator and must always be forwarded, or the cast-hold kit strands
+        // on the 1.14.2 client (2026-08-14 observed-skinning capture).
         const long DedupWindowMs = 500;
         long nowMs = Time.GetMSTime();
         var dedupKey = (casterUnit, spellId);
-        if (GetSession().GameState.RecentlyForwardedSpellFailedOther.TryGetValue(dedupKey, out var lastMs) &&
-            nowMs - lastMs < DedupWindowMs)
+        if (GetSession().GameState.ShouldDedupSpellFailedOther(casterUnit, spellId, nowMs, DedupWindowMs, out long msSinceLastForwarded))
         {
             // JimsProxy (warlock-pet-gcd-on-failure): the visual/SpellFailure storm is deduped, but a double-clicked pet-bar press is a distinct failed cast whose predicted GCD sweep must still be released. Gated to unqueued presses (CMSG_PET_ACTION, deterministic seed CastID).
             bool dedupReleasePetGcd = GetSession().GameState.CurrentPetGuid == casterUnit && !HasQueuedPetCast(spellId);
@@ -938,11 +941,19 @@ public partial class WorldClient
                 spellId,
                 reason,
                 casterCounter = casterUnit.GetCounter(),
-                ms_since_last = nowMs - lastMs,
+                ms_since_last = msSinceLastForwarded,
                 sentPetCastFailed = dedupReleasePetGcd,
             });
             return;
         }
+        if (msSinceLastForwarded >= 0)
+            Log.Event("spell.failed_other.dedup_bypassed_live_cast", new
+            {
+                spellId,
+                reason,
+                casterCounter = casterUnit.GetCounter(),
+                ms_since_last = msSinceLastForwarded,
+            });
         GetSession().GameState.RecentlyForwardedSpellFailedOther[dedupKey] = nowMs;
 
         WowGuid128 castId;

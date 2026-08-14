@@ -783,6 +783,33 @@ public sealed class GameSessionData
     // overridden with ServerGUID downstream → the auto-cast map entry is a harmless
     // orphan in that case.
     public ConcurrentDictionary<(WowGuid128 caster, uint spellId), WowGuid128> PetAutoCastActiveCastIds = new();
+
+    // JimsProxy (observed-pose strand, 2026-08-14): decide whether an incoming
+    // SMSG_SPELL_FAILED_OTHER may be dropped by the retry-storm dedup. A failure whose
+    // (caster, spell) has a live tracked cast instance (OtherCasterActiveCastIds /
+    // PetAutoCastActiveCastIds) is that instance's ONLY terminator — the next
+    // SPELL_START overwrites the tracked entry, so a skipped cancel permanently
+    // strands the cast-hold kit on the 1.14.2 client (observed player frozen in the
+    // skinning "crafting hands" pose until despawn; same for mob casting poses).
+    // The storm the dedup was built for (repeat failures with NO intervening
+    // SPELL_START) still dedups: the first routed failure removes the tracked entry,
+    // so storm repeats find no live instance.
+    // Returns true = skip this failure. msSinceLastForwarded: -1 when outside the
+    // window / first failure; >= 0 when within the window (callers log the
+    // live-cast bypass case). Callers record forwarded failures in
+    // RecentlyForwardedSpellFailedOther.
+    public bool ShouldDedupSpellFailedOther(WowGuid128 caster, uint spellId, long nowMs, long dedupWindowMs, out long msSinceLastForwarded)
+    {
+        msSinceLastForwarded = -1;
+        var key = (caster, spellId);
+        if (!RecentlyForwardedSpellFailedOther.TryGetValue(key, out var lastMs) || nowMs - lastMs >= dedupWindowMs)
+            return false;
+        msSinceLastForwarded = nowMs - lastMs;
+        if (OtherCasterActiveCastIds.ContainsKey(key) || PetAutoCastActiveCastIds.ContainsKey(key))
+            return false; // live cast instance: this failure is its terminator, never a duplicate
+        return true;
+    }
+
     // JimsProxy (cast-go-castid-recovery): per-spell FIFO of the client-facing CastIDs
     // forwarded to the modern client at the LOCAL PLAYER's SMSG_SPELL_START, keyed by spellId.
     // HandleSpellGo recalls the oldest when no PendingNormalCast / melee / auto-repeat entry
