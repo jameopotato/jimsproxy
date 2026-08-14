@@ -850,6 +850,14 @@ public sealed class GameSessionData
     // occupant", which the swap-wipe guard in the UpdateHandler aura loop cannot tell
     // apart by spell ID alone.
     public Dictionary<WowGuid128, Dictionary<byte, int>> UnitAuraDurationPushTime = [];
+    // JimsProxy (temp-enchant-0s-after-relogin): remaining-time pushes from
+    // SMSG_ITEM_ENCHANT_TIME_UPDATE, keyed item guid → (legacy enchantment slot →
+    // seconds + receipt tick). At login vanilla cores send the push BEFORE the item's
+    // create block (the only carrier of remaining time — the create's duration field is
+    // zero), and the modern client discards updates for guids it has not constructed.
+    // The push is stashed here and consumed into the item's create block when it is
+    // translated. Not carried across sessions: each login gets fresh pushes.
+    public Dictionary<WowGuid128, Dictionary<uint, (uint Seconds, int Tick)>> PendingItemEnchantDurations = [];
     public Dictionary<WowGuid128, Dictionary<byte, WowGuid128>> UnitAuraCaster = [];
     // Wall-clock aura expiry per (unit, spell). Unlike the per-slot caches above this
     // survives unit destroys AND relogs (carried over in CreateNewGameSessionData), so a
@@ -1569,6 +1577,40 @@ public sealed class GameSessionData
             UnitAuraDurationUpdateTime.TryGetValue(guid, out var timeDict) &&
             timeDict.TryGetValue(slot, out var time))
             left -= Environment.TickCount - time;
+    }
+    public void StorePendingItemEnchantDuration(WowGuid128 itemGuid, uint legacySlot, uint durationSeconds, int nowTick)
+    {
+        if (durationSeconds == 0)
+            return;
+
+        ref var slots = ref CollectionsMarshal.GetValueRefOrAddDefault(PendingItemEnchantDurations, itemGuid, out _);
+        slots ??= [];
+        slots[legacySlot] = (durationSeconds, nowTick);
+    }
+    public List<(uint LegacySlot, uint DurationMs)>? ConsumePendingItemEnchantDurations(WowGuid128 itemGuid, int nowTick)
+    {
+        if (!PendingItemEnchantDurations.Remove(itemGuid, out var slots) || slots.Count == 0)
+            return null;
+
+        List<(uint LegacySlot, uint DurationMs)> result = new(slots.Count);
+        foreach (var (slot, push) in slots)
+        {
+            // TickCount skew safety — a receipt tick "in the future" decays nothing.
+            int elapsed = unchecked(nowTick - push.Tick);
+            if (elapsed < 0)
+                elapsed = 0;
+
+            long remainingMs = (long)push.Seconds * 1000 - elapsed;
+            if (remainingMs > 0)
+                result.Add((slot, (uint)remainingMs));
+        }
+        return result.Count > 0 ? result : null;
+    }
+    // Inject only where the create shows a live enchant whose duration field the
+    // server left empty (vanilla's login shape); a server-provided duration wins.
+    public static bool ShouldInjectEnchantDuration(HermesProxy.World.Objects.ItemEnchantment? enchantment)
+    {
+        return enchantment is { ID: > 0 } && (enchantment.Duration == null || enchantment.Duration == 0);
     }
     public void StoreAuraCaster(WowGuid128 target, byte slot, WowGuid128 caster)
     {

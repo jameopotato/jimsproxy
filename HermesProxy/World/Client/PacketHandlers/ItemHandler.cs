@@ -419,14 +419,66 @@ public partial class WorldClient
         sell.Reason = packet.ReadUInt8();
         SendPacketToClient(sell);
     }
+    // (temp-enchant-0s-after-relogin): legacy Prop slots sit at different indices than
+    // the modern layout (vanilla 3.., TBC 6.., WotLK 7.. → modern 8..); every slot
+    // below the Prop block (Perm/Temp/Sock/Bonus/Prismatic) shares its index. Timed
+    // enchants live in Temp=1, so the old raw passthrough happened to work for them.
+    internal static uint TranslateEnchantmentSlotToModern(uint legacySlot)
+    {
+        int firstProp, max;
+        if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+        {
+            firstProp = Enums.Vanilla.EnchantmentSlot.Prop0;
+            max = Enums.Vanilla.EnchantmentSlot.Max;
+        }
+        else if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V3_0_2_9056))
+        {
+            firstProp = Enums.TBC.EnchantmentSlot.Prop0;
+            max = Enums.TBC.EnchantmentSlot.Max;
+        }
+        else
+        {
+            firstProp = Enums.WotLK.EnchantmentSlot.Prop0;
+            max = Enums.WotLK.EnchantmentSlot.Max;
+        }
+
+        if (legacySlot >= firstProp && legacySlot < max)
+            return (uint)(Enums.Classic.EnchantmentSlot.Prop0 + ((int)legacySlot - firstProp));
+        return legacySlot;
+    }
+
     [PacketHandler(Opcode.SMSG_ITEM_ENCHANT_TIME_UPDATE)]
     void HandleItemEnchantTimeUpdate(WorldPacket packet)
     {
         ItemEnchantTimeUpdate enchant = new ItemEnchantTimeUpdate();
         enchant.ItemGuid = packet.ReadGuid().To128(GetSession().GameState);
-        enchant.Slot = packet.ReadUInt32();
+        uint legacySlot = packet.ReadUInt32();
+        enchant.Slot = TranslateEnchantmentSlotToModern(legacySlot);
         enchant.DurationLeft = packet.ReadUInt32();
         enchant.OwnerGuid = packet.ReadGuid().To128(GetSession().GameState);
+
+        // (temp-enchant-0s-after-relogin): at login vanilla cores push this BEFORE the
+        // item's create block — it is the only carrier of the enchant's remaining time
+        // (the create's duration field is zero) and the modern client discards updates
+        // for guids it has not constructed, leaving the buff flashing a permanent "0s".
+        // Stash every live push; the item-create translation consumes it into the
+        // create's duration field. Forward only when the item already exists client-side.
+        GetSession().GameState.StorePendingItemEnchantDuration(enchant.ItemGuid, legacySlot, enchant.DurationLeft, Environment.TickCount);
+
+        if (GetSession().GameState.GetCachedObjectFieldsLegacy(enchant.ItemGuid) == null)
+        {
+            if (Framework.Settings.DebugOutput)
+            {
+                Log.Event("enchant.duration.stashed_precreate", new
+                {
+                    item_guid = enchant.ItemGuid.ToString(),
+                    legacy_slot = legacySlot,
+                    duration_seconds = enchant.DurationLeft,
+                });
+            }
+            return;
+        }
+
         SendPacketToClient(enchant);
     }
 

@@ -2570,6 +2570,40 @@ public partial class WorldClient
                     updateData.ItemData.Enchantment[Enums.Classic.EnchantmentSlot.Prop4] = ReadEnchantData(Enums.WotLK.EnchantmentSlot.Prop4);
                 }
 
+                // (temp-enchant-0s-after-relogin): consume stashed pre-create
+                // SMSG_ITEM_ENCHANT_TIME_UPDATE pushes into this create. At login the
+                // push beats the item's create block and the modern client discards it
+                // for an unbuilt guid — the enchant then renders with the create's zero
+                // duration field as a permanently flashing "0s" buff. The handler
+                // stashed the push (decay-tracked); write it into the create's duration
+                // field so the countdown starts at the real remaining time.
+                if (isCreate)
+                {
+                    var pendingEnchants = GetSession().GameState.ConsumePendingItemEnchantDurations(guid, Environment.TickCount);
+                    if (pendingEnchants != null)
+                    {
+                        foreach (var (legacySlot, durationMs) in pendingEnchants)
+                        {
+                            int modernSlot = (int)TranslateEnchantmentSlotToModern(legacySlot);
+                            if (modernSlot >= updateData.ItemData.Enchantment.Length)
+                                continue;
+                            var enchantment = updateData.ItemData.Enchantment[modernSlot];
+                            if (enchantment == null || !GameSessionData.ShouldInjectEnchantDuration(enchantment))
+                                continue;
+                            enchantment.Duration = durationMs;
+                            if (Framework.Settings.DebugOutput)
+                            {
+                                Log.Event("enchant.duration.injected_at_create", new
+                                {
+                                    item_guid = guid.ToString(),
+                                    legacy_slot = legacySlot,
+                                    duration_ms = durationMs,
+                                });
+                            }
+                        }
+                    }
+                }
+
                 uint?[] gems = new uint?[ItemConst.MaxGemSockets];
                 for (int i = 0; i < ItemConst.MaxGemSockets; i++)
                 {
