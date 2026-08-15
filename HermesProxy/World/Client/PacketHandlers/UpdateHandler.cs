@@ -1,4 +1,4 @@
-﻿//#define DEBUG_UPDATES
+//#define DEBUG_UPDATES
 
 using Framework;
 using Framework.GameMath;
@@ -2178,11 +2178,13 @@ public partial class WorldClient
     // the lingering object out of the world — clears it.
     //
     // Detection is one-shot per world login, on the FIRST create block for the local player,
-    // and only when the stunned flag arrives with ZERO debuff auras: every genuine vanilla stun
-    // is a MOD_STUN debuff occupying one of slots 32-47 of the same create block, so an aura-less
-    // stunned flag at login has exactly one producer — the logout machinery. A genuine stun at
-    // re-attach (debuff present) leaves the gate closed: a false negative is safe (no cure this
-    // login), a false positive is structurally impossible.
+    // and only when the stunned flag arrives with no debuff beyond the known-benign login set
+    // (Resurrection Sickness, Deserter): every genuine vanilla stun is a MOD_STUN debuff
+    // occupying one of slots 32-47 of the same create block, so a stunned flag whose only
+    // debuffs are certainly-not-stuns has exactly one producer — the logout machinery. A
+    // genuine stun at re-attach (its debuff is not on the allow-list) leaves the gate closed:
+    // a false negative is safe (no cure this login), a false positive is structurally
+    // impossible.
     //
     // Three layers, the last two individually toggleable:
     //   tripwire — login.self_create_state always logs the raw wire state, gate hit or not
@@ -2235,7 +2237,7 @@ public partial class WorldClient
                 (i < VanillaFirstDebuffSlot ? buffSpellIds : debuffSpellIds).Add(slot.UInt32Value);
         }
 
-        bool artificial = IsArtificialLogoutStun(rawFlags, debuffSpellIds.Count);
+        bool artificial = IsArtificialLogoutStun(rawFlags, debuffSpellIds);
 
         Log.Event("login.self_create_state", new
         {
@@ -2291,11 +2293,36 @@ public partial class WorldClient
     internal const int VanillaAuraSlotCount = 48;
     internal const int VanillaFirstDebuffSlot = 32;
 
-    // Pure gate: the stunned flag with no debuff present cannot be a real stun — every vanilla
-    // MOD_STUN aura occupies a debuff slot in the same create block.
-    internal static bool IsArtificialLogoutStun(uint rawUnitFlags, int debuffAuraCount)
+    // JimsProxy (#431 follow-up, 2026-08-15): vanilla debuffs that (a) persist across a login /
+    // re-attach and (b) are certainly not stuns. Their presence must not veto the
+    // artificial-logout-stun cure — the original debuffAuraCount==0 gate false-negatived
+    // whenever the artificial stun coincided with e.g. Resurrection Sickness, leaving the
+    // player half-rooted all session. Kept as an explicit allow-list, NOT a MOD_STUN
+    // classification: SpellAuraEffects is a curated stat subset with zero stun rows, so a real
+    // stun can never be positively identified from proxy data. Any debuff NOT on this list
+    // keeps the gate closed — a genuine stun (whose MOD_STUN debuff we would not recognize)
+    // still can never open it. Extend only with ids verified to carry no stun effect.
+    internal static readonly FrozenSet<uint> BenignLoginDebuffSpellIds = new uint[]
     {
-        return (rawUnitFlags & (uint)UnitFlagsVanilla.Stunned) != 0 && debuffAuraCount == 0;
+        15007, // Resurrection Sickness
+        26013, // Deserter
+    }.ToFrozenSet();
+
+    // Pure gate: the artificial logout stun is the stunned flag whose every present debuff is a
+    // known-benign login debuff (empty set = the original 2026-07-17 incident shape). A real
+    // stun's MOD_STUN debuff is not on the allow-list, so it keeps the gate closed — a false
+    // positive stays structurally impossible; this only removes the false negative when the
+    // artificial stun coincides with a benign login debuff.
+    internal static bool IsArtificialLogoutStun(uint rawUnitFlags, IReadOnlyList<uint> debuffSpellIds)
+    {
+        if ((rawUnitFlags & (uint)UnitFlagsVanilla.Stunned) == 0)
+            return false;
+        foreach (var id in debuffSpellIds)
+        {
+            if (!BenignLoginDebuffSpellIds.Contains(id))
+                return false;
+        }
+        return true;
     }
 
     private bool ShouldClearMountDisplayOnDeadNonPlayerUnit(WowGuid128 guid, ObjectType objectType, ObjectUpdate updateData, Dictionary<int, UpdateField> updates, int mountDisplayField)
