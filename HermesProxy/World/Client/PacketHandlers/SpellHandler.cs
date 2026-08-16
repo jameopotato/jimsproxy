@@ -1088,6 +1088,12 @@ public partial class WorldClient
             castIdCounter = castId.GetCounter(),
             casterIsPlayer,
             casterIsPet,
+            // JimsProxy (2026-08-16): decoded guid kind (Player/Creature/Pet/...). casterIsPlayer
+            // above means "caster is the LOCAL player" (CurrentPlayerGuid compare) — every OTHER
+            // player logs false, so any caster-kind split keyed on the flag buckets other players
+            // as mobs. Both corpora were mis-swept on exactly that this week. The flag stays for
+            // tooling compatibility; new sweeps must key on casterKind.
+            casterKind = casterUnit.GetHighType().ToString(),
             sentInterruptLog,
             sentCancelVisual,
             sentPetCastFailed,
@@ -1481,6 +1487,9 @@ public partial class WorldClient
             is_ranged_auto_attack = isRangedAutoAttack,
             isCaster = GetSession().GameState.CurrentPlayerGuid == casterUnit,
             isPetCaster = GetSession().GameState.CurrentPetGuid == casterUnit,
+            // JimsProxy (2026-08-16): decoded guid kind — see spell.failed_other.routed. isCaster
+            // above is a LOCAL-player compare, not a kind test.
+            casterKind = casterUnit.GetHighType().ToString(),
             dequeued,
             wasStarted,
             foundActiveCastId,
@@ -2658,8 +2667,12 @@ public partial class WorldClient
             spell_visual_id = dbdata.SpellXSpellVisualID,
             visual_lookup_missing = dbdata.SpellXSpellVisualID == 0,
             caster_guid = dbdata.CasterGUID.ToString(),
+            // JimsProxy (2026-08-16): caster_is_player means "caster is the LOCAL player" (guid
+            // compare against CurrentPlayerGuid) — other players log false. caster_kind is the
+            // decoded guid kind (Player/Creature/Pet/...); observed-caster sweeps must key on it.
             caster_is_player = dbdata.CasterGUID == GetSession().GameState.CurrentPlayerGuid,
             caster_is_pet = dbdata.CasterUnit == GetSession().GameState.CurrentPetGuid,
+            caster_kind = dbdata.CasterUnit.GetHighType().ToString(),
             cast_time = dbdata.CastTime,
             cast_flags = dbdata.CastFlags,
             casterCounter = dbdata.CasterUnit.GetCounter(), //MIRASU - lets us correlate with spell.failed_other.routed
