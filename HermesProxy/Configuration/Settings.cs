@@ -180,6 +180,13 @@ public static class Settings
     // renders first. Covers the client-side model-swap render time (frame-rate dependent, ~30ms
     // on a fast machine), NOT latency — do not tune per-connection. 0 disables.
     public static int FormExitStartDeferMs;
+    // JimsProxy (strafe cancel-gap): the 1.14 client emits CMSG_CANCEL_CAST atomically with
+    // forward/back/jump movement starts but never on strafe (wire-measured 5/5), so a strafe
+    // cast-cancel waits ~700ms for the legacy server's heartbeat-position movement detection
+    // instead of the ~190ms cancel-ack round trip. When on, the proxy synthesizes the missing
+    // legacy CMSG_CANCEL_CAST for started cast-time casts on strafe starts, gated on the 1.12
+    // movement-interrupt flag (SpellMovementInterrupt CSV). Kill switch — leave ON.
+    public static bool StrafeCancelPreempt;
     // JimsProxy (#313): width (ms) of the spell-queue hold window. A press arriving in the
     // last SpellQueueWindowMs of an active GCD or cast bar is held and fired at expiry; earlier
     // presses are forwarded and the server arbitrates (NOT_READY / SpellInProgress). Mirrors the
@@ -267,6 +274,7 @@ public static class Settings
             : rttPrefireStr.Equals("knocker", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Knocker
             : RttPrefireMode.Off;
         FormExitStartDeferMs = Math.Clamp(config.GetInt("FormExitStartDeferMs", 100), 0, 300);
+        StrafeCancelPreempt = config.GetBoolean("StrafeCancelPreempt", true);
         SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 400), 0, 1300);
         ThreatEngine = config.GetBoolean("ThreatEngine", false);
         var serverTypeStr = config.GetString("ServerType", "Kronos");

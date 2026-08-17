@@ -2186,8 +2186,15 @@ public sealed class GameSessionData
     /// trailing failure, the leak heals at the next cast event. Returns the
     /// number of casts marked, for diagnostics. Instants and not-yet-started
     /// casts are ignored (movement doesn't cancel them in vanilla).
+    ///
+    /// JimsProxy (strafe cancel-gap): when <paramref name="newlyMarked"/> is
+    /// provided, casts whose MovementCancelled flag TRANSITIONED false→true in
+    /// this call are appended — re-marks are excluded, so the strafe cancel
+    /// synth fires at most once per cast and never for a cast an earlier
+    /// movement key (with its own client-sent cancel) already marked.
     /// </summary>
-    public int MarkStartedCastsMovementCancelled(long watchdogDeadlineMs)
+    public int MarkStartedCastsMovementCancelled(long watchdogDeadlineMs,
+        List<ClientCastRequest>? newlyMarked = null)
     {
         int marked = 0;
         long nowTick = Environment.TickCount64;
@@ -2200,6 +2207,8 @@ public sealed class GameSessionData
                 if (cast.HasStarted && cast.StartedCastTimeMs > 0
                     && !GameData.IsChanneledSpell(cast.SpellId))
                 {
+                    if (!cast.MovementCancelled)
+                        newlyMarked?.Add(cast);
                     cast.MovementCancelled = true;
                     cast.MarkedAtTickMs = nowTick;
                     if (cast.WatchdogDeadlineMs == 0)
