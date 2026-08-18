@@ -34,6 +34,26 @@ public partial class WorldClient
         var state = GetSession().GameState;
         if (attack.Attacker == state.CurrentPlayerGuid)
         {
+            // JimsProxy (post-kill upstream stop): this stop is the server ECHOING the synthetic
+            // CMSG_ATTACK_STOP we sent when the victim died (HandlePartyKillLog) — the modern
+            // client already got its stop from the preempt. Forwarding would hand it a duplicate,
+            // and running the handshake bookkeeping below could tear down a swing the player
+            // re-started within the echo RTT (~200ms), the #464 wedge shape. Consumed by exact
+            // victim match only; empty-victim stops always fall through to the normal path.
+            // Checked BEFORE the armed-preempt consume: in the pathological ordering where the
+            // echo somehow beats the drain flush, the armed client stop must stay armed so the
+            // client still receives a stop.
+            if (state.TryConsumeSyntheticUpstreamStopEcho(rawVictim))
+            {
+                if (Framework.Settings.DebugOutput)
+                    Framework.Logging.Log.Event("combat.attack_stop_upstream_echo_swallowed", new
+                    {
+                        victim_low = rawVictim.GetCounter(),
+                        now_dead = attack.NowDead,
+                    });
+                return;
+            }
+
             // JimsProxy (#450): the server's own player stop arrived while our preemptive stop
             // was still armed. This packet forwards below — consume the armed one so the drain
             // flush can't follow it with a duplicate.
@@ -346,6 +366,28 @@ public partial class WorldClient
             var priorArmed = state.ArmPreemptAttackStop(log.Victim);
             if (priorArmed != default)
                 SendPreemptAttackStop(priorArmed, "rearm"); // multi-kill burst: flush the older stop before re-arming
+
+            // JimsProxy (post-kill upstream stop): the preempt above is CLIENT-only. The modern
+            // client, told its attack stopped, will never send CMSG_ATTACK_STOP — but Kronos
+            // never stopped the player's swing on victim death either, so the server keeps
+            // swinging at the corpse and refuses it on the next swing tick:
+            // ATTACKSWING_DEADTARGET 1.4-3.5s after essentially every kill (26 swing errors
+            // across ~26 kills in the 2026-08-18 capture). For those seconds server and client
+            // disagree about whether the player is attacking — the window where the post-kill
+            // stuck-highlight / silent /startattack reports cluster. Send the server the stop a
+            // real 1.12 client would have produced so both sides agree the melee ended. The
+            // echo it answers with (it names the corpse) is consumed in HandleAttackStop.
+            if (Framework.Settings.PreemptAttackStopUpstream)
+            {
+                state.RecordSyntheticUpstreamAttackStop(rawVictim);
+                WorldPacket upstreamStop = new WorldPacket(Opcode.CMSG_ATTACK_STOP);
+                SendPacketToServer(upstreamStop, Opcode.MSG_NULL_ACTION);
+                if (Framework.Settings.DebugOutput)
+                    Framework.Logging.Log.Event("combat.attack_stop_upstream_synth", new
+                    {
+                        victim_low = rawVictim.GetCounter(),
+                    });
+            }
         }
 
         // Mob just died — drop its threat list immediately so the modern

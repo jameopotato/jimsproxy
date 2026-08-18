@@ -179,6 +179,17 @@ public static class Settings
     // (~8ms later, in a clean frame, visual suppressed, no targets/log) so the client processes it
     // and closes the cast. No-op on clean casts. Independent of LowLatencyMode. Default OFF — opt-in.
     public static bool RefireSpellGo;
+    // JimsProxy (post-kill upstream stop): the ghost-swing preempt pushes the modern client an
+    // early SMSG_ATTACK_STOP when its melee victim dies, but that is CLIENT-only — the client,
+    // told it stopped, never sends CMSG_ATTACK_STOP, and Kronos keeps the player's swing running
+    // against the corpse until the next swing tick refuses it (ATTACKSWING_DEADTARGET 1.4-3.5s
+    // after essentially every kill; 26/~26 kills in the 2026-08-18 capture). For those seconds
+    // server and client disagree about whether the player is attacking — the window where
+    // post-kill stuck-highlight / silent-startattack reports cluster. When set, the preempt also
+    // sends the legacy server the CMSG_ATTACK_STOP a real 1.12 client would have produced, and
+    // the server's echo is consumed instead of forwarded. Kill switch: set false to restore the
+    // client-only preempt. Default on.
+    public static bool PreemptAttackStopUpstream = true;
     // JimsProxy (#379 form-exit): the 1.14 client auto-shifts out of a form to cast
     // (CMSG_CANCEL_AURA + CMSG_CAST_SPELL ~1ms apart), but the 1.12 server emits the cast's
     // SMSG_SPELL_START ~20ms BEFORE the form-removal SMSG_UPDATE_OBJECT. The cast's visual kit
@@ -279,6 +290,7 @@ public static class Settings
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);
         IdentityPinnedCastIds = config.GetBoolean("IdentityPinnedCastIds", false);
         RefireSpellGo = config.GetBoolean("RefireSpellGo", false);
+        PreemptAttackStopUpstream = config.GetBoolean("PreemptAttackStopUpstream", true);
         var rttPrefireStr = config.GetString("RttPrefire", "off");
         RttPrefire = rttPrefireStr.Equals("timer", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Timer
             : rttPrefireStr.Equals("knocker", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Knocker
