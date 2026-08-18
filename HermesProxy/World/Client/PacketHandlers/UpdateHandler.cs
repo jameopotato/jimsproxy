@@ -2031,9 +2031,39 @@ public partial class WorldClient
         SendPacketToClient(packet);
     }
 
+    // JimsProxy (feared-while-sitting, issue #479): CC-onset fallback for INSTANT fears —
+    // the local player's UNIT_FIELD_FLAGS gain Fleeing/Confused while seated. Cast-time
+    // fears are handled earlier and better (pre-stand at SPELL_START, guaranteed honored);
+    // this fallback's stand request reaches the server after the fear already applied, and
+    // whether the lineage server honors it mid-fear is untested (asked in #479) — worst
+    // case it is one ignored packet. Edge-tracked via LastLocalFearConfuseFlags so a held
+    // fear costs at most one synth regardless of FLAGS churn.
+    private void SynthStandOnFearCcOnset(WowGuid128 guid, Dictionary<int, UpdateField> updates)
+    {
+        if (guid.IsEmpty() || guid != GetSession().GameState.CurrentPlayerGuid)
+            return;
+        int flagsIndex = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_FLAGS);
+        if (flagsIndex < 0 || !updates.TryGetValue(flagsIndex, out var flagsField))
+            return;
+        uint newCcFlags = flagsField.UInt32Value & FearStandSynth.FearConfuseUnitFlagsMask;
+        uint previousCcFlags = GetSession().GameState.LastLocalFearConfuseFlags;
+        GetSession().GameState.LastLocalFearConfuseFlags = newCcFlags;
+
+        // Prefer the stand state carried in this very block — the legacy field cache
+        // lags on creates (see the create-miss note above).
+        int bytes1Index = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_BYTES_1);
+        uint standState = bytes1Index >= 0 && updates.TryGetValue(bytes1Index, out var bytes1)
+            ? bytes1.UInt32Value & 0xFF
+            : GetSession().GameState.GetLocalPlayerStandState();
+
+        if (FearStandSynth.ShouldStandOnCcOnset(Framework.Settings.SynthStandOnFear, previousCcFlags, newCcFlags, standState))
+            SendSynthStandUp("cc_onset", 0);
+    }
+
     private void AfterStoreObjectUpdateHook(WowGuid128 guid, ObjectType objectType, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, AuraUpdate auraUpdate, PowerUpdate? powerUpdate, bool isCreate, ObjectUpdate updateData, BitArray changedValuesMask)
     {
         DetectStuckLogoutStunAtSelfCreate(guid, updates, isCreate, updateData);
+        SynthStandOnFearCcOnset(guid, updates);
 
         // JimsProxy: comprehensive pet diagnostics for the Hunter-Pet-Stealth-Stuck
         // investigation. Fires on every UPDATE_OBJECT block targeting a pet GUID

@@ -1610,6 +1610,18 @@ public partial class WorldClient
         bool casterIsLocalPlayer = GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit;
         bool casterIsLocalPet    = GetSession().GameState.CurrentPetGuid    == spell.Cast.CasterUnit;
 
+        // JimsProxy (feared-while-sitting, issue #479): a fear-aura cast with a cast time
+        // is STARTING against the seated local player. Stand them up now, while they still
+        // have control server-side — guaranteed honored — so the fear lands on a standing
+        // player and fear-break items pass NOT_STANDING on both sides. Instant fears never
+        // produce a victim-side SPELL_START; those fall to the CC-onset fallback in
+        // UpdateHandler (SynthStandOnFearCcOnset).
+        if (FearStandSynth.ShouldPreStandOnIncomingFear(Framework.Settings.SynthStandOnFear,
+                (uint)spell.Cast.SpellID, spell.Cast.Target.Unit,
+                GetSession().GameState.CurrentPlayerGuid,
+                GetSession().GameState.GetLocalPlayerStandState()))
+            SendSynthStandUp("incoming_fear_cast", (uint)spell.Cast.SpellID);
+
         // Mark pending cast as started (queue-based, FIFO order)
         if (casterIsLocalPlayer &&
             GetSession().GameState.TryMarkPendingNormalCastStarted((uint)spell.Cast.SpellID, out var pendingCast))

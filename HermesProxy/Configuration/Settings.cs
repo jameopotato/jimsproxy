@@ -108,6 +108,15 @@ public static class Settings
     // NPC charmers (raid MC — Lucifron) are untouched. Default ON; key = kill switch.
     // Default-init true so paths that bypass LoadAndVerifyFrom (tests) get the fix.
     public static bool Charm382StripPetInCombat = true;
+    // JimsProxy (feared-while-sitting, issue #479): when a fear targets the seated local
+    // player, synthesize a legacy CMSG_STAND_STATE_CHANGE(STAND) — at incoming-cast start
+    // (honored unconditionally: the player still has control), with a CC-onset fallback
+    // for instant fears. Without it a player feared mid-drink stays seated for the whole
+    // fear and fear-break items (PvP insignia) die on NOT_STANDING on both sides — the
+    // 1.14 client surrenders all input on control loss and cannot stand itself. Key =
+    // kill switch. Default-init true so paths that bypass LoadAndVerifyFrom (tests) get
+    // the fix.
+    public static bool SynthStandOnFear = true;
     // JimsProxy (clean handshake teardown): bound the realmd auth handshake. If realmd accepts
     // the TCP connection but never sends LOGON_CHALLENGE (half-accepting login server, load-shed,
     // firewall), the login thread would otherwise block forever ("stuck on Connecting..."). On
@@ -255,6 +264,7 @@ public static class Settings
         LoginPreCreateOpHold = config.GetBoolean("LoginPreCreateOpHold", true);
         WorldEntryCarriedRootCure = config.GetBoolean("WorldEntryCarriedRootCure", true);
         Charm382StripPetInCombat = config.GetBoolean("Charm382StripPetInCombat", true);
+        SynthStandOnFear = config.GetBoolean("SynthStandOnFear", true);
         AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);
         ClientTcpNoDelay = config.GetBoolean("ClientTcpNoDelay", true);

@@ -131,6 +131,15 @@ public sealed class GameSessionData
     // by hardcoding 7.0f. Default true: a player who has never been CC'd is
     // always in control, so the natural login state is "has control already."
     public bool LastObservedHasControl = true;
+    // JimsProxy (feared-while-sitting, issue #479): the local player's stand state
+    // (UNIT_FIELD_BYTES_1 byte 0) as last written by the legacy server, read from the
+    // legacy field cache. Gate input for the synthesized stand-up on incoming fear.
+    public uint GetLocalPlayerStandState() =>
+        GetLegacyFieldValueUInt32(CurrentPlayerGuid, UnitField.UNIT_FIELD_BYTES_1) & 0xFF;
+    // JimsProxy (feared-while-sitting, issue #479): rising-edge tracker for the CC-onset
+    // fallback — the Fleeing|Confused bits of the local player's UNIT_FIELD_FLAGS as of
+    // the last FLAGS write. Reset at CMSG_PLAYER_LOGIN.
+    public uint LastLocalFearConfuseFlags;
     // JimsProxy (speed-stuck-after-fear-while-mounted): cached for reassert; see memory.
     public float LastKnownPlayerRunSpeed = 7.0f;
     // JimsProxy (speed-stuck-after-bg-end-while-mounted): deferred reassert flag; see memory.

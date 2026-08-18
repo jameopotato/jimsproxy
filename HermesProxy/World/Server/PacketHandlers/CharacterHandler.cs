@@ -324,6 +324,8 @@ public partial class WorldSocket
         GetSession().GameState.StuckStunDetectedThisLogin = false;
         GetSession().GameState.StuckStunCancelArmed = false;
         GetSession().GameState.AwaitingSynthLogoutCancelAck = false;
+        // JimsProxy (feared-while-sitting, #479): fresh login → CC-onset edge tracker restarts.
+        GetSession().GameState.LastLocalFearConfuseFlags = 0;
         GetSession().GameState.CurrentPlayerGuid = playerLogin.Guid;
         // JimsProxy (chronoboon-chat-link): static global survives char switches — reset so no char inherits the previous char's boon alias; this char's boon re-mints and re-sets it at login item-create.
         GameData.CurrentChronoboonAlias = 0;
