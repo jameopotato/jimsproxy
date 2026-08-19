@@ -461,12 +461,13 @@ public partial class WorldClient
         // item's create block — it is the only carrier of the enchant's remaining time
         // (the create's duration field is zero) and the modern client discards updates
         // for guids it has not constructed, leaving the buff flashing a permanent "0s".
-        // Stash every live push; the item-create translation consumes it into the
-        // create's duration field. Forward only when the item already exists client-side.
-        GetSession().GameState.StorePendingItemEnchantDuration(enchant.ItemGuid, legacySlot, enchant.DurationLeft, Environment.TickCount);
-
+        // Stash pre-create pushes only; the item-create translation consumes them into
+        // the create's duration field. Forward when the item already exists client-side —
+        // the forward path never needs the stash, and storing there would leave a
+        // never-consumed entry per enchanted item until logout.
         if (GetSession().GameState.GetCachedObjectFieldsLegacy(enchant.ItemGuid) == null)
         {
+            GetSession().GameState.StorePendingItemEnchantDuration(enchant.ItemGuid, legacySlot, enchant.DurationLeft, Environment.TickCount);
             if (Framework.Settings.DebugOutput)
             {
                 Log.Event("enchant.duration.stashed_precreate", new
