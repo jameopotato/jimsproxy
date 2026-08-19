@@ -946,7 +946,9 @@ public partial class WorldClient
             });
             return;
         }
-        if (msSinceLastForwarded >= 0)
+        // Gated: this is the fix-working breadcrumb, not an unexpected-edge signature
+        // (2026-08-18 review rubric — devs/testers run DebugOutput on).
+        if (msSinceLastForwarded >= 0 && Framework.Settings.DebugOutput)
             Log.Event("spell.failed_other.dedup_bypassed_live_cast", new
             {
                 spellId,
