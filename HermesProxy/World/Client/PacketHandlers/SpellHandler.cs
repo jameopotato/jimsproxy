@@ -1628,17 +1628,12 @@ public partial class WorldClient
         bool casterIsLocalPlayer = GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit;
         bool casterIsLocalPet    = GetSession().GameState.CurrentPetGuid    == spell.Cast.CasterUnit;
 
-        // JimsProxy (feared-while-sitting, issue #479): a fear-aura cast with a cast time
-        // is STARTING against the seated local player. Stand them up now, while they still
-        // have control server-side — guaranteed honored — so the fear lands on a standing
-        // player and fear-break items pass NOT_STANDING on both sides. Instant fears never
-        // produce a victim-side SPELL_START; those fall to the CC-onset fallback in
-        // UpdateHandler (SynthStandOnFearCcOnset).
-        if (FearStandSynth.ShouldPreStandOnIncomingFear(Framework.Settings.SynthStandOnFear,
-                (uint)spell.Cast.SpellID, spell.Cast.Target.Unit,
-                GetSession().GameState.CurrentPlayerGuid,
-                GetSession().GameState.GetLocalPlayerStandState()))
-            SendSynthStandUp("incoming_fear_cast", (uint)spell.Cast.SpellID);
+        // JimsProxy (feared-while-sitting, issue #479): the fear-lands stand-up moved from
+        // here (SPELL_START) to the SPELL_GO path in HandleSpellGo — see that trigger and
+        // FearStandSynth.ShouldStandOnFearGoHit. Standing at START breaks the drink of a
+        // seated player even when the fear cast is then interrupted / the caster dies / it
+        // fails at completion (no GO ever arrives); standing at GO-with-self-in-hit fires
+        // only when the fear actually lands.
 
         // Mark pending cast as started (queue-based, FIFO order)
         if (casterIsLocalPlayer &&
@@ -1975,6 +1970,34 @@ public partial class WorldClient
             LogSpellStartGoParseFailure(packet, e, isSpellGo: true);
             DrainOrphanedStartedNormalCastsOnParseFailure(isSpellGo: true);
             return;
+        }
+
+        // JimsProxy (feared-while-sitting, issue #479): a fear-aura cast has GONE with the
+        // seated local player in its HIT list — the fear actually LANDS. Synthesize a legacy
+        // CMSG_STAND_STATE_CHANGE(STAND) now, at the GO, not at the START. Standing at START
+        // was field-rejected: a started fear that is interrupted / whose caster dies / that
+        // fails at completion never GOes, so standing at START broke the player's drink for
+        // nothing. Gated on the HIT list only — a resisted/immune fear lists the player in
+        // the MISS list and must NOT stand them. This runs for casts by OTHER units targeting
+        // us (a fear is never self-cast): CasterUnit != local player, so the SoM remap in the
+        // dequeue block below never touches SpellID — the raw legacy id read here is correct,
+        // and this insertion is independent of that local-caster remap. Timing: the stand
+        // races the aura application inside Kronos's ~400ms batching window; win → the fear
+        // lands on a standing player and fear-break items pass NOT_STANDING both sides; lose →
+        // it degrades to a harmless mid-fear stand attempt, the same packet the CC-onset
+        // fallback (trigger 2, UpdateHandler) would send. Instant fears carry no victim-side
+        // GO and fall to that fallback. The (cheap) hit-list scan is gated behind the FrozenSet
+        // spell-id lookup so the common non-fear SPELL_GO path stays scan-free.
+        if (Framework.Settings.SynthStandOnFear &&
+            FearStandSynth.FearAuraSpellIds.Contains((uint)spell.Cast.SpellID))
+        {
+            var fearVictimGuid = GetSession().GameState.CurrentPlayerGuid;
+            bool selfInFearHitTargets = !fearVictimGuid.IsEmpty() &&
+                                        spell.Cast.HitTargets.Contains(fearVictimGuid);
+            if (FearStandSynth.ShouldStandOnFearGoHit(Framework.Settings.SynthStandOnFear,
+                    (uint)spell.Cast.SpellID, selfInFearHitTargets,
+                    GetSession().GameState.GetLocalPlayerStandState()))
+                SendSynthStandUp("fear_go_hit", (uint)spell.Cast.SpellID);
         }
 
         // JimsProxy (#383): a Summoning Portal (GameObject) casting a participant's

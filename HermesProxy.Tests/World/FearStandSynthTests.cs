@@ -60,44 +60,70 @@ public class FearStandSynthTests
         Assert.Equal(0x00C00000u, FearStandSynth.FearConfuseUnitFlagsMask);
     }
 
-    // --- trigger 1: pre-stand at incoming fear cast ---
+    // --- trigger 1: fear-lands stand at SPELL_GO ---
+    //
+    // The decision method takes isSelfInHitTargets as a bool; the caller (HandleSpellGo)
+    // computes it from the GO's HIT target list (never the miss list). SelfInHitList mirrors
+    // that caller-side gate so hit-vs-miss / self-vs-other is exercised end to end, not just
+    // asserted as a bare bool.
+    private static bool SelfInHitList(WowGuid128 self, params WowGuid128[] hitTargets) =>
+        !self.IsEmpty() && hitTargets.Contains(self);
 
     [Fact]
-    public void PreStand_Fires_WhenSeatedSelfTargetedByFearCast()
+    public void FearGo_Fires_WhenSeatedSelfInHitList()
     {
-        Assert.True(FearStandSynth.ShouldPreStandOnIncomingFear(true, WarlockFearR3, Self, Self, Seated));
+        bool selfHit = SelfInHitList(Self, Self); // GO hit list = [Self]
+        Assert.True(selfHit);
+        Assert.True(FearStandSynth.ShouldStandOnFearGoHit(true, WarlockFearR3, selfHit, Seated));
     }
 
     [Fact]
-    public void PreStand_Ignores_WhenAlreadyStanding()
+    public void FearGo_Ignores_WhenSelfOnlyInMissList_Resist()
     {
-        Assert.False(FearStandSynth.ShouldPreStandOnIncomingFear(true, WarlockFearR3, Self, Self, Standing));
+        // Resisted/immune fear: the player is in the MISS list, so the HIT list carries no
+        // self — the caller-side gate returns false and we must not break the drink.
+        bool selfHit = SelfInHitList(Self /* hit list has no targets */);
+        Assert.False(selfHit);
+        Assert.False(FearStandSynth.ShouldStandOnFearGoHit(true, WarlockFearR3, selfHit, Seated));
     }
 
     [Fact]
-    public void PreStand_Ignores_WhenTargetIsAnotherUnit()
+    public void FearGo_Ignores_WhenOnlyOtherPlayerInHitList()
     {
-        Assert.False(FearStandSynth.ShouldPreStandOnIncomingFear(true, WarlockFearR3, Other, Self, Seated));
+        // Fear landed on someone else; local player is seated but not a hit target.
+        bool selfHit = SelfInHitList(Self, Other);
+        Assert.False(selfHit);
+        Assert.False(FearStandSynth.ShouldStandOnFearGoHit(true, WarlockFearR3, selfHit, Seated));
     }
 
     [Fact]
-    public void PreStand_Ignores_NonFearSpell()
+    public void FearGo_Ignores_WhenAlreadyStanding()
     {
-        Assert.False(FearStandSynth.ShouldPreStandOnIncomingFear(true, 116, Self, Self, Seated));
+        bool selfHit = SelfInHitList(Self, Self);
+        Assert.False(FearStandSynth.ShouldStandOnFearGoHit(true, WarlockFearR3, selfHit, Standing));
     }
 
     [Fact]
-    public void PreStand_Ignores_WhenLeverOff()
+    public void FearGo_Ignores_NonFearSpell()
     {
-        Assert.False(FearStandSynth.ShouldPreStandOnIncomingFear(false, WarlockFearR3, Self, Self, Seated));
+        bool selfHit = SelfInHitList(Self, Self);
+        Assert.False(FearStandSynth.ShouldStandOnFearGoHit(true, 116, selfHit, Seated));
     }
 
     [Fact]
-    public void PreStand_Ignores_NullOrEmptyGuids()
+    public void FearGo_Ignores_WhenLeverOff()
     {
-        Assert.False(FearStandSynth.ShouldPreStandOnIncomingFear(true, WarlockFearR3, null, Self, Seated));
-        Assert.False(FearStandSynth.ShouldPreStandOnIncomingFear(true, WarlockFearR3, Self, null, Seated));
-        Assert.False(FearStandSynth.ShouldPreStandOnIncomingFear(true, WarlockFearR3, WowGuid128.Empty, WowGuid128.Empty, Seated));
+        bool selfHit = SelfInHitList(Self, Self);
+        Assert.False(FearStandSynth.ShouldStandOnFearGoHit(false, WarlockFearR3, selfHit, Seated));
+    }
+
+    [Fact]
+    public void FearGo_Ignores_WhenSelfGuidEmpty()
+    {
+        // Pre-login / unresolved local-player guid must never be counted as a hit target.
+        bool selfHit = SelfInHitList(WowGuid128.Empty, WowGuid128.Empty);
+        Assert.False(selfHit);
+        Assert.False(FearStandSynth.ShouldStandOnFearGoHit(true, WarlockFearR3, selfHit, Seated));
     }
 
     // --- trigger 2: CC-onset fallback ---

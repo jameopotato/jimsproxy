@@ -18,13 +18,19 @@ namespace HermesProxy.World.Client;
 /// gets the player out of the chair.
 ///
 /// Two triggers, both synthesizing a legacy CMSG_STAND_STATE_CHANGE(STAND):
-///  1. Incoming-cast pre-stand: a fear-aura cast with a cast time STARTS against
-///     the seated local player. The synth reaches the server while the player
-///     still has control, so it is honored unconditionally; the fear then lands
-///     on a standing player. Covers warlock Fear — the reported PvP case.
+///  1. Fear-lands stand: a fear-aura cast GOES (SMSG_SPELL_GO) with the seated local
+///     player in its HIT target list — i.e. the fear actually lands. Fired at the GO,
+///     not the START: a cast that is interrupted / whose caster dies / that fails at
+///     completion never GOes, so it no longer breaks the player's drink for nothing
+///     (the field-reported START-timing defect). A resisted/immune fear lists the
+///     player in the MISS list, not the hit list, so it never stands them. The stand
+///     races the aura application inside Kronos's ~400ms batching window; win → the
+///     fear lands on a standing player and fear-break items pass NOT_STANDING on both
+///     sides; lose → it degrades to a harmless mid-fear stand attempt (the same packet
+///     trigger 2 sends). Covers warlock Fear — the reported PvP case.
 ///  2. CC-onset fallback: the local player's UNIT_FIELD_FLAGS gain Fleeing or
 ///     Confused while seated (instant fears — Psychic Scream, many mob fears —
-///     never produce a victim-side SPELL_START). Whether the lineage server
+///     never produce a victim-side SPELL_GO). Whether the lineage server
 ///     honors a stand-state change mid-fear is untested (asked in #479); if
 ///     ignored, the synth is one harmless packet.
 /// </summary>
@@ -50,14 +56,17 @@ public static class FearStandSynth
         28315, 28412, 29111, 29124, 29168, 29419, 29685, 30001, 30002, 31365,
     }.ToFrozenSet();
 
-    // Trigger 1 gate: fear-aura cast STARTING against the seated local player.
-    internal static bool ShouldPreStandOnIncomingFear(bool leverOn, uint spellId, WowGuid128? targetUnit, WowGuid128? localPlayer, uint localStandState)
+    // Trigger 1 gate: a fear-aura cast GOES (SMSG_SPELL_GO) with the seated local player
+    // in its HIT target list — the fear actually lands. The caller computes
+    // isSelfInHitTargets from the GO's HIT list (never the MISS list), so a resisted or
+    // immune fear (self in the miss list) leaves it false and never stands the player.
+    // spellId is the RAW legacy spell id off the GO: a fear is always cast by ANOTHER unit
+    // on us, so the SoM remap (local-caster only) never touches it.
+    internal static bool ShouldStandOnFearGoHit(bool leverOn, uint spellId, bool isSelfInHitTargets, uint localStandState)
     {
         if (!leverOn || localStandState == 0)
             return false;
-        if (targetUnit is not WowGuid128 target || localPlayer is not WowGuid128 self)
-            return false;
-        if (self.IsEmpty() || target != self)
+        if (!isSelfInHitTargets)
             return false;
         return FearAuraSpellIds.Contains(spellId);
     }
