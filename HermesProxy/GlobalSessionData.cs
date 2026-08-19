@@ -777,7 +777,149 @@ public sealed class GameSessionData
     //MIRASU   Without this, mob casts reuse a deterministic CastID (spellId+casterCounter) on
     //MIRASU   every cycle and the modern client treats consecutive casts as the same in-flight
     //MIRASU   cast -- visuals/sounds drift and target-frame cast bars don't dismiss on kick.
-    public ConcurrentDictionary<(WowGuid128 caster, uint spellId), WowGuid128> OtherCasterActiveCastIds = new();
+    // JimsProxy (#484 observed-castid-pairing): was a single slot per (caster, spell) — a
+    // rapid same-spell recast overwrote the predecessor's CastID, so the predecessor's late
+    // cancel broadcast (Kronos delivers it 0-554ms AFTER the successor's SPELL_START) popped
+    // the SUCCESSOR's ID: the terminator built for the old cast was stamped with the new
+    // cast's identity and killed the new bar at 0ms (field: 9 instances, heal-snipe /
+    // chain-cast spam). Now a short FIFO per key, mirroring _playerForwardedStartCastIds.
+    // The server runs at most ONE live cast per unit, so the list is [superseded
+    // predecessor?, live cast]: a terminator pairs with the OLDEST (a predecessor's echo
+    // always precedes any event of the successor's outcome), a GO pairs with the NEWEST
+    // (only the live cast can complete). The predecessor's echo window provably closes at
+    // the successor's GO (the echo lags the superseding START by less than one cast time),
+    // so GO purges everything older — an entry cannot outlive one cast cycle and a stale
+    // zombie can never eat a later cast's terminator.
+    private readonly Dictionary<(WowGuid128 caster, uint spellId), List<WowGuid128>> _observedLiveCastIds = new();
+    // JimsProxy (#485 killed-then-fired recovery): last CastID consumed by a terminator per
+    // key, kept until the next same-key START or GO. Kronos broadcasts SPELL_FAILED_OTHER
+    // for casts it then COMPLETES (non-terminal failures: 536/16.7k observed-player casts in
+    // the 12-day corpus) — the terminator pops the tracked entry, so the following GO would
+    // mint a fresh CastID the client never saw start. Recovering the terminated ID instead
+    // lets START/terminator/GO tell one coherent story and makes the killed-then-fired
+    // signature sweepable from always-on events (terminator castIdCounter == GO
+    // castIdCounter).
+    private readonly Dictionary<(WowGuid128 caster, uint spellId), WowGuid128> _observedTerminatedCastIds = new();
+    private readonly object _observedCastIdsLock = new();
+
+    /// <summary>
+    /// Record the CastID minted at an observed (non-local, non-pet) caster's SPELL_START.
+    /// Keeps at most the direct predecessor alongside the new live cast: anything older has
+    /// had a full cast cycle for its echo to arrive and is dropped (see field notes above).
+    /// A new START also invalidates any stashed terminated-ID recovery for the key.
+    /// </summary>
+    public void EnqueueObservedStartCastId(WowGuid128 caster, uint spellId, WowGuid128 castId)
+    {
+        var key = (caster, spellId);
+        lock (_observedCastIdsLock)
+        {
+            _observedTerminatedCastIds.Remove(key);
+            if (!_observedLiveCastIds.TryGetValue(key, out var list))
+            {
+                list = new List<WowGuid128>(2);
+                _observedLiveCastIds[key] = list;
+            }
+            // Keep only the cast that was live until now (the direct predecessor).
+            while (list.Count > 1)
+                list.RemoveAt(0);
+            list.Add(castId);
+        }
+    }
+
+    /// <summary>
+    /// Pair an observed caster's SPELL_GO with the NEWEST tracked CastID — the server runs
+    /// one live cast per unit, so only the newest can complete; anything older is a
+    /// superseded predecessor whose echo window this GO closes (purged here). Also clears
+    /// the terminated-ID stash: a completed successor means any stashed predecessor ID is
+    /// stale.
+    /// </summary>
+    public bool TryPairObservedGoCastId(WowGuid128 caster, uint spellId, out WowGuid128 castId)
+    {
+        var key = (caster, spellId);
+        lock (_observedCastIdsLock)
+        {
+            if (_observedLiveCastIds.TryGetValue(key, out var list) && list.Count > 0)
+            {
+                castId = list[^1];
+                _observedLiveCastIds.Remove(key);
+                _observedTerminatedCastIds.Remove(key);
+                return true;
+            }
+        }
+        castId = default;
+        return false;
+    }
+
+    /// <summary>
+    /// Pair an observed caster's terminator (SPELL_FAILED_OTHER / SPELL_FAILURE) with the
+    /// OLDEST tracked CastID: when a superseded predecessor is still tracked, its late echo
+    /// is the first terminator to arrive, so the echo consumes the predecessor and the live
+    /// cast keeps its identity. pairedLiveCast reports whether the consumed entry WAS the
+    /// live (newest) cast — callers gate the client-visible interrupt synthesis on it so a
+    /// predecessor's echo can no longer dismiss the on-screen bar (#484). The consumed ID is
+    /// stashed for killed-then-fired GO recovery (#485).
+    /// </summary>
+    public bool TryPairObservedTerminatorCastId(WowGuid128 caster, uint spellId, out WowGuid128 castId, out bool pairedLiveCast)
+    {
+        var key = (caster, spellId);
+        lock (_observedCastIdsLock)
+        {
+            if (_observedLiveCastIds.TryGetValue(key, out var list) && list.Count > 0)
+            {
+                castId = list[0];
+                pairedLiveCast = list.Count == 1;
+                list.RemoveAt(0);
+                if (list.Count == 0)
+                    _observedLiveCastIds.Remove(key);
+                _observedTerminatedCastIds[key] = castId;
+                return true;
+            }
+        }
+        castId = default;
+        pairedLiveCast = false;
+        return false;
+    }
+
+    /// <summary>
+    /// Recover the CastID a terminator consumed when the cast then completes anyway
+    /// (killed-then-fired, #485): SPELL_GO with no live tracked entry re-uses the terminated
+    /// cast's ID instead of minting one the client never saw start. Single-shot; invalidated
+    /// by any same-key START or GO.
+    /// </summary>
+    public bool TryRecoverTerminatedObservedCastId(WowGuid128 caster, uint spellId, out WowGuid128 castId)
+    {
+        var key = (caster, spellId);
+        lock (_observedCastIdsLock)
+        {
+            if (_observedTerminatedCastIds.TryGetValue(key, out castId))
+            {
+                _observedTerminatedCastIds.Remove(key);
+                return true;
+            }
+        }
+        castId = default;
+        return false;
+    }
+
+    /// <summary>Whether an observed cast instance is tracked live for (caster, spell) — the dedup's live-terminator bypass (#471).</summary>
+    public bool HasLiveObservedCast(WowGuid128 caster, uint spellId)
+    {
+        lock (_observedCastIdsLock)
+        {
+            return _observedLiveCastIds.ContainsKey((caster, spellId));
+        }
+    }
+
+    private int ClearObservedCastIds()
+    {
+        lock (_observedCastIdsLock)
+        {
+            int count = _observedLiveCastIds.Count;
+            _observedLiveCastIds.Clear();
+            _observedTerminatedCastIds.Clear();
+            return count;
+        }
+    }
     //MIRASU - monotonic sequence used to make non-player CastIDs unique per cast.
     public int OtherCastSequenceCounter;
     public int PlayerChildCastSequence;
@@ -795,9 +937,8 @@ public sealed class GameSessionData
 
     // JimsProxy (observed-pose strand, 2026-08-14): decide whether an incoming
     // SMSG_SPELL_FAILED_OTHER may be dropped by the retry-storm dedup. A failure whose
-    // (caster, spell) has a live tracked cast instance (OtherCasterActiveCastIds /
-    // PetAutoCastActiveCastIds) is that instance's ONLY terminator — the next
-    // SPELL_START overwrites the tracked entry, so a skipped cancel permanently
+    // (caster, spell) has a live tracked cast instance (_observedLiveCastIds /
+    // PetAutoCastActiveCastIds) is that instance's terminator — a skipped cancel
     // strands the cast-hold kit on the 1.14.2 client (observed player frozen in the
     // skinning "crafting hands" pose until despawn; same for mob casting poses).
     // The storm the dedup was built for (repeat failures with NO intervening
@@ -814,7 +955,7 @@ public sealed class GameSessionData
         if (!RecentlyForwardedSpellFailedOther.TryGetValue(key, out var lastMs) || nowMs - lastMs >= dedupWindowMs)
             return false;
         msSinceLastForwarded = nowMs - lastMs;
-        if (OtherCasterActiveCastIds.ContainsKey(key) || PetAutoCastActiveCastIds.ContainsKey(key))
+        if (HasLiveObservedCast(caster, spellId) || PetAutoCastActiveCastIds.ContainsKey(key))
             return false; // live cast instance: this failure is its terminator, never a duplicate
         return true;
     }
@@ -2767,7 +2908,7 @@ public sealed class GameSessionData
     /// time gets silently rejected by HasNonStartedPendingCastForSpell —
     /// user-visible symptom is "spell stuck, spamming key does nothing, no
     /// error message" (e.g. rogue's R-key Sinister Strike not firing). Same
-    /// story for OtherCasterActiveCastIds (mob/other-player CastIDs minted
+    /// story for _observedLiveCastIds (mob/other-player CastIDs minted
     /// pre-DC won't match anything the new server-side state knows about).
     /// Returns the count of entries cleared so the reconnect log can show
     /// whether the gap was actually significant.
@@ -2783,8 +2924,7 @@ public sealed class GameSessionData
             petCount = PendingPetCasts.Count;
             while (PendingPetCasts.TryDequeue(out _)) { }
         }
-        int otherCount = OtherCasterActiveCastIds.Count;
-        OtherCasterActiveCastIds.Clear();
+        int otherCount = ClearObservedCastIds();
         PetAutoCastActiveCastIds.Clear();
         ClearForwardedStartCastIds();
         // Single-slot trackers for melee + auto-repeat (Auto Shot, Shoot Wand)

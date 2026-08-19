@@ -956,6 +956,11 @@ public partial class WorldClient
 
         WowGuid128 castId;
         uint spellVisual;
+        // JimsProxy (#484): whether this terminator paired with the LIVE (newest) tracked
+        // observed cast — the one whose bar is on screen. False only when it consumed a
+        // superseded predecessor's entry; the interrupt-kit synthesis is gated on it.
+        // Defaults true so the local/pet/fallback paths keep today's behavior.
+        bool pairedLiveObservedCast = true;
         // Try to find pending cast info (peek, don't remove - this is informational).
         // Match by either modern SpellId or LegacySpellId for SoM-renumbered items.
         if (GetSession().GameState.CurrentPlayerGuid == casterUnit &&
@@ -980,9 +985,17 @@ public partial class WorldClient
             //MIRASU   the dismiss references the same in-flight cast the modern client is
             //MIRASU   tracking. Falls back to the deterministic seed if no active cast was
             //MIRASU   recorded (e.g. SPELL_START was missed or arrived out of order).
+            // JimsProxy (#484): pairs with the OLDEST tracked entry — when a rapid recast
+            // superseded a predecessor, the predecessor's late cancel echo is the first
+            // terminator to arrive and must consume the PREDECESSOR's ID, not the live
+            // cast's. pairedLiveObservedCast=false marks that case: the interrupt-kit
+            // synthesis below is skipped so the echo can't dismiss the on-screen bar.
             var activeKey = (casterUnit, spellId);
-            if (GetSession().GameState.OtherCasterActiveCastIds.TryRemove(activeKey, out var trackedCastId))
+            if (GetSession().GameState.TryPairObservedTerminatorCastId(casterUnit, spellId, out var trackedCastId, out var pairedLive))
+            {
                 castId = trackedCastId;
+                pairedLiveObservedCast = pairedLive;
+            }
             // JimsProxy: pet AUTO-CAST failure — pull the unique CastID stored at
             // SPELL_START in PetAutoCastActiveCastIds. Without this lookup, the
             // synthesized CancelSpellVisual below targets the deterministic seed
@@ -1034,7 +1047,12 @@ public partial class WorldClient
         ulong interruptLogVictimLow = 0;
         int interruptLogBackfireSpellId = 0;
         ulong cancelVisualSourceLow = 0;
-        if (reason == 61 /* Interrupted */ && !casterIsPlayer && !casterIsPet)
+        // JimsProxy (#484): pairedLiveObservedCast gate — InterruptLog/CancelSpellVisual are
+        // caster-addressed (no cast identity on the wire), so when this terminator consumed a
+        // superseded predecessor's entry they would dismiss the SUCCESSOR's on-screen bar and
+        // kill its casting kit. Skip them; the FAILED_OTHER above still carries the
+        // predecessor's CastID for the combat log.
+        if (reason == 61 /* Interrupted */ && !casterIsPlayer && !casterIsPet && pairedLiveObservedCast)
         {
             SpellInterruptLog interruptLog = new SpellInterruptLog();
             interruptLog.Caster = GetSession().GameState.CurrentPlayerGuid;
@@ -1103,6 +1121,9 @@ public partial class WorldClient
             // as mobs. Both corpora were mis-swept on exactly that this week. The flag stays for
             // tooling compatibility; new sweeps must key on casterKind.
             casterKind = casterUnit.GetHighType().ToString(),
+            // JimsProxy (#484): false = this terminator consumed a superseded predecessor's
+            // entry (interrupt-kit synthesis skipped). Always-on for corpus sweeps.
+            pairedLiveCast = pairedLiveObservedCast,
             sentInterruptLog,
             sentCancelVisual,
             sentPetCastFailed,
@@ -1224,6 +1245,9 @@ public partial class WorldClient
         bool dequeued = false;
         bool wasStarted = false;
         bool foundActiveCastId = false;
+        // JimsProxy (#484): see HandleSpellFailedOther — false when the terminator consumed
+        // a superseded predecessor's tracked entry; gates the interrupt-kit synthesis.
+        bool failurePairedLiveCast = true;
 
         // JimsProxy: Twinstar's Spell::SendInterrupted hardcodes the wire reason
         // byte to vanilla 0 (= classic AffectingCombat=1 after translation). For
@@ -1371,8 +1395,11 @@ public partial class WorldClient
             //MIRASU   references the same in-flight cast the modern client is tracking;
             //MIRASU   otherwise the deterministic seed mismatches and the target-frame cast bar
             //MIRASU   keeps filling until movement triggers a separate dismiss path.
+            // JimsProxy (#484): same oldest-first pairing + live-cast synth gate as
+            // HandleSpellFailedOther — a superseded predecessor's echo must not consume
+            // the live cast's ID or dismiss its bar.
             var activeKey = (casterUnit, spellId);
-            foundActiveCastId = GetSession().GameState.OtherCasterActiveCastIds.TryRemove(activeKey, out var trackedCastId);
+            foundActiveCastId = GetSession().GameState.TryPairObservedTerminatorCastId(casterUnit, spellId, out var trackedCastId, out failurePairedLiveCast);
             if (foundActiveCastId)
                 castId = trackedCastId;
             // JimsProxy: pet AUTO-CAST failure path — same rationale as
@@ -1432,7 +1459,7 @@ public partial class WorldClient
         ulong interruptLogVictimLow = 0;
         int interruptLogBackfireSpellId = 0;
         ulong cancelVisualSourceLow = 0;
-        if (reason == 61 /* Interrupted */ && foundActiveCastId && !casterIsPlayer && !casterIsPet)
+        if (reason == 61 /* Interrupted */ && foundActiveCastId && !casterIsPlayer && !casterIsPet && failurePairedLiveCast)
         {
             SpellInterruptLog interruptLog = new SpellInterruptLog();
             interruptLog.Caster = GetSession().GameState.CurrentPlayerGuid;
@@ -1540,6 +1567,8 @@ public partial class WorldClient
             dequeued,
             wasStarted,
             foundActiveCastId,
+            // JimsProxy (#484): false = consumed a superseded predecessor's entry (synth skipped).
+            pairedLiveCast = failurePairedLiveCast,
             sentInterruptLog,
             sentCancelVisual,
             sentPetCastFailed,
@@ -2639,11 +2668,28 @@ public partial class WorldClient
         bool casterIsPet = dbdata.CasterUnit == gameState.CurrentPetGuid;
         if (!casterIsPlayer && !casterIsPet)
         {
-            var key = (dbdata.CasterUnit, (uint)dbdata.SpellID);
-            if (isSpellGo && gameState.OtherCasterActiveCastIds.TryRemove(key, out var existingCastId))
+            if (isSpellGo && gameState.TryPairObservedGoCastId(dbdata.CasterUnit, (uint)dbdata.SpellID, out var existingCastId))
             {
                 // Cast started before; reuse the same CastID assigned at SPELL_START.
+                // Pairs with the NEWEST tracked entry — only the live cast can complete;
+                // an older entry is a superseded predecessor this GO purges (#484).
                 dbdata.CastID = existingCastId;
+            }
+            // JimsProxy (#485 killed-then-fired): a terminator already consumed the tracked
+            // entry but the cast completed anyway (Kronos broadcasts SPELL_FAILED_OTHER for
+            // casts it then fires — 536/16.7k observed casts in the 12-day corpus). Re-use
+            // the terminated cast's ID so START/terminator/GO reference one cast instead of
+            // shipping a GO the client never saw start.
+            else if (isSpellGo && gameState.TryRecoverTerminatedObservedCastId(dbdata.CasterUnit, (uint)dbdata.SpellID, out var terminatedCastId))
+            {
+                dbdata.CastID = terminatedCastId;
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("cast.observed_go_after_terminator", new
+                    {
+                        spell_id = dbdata.SpellID,
+                        caster_low = dbdata.CasterUnit.GetCounter(),
+                        cast_id_low = terminatedCastId.GetCounter(),
+                    });
             }
             else
             {
@@ -2652,7 +2698,7 @@ public partial class WorldClient
                 ulong uniqueLow = ((ulong)sequence << 32) | (uint)((uint)dbdata.SpellID + dbdata.CasterUnit.GetCounter());
                 dbdata.CastID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)gameState.CurrentMapId!, (uint)dbdata.SpellID, uniqueLow);
                 if (!isSpellGo)
-                    gameState.OtherCasterActiveCastIds[key] = dbdata.CastID;
+                    gameState.EnqueueObservedStartCastId(dbdata.CasterUnit, (uint)dbdata.SpellID, dbdata.CastID);
             }
         }
         else
