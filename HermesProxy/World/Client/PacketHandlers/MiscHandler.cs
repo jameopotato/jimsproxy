@@ -185,20 +185,21 @@ public partial class WorldClient
     // JimsProxy (feared-while-sitting, issue #479): synthesize the stand-up the 1.14
     // client cannot produce itself — it surrenders all input the moment control is
     // removed. One legacy CMSG_STAND_STATE_CHANGE(STAND); the server's BYTES_1 echo then
-    // updates the client and every observer. Event is ungated: it fires at most once per
-    // fear-landing-on-a-seated-player (rare), and its presence in a bundle is the fix's
-    // own breadcrumb.
+    // updates the client and every observer. Event is DebugOutput-gated: it is the
+    // fix-working breadcrumb, not an unexpected-edge signature (2026-08-18 review
+    // rubric — devs/testers run DebugOutput on, and a misfire is player-visible).
     internal void SendSynthStandUp(string trigger, uint spellId)
     {
         WorldPacket packet = new WorldPacket(Opcode.CMSG_STAND_STATE_CHANGE);
         packet.WriteUInt32(0); // UNIT_STAND_STATE_STAND
         SendPacketToServer(packet);
-        Framework.Logging.Log.Event("standstate.synth_stand", new
-        {
-            trigger,
-            spell_id = spellId,
-            cached_stand_state = GetSession().GameState.GetLocalPlayerStandState(),
-        });
+        if (Framework.Settings.DebugOutput)
+            Framework.Logging.Log.Event("standstate.synth_stand", new
+            {
+                trigger,
+                spell_id = spellId,
+                cached_stand_state = GetSession().GameState.GetLocalPlayerStandState(),
+            });
     }
 
     [PacketHandler(Opcode.SMSG_EXPLORATION_EXPERIENCE)]
