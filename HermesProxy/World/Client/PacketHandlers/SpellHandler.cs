@@ -1116,6 +1116,22 @@ public partial class WorldClient
         });
     }
 
+    /// <summary>
+    /// JimsProxy (strafe cancel-gap presentation parity): the client-bound SpellFailure
+    /// reason for a movement-cancelled cast's trailing failure, or null to keep today's
+    /// suppression. Forward/back/jump cancels are predicted client-side — the 1.14 client
+    /// already flashed the red "Interrupted" on its own cast bar, so the broadcast stays
+    /// suppressed (null). Strafe cancels are synthesized by the proxy (the client never
+    /// sends nor predicts one), so return the interrupt reason to forward SMSG_SPELL_FAILURE
+    /// and reproduce that same "Interrupted" render instead of a silent fizzle. Pure /
+    /// deterministic — decided solely by the tracked cast's StrafeSynthCancelled flag, which
+    /// is only ever set when the StrafeCancelPreempt synth fired.
+    /// </summary>
+    internal static SpellCastResultClassic? ResolveMovementCancelInterruptReason(ClientCastRequest cast)
+    {
+        return cast.StrafeSynthCancelled ? SpellCastResultClassic.Interrupted : null;
+    }
+
     // JimsProxy: SMSG_SPELL_FAILURE handler. Block 2 gameplay testing on Kronos
     // surfaced this as packet.untranslated 7x in a 10-min priest leveling session
     // (Smite/Heal failing for OOM, OOR, LoS). Without this, the modern client
@@ -1222,6 +1238,12 @@ public partial class WorldClient
         // reason and renders the correct popup.
         bool overrideReasonForLocalBroadcast = false;
         bool skipBroadcastFailure = false;
+        // JimsProxy (strafe cancel-gap presentation parity): when set, the broadcast
+        // SpellFailure is forwarded with THIS classic reason instead of being
+        // suppressed — used for strafe-synth-cancelled casts so the client renders
+        // the red "Interrupted" it never predicted locally. Null leaves the existing
+        // suppress / reason-override behavior untouched.
+        byte? forcedBroadcastReason = null;
         // JimsProxy (transient-no-dismiss-started): under LowLatencyMode, defer a STARTED local
         // cast's bar-dismiss AND visual-cancel to the caller-aware trailing CAST_FAILED (which
         // knows the real reason — spare a dup-rejection, dismiss a real failure). Set in the
@@ -1283,8 +1305,23 @@ public partial class WorldClient
             // prediction. Suppress the broadcast SpellFailure entirely —
             // emitting it would surface a misleading "You are in combat" popup
             // (Spell::SendInterrupted hardcodes the wire reason to 0).
+            //
+            // JimsProxy (strafe cancel-gap presentation parity): EXCEPT when the
+            // proxy synthesized the cancel itself (strafe). The 1.14 client never
+            // sends nor predicts a cancel on strafe, so it never rendered the red
+            // "Interrupted" — suppressing here would leave a silent fizzle. Forward
+            // the interrupt instead (SMSG_SPELL_FAILURE for the local caster is read
+            // as "in-flight cast interrupted"), keyed purely on the tracked cast, so
+            // the bar matches the forward/back/jump presentation. Inert when the
+            // strafe synth (StrafeCancelPreempt) never fired.
             if (pendingNormal.MovementCancelled)
-                skipBroadcastFailure = true;
+            {
+                var strafeInterruptReason = ResolveMovementCancelInterruptReason(pendingNormal);
+                if (strafeInterruptReason.HasValue)
+                    forcedBroadcastReason = (byte)strafeInterruptReason.Value;
+                else
+                    skipBroadcastFailure = true;
+            }
             // Instant cast that wasn't a ranged auto-attack: SPELL_START was
             // never forwarded, so there's no cast bar to dismiss. Skip the misleading
             // broadcast SpellFailure entirely. The trailing SMSG_CAST_FAILED via
@@ -1366,7 +1403,8 @@ public partial class WorldClient
                 });
         }
 
-        byte broadcastReason = overrideReasonForLocalBroadcast ? (byte)SpellCastResultClassic.DontReport : reason;
+        byte broadcastReason = forcedBroadcastReason
+            ?? (overrideReasonForLocalBroadcast ? (byte)SpellCastResultClassic.DontReport : reason);
         if (!skipBroadcastFailure)
         {
             SpellFailure spell = new SpellFailure();

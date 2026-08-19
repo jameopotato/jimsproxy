@@ -3644,6 +3644,18 @@ public class ClientCastRequest
     // client gets its CMSG_CANCEL_CAST ack without a popup.
     public bool MovementCancelled;
 
+    // JimsProxy (strafe cancel-gap presentation parity): set true (alongside
+    // MovementCancelled) ONLY for casts the strafe branch synthesized a
+    // CMSG_CANCEL_CAST for — i.e. the ones the 1.14 client did NOT cancel itself.
+    // The client renders the red "Interrupted" locally when IT initiates the
+    // cancel (forward/back/jump), but it never sends nor predicts a cancel on
+    // strafe, so a strafe-synth-cancelled cast's trailing SMSG_SPELL_FAILURE must
+    // be FORWARDED with the interrupt reason (not suppressed like the
+    // client-predicted case) to reproduce that "Interrupted" render. Only ever set
+    // when Settings.StrafeCancelPreempt is on (the synth's sole trigger), so it is
+    // structurally inert when the kill switch is off.
+    public bool StrafeSynthCancelled;
+
     // DIAGNOSTIC (stuck-spell investigation): TickCount64 when MovementCancelled
     // was set. Used by cast.movement_resolved debug events to measure how long
     // between proxy-side mark and actual server resolution (CAST_FAILED /

@@ -3,6 +3,8 @@ using System.Collections.Frozen;
 using System.Collections.Generic;
 using HermesProxy;
 using HermesProxy.World;
+using HermesProxy.World.Client;
+using HermesProxy.World.Enums;
 using HermesProxy.World.Server;
 using Xunit;
 
@@ -186,5 +188,51 @@ public class StrafeCancelSynthTests
         {
             GameData.MovementInterruptibleSpells = prev;
         }
+    }
+
+    // ---- interrupted-presentation parity (strafe cancel-gap follow-up) ----
+    //
+    // The forward/back/jump client-sent cancel makes the 1.14 client render the red
+    // "Interrupted" locally; the strafe cancel the proxy synthesizes does not, so the
+    // trailing SMSG_SPELL_FAILURE must be FORWARDED with the interrupt reason (not
+    // suppressed like the client-predicted case) to match that presentation. The
+    // suppress-vs-forward decision is the pure ResolveMovementCancelInterruptReason.
+
+    [Fact]
+    public void ResolveMovementCancelInterruptReason_StrafeSynthCancelled_ReturnsInterrupted()
+    {
+        var cast = MakeCast(10181, castTimeMs: 3000, hasStarted: true);
+        cast.MovementCancelled = true;
+        cast.StrafeSynthCancelled = true; // proxy synthesized the cancel — client never rendered it
+
+        var reason = WorldClient.ResolveMovementCancelInterruptReason(cast);
+
+        Assert.Equal(SpellCastResultClassic.Interrupted, reason);
+    }
+
+    [Fact]
+    public void ResolveMovementCancelInterruptReason_ClientPredictedCancel_ReturnsNullSuppress()
+    {
+        // forward/back/jump: MovementCancelled but NOT strafe-synth. The client
+        // already flashed "Interrupted" from its own cancel, so the broadcast stays
+        // suppressed (null) — forwarding would double up / mis-render.
+        var cast = MakeCast(10181, castTimeMs: 3000, hasStarted: true);
+        cast.MovementCancelled = true;
+        cast.StrafeSynthCancelled = false;
+
+        Assert.Null(WorldClient.ResolveMovementCancelInterruptReason(cast));
+    }
+
+    [Fact]
+    public void ResolveMovementCancelInterruptReason_KillSwitchOffLeavesFlagUnset_Suppresses()
+    {
+        // Structural inertness: with StrafeCancelPreempt off the synth never runs,
+        // so StrafeSynthCancelled is never set and the decision collapses to today's
+        // suppression regardless of the movement-cancel mark.
+        var cast = MakeCast(10181, castTimeMs: 3000, hasStarted: true);
+        cast.MovementCancelled = true;
+        // StrafeSynthCancelled deliberately left at its default (false)
+
+        Assert.Null(WorldClient.ResolveMovementCancelInterruptReason(cast));
     }
 }

@@ -114,6 +114,13 @@ public partial class WorldSocket
                     uint cancelSpellId = ResolveStrafeCancelSpellId(cast);
                     if (cancelSpellId == 0)
                         continue;
+                    // Presentation parity: the 1.14 client never predicted this
+                    // interrupt (it doesn't self-cancel on strafe), so flag the cast
+                    // for HandleSpellFailure to FORWARD the interrupt broadcast rather
+                    // than suppress it — otherwise the cast bar silently fizzles
+                    // instead of showing the red "Interrupted" the client-sent cancels
+                    // (forward/back/jump) render locally.
+                    cast.StrafeSynthCancelled = true;
                     WorldPacket cancel = new WorldPacket(Opcode.CMSG_CANCEL_CAST);
                     if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
                         cancel.WriteUInt8(0);
