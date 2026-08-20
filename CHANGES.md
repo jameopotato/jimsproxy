@@ -13,23 +13,25 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
-## 2026-08-20 — Unlock epic Reins of the Nightsaber (12303); stale-cache RCA
+## 2026-08-20 — Unlock epic Reins of the Nightsaber (12303); proxy exonerated on the report
 
 **Issue:** an undead player reported the shop-bought Reins of the Spotted Nightsaber (8628)
-race-locked. The data was intact — PR #280's unlock verified present at every layer — so the
-root cause is client-side: the 1.14 client permanently skips hotfix IDs it has already applied
-(persistent Cache/ADB state), so a client whose cache predates 2026-05-20 (or whose cache has
-degraded) keeps the old race-locked records. Cure for affected players: delete the client
-Cache folder (the launcher can force this on update). The player's "relog until 'server
-offline' then it works" ritual was an accidental cache rebuild.
+race-locked. Full audit: the #280 unlock data is intact at every layer, AND wire analysis of 30
+v5.2.0-beta.4 sessions proved the delivery pipeline clean — SMSG_AVAILABLE_HOTFIXES advertises the
+complete ItemSparse bands (220001-220270, 300001-300585) every login, the 42597 client re-requests
+the full set every login (so client cache state is irrelevant on a current proxy), and
+SMSG_HOTFIX_CONNECT serves 8628 with AllowableRace=-1, status Valid, byte-for-byte. The failing
+player therefore is not talking to a current proxy in the failing sessions (stale
+JimsProxy.exe/folder — e.g. the pre-May build-single distribution) or has a client-internal
+application failure the modern-side wire cannot see.
 
-**Change:** while auditing, one genuine data gap surfaced: the epic Reins of the Nightsaber
-(12303, listed on the shop under the same name as the already-unlocked 8627) was never
-unlocked — set AllowableRace=-1 in `CSV/Hotfix/ItemSparse1.csv` and
-`CSV/Hotfix/ItemSparse1.kronos.csv`. Data-only; no code change; no hotfix IDs shift.
+**Change:** the audit against the real shop item IDs (page source) found exactly one data gap:
+the shop sells epic Reins of the Nightsaber (12303) — same display name as the already-unlocked,
+not-sold 8627 — still race-locked (1101). Set AllowableRace=-1 in `CSV/Hotfix/ItemSparse1.csv`
+and `CSV/Hotfix/ItemSparse1.kronos.csv`. Data-only; no code change; no hotfix IDs shift.
 
-**Verification:** full suite green. Field: after a client Cache clear, an undead can use the
-shop mounts; 12303 usable cross-race once a fresh-cache client connects.
+**Verification:** full suite green; wire captures confirm the band the row rides is served every
+login. Field: an undead uses shop-bought 12303 on a current proxy.
 
 ---
 
