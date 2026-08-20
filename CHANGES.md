@@ -13,24 +13,23 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
-## 2026-08-20 — Shop-mount race unlock: re-issue at fresh hotfix IDs + epic Nightsaber
+## 2026-08-20 — Unlock epic Reins of the Nightsaber (12303); stale-cache RCA
 
 **Issue:** an undead player reported the shop-bought Reins of the Spotted Nightsaber (8628)
-race-locked — despite PR #280's unlock being intact in the data. Root cause: the 1.14 client
-permanently skips hotfix IDs it has already applied, and #280 changed row CONTENT without
-changing hotfix IDs (IDs = 220000 + row position). Any client whose hotfix cache predates
-2026-05-20 therefore never received the unlocked values. The player's "relog until 'server
-offline' then it works" ritual was an accidental client cache rebuild.
+race-locked. The data was intact — PR #280's unlock verified present at every layer — so the
+root cause is client-side: the 1.14 client permanently skips hotfix IDs it has already applied
+(persistent Cache/ADB state), so a client whose cache predates 2026-05-20 (or whose cache has
+degraded) keeps the old race-locked records. Cure for affected players: delete the client
+Cache folder (the launcher can force this on update). The player's "relog until 'server
+offline' then it works" ritual was an accidental cache rebuild.
 
-**Change:** `CSV/Hotfix/ItemSparse1.csv` — re-issued all 16 #280 shop-mount rows plus the epic
-Reins of the Nightsaber (12303, sold on the shop but missed by #280) as appended tail rows,
-giving them brand-new hotfix IDs every client fetches and applies (later application wins,
-same layering the Kronos overlay relies on). Also set 12303 to AllowableRace=-1 in place in
-both `ItemSparse1.csv` and `ItemSparse1.kronos.csv`. Appending shifts no existing row's
-hotfix ID, so no other cached record is disturbed. Data-only; no code change.
+**Change:** while auditing, one genuine data gap surfaced: the epic Reins of the Nightsaber
+(12303, listed on the shop under the same name as the already-unlocked 8627) was never
+unlocked — set AllowableRace=-1 in `CSV/Hotfix/ItemSparse1.csv` and
+`CSV/Hotfix/ItemSparse1.kronos.csv`. Data-only; no code change; no hotfix IDs shift.
 
-**Verification:** full suite green; field gate = a player with a pre-May cache (or after the
-manual workaround: delete the client Cache folder) can use the shop mount on any race.
+**Verification:** full suite green. Field: after a client Cache clear, an undead can use the
+shop mounts; 12303 usable cross-race once a fresh-cache client connects.
 
 ---
 
