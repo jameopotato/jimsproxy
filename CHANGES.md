@@ -13,6 +13,35 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-08-20 — Correct the shipped config defaults for standalone (non-launcher) use
+
+**Issue:** `HermesProxy/HermesProxy.config` is what anyone building from source or running the
+proxy without the launcher actually gets, and it had drifted from the client this fork targets.
+`ClientBuild` shipped as `40618` (1.14.0) while development, testing, and the launcher's own
+client check all pin 1.14.2 build `42597` (`repair.rs:145`, `EXPECTED_CLIENT_VERSION`) — and a
+`ClientBuild` that does not match the running client fails login outright. `PacketsLog` shipped
+as `true`, so every standalone session wrote a full packet capture to disk unprompted and
+indefinitely; the launcher already forced this off, so only standalone users paid for it.
+Separately, `ThreatEngine` and `ServerType` were the only two keys in the file with no
+`Option/Description/Default` comment block, leaving a standalone user no way to learn what they
+do — `ServerType` in particular silently selects the fork-specific item-data overlays loaded at
+startup.
+
+**Change:** `HermesProxy/HermesProxy.config` — `ClientBuild` `40618` → `42597`; `PacketsLog`
+`true` → `false`; added full comment blocks for `ThreatEngine` and `ServerType`, documenting
+`ServerType` values as `Kronos` (default) and `Generic`, with `Generic` stated as scaffolding for
+future server support rather than a tested configuration. `ServerAddress` (`127.0.0.1`),
+`ServerBuild` (`auto`) and `ClientSeed` deliberately unchanged — the first two are correct
+generic defaults, and `ClientSeed` is the static-seed fallback users should never edit.
+Data-only; no code change. The launcher writes its own config from a template (`setup.rs`) and
+is unaffected.
+
+**Verification:** XML parses clean, BOM preserved, file remains pure ASCII. Field gate pending:
+a standalone run using only the documented manual steps (take the shipped config, set
+`ServerAddress`, start the proxy, log in) against Kronos.
+
+---
+
 ## 2026-08-20 — Unlock the shop's epic Reins of the Nightsaber (12303)
 
 **Issue:** an undead player could not use the shop-bought **Reins of the Nightsaber (12303)**.
