@@ -13,25 +13,24 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
-## 2026-08-20 — Unlock epic Reins of the Nightsaber (12303); proxy exonerated on the report
+## 2026-08-20 — Unlock the shop's epic Reins of the Nightsaber (12303)
 
-**Issue:** an undead player reported the shop-bought Reins of the Spotted Nightsaber (8628)
-race-locked. Full audit: the #280 unlock data is intact at every layer, AND wire analysis of 30
-v5.2.0-beta.4 sessions proved the delivery pipeline clean — SMSG_AVAILABLE_HOTFIXES advertises the
-complete ItemSparse bands (220001-220270, 300001-300585) every login, the 42597 client re-requests
-the full set every login (so client cache state is irrelevant on a current proxy), and
-SMSG_HOTFIX_CONNECT serves 8628 with AllowableRace=-1, status Valid, byte-for-byte. The failing
-player therefore is not talking to a current proxy in the failing sessions (stale
-JimsProxy.exe/folder — e.g. the pre-May build-single distribution) or has a client-internal
-application failure the modern-side wire cannot see.
+**Issue:** an undead player could not use the shop-bought **Reins of the Nightsaber (12303)**.
+PR #280 unlocked 8627 — same display name, but NOT the item the shop sells — and missed 12303,
+which stayed AllowableRace=1101 (Alliance-only) in both hotfix files. Wire analysis (30 beta.4
+sessions) confirmed the proxy delivers this lock to every client at every login (the 42597 client
+re-requests the full custom hotfix set per login), so the mount was blocked in every normal
+session; the player's occasional "it worked" sessions are consistent with the hotfix failing to
+apply that session and the client falling back to its more permissive native data. Audit against
+the shop page's real item IDs confirmed 12303 is the ONLY sold mount still locked; the other 15
+were correctly unlocked by #280 (whose delivery was verified clean on the wire, e.g. 8628 served
+as -1 in 30/30 sessions).
 
-**Change:** the audit against the real shop item IDs (page source) found exactly one data gap:
-the shop sells epic Reins of the Nightsaber (12303) — same display name as the already-unlocked,
-not-sold 8627 — still race-locked (1101). Set AllowableRace=-1 in `CSV/Hotfix/ItemSparse1.csv`
-and `CSV/Hotfix/ItemSparse1.kronos.csv`. Data-only; no code change; no hotfix IDs shift.
+**Change:** `CSV/Hotfix/ItemSparse1.csv` + `CSV/Hotfix/ItemSparse1.kronos.csv` — 12303
+AllowableRace 1101 → -1. Data-only; no code change; no hotfix IDs shift.
 
-**Verification:** full suite green; wire captures confirm the band the row rides is served every
-login. Field: an undead uses shop-bought 12303 on a current proxy.
+**Verification:** full suite green; wire captures prove the bands this row rides are served every
+login. Field gate: the reporting undead uses their Reins of the Nightsaber on a current build.
 
 ---
 
