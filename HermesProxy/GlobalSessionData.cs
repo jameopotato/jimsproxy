@@ -765,7 +765,13 @@ public sealed class GameSessionData
         }
     }
 
-    // JimsProxy (fifo-terminator-symmetry): per-spell STARTED twin of the check above.
+    // JimsProxy (fifo-terminator-symmetry + dup-failure frame hold): per-spell STARTED twin
+    // of the check above — "is a same-spell cast currently between its forwarded SPELL_START
+    // and its terminal event?" For the frame hold that in-flight window is the hold predicate:
+    // a dup press's CAST_FAILED delivered during it can share a client frame with the cast's
+    // SPELL_GO, and the client's kit-cancel sweep runs by (unit, visualID) — not CastID — so
+    // the correctly-CastID'd dup failure can still tear the live cast's visual kit in the same
+    // frame its GO is closing it (the #394 looping-sound collision, 2026-08-14 Stonetavern JSONL).
     public bool HasStartedPendingCastForSpell(uint spellId)
     {
         lock (PendingCastsLock)
@@ -779,6 +785,96 @@ public sealed class GameSessionData
             return false;
         }
     }
+
+    // JimsProxy (dup-failure frame hold): a dup press's failure delivery, held while its
+    // same-spell started cast is still in flight. Either a list of fully-built client packets
+    // (SpellPrepare + CastFailed, the unsuppressed path) or the pending request to ack via
+    // SendCastRequestFailed(DontReport) (the SuppressSpellCastErrors path). Released after the
+    // started cast's terminal event forwards — SugarProxy's AddFailedPacket/GetFailedPacket
+    // shape (hold by data dependency, never a clock), with a strictly wider release set: the
+    // stale sweep ties held entries to the pending-cast lifecycle, so a silently-evicted cast
+    // can't strand its dup's button-release past the next cast event.
+    public sealed class HeldDupFailure
+    {
+        public uint SpellId;
+        public List<ServerPacket> Packets = new();
+        public ClientCastRequest? SuppressAck;
+        public uint ReasonId;
+        public long HeldAtMs;
+    }
+
+    // Lock order: _heldDupFailuresLock may be taken BEFORE PendingCastsLock (the stale sweep
+    // checks anchors under it) — never call the held-dup methods while holding PendingCastsLock.
+    private readonly Dictionary<uint, List<HeldDupFailure>> _heldDupFailures = new();
+    private readonly object _heldDupFailuresLock = new();
+
+    public void HoldDupFailure(HeldDupFailure held)
+    {
+        lock (_heldDupFailuresLock)
+        {
+            if (!_heldDupFailures.TryGetValue(held.SpellId, out var list))
+            {
+                list = new List<HeldDupFailure>();
+                _heldDupFailures[held.SpellId] = list;
+            }
+            list.Add(held);
+        }
+    }
+
+    public int HeldDupFailureCount
+    {
+        get { lock (_heldDupFailuresLock) { int n = 0; foreach (var l in _heldDupFailures.Values) n += l.Count; return n; } }
+    }
+
+    /// <summary>
+    /// Remove and return every held dup failure for this spell, in hold (FIFO) order —
+    /// null when none (keeps the per-GO hot path allocation-free). Called right after the
+    /// started cast's terminal event (SPELL_GO or its real CAST_FAILED) forwards, so the
+    /// release lands in the flush AFTER the terminal — Sugar's replay position, empirically
+    /// safe in its field record.
+    /// </summary>
+    public List<HeldDupFailure>? TakeHeldDupFailures(uint spellId)
+    {
+        lock (_heldDupFailuresLock)
+        {
+            if (_heldDupFailures.Count != 0 && _heldDupFailures.Remove(spellId, out var list))
+                return list;
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Remove and return held dup failures whose anchor died: no started same-spell cast
+    /// remains pending (evicted by the watchdog, parse-failure drain, destroy eviction, or a
+    /// world transfer clear). The caller must still DELIVER these — a never-released dup
+    /// failure strands the client's action button lit (the press is never answered).
+    /// Self-healing: run on every local cast event, like RunWatchdogEviction.
+    /// </summary>
+    public List<HeldDupFailure>? TakeStaleHeldDupFailures()
+    {
+        List<HeldDupFailure>? stale = null;
+        lock (_heldDupFailuresLock)
+        {
+            if (_heldDupFailures.Count == 0)
+                return null;
+            List<uint>? deadKeys = null;
+            foreach (var key in _heldDupFailures.Keys)
+            {
+                if (!HasStartedPendingCastForSpell(key))
+                    (deadKeys ??= new List<uint>()).Add(key);
+            }
+            if (deadKeys != null)
+            {
+                foreach (var key in deadKeys)
+                {
+                    if (_heldDupFailures.Remove(key, out var list))
+                        (stale ??= new List<HeldDupFailure>()).AddRange(list);
+                }
+            }
+        }
+        return stale;
+    }
+
 
     // JimsProxy: proxy→server RTT measurement for adaptive GCD fire offset.
     private readonly object _rttLock = new();

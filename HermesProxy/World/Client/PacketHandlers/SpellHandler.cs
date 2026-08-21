@@ -28,6 +28,50 @@ public partial class WorldClient
     // in a clean client frame past the coalesced START+GO burst. A couple of frames at 60fps.
     private const int SpellSuccessRefireDeferMs = 8;
 
+    // JimsProxy (dup-failure frame hold): deliver a batch of held dup failures, in hold order.
+    // Runs on the WorldClient receive thread at a release site — always AFTER the started
+    // cast's terminal event forwarded (or when the anchor entry is gone), never between a
+    // START and its GO.
+    private void DeliverHeldDupFailures(List<GameSessionData.HeldDupFailure> held, string release)
+    {
+        foreach (var item in held)
+        {
+            if (item.SuppressAck != null)
+            {
+                // Stale releases can land in a transfer window where the client-facing
+                // socket is already gone — the client is resetting its own state then,
+                // so dropping the ack is correct, and an NRE here would DC the session.
+                GetSession().InstanceSocket?.SendCastRequestFailed(item.SuppressAck, false, SpellCastResultClassic.DontReport);
+            }
+            else
+                foreach (var pkt in item.Packets)
+                    SendPacketToClient(pkt);
+            if (Framework.Settings.DebugOutput)
+                Log.Event("cast.fail.dup_flushed", new
+                {
+                    spell_id = item.SpellId,
+                    reason_id = item.ReasonId,
+                    held_ms = Environment.TickCount64 - item.HeldAtMs,
+                    release,
+                });
+        }
+    }
+
+    // JimsProxy (dup-failure frame hold): self-healing release for held dup failures whose
+    // started anchor cast left PendingNormalCasts through a path other than its GO / real
+    // CAST_FAILED (watchdog eviction, parse-failure drain, destroy eviction, world-transfer
+    // clear). They must still be DELIVERED — an unanswered dup press strands the client's
+    // action button lit. Run on every local cast event, mirroring RunWatchdogEviction.
+    private void ReleaseStaleHeldDupFailures()
+    {
+        var gameState = GetSession().GameState;
+        if (gameState.HeldDupFailureCount == 0)
+            return;
+        var stale = gameState.TakeStaleHeldDupFailures();
+        if (stale != null)
+            DeliverHeldDupFailures(stale, "stale");
+    }
+
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_SEND_KNOWN_SPELLS)]
     void HandleSendKnownSpells(WorldPacket packet)
@@ -334,6 +378,9 @@ public partial class WorldClient
         // get its own trailing CAST_FAILED — happens occasionally on Kronos
         // for cast-time + target-dies. Self-healing on every cast event.
         GetSession().RunWatchdogEviction();
+        // JimsProxy (dup-failure frame hold): after the watchdog may have evicted a started
+        // cast, deliver any held dup failures whose anchor died — same self-healing cadence.
+        ReleaseStaleHeldDupFailures();
 
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
             packet.ReadUInt8(); // cast count
@@ -486,7 +533,32 @@ public partial class WorldClient
             // with no popup / error sound. Mirrors the item-use-orphan eviction ack above.
             // preferStarted:false (H7, from #372): consume the UNSTARTED dup, leave the started cast for its GO.
             if (GetSession().GameState.TryDequeuePendingNormalCast(spellId, out var suppressedCast, preferStarted: false) && suppressedCast != null)
-                GetSession().InstanceSocket.SendCastRequestFailed(suppressedCast, false, SpellCastResultClassic.DontReport);
+            {
+                // JimsProxy (dup-failure frame hold): if this dup's started twin is still in
+                // flight, even the DontReport ack rides the hold — whether a DontReport
+                // CastFailed skips the client's (unit, visualID) kit-cancel sweep is unproven,
+                // and the ack loses nothing by arriving one terminal later.
+                if (!suppressedCast.HasStarted &&
+                    GetSession().GameState.HasStartedPendingCastForSpell(spellId))
+                {
+                    GetSession().GameState.HoldDupFailure(new GameSessionData.HeldDupFailure
+                    {
+                        SpellId = suppressedCast.SpellId,
+                        SuppressAck = suppressedCast,
+                        ReasonId = reason,
+                        HeldAtMs = Environment.TickCount64,
+                    });
+                    if (Framework.Settings.DebugOutput)
+                        Log.Event("cast.fail.dup_held", new
+                        {
+                            spell_id = suppressedCast.SpellId,
+                            reason_id = reason,
+                            path = "suppress_ack",
+                        });
+                }
+                else
+                    GetSession().InstanceSocket.SendCastRequestFailed(suppressedCast, false, SpellCastResultClassic.DontReport);
+            }
             Log.Event("cast.error_suppressed", new
             {
                 spell_id = spellId,
@@ -499,7 +571,13 @@ public partial class WorldClient
         // caster directly, so any pending resurrection cast tracked for
         // us is now cancelled — emit HC-1.0 stop so 1.12-native listeners
         // clear the rez indicator on their unit frames.
-        GetSession().HealCommBridge.OnLocalPlayerSpellStop(spellId);
+        // JimsProxy (dup-failure frame hold rider): transient reasons (NotReady /
+        // SpellInProgress) are dup-press rejections, never an interrupt of the cast in
+        // progress (the #397 axiom: the server never starts a cast and then rejects it with a
+        // pre-cast reason) — firing the stop for them falsely cleared the rez indicator while
+        // the real cast was still casting. Real failures keep firing exactly as before.
+        if (!isTransientReason)
+            GetSession().HealCommBridge.OnLocalPlayerSpellStop(spellId);
 
         // Check special casts first - try next melee, then auto repeat
         ClientCastRequest? specialCast = null;
@@ -594,12 +672,32 @@ public partial class WorldClient
                         client_cast_id = pendingCast.ClientGUID.ToString(),
                     });
             }
-            else if (!pendingCast.HasStarted)
+            // JimsProxy (dup-failure frame hold, the #394 collision strand): a dup press's
+            // failure resolved while its same-spell STARTED cast is still in flight. Delivering
+            // it now can land it in the same client frame as that cast's SPELL_GO (Stonetavern
+            // batches the dup rejection into the tick that completes the cast — 2/2 specimens in
+            // the 2026-08-14 reporter JSONL, both at Δ0-1ms from the GO). The failure's CastID is
+            // correct (the dup's), but the client's kit-cancel sweep runs by (unit, visualID) —
+            // a same-frame FAILED+GO can tear the live kit ahead of its end-event close and
+            // orphan the loop sound. Build everything exactly as before, but HOLD the delivery;
+            // released after the started cast's terminal event forwards (GO / real CAST_FAILED /
+            // eviction sweep) — SugarProxy's AddFailedPacket shape, keyed on data dependency,
+            // never a clock. MovementCancelled acks are exempt: the client is blocked on them
+            // (its own cancel awaits the confirm — the #161 bar-linger), and they never carry a
+            // live same-spell started twin anyway.
+            bool holdAsDup = !pendingCast.HasStarted && !movementSuppressed &&
+                GetSession().GameState.HasStartedPendingCastForSpell(spellId);
+
+            SpellPrepare? dupPrepare = null;
+            if (!movementSuppressed && !pendingCast.HasStarted)
             {
                 SpellPrepare prepare2 = new SpellPrepare();
                 prepare2.ClientCastID = pendingCast.ClientGUID;
                 prepare2.ServerCastID = pendingCast.ServerGUID;
-                SendPacketToClient(prepare2);
+                if (holdAsDup)
+                    dupPrepare = prepare2;
+                else
+                    SendPacketToClient(prepare2);
             }
 
             CastFailed failed = new();
@@ -616,7 +714,28 @@ public partial class WorldClient
                 failed.CastID = pinnedFailCastId;
             failed.FailedArg1 = arg1;
             failed.FailedArg2 = arg2;
-            SendPacketToClient(failed);
+            if (holdAsDup)
+            {
+                var held = new GameSessionData.HeldDupFailure
+                {
+                    SpellId = pendingCast.SpellId,
+                    ReasonId = reason,
+                    HeldAtMs = Environment.TickCount64,
+                };
+                if (dupPrepare != null)
+                    held.Packets.Add(dupPrepare);
+                held.Packets.Add(failed);
+                GetSession().GameState.HoldDupFailure(held);
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("cast.fail.dup_held", new
+                    {
+                        spell_id = pendingCast.SpellId,
+                        reason_id = reason,
+                        path = "cast_failed",
+                    });
+            }
+            else
+                SendPacketToClient(failed);
 
             // JimsProxy (transient-no-dismiss-started): under LowLatencyMode the SPELL_FAILURE
             // deferred the caster-side visual-cancel to here so the REAL reason drives it. A real
@@ -634,6 +753,17 @@ public partial class WorldClient
                     cancelVisual.SpellVisualID = (int)resolvedVisual;
                     SendPacketToClient(cancelVisual);
                 }
+            }
+
+            // JimsProxy (dup-failure frame hold): this failure terminated the STARTED cast —
+            // its terminal is on the wire, so release any dup failures held against it, after
+            // it (a FAILED+FAILED frame contradicts nothing; the kit is closing via the real
+            // terminator that just went out).
+            if (pendingCast.HasStarted)
+            {
+                var heldOnTerminator = GetSession().GameState.TakeHeldDupFailures(pendingCast.SpellId);
+                if (heldOnTerminator != null)
+                    DeliverHeldDupFailures(heldOnTerminator, "terminator");
             }
 
             var gameState = GetSession().GameState;
@@ -1194,6 +1324,9 @@ public partial class WorldClient
         // get a trailing CAST_FAILED within the watchdog window. Runs before
         // we set up a new watchdog so leaks can't accumulate across failures.
         GetSession().RunWatchdogEviction();
+        // JimsProxy (dup-failure frame hold): same self-healing cadence as the other
+        // cast-event handlers — the watchdog above may have just evicted a held dup's anchor.
+        ReleaseStaleHeldDupFailures();
 
         WowGuid128 casterUnit;
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
@@ -2055,6 +2188,11 @@ public partial class WorldClient
         if (GetSession().GameState.CurrentMapId == null)
             return;
 
+        // JimsProxy (dup-failure frame hold): self-healing release for orphaned holds —
+        // same cadence as HandleCastFailed's sweep, so a spell the player only ever
+        // completes (GOs, no failures) still can't strand another spell's held dup.
+        ReleaseStaleHeldDupFailures();
+
         SpellGo spell = new SpellGo();
         try
         {
@@ -2589,6 +2727,19 @@ public partial class WorldClient
         else
         {
             SendPacketToClient(spell);
+        }
+
+        // JimsProxy (dup-failure frame hold): the local cast's GO is on the wire — release any
+        // dup failures held against it now, AFTER the GO (Sugar's replay position: the failure
+        // can no longer share the frame that closes the kit ahead of the close). In the
+        // form-exit branch above the GO send is deferred; releasing here puts the failure
+        // BEFORE the deferred START+GO pair, which is the safe order (sweep with nothing live,
+        // then open+close in a later frame).
+        if (spell.Cast.CasterUnit == GetSession().GameState.CurrentPlayerGuid)
+        {
+            var heldOnGo = GetSession().GameState.TakeHeldDupFailures((uint)spell.Cast.SpellID);
+            if (heldOnGo != null)
+                DeliverHeldDupFailures(heldOnGo, "go");
         }
 
         // JimsProxy threat translation: route Hunter / Pet / class abilities
