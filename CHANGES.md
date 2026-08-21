@@ -36,9 +36,12 @@ generic defaults, and `ClientSeed` is the static-seed fallback users should neve
 Data-only; no code change. The launcher writes its own config from a template (`setup.rs`) and
 is unaffected.
 
-**Verification:** XML parses clean, BOM preserved, file remains pure ASCII. Field gate pending:
-a standalone run using only the documented manual steps (take the shipped config, set
-`ServerAddress`, start the proxy, log in) against Kronos.
+**Verification:** XML parses clean, BOM preserved, file remains pure ASCII. **Field gate passed
+2026-08-20** — a standalone run against Kronos using only the documented manual steps (take the
+shipped config, edit `ServerAddress` and nothing else, start `JimsProxy.exe`, log in) reached
+in-game with no errors, with no launcher involved at any step. That clears the change under
+test: `ClientBuild=42597` is correct against the real 1.14.2 client and produces no version
+mismatch. Test composition: 5.2.0-beta.4 exe (`f842db7d`) + `CSV/` + this config.
 
 ---
 
