@@ -2188,11 +2188,6 @@ public partial class WorldClient
         if (GetSession().GameState.CurrentMapId == null)
             return;
 
-        // JimsProxy (dup-failure frame hold): self-healing release for orphaned holds —
-        // same cadence as HandleCastFailed's sweep, so a spell the player only ever
-        // completes (GOs, no failures) still can't strand another spell's held dup.
-        ReleaseStaleHeldDupFailures();
-
         SpellGo spell = new SpellGo();
         try
         {
@@ -2741,6 +2736,17 @@ public partial class WorldClient
             if (heldOnGo != null)
                 DeliverHeldDupFailures(heldOnGo, "go");
         }
+
+        // JimsProxy (dup-failure frame hold): the stale sweep for THIS handler runs here, after
+        // the forward — NOT at the top like the failure handlers' sweeps. A top-of-handler
+        // sweep can front-run a same-spell GO in this very invocation: a held dup whose
+        // STARTED anchor was destroy-evicted while the server still completes the cast (the
+        // #493 mining-race geometry, started variant) would release its FAILED first and put
+        // FAILED-then-GO in one flush with the kit live — the exact contradiction this fix
+        // exists to prevent. Post-forward, every release lands after the GO in all geometries.
+        // The failure handlers keep their top-of-handler sweeps: they only ever emit
+        // failure-class packets, and a FAILED+FAILED frame contradicts nothing.
+        ReleaseStaleHeldDupFailures();
 
         // JimsProxy threat translation: route Hunter / Pet / class abilities
         // through the threat tracker so SMSG_THREAT_UPDATE reflects the cast.
