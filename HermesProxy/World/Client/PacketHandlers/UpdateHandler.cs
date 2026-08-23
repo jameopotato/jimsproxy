@@ -1,4 +1,4 @@
-﻿//#define DEBUG_UPDATES
+//#define DEBUG_UPDATES
 
 using Framework;
 using Framework.GameMath;
@@ -88,6 +88,40 @@ public partial class WorldClient
         if (!ModScaleSpellIds.Contains(spellId))
             return false;
         return guid.GetHighType() == HighGuidType.Creature;
+    }
+
+    // JimsProxy (#382 PetInCombat charm strip): tracking predicate for a PLAYER charmed by
+    // ANOTHER PLAYER — all perspectives (victim's own session and the charmer's included:
+    // the victim FPS-drops too, and the hybrid state is wrong from every viewpoint). NPC
+    // charmers (Lucifron's Dominate Mind et al.) are excluded — long-stable raid content.
+    internal static bool IsPlayerCharmedByPlayer(WowGuid128 guid, WowGuid128 charmedBy)
+    {
+        return guid.IsPlayer() && charmedBy.IsPlayer();
+    }
+
+    // JimsProxy (#382): strip UNIT_FLAG_PET_IN_COMBAT (0x800) from a player's forwarded
+    // flags for exactly the duration of a player-charm. Vanilla cores pin the flag on the
+    // charmed unit itself (cmangos/vmangos SetInCombatState: any unit with a charmer);
+    // modern servers pin it on the CHARMER — so charm+0x800 on one player is a hybrid no
+    // modern server produces, and the leading #382 suspect. Deliberate concession: a
+    // charmed pet-class player whose own pet keeps fighting loses the (then-legitimate)
+    // flag while charmed — that coexistence IS the suspected trigger, so no exemption.
+    internal static uint ApplyPetInCombatCharmStrip(uint modernFlags, bool leverOn, bool isCharmTracked)
+    {
+        if (!leverOn || !isCharmTracked)
+            return modernFlags;
+        return modernFlags & ~(uint)UnitFlags.PetInCombat;
+    }
+
+    // JimsProxy (#382, the pre-charmed-pet-owner corner): a charm apply can arrive with NO
+    // flags write in the block (capture cap2: CHARMEDBY+faction only) — a passive strip
+    // never fires and the client keeps its held pre-charm 0x800 alongside the new charm
+    // state. On a charm EDGE (apply or clear) with no flags in the update mask and a cached
+    // last-known raw carrying 0x800, synthesize a flags re-send (stripped on apply, restored
+    // on clear) so the client's held state never combines charm + PetInCombat.
+    internal static bool ShouldSynthPetInCombatFlagsResync(bool leverOn, bool charmEdgeThisBlock, bool flagsInUpdateMask, bool cachedRawHasPetInCombat)
+    {
+        return leverOn && charmEdgeThisBlock && !flagsInUpdateMask && cachedRawHasPetInCombat;
     }
 
     // (DisplayId, wire * 1000 rounded) pairs where Twinstar's bias on top of CMS_v
@@ -343,6 +377,26 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_UPDATE_OBJECT)]
     void HandleUpdateObject(WorldPacket packet)
     {
+        // JimsProxy (camp login-eviction merge): the first object update after a
+        // held instanced login-verify means no eviction is coming — healthy login.
+        // Flush the held stream in arrival order ahead of this update's own
+        // translation. Cost on healthy instanced logins = the create-arrival delay
+        // the hold added (~4-200ms observed). No-op (null) when nothing is held.
+        var evictionHoldReleased = GetSession().GameState.LoginEvictionHold.TryReleaseOnFirstUpdateObject();
+        if (evictionHoldReleased != null)
+        {
+            foreach (var held in evictionHoldReleased)
+                SendPacketToClientDirect(held);
+            if (Settings.DebugOutput)
+            {
+                Log.Event("login.eviction_hold.released_healthy", new
+                {
+                    held_packets = evictionHoldReleased.Count,
+                    hold_ms = Environment.TickCount64 - GetSession().GameState.LoginEvictionHold.StartTick,
+                });
+            }
+        }
+
         var count = packet.ReadUInt32();
         PrintString($"Updates Count = {count}");
 
@@ -598,9 +652,36 @@ public partial class WorldClient
         foreach (var auraUpdate in auraUpdates)
             SendPacketToClient(auraUpdate);
 
+        // JimsProxy (camp stun lock, step 2): this update carried the login's first
+        // self create block (marked in DetectStuckLogoutStunAtSelfCreate) — release
+        // any control ops held from before it, in arrival order, now that the create
+        // and its aura updates are out. On healthy logins the list is empty (their
+        // ops arrive after the create); a non-empty release IS the wedge signature,
+        // so the event is always-on.
+        var preCreateOpsReleased = GetSession().GameState.PreCreateOpHold.TakeForRelease();
+        if (preCreateOpsReleased != null && preCreateOpsReleased.Count > 0)
+        {
+            foreach (var heldOp in preCreateOpsReleased)
+                SendPacketToClient(heldOp);
+            Log.Event("login.precreate_op_hold.released", new
+            {
+                op_count = preCreateOpsReleased.Count,
+                ops = preCreateOpsReleased.ConvertAll(p => p.GetUniversalOpcode().ToString()),
+                held_ms = Environment.TickCount64 - GetSession().GameState.PreCreateOpHold.ArmTick,
+            });
+        }
+
         // MIRASU (mc-rune-dousing): after the packet's own updates are out, push rune targetability for any boss life-state edges seen in it, and hide respawned circles around doused runes.
         FlushPendingMcRuneResyncs();
         SuppressMcCirclesOnDousedRunes();
+
+        // JimsProxy (Kronos Chronoboon): repaint the remaining on-use sweep AFTER the aliased create is
+        // forwarded — the fresh alias replaced the item the client bound its login cooldown to.
+        if (GetSession().GameState.ChronoboonRepaintPendingGuid is { } chronoRepaintGuid)
+        {
+            GetSession().GameState.ChronoboonRepaintPendingGuid = null;
+            SendChronoboonRemainingCooldown(chronoRepaintGuid);
+        }
 
         // JimsProxy (stuck-logout-stun): fire the cure only after the whole update packet is
         // processed and forwarded. Armed exclusively by DetectStuckLogoutStunAtSelfCreate;
@@ -612,6 +693,25 @@ public partial class WorldClient
             WorldPacket cancel = new WorldPacket(Opcode.CMSG_LOGOUT_CANCEL);
             SendPacketToServer(cancel);
             Log.Event("login.stuck_stun.cancel_synthesized", null);
+        }
+
+        // JimsProxy (carried-root cure): deliver the missing unroot after the whole
+        // destination update has forwarded (never ahead of the create). Sentinel
+        // counter — the legacy server never sent this op; its ack is swallowed in
+        // HandleMoveForceAck2. Always-on event: this firing means a player would
+        // otherwise have arrived movement-locked.
+        if (GetSession().GameState.WorldEntryCarriedRootCureArmed)
+        {
+            GetSession().GameState.WorldEntryCarriedRootCureArmed = false;
+            GetSession().GameState.ClientBelievesRooted = false;
+            MoveSetFlag cureUnroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
+            cureUnroot.MoverGUID = GetSession().GameState.CurrentPlayerGuid;
+            cureUnroot.MoveCounter = WorldEntryCeremonyTracker.SynthCounterUnroot;
+            SendPacketToClient(cureUnroot);
+            Log.Event("worldentry.carried_root_cured", new
+            {
+                map_id = GetSession().GameState.CurrentMapId,
+            });
         }
     }
 
@@ -712,11 +812,19 @@ public partial class WorldClient
     {
         BitArray? updateMaskArray = null;
         var updates = ReadValuesUpdateBlock(packet, ref type, index, true, null, out updateMaskArray, out var actuallyChangedValuesMaskArray);
-        StoreObjectUpdate(guid, type, updateMaskArray, updates, auraUpdate, null, true, updateData, actuallyChangedValuesMaskArray);
+        // JimsProxy (collision-visual-parity #359): publish the field cache BEFORE the store
+        // hook runs, matching the values-update path (which mutates the cached dictionary in
+        // place, so its hook always sees current values). The old write-after order made every
+        // GetLegacyFieldValue* read inside AfterStoreObjectUpdateHook miss on creates — the
+        // player collision-height block hit its rawScaleX==0 guard and silently skipped, so
+        // login/teleport-arrival creates never emitted a collision packet while later value
+        // updates did, splitting the client between two height sources (#359's
+        // fits-at-login-stuck-after-shift asymmetry).
         lock (GetSession().GameState.ObjectCacheLock)
         {
             GetSession().GameState.ObjectCacheLegacy[guid] = updates;
         }
+        StoreObjectUpdate(guid, type, updateMaskArray, updates, auraUpdate, null, true, updateData, actuallyChangedValuesMaskArray);
     }
 
     public void ReadValuesUpdateBlock(WorldPacket packet, WowGuid128 guid, ObjectUpdate updateData, AuraUpdate auraUpdate, PowerUpdate powerUpdate, int index)
@@ -1288,6 +1396,35 @@ public partial class WorldClient
                             mode = pendingMode.ToString(),
                             reason = moveInfo.TransportGuid.IsEmpty() ? "source_off_transport" : "destination_on_transport",
                         });
+                    }
+                }
+
+                // JimsProxy (carried-root cure 2026-08-03, THE FIX for the BG-exit
+                // movement lockup): a spam-clicked Leave departs while the BG-end
+                // root is being removed; the server's unroot fires between maps and
+                // is silently discarded (cmangos Unit.cpp:751, deterministic — R40
+                // (a)), so the client arrives still force-rooted while the server
+                // considers it mobile. Harness-proven equivalence: root minus unroot
+                // = the exact reported symptom incl. /reload cure (R2). Decide here
+                // on the server's authoritative destination movement state; deliver
+                // at end-of-UPDATE_OBJECT (stuck-stun pattern) so the unroot can
+                // never race ahead of the create it cures.
+                if (GetSession().GameState.WorldEntryPendingCarriedRootCheck)
+                {
+                    GetSession().GameState.WorldEntryPendingCarriedRootCheck = false;
+                    if (Framework.Settings.WorldEntryCarriedRootCure &&
+                        WorldEntryCeremonyTracker.ShouldCureCarriedRoot(GetSession().GameState.ClientBelievesRooted))
+                    {
+                        GetSession().GameState.WorldEntryCarriedRootCureArmed = true;
+                        if (Framework.Settings.DebugOutput)
+                        {
+                            Framework.Logging.Log.Event("worldentry.carried_root.armed", new
+                            {
+                                path = "new_world",
+                                // echo of the client's own state, telemetry only
+                                destination_flags_rooted = ((MovementFlagWotLK)moveInfo.Flags).HasAnyFlag(MovementFlagWotLK.Root),
+                            });
+                        }
                     }
                 }
             }
@@ -1894,9 +2031,39 @@ public partial class WorldClient
         SendPacketToClient(packet);
     }
 
+    // JimsProxy (feared-while-sitting, issue #479): CC-onset fallback for INSTANT fears —
+    // the local player's UNIT_FIELD_FLAGS gain Fleeing/Confused while seated. Cast-time
+    // fears are handled earlier and better (pre-stand at SPELL_START, guaranteed honored);
+    // this fallback's stand request reaches the server after the fear already applied, and
+    // whether the lineage server honors it mid-fear is untested (asked in #479) — worst
+    // case it is one ignored packet. Edge-tracked via LastLocalFearConfuseFlags so a held
+    // fear costs at most one synth regardless of FLAGS churn.
+    private void SynthStandOnFearCcOnset(WowGuid128 guid, Dictionary<int, UpdateField> updates)
+    {
+        if (guid.IsEmpty() || guid != GetSession().GameState.CurrentPlayerGuid)
+            return;
+        int flagsIndex = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_FLAGS);
+        if (flagsIndex < 0 || !updates.TryGetValue(flagsIndex, out var flagsField))
+            return;
+        uint newCcFlags = flagsField.UInt32Value & FearStandSynth.FearConfuseUnitFlagsMask;
+        uint previousCcFlags = GetSession().GameState.LastLocalFearConfuseFlags;
+        GetSession().GameState.LastLocalFearConfuseFlags = newCcFlags;
+
+        // Prefer the stand state carried in this very block — the legacy field cache
+        // lags on creates (see the create-miss note above).
+        int bytes1Index = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_BYTES_1);
+        uint standState = bytes1Index >= 0 && updates.TryGetValue(bytes1Index, out var bytes1)
+            ? bytes1.UInt32Value & 0xFF
+            : GetSession().GameState.GetLocalPlayerStandState();
+
+        if (FearStandSynth.ShouldStandOnCcOnset(Framework.Settings.SynthStandOnFear, previousCcFlags, newCcFlags, standState))
+            SendSynthStandUp("cc_onset", 0);
+    }
+
     private void AfterStoreObjectUpdateHook(WowGuid128 guid, ObjectType objectType, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, AuraUpdate auraUpdate, PowerUpdate? powerUpdate, bool isCreate, ObjectUpdate updateData, BitArray changedValuesMask)
     {
         DetectStuckLogoutStunAtSelfCreate(guid, updates, isCreate, updateData);
+        SynthStandOnFearCcOnset(guid, updates);
 
         // JimsProxy: comprehensive pet diagnostics for the Hunter-Pet-Stealth-Stuck
         // investigation. Fires on every UPDATE_OBJECT block targeting a pet GUID
@@ -1951,38 +2118,18 @@ public partial class WorldClient
                 if (!changedValuesMask.Get(UNIT_FIELD_NATIVEDISPLAYID) && !changedValuesMask.Get(UNIT_FIELD_MOUNTDISPLAYID) && !changedValuesMask.Get(OBJECT_FIELD_SCALE_X))
                     return; // No need for an update
 
-                int nativeDisplayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
+                // Reads UNIT_FIELD_DISPLAYID (the currently rendered, form-aware model), not
+                // NATIVEDISPLAYID — the collision cylinder must track what is on screen (#359).
+                int currentDisplayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
                 int mountDisplayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_MOUNTDISPLAYID);
                 float rawScaleX = Session.GameState.GetLegacyFieldValueFloat(guid, ObjectField.OBJECT_FIELD_SCALE_X);
 
                 if (rawScaleX == 0.0f)
                     return;
 
-                var regularNativeDisplaySize = GameData.GetUnitCompleteDisplayScale((uint)nativeDisplayId);
-                var scale = rawScaleX / regularNativeDisplaySize;
-
-                var ourDisplayInfo = GameData.GetDisplayInfo((uint)nativeDisplayId);
-                var ourModel = GameData.GetModelData(ourDisplayInfo.ModelId);
-
-                float calculatedBaseHeight;
-                if (mountDisplayId != 0 && LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
-                { // in vanilla there were no mount collisions
-                    var mountDisplayInfo = GameData.GetDisplayInfo((uint)mountDisplayId);
-                    var mountModel = GameData.GetModelData(mountDisplayInfo.ModelId);
-                    calculatedBaseHeight = mountModel.MountHeight * mountDisplayInfo.DisplayScale + (ourModel.Height * ourModel.ModelScale * ourDisplayInfo.DisplayScale * 0.5f);
-                }
-                else
-                {
-                    calculatedBaseHeight = ourDisplayInfo.DisplayScale * ourModel.Height * ourModel.ModelScale;
-                }
-
-                if (calculatedBaseHeight == 0)
-                    calculatedBaseHeight = mountDisplayId != 0 ? PlayerHeight.Mounted : PlayerHeight.Normal;
-
-                var heightScale = Math.Max(scale, regularNativeDisplaySize); // you HitBox cannot be smaller than displaySize in legacy clients
-                var scaledHeight = heightScale * calculatedBaseHeight;
-
-                var displayScale = regularNativeDisplaySize * scale;
+                float scaledHeight = ComputeVisualCollisionHeight(currentDisplayId, mountDisplayId, rawScaleX);
+                if (scaledHeight == 0)
+                    scaledHeight = mountDisplayId != 0 ? PlayerHeight.Mounted : PlayerHeight.Normal;
 
                 var reason = changedValuesMask.Get(UNIT_FIELD_MOUNTDISPLAYID)
                     ? MoveSetCollisionHeight.UpdateCollisionHeightReason.Mount
@@ -1992,13 +2139,60 @@ public partial class WorldClient
                 {
                     MoverGUID = guid,
                     Height = scaledHeight,
-                    Scale = displayScale,
+                    Scale = rawScaleX,
                     Reason = reason,
                     MountDisplayID = (uint) mountDisplayId,
                 };
                 SendPacketToClient(height, Opcode.SMSG_UPDATE_OBJECT);
+                // JimsProxy (collision-visual-parity #359): field-verifiable without a .pkt.
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("unit.collision_height.sent", new
+                    {
+                        guid = guid.ToString(),
+                        display_id = currentDisplayId,
+                        mount_display_id = mountDisplayId,
+                        raw_scale = rawScaleX,
+                        height = scaledHeight,
+                        reason = reason.ToString(),
+                    });
             }
         }
+    }
+
+    // JimsProxy (collision-visual-parity #359): the height the modern client's collision
+    // cylinder must have to agree with the model it is rendering. The invariant is
+    // collision ≡ visible height in every state, before and after any form/mount change:
+    //
+    //     height = CollisionHeight(model) × ModelScale(model) × CMS_effective(display) × wire scale
+    //
+    // CreatureModelData.CollisionHeight is Blizzard's authored collision for the mesh at
+    // scale 1.0, and (wire × CMS × ModelScale) is exactly the render scale the 1.14 client
+    // applies (established by direct DB2 parse, 52ab6f88). CMS_effective is hotfix-aware:
+    // when we push a CreatureDisplayInfo CMS override (tauren K=0.75), the client renders
+    // with it, so collision must use it too — the May 2026 render hotfix without this was
+    // the root of #359 (♀ tauren sent 3.299 while rendering at 2.474; Tarren Mill doorway
+    // measured in (3.012, 3.299) — 1.12-native-sized geometry that the inflated cylinder
+    // failed while the visibly taller dire bear at a truthful 3.000 passed).
+    //
+    // Deliberately NOT ported from the upstream formula (_BLU 2023): the
+    // Max(scale, displaySize) hitbox floor — it inflated every CMS<1 form (travel/NE cat/
+    // NE moonkin) above its visible size — and the displayId-keyed GetModelData lookup.
+    // Zero-height models fall back to PlayerHeight at the call site.
+    public static float ComputeVisualCollisionHeight(int displayId, int mountDisplayId, float rawScaleX)
+    {
+        var displayInfo = GameData.GetDisplayInfo((uint)displayId);
+        var model = GameData.GetModelData(displayInfo.ModelId);
+        float cms = GameData.GetClientEffectiveDisplayScale((uint)displayId);
+
+        if (mountDisplayId != 0 && LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
+        { // in vanilla there were no mount collisions
+            var mountDisplayInfo = GameData.GetDisplayInfo((uint)mountDisplayId);
+            var mountModel = GameData.GetModelData(mountDisplayInfo.ModelId);
+            float mountCms = GameData.GetClientEffectiveDisplayScale((uint)mountDisplayId);
+            return rawScaleX * (mountModel.MountHeight * mountCms + model.Height * model.ModelScale * cms * 0.5f);
+        }
+
+        return rawScaleX * cms * model.Height * model.ModelScale;
     }
 
     // JimsProxy (stuck-logout-stun 2026-07-17): vanilla cores implement the logout countdown by
@@ -2014,11 +2208,13 @@ public partial class WorldClient
     // the lingering object out of the world — clears it.
     //
     // Detection is one-shot per world login, on the FIRST create block for the local player,
-    // and only when the stunned flag arrives with ZERO debuff auras: every genuine vanilla stun
-    // is a MOD_STUN debuff occupying one of slots 32-47 of the same create block, so an aura-less
-    // stunned flag at login has exactly one producer — the logout machinery. A genuine stun at
-    // re-attach (debuff present) leaves the gate closed: a false negative is safe (no cure this
-    // login), a false positive is structurally impossible.
+    // and only when the stunned flag arrives with no debuff beyond the known-benign login set
+    // (Resurrection Sickness, Deserter): every genuine vanilla stun is a MOD_STUN debuff
+    // occupying one of slots 32-47 of the same create block, so a stunned flag whose only
+    // debuffs are certainly-not-stuns has exactly one producer — the logout machinery. A
+    // genuine stun at re-attach (its debuff is not on the allow-list) leaves the gate closed:
+    // a false negative is safe (no cure this login), a false positive is structurally
+    // impossible.
     //
     // Three layers, the last two individually toggleable:
     //   tripwire — login.self_create_state always logs the raw wire state, gate hit or not
@@ -2038,6 +2234,14 @@ public partial class WorldClient
             return;
         if (guid != GetSession().GameState.CurrentPlayerGuid)
             return;
+
+        // JimsProxy (camp stun lock, step 2): the first self create block this login
+        // is the pre-create op hold's release trigger. Mark here (mid-translation,
+        // before any legacy-version gate — the hold must release on every server
+        // flavor); the actual flush runs at the end of HandleUpdateObject, after the
+        // create and its aura updates have been sent.
+        GetSession().GameState.PreCreateOpHold.NoteSelfCreateForwarding();
+
         // Vanilla-only: the slot layout and the incomplete-reconnect behavior are 1.12 facts.
         if (!LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
             return;
@@ -2063,7 +2267,7 @@ public partial class WorldClient
                 (i < VanillaFirstDebuffSlot ? buffSpellIds : debuffSpellIds).Add(slot.UInt32Value);
         }
 
-        bool artificial = IsArtificialLogoutStun(rawFlags, debuffSpellIds.Count);
+        bool artificial = IsArtificialLogoutStun(rawFlags, debuffSpellIds);
 
         Log.Event("login.self_create_state", new
         {
@@ -2119,11 +2323,36 @@ public partial class WorldClient
     internal const int VanillaAuraSlotCount = 48;
     internal const int VanillaFirstDebuffSlot = 32;
 
-    // Pure gate: the stunned flag with no debuff present cannot be a real stun — every vanilla
-    // MOD_STUN aura occupies a debuff slot in the same create block.
-    internal static bool IsArtificialLogoutStun(uint rawUnitFlags, int debuffAuraCount)
+    // JimsProxy (#431 follow-up, 2026-08-15): vanilla debuffs that (a) persist across a login /
+    // re-attach and (b) are certainly not stuns. Their presence must not veto the
+    // artificial-logout-stun cure — the original debuffAuraCount==0 gate false-negatived
+    // whenever the artificial stun coincided with e.g. Resurrection Sickness, leaving the
+    // player half-rooted all session. Kept as an explicit allow-list, NOT a MOD_STUN
+    // classification: SpellAuraEffects is a curated stat subset with zero stun rows, so a real
+    // stun can never be positively identified from proxy data. Any debuff NOT on this list
+    // keeps the gate closed — a genuine stun (whose MOD_STUN debuff we would not recognize)
+    // still can never open it. Extend only with ids verified to carry no stun effect.
+    internal static readonly FrozenSet<uint> BenignLoginDebuffSpellIds = new uint[]
     {
-        return (rawUnitFlags & (uint)UnitFlagsVanilla.Stunned) != 0 && debuffAuraCount == 0;
+        15007, // Resurrection Sickness
+        26013, // Deserter
+    }.ToFrozenSet();
+
+    // Pure gate: the artificial logout stun is the stunned flag whose every present debuff is a
+    // known-benign login debuff (empty set = the original 2026-07-17 incident shape). A real
+    // stun's MOD_STUN debuff is not on the allow-list, so it keeps the gate closed — a false
+    // positive stays structurally impossible; this only removes the false negative when the
+    // artificial stun coincides with a benign login debuff.
+    internal static bool IsArtificialLogoutStun(uint rawUnitFlags, IReadOnlyList<uint> debuffSpellIds)
+    {
+        if ((rawUnitFlags & (uint)UnitFlagsVanilla.Stunned) == 0)
+            return false;
+        foreach (var id in debuffSpellIds)
+        {
+            if (!BenignLoginDebuffSpellIds.Contains(id))
+                return false;
+        }
+        return true;
     }
 
     private bool ShouldClearMountDisplayOnDeadNonPlayerUnit(WowGuid128 guid, ObjectType objectType, ObjectUpdate updateData, Dictionary<int, UpdateField> updates, int mountDisplayField)
@@ -2165,10 +2394,43 @@ public partial class WorldClient
         {
             updateData.ObjectData.EntryID = updates[OBJECT_FIELD_ENTRY].Int32Value;
 
-            // JimsProxy (Kronos Chronoboon): proactive login-alias removed 2026-06-22 (it regressed the
-            // bag sound). The login bag sound is now delivered statically by the Kronos Item overlay
-            // (CSV/Hotfix/Item1.kronos.csv, ItemGroupSoundsId 24) — a fresh hotfix id the cached client
-            // re-fetches at login via SMSG_AVAILABLE_HOTFIXES, so no login alias is needed for the sound.
+            // JimsProxy (Kronos Chronoboon): login-time tooltip refresh. The boon's state can change where the
+            // proxy can't see it (native 1.12 client session), leaving the 1.14 client rendering a stale cached
+            // template on the next proxied login. Kronos PUSHES the boon's per-player rebuilt template
+            // unsolicited during login — a solicited entry query answers with the BASE template (2026-07-30
+            // log: push=858B supercharged vs query reply=479B base), so the push is the ONLY correct source.
+            // Mint the alias from it BEFORE the substitution below so this very create carries the fresh id —
+            // no destroy+recreate, no extra traffic. Skipped when the existing alias already shows the pushed
+            // state. If the push hasn't arrived yet, park the GUID for HandleItemQueryResponse (ordering
+            // fallback). Once per GUID per login.
+            if (isCreate && objectType == ObjectType.Item &&
+                Framework.Settings.ServerType == Framework.ServerFork.Kronos &&
+                updates[OBJECT_FIELD_ENTRY].Int32Value == (int)GameData.KronosChronoboonEntry &&
+                !GetSession().GameState.ChronoboonLoginRefreshFired.Contains(guid))
+            {
+                var pushedTemplate = GetSession().GameState.ChronoboonLoginPushTemplate;
+                if (pushedTemplate != null)
+                {
+                    GetSession().GameState.ChronoboonLoginRefreshFired.Add(guid);
+                    bool reminted = ChronoboonAliasNeedsRefresh(guid, pushedTemplate);
+                    if (reminted)
+                    {
+                        MintChronoboonAlias(guid, pushedTemplate);
+                        GetSession().GameState.ChronoboonRepaintPendingGuid = guid;
+                    }
+                    Log.Event("item.chronoboon.login_refresh_at_create", new
+                    {
+                        guid = guid.ToString(),
+                        name = pushedTemplate.Name[0],
+                        reminted = reminted,
+                    });
+                }
+                else
+                {
+                    GetSession().GameState.ChronoboonLoginBoonGuids.Add(guid);
+                    Log.Event("item.chronoboon.login_refresh_waiting_push", new { guid = guid.ToString() });
+                }
+            }
 
             // JimsProxy (Kronos Chronoboon alias): present a throwaway alias entry to the client
             // for items whose tooltip is dynamic server-side, so it re-fetches the template (the
@@ -2365,6 +2627,40 @@ public partial class WorldClient
                     updateData.ItemData.Enchantment[Enums.Classic.EnchantmentSlot.Prop4] = ReadEnchantData(Enums.WotLK.EnchantmentSlot.Prop4);
                 }
 
+                // (temp-enchant-0s-after-relogin): consume stashed pre-create
+                // SMSG_ITEM_ENCHANT_TIME_UPDATE pushes into this create. At login the
+                // push beats the item's create block and the modern client discards it
+                // for an unbuilt guid — the enchant then renders with the create's zero
+                // duration field as a permanently flashing "0s" buff. The handler
+                // stashed the push (decay-tracked); write it into the create's duration
+                // field so the countdown starts at the real remaining time.
+                if (isCreate)
+                {
+                    var pendingEnchants = GetSession().GameState.ConsumePendingItemEnchantDurations(guid, Environment.TickCount);
+                    if (pendingEnchants != null)
+                    {
+                        foreach (var (legacySlot, durationMs) in pendingEnchants)
+                        {
+                            int modernSlot = (int)TranslateEnchantmentSlotToModern(legacySlot);
+                            if (modernSlot >= updateData.ItemData.Enchantment.Length)
+                                continue;
+                            var enchantment = updateData.ItemData.Enchantment[modernSlot];
+                            if (enchantment == null || !GameSessionData.ShouldInjectEnchantDuration(enchantment))
+                                continue;
+                            enchantment.Duration = durationMs;
+                            if (Framework.Settings.DebugOutput)
+                            {
+                                Log.Event("enchant.duration.injected_at_create", new
+                                {
+                                    item_guid = guid.ToString(),
+                                    legacy_slot = legacySlot,
+                                    duration_ms = durationMs,
+                                });
+                            }
+                        }
+                    }
+                }
+
                 uint?[] gems = new uint?[ItemConst.MaxGemSockets];
                 for (int i = 0; i < ItemConst.MaxGemSockets; i++)
                 {
@@ -2430,6 +2726,11 @@ public partial class WorldClient
             (objectType == ObjectType.Player) ||
             (objectType == ObjectType.ActivePlayer))
         {
+            // JimsProxy (#382 PetInCombat charm strip): set when THIS update block changes a
+            // player's player-charm state (apply or clear) — arms the charm-edge flags
+            // re-sync below for blocks that carry no flags write of their own.
+            bool charmEdgeThisBlock = false;
+
             int UNIT_FIELD_CHARM = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_CHARM);
             if (UNIT_FIELD_CHARM >= 0 && updateMaskArray[UNIT_FIELD_CHARM])
             {
@@ -2443,34 +2744,31 @@ public partial class WorldClient
             int UNIT_FIELD_CHARMEDBY = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_CHARMEDBY);
             if (UNIT_FIELD_CHARMEDBY >= 0 && updateMaskArray[UNIT_FIELD_CHARMEDBY])
             {
-                WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To128(GetSession().GameState);
+WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To128(GetSession().GameState);
                 updateData.UnitData.CharmedBy = charmedBy;
 
-                // JimsProxy (#382 observer lockup): track players charmed by ANOTHER PLAYER,
-                // so the flags translation below can present them as possessed (see
-                // GameSessionData.ObservedCharmedPlayers). Excludes the charmer (needs the real
-                // charm/pet bar) and the local player as target (lives the real charm), so the
-                // charm-vs-possess control difference is preserved for the participants.
-                // NPC charmers (Lucifron's Dominate Mind et al.) are deliberately excluded:
-                // years of raid MCs have produced no observer-lockup reports, so that
-                // long-stable content stays untouched.
+                // JimsProxy (#382 PetInCombat charm strip): all-perspective tracking (no
+                // self/charmer exclusion — the victim's own client drops too, and the
+                // charm+0x800 hybrid is wrong from every viewpoint). NPC charmers
+                // (Lucifron's Dominate Mind et al.) are excluded by the predicate:
+                // long-stable raid content stays untouched.
                 var gameState = GetSession().GameState;
-                bool observedCharmedPlayer = guid.IsPlayer() &&
-                    charmedBy.IsPlayer() &&
-                    guid != gameState.CurrentPlayerGuid &&
-                    charmedBy != gameState.CurrentPlayerGuid;
-                if (observedCharmedPlayer)
+                if (IsPlayerCharmedByPlayer(guid, charmedBy))
                 {
-                    if (gameState.ObservedCharmedPlayers.Add(guid))
-                        Log.Event("charm.observed_player.possess_shim", new
+                    if (gameState.PlayerCharmedByPlayer.Add(guid))
+                    {
+                        charmEdgeThisBlock = true;
+                        Log.Event("charm.petincombat.strip_armed", new
                         {
                             guid_low = guid.GetCounter(),
                             charmed_by_low = charmedBy.GetCounter(),
                         });
+                    }
                 }
-                else if (gameState.ObservedCharmedPlayers.Remove(guid))
+                else if (gameState.PlayerCharmedByPlayer.Remove(guid))
                 {
-                    Log.Event("charm.observed_player.possess_shim_cleared", new
+                    charmEdgeThisBlock = true;
+                    Log.Event("charm.petincombat.strip_disarmed", new
                     {
                         guid_low = guid.GetCounter(),
                     });
@@ -2479,8 +2777,10 @@ public partial class WorldClient
             else if (isCreate)
             {
                 // A create block without CHARMEDBY means the unit is not charmed — drop any
-                // stale shim entry from a charm that ended while the unit was out of range.
-                GetSession().GameState.ObservedCharmedPlayers.Remove(guid);
+                // stale strip entry from a charm that ended while the unit was out of range.
+                // (Creates always carry flags, so the normal forwarding below restores the
+                // un-stripped value in this block.)
+                GetSession().GameState.PlayerCharmedByPlayer.Remove(guid);
             }
             int UNIT_FIELD_SUMMONEDBY = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_SUMMONEDBY);
             if (UNIT_FIELD_SUMMONEDBY >= 0 && updateMaskArray[UNIT_FIELD_SUMMONEDBY])
@@ -2736,14 +3036,16 @@ public partial class WorldClient
                 if (Session.GameState.KnownSwimmingMobs.Contains(guid))
                     updateData.UnitData.Flags |= (uint)UnitFlags.CanSwim;
 
-                // JimsProxy (#382 observer lockup): present an observed charmed PLAYER as
-                // possessed. Vanilla MOD_CHARM (Gnomish MC Cap 13181) emits PLAYER_CONTROLLED
-                // + CHARMEDBY without POSSESSED; a charmed player is unrepresentable to the
-                // 1.14 client (BG bystanders FPS-lock rendering it), while possess (priest
-                // MC 605) renders fine. CHARMEDBY is processed above before this flags block,
-                // so apply/clear ordering within a single update is already correct.
-                if (Session.GameState.ObservedCharmedPlayers.Contains(guid))
-                    updateData.UnitData.Flags |= (uint)UnitFlags.Possessed;
+// JimsProxy (#382 PetInCombat charm strip): cache the RAW server flags for
+                // players (never the stripped presentation — the charm-edge re-sync below
+                // needs the server truth to strip from and restore from), then remove the
+                // vanilla-only charm+0x800 hybrid from the forwarded value while the unit
+                // is player-charmed. See Charm382StripPetInCombat in Settings for rationale.
+                if (guid.IsPlayer())
+                    Session.GameState.LastKnownPlayerUnitFlags[guid] = updates[UNIT_FIELD_FLAGS].UInt32Value;
+                updateData.UnitData.Flags = ApplyPetInCombatCharmStrip(updateData.UnitData.Flags.Value,
+                    Settings.Charm382StripPetInCombat,
+                    Session.GameState.PlayerCharmedByPlayer.Contains(guid));
 
                 // Here because of this bullshit in cmangos:
                 // https://github.com/cmangos/mangos-tbc/blob/fd093b33071b546545cc5973608304bccc5a041b/src/game/Entities/Object.cpp#L544
@@ -2778,6 +3080,31 @@ public partial class WorldClient
                         raw_unit_flags = updates[UNIT_FIELD_FLAGS].UInt32Value,
                     });
                 }
+            }
+            else if (ShouldSynthPetInCombatFlagsResync(Settings.Charm382StripPetInCombat,
+                charmEdgeThisBlock,
+                flagsInUpdateMask: false,
+                cachedRawHasPetInCombat: GetSession().GameState.LastKnownPlayerUnitFlags.TryGetValue(guid, out uint lastRawUnitFlags) &&
+                    (lastRawUnitFlags & (uint)UnitFlagsVanilla.PetInCombat) != 0))
+            {
+                // JimsProxy (#382, pre-charmed-pet-owner corner): this block flipped the
+                // unit's player-charm state but carried NO flags write (real pattern — a
+                // charm apply can be CHARMEDBY+faction only), and the client's held flags
+                // include PET_IN_COMBAT (e.g. a warlock whose pet was fighting before the
+                // cap landed). Re-send the last-known flags so the held state never combines
+                // charm + 0x800: stripped while the charm is tracked (apply edge), restored
+                // verbatim once it isn't (clear edge). Same name-map as the real path.
+                uint synthFlags = (uint)((UnitFlagsVanilla)lastRawUnitFlags).CastFlags<UnitFlags>();
+                synthFlags = ApplyPetInCombatCharmStrip(synthFlags,
+                    Settings.Charm382StripPetInCombat,
+                    Session.GameState.PlayerCharmedByPlayer.Contains(guid));
+                updateData.UnitData.Flags = synthFlags;
+                Log.Event("charm.petincombat.flags_resynced", new
+                {
+                    guid_low = guid.GetCounter(),
+                    raw_flags = lastRawUnitFlags,
+                    synth_flags = synthFlags,
+                });
             }
             int UNIT_FIELD_FLAGS_2 = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_FLAGS_2);
             if (UNIT_FIELD_FLAGS_2 >= 0 && updateMaskArray[UNIT_FIELD_FLAGS_2])
@@ -3093,7 +3420,7 @@ public partial class WorldClient
                         if (spellId != 0)
                         {
                             channelSpells[guid] = spellId;
-                            if (GetSession().GameState.JimsPlusSideband)
+                            if (GetSession().GameState.IsJimsPlusSidebandActive())
                             {
                                 var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
                                     $"JP_CH:S:{guidStr}:{spellId}");
@@ -3104,7 +3431,7 @@ public partial class WorldClient
                         {
                             channelSpells.TryRemove(guid, out _);
                             GetSession().GameState.ChannelSourceObjectByUnit.TryRemove(guid, out _); // #383
-                            if (GetSession().GameState.JimsPlusSideband)
+                            if (GetSession().GameState.IsJimsPlusSidebandActive())
                             {
                                 var chatPkt = new ChatPkt(GetSession(), ChatMessageTypeModern.System,
                                     $"JP_CH:X:{guidStr}");
@@ -3447,6 +3774,39 @@ public partial class WorldClient
                             }
                             else
                             {
+                                // Slot occupant swapped spells without passing through 0 (Y→X in
+                                // one tick) — Y's decayed duration must not be served, or worse
+                                // persisted, under X.
+                                //
+                                // JimsProxy (res-sickness-swap-race): EXCEPT when a server duration
+                                // push for this exact slot arrived within the last second — vanilla
+                                // cores send SMSG_UPDATE_AURA_DURATION immediately at apply while the
+                                // field update batches at end of tick, so on a direct swap the NEW
+                                // occupant's duration precedes the swap by a few ms. Canonical case:
+                                // Ghost → Resurrection Sickness at a spirit-healer res; wiping here
+                                // left the sickness debuff with no timer for the whole session
+                                // (jimsproxy-20260802-182258.jsonl, duration stored then cleared 8 ms
+                                // later). Only push-path stores arm this window, so stale-Y durations
+                                // (stored at Y's cast/emit, always older than a second at swap time)
+                                // are still wiped.
+                                var prevEmitted = GetSession().GameState.GetLastEmittedAura(guid, i);
+                                if (prevEmitted != null && prevEmitted.SpellID != aura.AuraData.SpellID)
+                                {
+                                    if (GetSession().GameState.HasFreshAuraDurationPush(guid, i, Environment.TickCount))
+                                    {
+                                        Framework.Logging.Log.Event("aura.duration.preserved_on_swap", new
+                                        {
+                                            target_low = guid.GetCounter(),
+                                            slot = i,
+                                            prev_spell_id = prevEmitted.SpellID,
+                                            spell_id = aura.AuraData.SpellID,
+                                        });
+                                    }
+                                    else
+                                    {
+                                        GetSession().GameState.ClearAuraDuration(guid, i);
+                                    }
+                                }
                                 GetSession().GameState.GetAuraDuration(guid, i, out durationLeft, out durationFull);
                                 // JimsProxy (Cheap-Shot-aura-duration 2026-05-07): mirror the
                                 // SpellHandler refresh path's CSV fallback. On a cold cache (fresh
@@ -3462,6 +3822,25 @@ public partial class WorldClient
                                     int? talentDur = GameData.TryGetTalentDuration(auraSpellId, GetSession().GameState.CurrentPlayerKnownSpells);
                                     durationFull = talentDur ?? GameData.GetAuraSpellDuration(auraSpellId);
                                 }
+                                // Cold per-slot cache on a re-seen unit (relog, stealth
+                                // destroy/recreate) — resume the wall-clock remaining time
+                                // instead of restarting the timer at full duration.
+                                if (durationLeft <= 0 && isCreate &&
+                                    GetSession().GameState.TryGetAuraRemainingMs(guid, (int)aura.AuraData.SpellID) is int persistedMs)
+                                {
+                                    durationLeft = persistedMs;
+                                    if (durationFull < persistedMs)
+                                        durationFull = persistedMs;
+                                    GetSession().GameState.StoreAuraDurationFull(guid, i, durationFull);
+                                    GetSession().GameState.StoreAuraDurationLeft(guid, i, persistedMs, Environment.TickCount);
+                                    Framework.Logging.Log.Event("aura.duration.restored_from_expiry", new
+                                    {
+                                        target_low = guid.GetCounter(),
+                                        slot = i,
+                                        spell_id = aura.AuraData.SpellID,
+                                        remaining_ms = persistedMs,
+                                    });
+                                }
                             }
 
                             if (durationLeft > 0 && durationFull > 0)
@@ -3470,6 +3849,8 @@ public partial class WorldClient
                                 aura.AuraData.Duration = durationFull;
                                 aura.AuraData.Remaining = durationLeft;
                             }
+                            if (!appsOnlyChanged && aura.AuraData.Remaining is int remainingMs && remainingMs > 0)
+                                GetSession().GameState.RecordAuraExpiry(guid, (int)aura.AuraData.SpellID, remainingMs);
                             Framework.Logging.Log.Event("aura.slot.set", new
                             {
                                 target_low = guid.GetCounter(),
@@ -3510,6 +3891,10 @@ public partial class WorldClient
                             // Forward the empty AuraInfo so the client removes the icon, and drop
                             // the cached per-slot state so a later refresh doesn't inherit stale
                             // duration / caster from the previous occupant.
+                            var clearedAura = GetSession().GameState.GetLastEmittedAura(guid, i);
+                            if (clearedAura != null &&
+                                !GetSession().GameState.IsSpellEmittedInAnotherSlot(guid, i, clearedAura.SpellID))
+                                GetSession().GameState.ClearAuraExpiry(guid, (int)clearedAura.SpellID);
                             GetSession().GameState.ClearAuraDuration(guid, i);
                             GetSession().GameState.ClearAuraCaster(guid, i);
                             GetSession().GameState.ClearLastEmittedAura(guid, i);

@@ -213,6 +213,9 @@ public partial class WorldSocket
         WorldPacket packet = new WorldPacket(Opcode.CMSG_QUERY_PET_NAME);
         packet.WriteUInt32(queryName.UnitGUID.GetEntry());
         packet.WriteGuid(queryName.UnitGUID.To64());
+        // Modern pet guids embed the pet number as their entry — register the mapping now
+        // so the response resolves even for pets we never saw a unit create for.
+        GetSession().GameState.CachedPetNumbers[queryName.UnitGUID.GetEntry()] = queryName.UnitGUID;
         Framework.Logging.Log.Event("pet.name_query.sent", new
         {
             client_guid = queryName.UnitGUID.ToString(),

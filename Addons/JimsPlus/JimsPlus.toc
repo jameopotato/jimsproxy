@@ -13,6 +13,7 @@ TaxiFix.lua
 TooltipFix.lua
 ZoneSync.lua
 MoonkinSound.lua
+BowSheatheFix.lua
 AuctionsPaginationFix.lua
 MailNameFix.lua
 NameDashFix.lua

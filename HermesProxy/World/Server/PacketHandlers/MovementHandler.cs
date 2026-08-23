@@ -1,4 +1,5 @@
-﻿using Framework.Constants;
+﻿using Framework;
+using Framework.Constants;
 using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World;
@@ -6,6 +7,7 @@ using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
 using System;
+using System.Collections.Generic;
 
 namespace HermesProxy.World.Server;
 
@@ -70,8 +72,20 @@ public partial class WorldSocket
         // so the entry doesn't leak if the legacy server response never arrives.
         if (isMoveStart)
         {
+            // JimsProxy (strafe cancel-gap 2026-08-16): the 1.14 client sends
+            // CMSG_CANCEL_CAST atomically with forward/back/jump starts (9/9 wire
+            // trials) but never on strafe (5/5), so a strafe-cancelled cast waits
+            // ~700ms for Kronos's heartbeat-position movement detection instead of
+            // the ~190ms cancel-ack round trip. Collect the casts this movement
+            // start newly marked so the strafe branch below can synthesize the
+            // cancel the client didn't send.
+            bool isStrafeStart = movement.GetUniversalOpcode() == Opcode.CMSG_MOVE_START_STRAFE_LEFT
+                || movement.GetUniversalOpcode() == Opcode.CMSG_MOVE_START_STRAFE_RIGHT;
+            List<ClientCastRequest>? newlyMarked =
+                isStrafeStart && Settings.StrafeCancelPreempt ? new List<ClientCastRequest>() : null;
+
             int marked = GetSession().GameState.MarkStartedCastsMovementCancelled(
-                Environment.TickCount64 + 2500);
+                Environment.TickCount64 + 2500, newlyMarked);
             if (marked > 0)
             {
                 Framework.Logging.Log.Event("cast.movement_cancel_preempted", new
@@ -79,6 +93,48 @@ public partial class WorldSocket
                     casts_marked = marked,
                     trigger_opcode = movement.GetUniversalOpcode().ToString(),
                 });
+            }
+
+            // Server-bound only — the client-bound stream stays exactly today's
+            // (suppressed SPELL_FAILURE broadcast, trailing CastFailed(DontReport)),
+            // just one cancel-ack RTT after the keypress instead of ~700ms. Emitted
+            // BEFORE the movement forward at the bottom of this handler, mirroring
+            // the client's own cancel+move burst order on forward/back/jump; the
+            // legacy socket is FIFO, so the cancel can never hit a cast forwarded
+            // after this strafe. ResolveStrafeCancelSpellId gates on the 1.12
+            // movement-interrupt flag: a spell Kronos would not movement-interrupt
+            // (ranged shots, novelty item casts, unknown server-custom ids) gets no
+            // synth and keeps today's behavior. A stale cancel racing SPELL_GO is a
+            // server no-op keyed by spell id — the same race the client's own
+            // forward/back cancels produce routinely.
+            if (newlyMarked != null)
+            {
+                foreach (var cast in newlyMarked)
+                {
+                    uint cancelSpellId = ResolveStrafeCancelSpellId(cast);
+                    if (cancelSpellId == 0)
+                        continue;
+                    // Presentation parity: the 1.14 client never predicted this
+                    // interrupt (it doesn't self-cancel on strafe), so flag the cast
+                    // for HandleSpellFailure to FORWARD the interrupt broadcast rather
+                    // than suppress it — otherwise the cast bar silently fizzles
+                    // instead of showing the red "Interrupted" the client-sent cancels
+                    // (forward/back/jump) render locally.
+                    cast.StrafeSynthCancelled = true;
+                    WorldPacket cancel = new WorldPacket(Opcode.CMSG_CANCEL_CAST);
+                    if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
+                        cancel.WriteUInt8(0);
+                    cancel.WriteUInt32(cancelSpellId);
+                    SendPacketToServer(cancel);
+                    if (Framework.Settings.DebugOutput)
+                        Framework.Logging.Log.Event("cast.strafe_cancel_synth", new
+                        {
+                            spell_id = cast.SpellId,
+                            legacy_spell_id = cancelSpellId,
+                            client_cast_id = cast.ClientGUID.ToString(),
+                            trigger_opcode = movement.GetUniversalOpcode().ToString(),
+                        });
+                }
             }
         }
 
@@ -154,9 +210,42 @@ public partial class WorldSocket
         }
     }
 
+    /// <summary>
+    /// JimsProxy (strafe cancel-gap): pure decision half of the strafe cancel synth —
+    /// the legacy spell id to cancel for a newly movement-marked cast, or 0 when the
+    /// 1.12 data says the server would not movement-interrupt this spell (ranged shots
+    /// like Arcane Shot / Serpent Sting, novelty item casts, unknown server-custom ids).
+    /// Keyed by the legacy-effective id: that is both what CMSG_CANCEL_CAST must carry
+    /// on the wire and what SpellMovementInterrupt1.csv is keyed by.
+    /// </summary>
+    internal static uint ResolveStrafeCancelSpellId(ClientCastRequest cast)
+    {
+        uint cancelSpellId = cast.LegacySpellId != 0 ? cast.LegacySpellId : cast.SpellId;
+        return GameData.IsMovementInterruptible(cancelSpellId) ? cancelSpellId : 0;
+    }
+
     [PacketHandler(Opcode.CMSG_MOVE_TELEPORT_ACK)]
     void HandleMoveTeleportAck(MoveTeleportAck teleport)
     {
+        // JimsProxy (carried-root cure, same-map variant): the client just proved it
+        // processed the teleport — deliver the missing unroot armed at the self
+        // MoveTeleport. Sentinel counter; its ack is swallowed in HandleMoveForceAck2.
+        if (GetSession().GameState.WorldEntryCureAfterTeleportAck &&
+            teleport.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            GetSession().GameState.WorldEntryCureAfterTeleportAck = false;
+            GetSession().GameState.ClientBelievesRooted = false;
+            MoveSetFlag cureUnroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
+            cureUnroot.MoverGUID = GetSession().GameState.CurrentPlayerGuid;
+            cureUnroot.MoveCounter = World.Client.WorldEntryCeremonyTracker.SynthCounterUnroot;
+            SendPacket(cureUnroot);
+            Log.Event("worldentry.carried_root_cured", new
+            {
+                map_id = GetSession().GameState.CurrentMapId,
+                path = "teleport_ack",
+            });
+        }
+
         // JimsProxy (zep-stuck-no-move 2026-05-14): if this ack corresponds to the
         // synthesized SMSG_MOVE_TELEPORT emitted by HandleNewWorld to clear stale
         // MOVEMENTFLAG_ONTRANSPORT, drop it — the legacy server never sent the
@@ -190,6 +279,33 @@ public partial class WorldSocket
     void HandleWorldPortResponse(WorldPortResponse teleport)
     {
         GetSession().GameState.IsWaitingForWorldPortAck = false;
+
+        // JimsProxy (worldentry stage-0 tripwire): this ack is the client saying it
+        // finished loading — close the window telemetry. duration_ms (NEW_WORLD →
+        // ack) is the machine-dependent variable the investigation is after.
+        var gameState = GetSession().GameState;
+        if (gameState.WorldEntryNewWorldTick != 0)
+        {
+            if (Framework.Settings.DebugOutput)
+            {
+                int forwarded = gameState.WorldEntryWindowForwardCount;
+                Framework.Logging.Log.Event("worldentry.window.closed", new
+                {
+                    seq = gameState.WorldEntryWindowSeq,
+                    duration_ms = Environment.TickCount64 - gameState.WorldEntryNewWorldTick,
+                    total_ms = gameState.WorldEntryTransferPendingTick != 0
+                        ? Environment.TickCount64 - gameState.WorldEntryTransferPendingTick
+                        : -1,
+                    forwarded_in_window = forwarded,
+                    forward_lines_suppressed = forwarded > WorldEntryForwardLineCap
+                        ? forwarded - WorldEntryForwardLineCap
+                        : 0,
+                });
+            }
+            gameState.WorldEntryNewWorldTick = 0;
+            gameState.WorldEntryTransferPendingTick = 0;
+        }
+
         // JimsProxy (speed-stuck-after-bg-end-while-mounted): arm post-teleport reassert; see memory.
         GetSession().GameState.PendingPostTeleportRunSpeedReassert = true;
         WorldPacket packet = new WorldPacket(Opcode.MSG_MOVE_WORLDPORT_ACK);
@@ -278,6 +394,35 @@ public partial class WorldSocket
     void HandleMoveForceAck2(MovementAckMessage movementAck)
     {
         var universalOpcode = movementAck.GetUniversalOpcode();
+
+        // JimsProxy (carried-root cure): the ack for the proxy-synthesized cure
+        // unroot carries a sentinel counter. The legacy server never sent that op,
+        // so the ack must not cross (a spurious force-ack can feed Kronos's
+        // malformed-input kick counters). The ack's presence is also the proof the
+        // client APPLIED the cure — log it always-on.
+        if (World.Client.WorldEntryCeremonyTracker.IsSynthCounter(movementAck.Ack.MoveCounter))
+        {
+            Log.Event("worldentry.carried_root.cure_acked", new
+            {
+                opcode = universalOpcode.ToString(),
+                move_counter = movementAck.Ack.MoveCounter,
+            });
+            return;
+        }
+
+        // JimsProxy (worldentry root-ceremony instrumentation 2026-08-03): the ack
+        // legs of the arrival ROOT/UNROOT ceremony. A forwarded-but-never-acked leg
+        // is the discard fingerprint (stuck-stun golden capture) the always-on
+        // breadcrumb keys on; see WorldEntryCeremony.cs.
+        var ceremony = GetSession().GameState.WorldEntryCeremony;
+        if (ceremony.Active && movementAck.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            if (universalOpcode == Opcode.CMSG_MOVE_FORCE_ROOT_ACK)
+                System.Threading.Interlocked.Increment(ref ceremony.RootAcks);
+            else if (universalOpcode == Opcode.CMSG_MOVE_FORCE_UNROOT_ACK)
+                System.Threading.Interlocked.Increment(ref ceremony.UnrootAcks);
+        }
+
         uint legacyOpcode = LegacyVersion.GetCurrentOpcode(universalOpcode);
         if (legacyOpcode == 0)
         {
@@ -312,6 +457,11 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_SET_ACTIVE_MOVER)]
     void HandleMoveSetActiveMover(SetActiveMover move)
     {
+        LogWorldEntryClientSignal("set_active_mover", new
+        {
+            mover_low = move.MoverGUID.GetCounter(),
+            is_self = move.MoverGUID == GetSession().GameState.CurrentPlayerGuid,
+        });
         WorldPacket packet = new WorldPacket(Opcode.CMSG_SET_ACTIVE_MOVER);
         packet.WriteGuid(move.MoverGUID.To64());
         SendPacketToServer(packet);
@@ -320,6 +470,14 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MOVE_INIT_ACTIVE_MOVER_COMPLETE)]
     void HandleMoveInitActiveMoverComplete(InitActiveMoverComplete move)
     {
+        LogWorldEntryClientSignal("init_active_mover_complete");
+
+        // JimsProxy (worldentry root-ceremony instrumentation 2026-08-03): the
+        // client's mover re-init completion — the phase boundary the arrival
+        // ceremony races (wire-verified: ROOT#1 lands at this boundary on nearly
+        // every arrival). Stamp the breadcrumb.
+        GetSession().GameState.WorldEntryCeremony.InitMoverCompleteSeen = true;
+
         WorldPacket packet = new WorldPacket(Opcode.CMSG_SET_ACTIVE_MOVER);
         packet.WriteGuid(GetSession().GameState.CurrentPlayerGuid.To64());
         SendPacketToServer(packet);

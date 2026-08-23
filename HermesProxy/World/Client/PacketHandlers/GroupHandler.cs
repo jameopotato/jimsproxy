@@ -684,7 +684,116 @@ public partial class WorldClient
             }); //MIRASU
         } //MIRASU
 
+        MergeAndRefreshPartyStats(state, updateFlags.HasFlag(GroupUpdateFlagVanilla.PetGuid));
+        CachePartyPetName(state.Pet);
+        // JimsProxy (review follow-up): partial states stream continuously for every
+        // member (health ticks alone), so an ungated per-packet event is ~10/s of
+        // permanent JSONL in a 40-raid. DebugOutput-gated; pet.name.* stays ungated
+        // (rare, per-edge).
+        if (Framework.Settings.DebugOutput)
+            Log.Event("party.partial_state.translated", new
+            {
+                member_guid = state.AffectedGUID.ToString(),
+                update_flags = (uint)updateFlags,
+                level = state.Level,
+                aura_count = state.Auras?.Count,
+                has_pet = state.Pet != null,
+                pet_guid = state.Pet != null ? state.Pet.NewPetGuid.ToString() : null,
+                pet_name = state.Pet?.NewPetName,
+                pet_health = state.Pet?.Health,
+            });
         SendPacketToClient(state);
+    }
+
+    // The legacy server only re-sends party fields when they change, but the modern
+    // client expires member/pet data it hasn't seen refreshed — merge each delta into
+    // a per-member snapshot and re-attach it to every forwarded partial update.
+    void MergeAndRefreshPartyStats(PartyMemberPartialState state, bool petGuidInPacket)
+    {
+        var gameState = GetSession().GameState;
+        if (state.Level.HasValue)
+            gameState.PartyMemberLevels[state.AffectedGUID] = state.Level.Value;
+        else if (gameState.PartyMemberLevels.TryGetValue(state.AffectedGUID, out var level))
+            state.Level = level;
+
+        var pets = gameState.PartyPetStats;
+        if (petGuidInPacket && (state.Pet == null || state.Pet.NewPetGuid == default))
+        {
+            // guid arrived as zero — the pet was dismissed, drop the snapshot
+            pets.Remove(state.AffectedGUID);
+            if (state.Pet != null)
+                state.Pet.ExplicitClear = true;
+            return;
+        }
+        pets.TryGetValue(state.AffectedGUID, out var cached);
+        if (state.Pet != null)
+        {
+            cached ??= new PartyMemberPetStats();
+            if (state.Pet.NewPetGuid != default)
+                cached.NewPetGuid = state.Pet.NewPetGuid;
+            if (!string.IsNullOrEmpty(state.Pet.NewPetName))
+                cached.NewPetName = state.Pet.NewPetName;
+            if (state.Pet.DisplayID.HasValue)
+                cached.DisplayID = state.Pet.DisplayID;
+            if (state.Pet.Health.HasValue)
+                cached.Health = state.Pet.Health;
+            if (state.Pet.MaxHealth.HasValue)
+                cached.MaxHealth = state.Pet.MaxHealth;
+            pets[state.AffectedGUID] = cached;
+        }
+        if (cached == null || cached.NewPetGuid == default)
+            return;
+        state.Pet ??= new PartyMemberPetStats();
+        if (state.Pet.NewPetGuid == default)
+            state.Pet.NewPetGuid = cached.NewPetGuid;
+        if (string.IsNullOrEmpty(state.Pet.NewPetName))
+            state.Pet.NewPetName = cached.NewPetName;
+        state.Pet.DisplayID ??= cached.DisplayID;
+        state.Pet.Health ??= cached.Health;
+        state.Pet.MaxHealth ??= cached.MaxHealth;
+    }
+
+    // Full-state counterpart: refresh the snapshots and backfill level if the legacy
+    // full state omitted it (a full state would otherwise zero it client-side).
+    void SnapshotPartyStatsFromFull(PartyMemberFullState state, bool petGuidInPacket, bool levelInPacket)
+    {
+        var gameState = GetSession().GameState;
+        if (levelInPacket)
+            gameState.PartyMemberLevels[state.MemberGuid] = state.Level;
+        else if (gameState.PartyMemberLevels.TryGetValue(state.MemberGuid, out var level))
+            state.Level = level;
+
+        if (state.Pet != null && state.Pet.NewPetGuid != default)
+        {
+            gameState.PartyPetStats[state.MemberGuid] = new PartyMemberPetStats
+            {
+                NewPetGuid = state.Pet.NewPetGuid,
+                NewPetName = state.Pet.NewPetName,
+                DisplayID = state.Pet.DisplayID,
+                Health = state.Pet.Health,
+                MaxHealth = state.Pet.MaxHealth,
+            };
+        }
+        else if (petGuidInPacket)
+            gameState.PartyPetStats.Remove(state.MemberGuid);
+    }
+
+    // Remember party pet names so pet name queries can be answered even when the
+    // legacy server returns an empty name for an out-of-range pet.
+    void CachePartyPetName(PartyMemberPetStats? pet)
+    {
+        if (pet == null || pet.NewPetGuid == default || pet.NewPetGuid == WowGuid128.Empty || string.IsNullOrEmpty(pet.NewPetName))
+            return;
+        var gameState = GetSession().GameState;
+        uint petNumber = pet.NewPetGuid.GetEntry();
+        gameState.CachedPetNumbers[petNumber] = pet.NewPetGuid;
+        gameState.PartyPetNames[petNumber] = pet.NewPetName;
+        Log.Event("pet.name.party_stats_cached", new
+        {
+            pet_guid = pet.NewPetGuid.ToString(),
+            pet_number = petNumber,
+            name = pet.NewPetName,
+        });
     }
 
     [PacketHandler(Opcode.SMSG_PARTY_MEMBER_PARTIAL_STATE, ClientVersionBuild.V2_0_1_6180)]
@@ -831,6 +940,8 @@ public partial class WorldClient
             }
         }
 
+        MergeAndRefreshPartyStats(state, updateFlags.HasFlag(GroupUpdateFlagTBC.PetGuid));
+        CachePartyPetName(state.Pet);
         SendPacketToClient(state);
     }
 
@@ -893,6 +1004,7 @@ public partial class WorldClient
             statusOnlyM.AffectedGUID = state.MemberGuid; //MIRASU
             if (updateFlags.HasFlag(GroupUpdateFlagVanilla.Status)) //MIRASU
                 statusOnlyM.StatusFlags = (ushort)(GroupMemberOnlineStatus)packet.ReadUInt8(); //MIRASU
+            MergeAndRefreshPartyStats(statusOnlyM, false);
             SendPacketToClient(statusOnlyM); //MIRASU
             return; //MIRASU - skip the full-state build entirely
         } //MIRASU  
@@ -1074,6 +1186,26 @@ public partial class WorldClient
                 state.Pet.Auras.Add(aura);
             }
         }
+        SnapshotPartyStatsFromFull(state, updateFlags.HasFlag(GroupUpdateFlagVanilla.PetGuid), updateFlags.HasFlag(GroupUpdateFlagVanilla.Level));
+        CachePartyPetName(state.Pet);
+        // JimsProxy (review follow-up): DebugOutput-gated with its partial-state
+        // sibling above — full states are rarer but ride the same raid-scale bursts.
+        if (Framework.Settings.DebugOutput)
+            Log.Event("party.full_state.translated", new
+            {
+                member_guid = state.MemberGuid.ToString(),
+                update_flags = (uint)updateFlags,
+                status = (ushort)state.StatusFlags,
+                level = state.Level,
+                zone = state.ZoneID,
+                current_health = state.CurrentHealth,
+                max_health = state.MaxHealth,
+                aura_count = state.Auras?.Count ?? 0,
+                has_pet = state.Pet != null,
+                pet_guid = state.Pet != null ? state.Pet.NewPetGuid.ToString() : null,
+                pet_name = state.Pet?.NewPetName,
+                pet_health = state.Pet?.Health,
+            });
         SendPacketToClient(state); //MIRASU: Restore missing call — was lost during earlier brace-rearrangement edits. Without this the modern client never gets the initial full-state on party join, so members show as offline/unknown until a PARTIAL_STATE delta arrives (which may never include Status+Health together).     
     }
 
@@ -1231,6 +1363,8 @@ public partial class WorldClient
             }
         }
 
+        SnapshotPartyStatsFromFull(state, updateFlags.HasFlag(GroupUpdateFlagTBC.PetGuid), updateFlags.HasFlag(GroupUpdateFlagTBC.Level));
+        CachePartyPetName(state.Pet);
         SendPacketToClient(state);
     }
 

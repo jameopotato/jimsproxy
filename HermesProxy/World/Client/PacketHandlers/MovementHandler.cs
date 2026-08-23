@@ -5,6 +5,7 @@ using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
 using System;
+using System.Collections.Generic;
 
 namespace HermesProxy.World.Client;
 
@@ -211,13 +212,60 @@ public partial class WorldClient
         SendPacketToClient(knockback);
     }
 
+    // JimsProxy (move-time-skipped translation): the legacy server relays
+    // MSG_MOVE_TIME_SKIPPED (vanilla 0x319) as a peer clock-continuity signal — when
+    // *another* nearby player's client hitches/alt-tabs/loads, its movement clock
+    // jumps and the server tells observers so their per-unit movement-time base for
+    // that mover stays aligned with the (now time-jumped) movement packets that
+    // follow. Upstream dropped this as an unknown s2c opcode; the 1.14 client has a
+    // live handler for the modern twin SMSG_MOVE_SKIP_TIME (0x2E18), so we translate
+    // rather than drop. Wire: packed 64-bit guid + uint32 (all reference cores relay
+    // this shape). The relay is observer-only on every core (the server excludes the
+    // originator), so a self-targeted skip shouldn't arrive — drop it defensively so
+    // it can't fight the client's own movement clock. Also drop for a just-destroyed
+    // mover (mirrors the WasObjectRecentlyDestroyed gate in HandleMovementMessages),
+    // so a stale skip can't touch a unit we already retired.
+    //
+    // Possible relation to #418 (observed players "move laggy / delayed") — WEAK and
+    // unproven. That investigation exonerated the proxy's outbound leg and pinned the
+    // dominant cause to client-side cross-engine jump-arc reconstruction, not this.
+    // But it flagged one untested residual: "a laggy sender's TIME_SKIPPED path is
+    // code-verified but not field-exercised" (0 skips seen in that low-latency
+    // session). This handler is the observer-side (s2c) half of that path — before
+    // it, a hitching/lagging peer's clock skip was dropped, so observers never
+    // re-based that mover's movement time. Whether that feeds the #418 symptom is
+    // unproven; the peer-hitch-under-lag A/B is exactly the field test #418 lacked.
+    [PacketHandler(Opcode.MSG_MOVE_TIME_SKIPPED)]
+    void HandleMoveTimeSkipped(WorldPacket packet)
+    {
+        MoveSkipTime skip = new MoveSkipTime();
+        skip.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
+        skip.TimeSkipped = packet.ReadUInt32();
+
+        if (skip.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+            return;
+        if (GetSession().GameState.WasObjectRecentlyDestroyed(skip.MoverGUID, out _))
+            return;
+
+        SendPacketToClient(skip);
+    }
+
     [PacketHandler(Opcode.SMSG_CONTROL_UPDATE)]
     void HandleControlUpdate(WorldPacket packet)
     {
         ControlUpdate control = new ControlUpdate();
         control.Guid = packet.ReadPackedGuid().To128(GetSession().GameState);
         control.HasControl = packet.ReadBool();
-        SendPacketToClient(control);
+
+        // JimsProxy (camp stun lock, step 2): a self control-update arriving before
+        // the login's first self create block is part of the wedge's lock recipe —
+        // hold it (and the walk-fix speed reassert below, so the pair stays in its
+        // emission order) for release right after the create forwards. Proxy-side
+        // bookkeeping below runs at translate time regardless.
+        bool heldPreCreate = control.Guid == GetSession().GameState.CurrentPlayerGuid &&
+            GetSession().GameState.PreCreateOpHold.TryCapture(control);
+        if (!heldPreCreate)
+            SendPacketToClient(control);
 
         // --- Mirasu RP Walk Bug Fix ---
         // The 1.14 client forgets to un-toggle Walk mode after CC wears off.
@@ -274,7 +322,9 @@ public partial class WorldClient
             runFix.MoverGUID = control.Guid;
             runFix.MoveCounter = 0;
             runFix.Speed = GetSession().GameState.LastKnownPlayerRunSpeed;
-            SendPacketToClient(runFix);
+            // step-2 hold: ride behind the held control-update in emission order.
+            if (!heldPreCreate || !GetSession().GameState.PreCreateOpHold.TryCapture(runFix))
+                SendPacketToClient(runFix);
         }
     }
 
@@ -386,6 +436,31 @@ public partial class WorldClient
         if (guid == GetSession().GameState.CurrentPlayerGuid)
         {
             GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
+
+            // JimsProxy (carried-root cure, same-map variant): hearth/tele/portal
+            // within a map is a MoveTeleport, not a NEW_WORLD — a stranded root
+            // crosses this loading screen too. Belief-only gate (the teleport's
+            // MovementInfo flags are an echo of the client's own stuck state — see
+            // ShouldCureCarriedRoot); deliver only once the client ACKS the
+            // teleport (proof it processed it — an unroot delivered while the
+            // teleport is pending could be lost). Armed BEFORE the pre-create hold
+            // below: a held teleport is still delivered post-create, so its
+            // eventual client ack — the cure's trigger — still comes.
+            if (Framework.Settings.WorldEntryCarriedRootCure &&
+                WorldEntryCeremonyTracker.ShouldCureCarriedRoot(GetSession().GameState.ClientBelievesRooted))
+            {
+                GetSession().GameState.WorldEntryCureAfterTeleportAck = true;
+                if (Framework.Settings.DebugOutput)
+                    Framework.Logging.Log.Event("worldentry.carried_root.armed", new { path = "move_teleport" });
+            }
+
+            // JimsProxy (camp stun lock, step 2): a SERVER-originated self teleport
+            // before the login's first self create block joins the pre-create hold
+            // (R56 op set). Our own transport-clear synth doesn't route through this
+            // handler and stays unheld — it is present on every healthy login and
+            // provably not part of the lock recipe.
+            if (GetSession().GameState.PreCreateOpHold.TryCapture(teleport))
+                return;
         }
         SendPacketToClient(teleport);
     }
@@ -393,17 +468,59 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_TRANSFER_PENDING)]
     void HandleTransferPending(WorldPacket packet)
     {
+        uint transferMapId = packet.ReadUInt32();
+
+        // JimsProxy (camp login-eviction merge): a transfer arriving while the login
+        // stream is held is the over-cap eviction announcing itself. Swallow it
+        // client-side (no TransferPending, no SuspendToken, no transfer flags) — the
+        // NEW_WORLD that follows is merged into the held login-verify in
+        // HandleNewWorld. Always-on event: this only fires on the bug.
+        var evictionHold = GetSession().GameState.LoginEvictionHold;
+        if (evictionHold.OnTransferPending(transferMapId))
+        {
+            GetSession().GameState.PendingTransferMapId = transferMapId;
+            Log.Event("login.eviction_hold.transfer_pending", new
+            {
+                login_map_id = evictionHold.LoginMapId,
+                transfer_map_id = transferMapId,
+                ms_since_login_verify = Environment.TickCount64 - evictionHold.StartTick,
+            });
+            return;
+        }
+
         if (GetSession().GameState.IsWaitingForWorldPortAck)
         {
             Log.Print(LogType.Error, "Skipping SMSG_TRANSFER_PENDING, client is already being teleported.");
             return;
         }
 
+        // JimsProxy (worldentry root-ceremony breadcrumb): the previous arrival's
+        // ceremony accounting ends where the next transition begins.
+        FlushWorldEntryCeremony("transfer_pending");
+
         TransferPending transfer = new TransferPending();
-        transfer.MapID = GetSession().GameState.PendingTransferMapId = packet.ReadUInt32();
+        transfer.MapID = GetSession().GameState.PendingTransferMapId = transferMapId;
         transfer.OldMapPosition = Vector3.Zero;
         SendPacketToClient(transfer);
         GetSession().GameState.IsFirstEnterWorld = false;
+
+        // JimsProxy (worldentry stage-0 tripwire): open the window telemetry BEFORE
+        // raising the flag so every in-window forward line has a non-zero anchor.
+        var gameState = GetSession().GameState;
+        gameState.WorldEntryWindowSeq++;
+        gameState.WorldEntryTransferPendingTick = Environment.TickCount64;
+        gameState.WorldEntryNewWorldTick = 0;
+        gameState.WorldEntryWindowForwardCount = 0;
+        if (Framework.Settings.DebugOutput)
+        {
+            Log.Event("worldentry.window.opened", new
+            {
+                seq = gameState.WorldEntryWindowSeq,
+                old_map = gameState.CurrentMapId,
+                new_map = transfer.MapID,
+            });
+        }
+
         GetSession().GameState.IsWaitingForNewWorld = true;
 
         SuspendToken suspend = new();
@@ -433,8 +550,43 @@ public partial class WorldClient
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
             transfer.Arg = packet.ReadUInt8();
 
+        // JimsProxy (camp login-eviction merge): the client never saw the swallowed
+        // TRANSFER_PENDING, so its abort must be swallowed too. The hold drops back
+        // to plain holding — the original login stands, and the first UPDATE_OBJECT
+        // releases the held stream as a healthy login. Always-on: rare anomaly.
+        if (GetSession().GameState.LoginEvictionHold.OnTransferAborted())
+        {
+            Log.Event("login.eviction_hold.transfer_aborted", new
+            {
+                aborted_map_id = transfer.MapID,
+                reason = transfer.Reason.ToString(),
+            });
+            return;
+        }
+
         SendPacketToClient(transfer);
         GetSession().GameState.IsWaitingForNewWorld = false;
+
+        // JimsProxy (worldentry stage-0 tripwire): a transfer that aborts never gets
+        // its CMSG_WORLD_PORT_RESPONSE — close out the telemetry anchors here so a
+        // stale anchor can't leak into the next window's timing.
+        var trackedState = GetSession().GameState;
+        if (trackedState.WorldEntryTransferPendingTick != 0)
+        {
+            if (Framework.Settings.DebugOutput)
+            {
+                Log.Event("worldentry.window.aborted", new
+                {
+                    seq = trackedState.WorldEntryWindowSeq,
+                    aborted_map_id = transfer.MapID,
+                    reason = transfer.Reason.ToString(),
+                    ms_since_transfer_pending = Environment.TickCount64 - trackedState.WorldEntryTransferPendingTick,
+                    forwarded_in_window = trackedState.WorldEntryWindowForwardCount,
+                });
+            }
+            trackedState.WorldEntryTransferPendingTick = 0;
+            trackedState.WorldEntryNewWorldTick = 0;
+        }
 
         var clearedCounts = GetSession().GameState.ResetInFlightCastState();
         var droppedGcdHold = GetSession().GameState.CancelGcdHold();
@@ -466,16 +618,84 @@ public partial class WorldClient
         GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
 
         NewWorld teleport = new NewWorld();
+        var previousMapId = GetSession().GameState.CurrentMapId;
         GetSession().GameState.CurrentMapId = teleport.MapID = packet.ReadUInt32();
         teleport.Position = packet.ReadVector3();
         teleport.Orientation = packet.ReadFloat();
         teleport.Reason = 4;
+
+        // JimsProxy (camp login-eviction merge): the eviction's NEW_WORLD while the
+        // login stream is held — merge instead of forwarding. The held login-verify
+        // is rewritten to this destination (from the payload — different dungeons
+        // evict to map 0 or 1) and the held stream flushed, so the client does ONE
+        // clean load: exactly the shape the healthy post-eviction login proves
+        // works. The client never sees a transfer, so the MSG_MOVE_WORLDPORT_ACK
+        // its CMSG_WORLD_PORT_RESPONSE would normally produce (Server-side
+        // MovementHandler.HandleWorldPortResponse) is synthesized here instead.
+        // IsFirstEnterWorld deliberately stays TRUE — the client is still doing its
+        // first world entry, and the login-initial handlers gated on it (the
+        // SMSG_INITIALIZE_FACTIONS TimeSyncRequest synth the client needs to be
+        // able to move, SMSG_LOGIN_SET_TIME_SPEED) may run after the merge. The
+        // deferred transport synth likewise stays in Login mode. No
+        // IsWaitingForWorldPortAck: the client will never ack a transfer it never
+        // saw.
+        var evictionHold = GetSession().GameState.LoginEvictionHold;
+        var mergedHold = evictionHold.TryMergeOnNewWorld(teleport.MapID, teleport.Position, teleport.Orientation);
+        if (mergedHold != null)
+        {
+            // Same cast-state sweep a real transfer performs. A fresh login should
+            // have nothing in flight; parity keeps the two paths equivalent.
+            var mergeClearedCounts = GetSession().GameState.ResetInFlightCastState();
+            var mergeDroppedGcdHold = GetSession().GameState.CancelGcdHold();
+            var mergeDroppedCastTimeHold = GetSession().GameState.ClearHeldCastTimeCast();
+
+            foreach (var held in mergedHold)
+                SendPacketToClientDirect(held);
+
+            SendPacketToServer(new WorldPacket(Opcode.MSG_MOVE_WORLDPORT_ACK));
+
+            // Always-on: fires only on the bug — the field signature that the merge ran.
+            Log.Event("login.eviction_merge.merged", new
+            {
+                login_map_id = evictionHold.LoginMapId,
+                new_map_id = teleport.MapID,
+                x = teleport.Position.X,
+                y = teleport.Position.Y,
+                z = teleport.Position.Z,
+                held_packets = mergedHold.Count,
+                hold_ms = Environment.TickCount64 - evictionHold.StartTick,
+                normal_casts_cleared = mergeClearedCounts.normalCasts,
+                pet_casts_cleared = mergeClearedCounts.petCasts,
+                gcd_hold_dropped_spell_id = mergeDroppedGcdHold?.SpellId ?? 0,
+                cast_time_hold_dropped_spell_id = mergeDroppedCastTimeHold?.SpellId ?? 0,
+            });
+            return;
+        }
+
         GetSession().GameState.IsFirstEnterWorld = false;
 
         if (GetSession().GameState.IsWaitingForNewWorld)
         {
             GetSession().GameState.IsWaitingForNewWorld = false;
             GetSession().GameState.IsWaitingForWorldPortAck = true;
+
+            // JimsProxy (worldentry stage-0 tripwire): anchor the ack-wait phase.
+            // NEW_WORLD itself is forwarded ~50ms later (scheduling breath below), so
+            // window durations measured from here include that fixed offset.
+            var trackedState = GetSession().GameState;
+            trackedState.WorldEntryNewWorldTick = Environment.TickCount64;
+            if (Framework.Settings.DebugOutput)
+            {
+                Log.Event("worldentry.window.new_world", new
+                {
+                    seq = trackedState.WorldEntryWindowSeq,
+                    old_map = previousMapId,
+                    new_map = teleport.MapID,
+                    ms_since_transfer_pending = trackedState.WorldEntryTransferPendingTick != 0
+                        ? Environment.TickCount64 - trackedState.WorldEntryTransferPendingTick
+                        : -1,
+                });
+            }
 
             // JimsProxy (zone-transfer cast-state cleanup): the source map's server
             // state is torn down on transition (BG entry, instance change, zep arrival,
@@ -517,6 +737,16 @@ public partial class WorldClient
             // --- END FIX ---
 
             SendPacketToClient(teleport);
+
+            // JimsProxy (worldentry root-ceremony breadcrumb): the arrival ceremony
+            // (ROOT ×2 + UNROOT, wire-verified on every Kronos arrival) begins after
+            // the worldport ack; open the accounting here.
+            GetSession().GameState.WorldEntryCeremony.Begin("new_world", Environment.TickCount64);
+
+            // JimsProxy (carried-root cure): arm the destination-side check. If the
+            // client crosses this boundary believing itself rooted, the missing
+            // unroot is synthesized at the player's first destination update.
+            GetSession().GameState.WorldEntryPendingCarriedRootCheck = true;
 
             // JimsProxy (zep-stuck-low-latency-race 2026-05-17): defer the
             // transport-clear synth until the player's first post-NEW_WORLD
@@ -743,6 +973,34 @@ public partial class WorldClient
         Opcode universalOpcode = packet.GetUniversalOpcode(false);
         MoveSplineSetFlag spline = new MoveSplineSetFlag(universalOpcode);
         spline.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
+
+        // JimsProxy (worldentry root-ceremony breadcrumb, R40 branch (c)): a
+        // spline-family root leg addressed to the PLAYER is the wrong-family
+        // signature (server emits it instead of the force op while
+        // CLIENT_CONTROL_LOST is up — e.g. the BG-end window an instant Leave
+        // click races). Zero occurrences in the healthy corpus; count them so the
+        // ceremony breadcrumb can name the family, not just the absence.
+        var splineCeremony = GetSession().GameState.WorldEntryCeremony;
+        if (spline.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            if (universalOpcode == Opcode.SMSG_MOVE_SPLINE_ROOT)
+            {
+                if (splineCeremony.Active)
+                    System.Threading.Interlocked.Increment(ref splineCeremony.SplineRootsForwarded);
+                // Carried-root belief: conservative — treat a self spline-root as
+                // rooting (if the client ignores it, the stale belief only costs a
+                // harmless no-op unroot at the next arrival).
+                GetSession().GameState.ClientBelievesRooted = true;
+            }
+            else if (universalOpcode == Opcode.SMSG_MOVE_SPLINE_UNROOT)
+            {
+                if (splineCeremony.Active)
+                    System.Threading.Interlocked.Increment(ref splineCeremony.SplineUnrootsForwarded);
+                // R5-proven: the client accepts a spline-family unroot as clearing.
+                GetSession().GameState.ClientBelievesRooted = false;
+            }
+        }
+
         SendPacketToClient(spline);
         // MIRASU (onyxia-landed-still-hovering): explicit hover toggles drive the registry + anim/gravity synth, else a landed mob keeps hover anim forever and a parked flyer stands and bounces.
         if (universalOpcode is Opcode.SMSG_MOVE_SPLINE_SET_HOVER or Opcode.SMSG_MOVE_SPLINE_UNSET_HOVER)
@@ -765,10 +1023,85 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_MOVE_SET_NORMAL_FALL)]
     void HandleMoveForceFlagChange(WorldPacket packet)
     {
-        MoveSetFlag flag = new MoveSetFlag(packet.GetUniversalOpcode(false));
+        Opcode universalOpcode = packet.GetUniversalOpcode(false);
+        MoveSetFlag flag = new MoveSetFlag(universalOpcode);
         flag.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
         flag.MoveCounter = packet.ReadUInt32();
+
+        // JimsProxy (worldentry root-ceremony breadcrumb + carried-root cure
+        // 2026-08-03): count the player's arrival ROOT/UNROOT ceremony legs for the
+        // always-on unclosed-ceremony breadcrumb, and maintain the client-root
+        // belief model — the proxy's record of what the client was last told about
+        // its root state, which the carried-root cure gates on. No-op for non-self
+        // movers and for the other force flags in this handler. See
+        // WorldEntryCeremony.cs. Runs BEFORE the pre-create op hold below: a held
+        // op is still delivered to the client (post-create), and on the rare
+        // login-failure discard the stale belief errs fail-safe (one no-op synth
+        // unroot at the next boundary; the next login's fresh GameSessionData
+        // clears it).
+        bool selfRoot = universalOpcode == Opcode.SMSG_MOVE_ROOT &&
+                        flag.MoverGUID == GetSession().GameState.CurrentPlayerGuid;
+        bool selfUnroot = universalOpcode == Opcode.SMSG_MOVE_UNROOT &&
+                          flag.MoverGUID == GetSession().GameState.CurrentPlayerGuid;
+        var ceremony = GetSession().GameState.WorldEntryCeremony;
+        if (ceremony.Active && selfRoot)
+            System.Threading.Interlocked.Increment(ref ceremony.RootsForwarded);
+        if (ceremony.Active && selfUnroot)
+            System.Threading.Interlocked.Increment(ref ceremony.UnrootsForwarded);
+        if (selfRoot)
+            GetSession().GameState.ClientBelievesRooted = true;
+        else if (selfUnroot)
+            GetSession().GameState.ClientBelievesRooted = false;
+
+        // JimsProxy (camp stun lock, step 2): a self root/unroot arriving before the
+        // login's first self create block is the wedge's lock recipe — hold it for
+        // in-order release right after the create forwards (PreCreateOpHold; the
+        // other force flags are not part of the arrival control ceremony and pass).
+        if ((selfRoot || selfUnroot) &&
+            GetSession().GameState.PreCreateOpHold.TryCapture(flag))
+            return;
+
         SendPacketToClient(flag);
+    }
+
+    // JimsProxy (worldentry root-ceremony breadcrumb 2026-08-03): close out the
+    // previous arrival's ceremony accounting. An opened-but-not-observably-closed
+    // ceremony logs ONE always-on line (worldentry.ceremony.unclosed) so any field
+    // Export Diagnostics carries the movement-lockup discriminator: missing unroot =
+    // server never sent it; unroot forwarded but never acked = the client rejected
+    // or could not apply it (the stuck-stun golden capture's discard fingerprint);
+    // root acks short = a root leg was discarded; spline legs = the wrong-family
+    // dialect. Healthy ceremonies log only under DebugOutput.
+    internal void FlushWorldEntryCeremony(string reason)
+    {
+        var gameState = GetSession().GameState;
+        var ceremony = gameState.WorldEntryCeremony;
+        if (!ceremony.Active)
+            return;
+
+        bool anomalous = WorldEntryCeremonyTracker.IsAnomalous(
+            ceremony.RootsForwarded, ceremony.RootAcks,
+            ceremony.UnrootsForwarded, ceremony.UnrootAcks,
+            ceremony.SplineRootsForwarded, ceremony.SplineUnrootsForwarded);
+        if (anomalous || Framework.Settings.DebugOutput)
+        {
+            Framework.Logging.Log.Event(
+                anomalous ? "worldentry.ceremony.unclosed" : "worldentry.ceremony.closed",
+                new
+                {
+                    anchor = ceremony.Anchor,
+                    flush_reason = reason,
+                    ms_since_anchor = Environment.TickCount64 - ceremony.AnchorTickMs,
+                    roots_forwarded = ceremony.RootsForwarded,
+                    root_acks = ceremony.RootAcks,
+                    unroots_forwarded = ceremony.UnrootsForwarded,
+                    unroot_acks = ceremony.UnrootAcks,
+                    spline_roots_forwarded = ceremony.SplineRootsForwarded,
+                    spline_unroots_forwarded = ceremony.SplineUnrootsForwarded,
+                    init_mover_complete_seen = ceremony.InitMoverCompleteSeen,
+                });
+        }
+        ceremony.Reset();
     }
 
     [PacketHandler(Opcode.SMSG_COMPRESSED_MOVES)]

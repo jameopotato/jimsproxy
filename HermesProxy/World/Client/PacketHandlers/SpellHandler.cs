@@ -109,7 +109,13 @@ public partial class WorldClient
                 // a banked boon's sweep — the client gets the spell cooldown now but won't bind it to a bank
                 // item that only becomes visible when the bank opens. Keyed by on-use spell; endTick = now+left.
                 if (history.ItemID != 0 && history.RecoveryTime > 0)
+                {
                     GetSession().GameState.ChronoboonOnUseCooldownEndMs[history.SpellID] = Environment.TickCount64 + history.RecoveryTime;
+                    // JimsProxy (Kronos Chronoboon): also keyed by item entry — the boon's store and restore are
+                    // DIFFERENT spells, so a lookup via the current template's on-use spell misses the cooldown
+                    // left by the other state's use. Item-entry key finds it regardless.
+                    GetSession().GameState.LoginItemCooldownByItemEntry[history.ItemID] = (history.SpellID, Environment.TickCount64 + history.RecoveryTime);
+                }
             }
             SendPacketToClient(histories, Opcode.SMSG_SEND_UNLEARN_SPELLS);
         }
@@ -144,16 +150,9 @@ public partial class WorldClient
         // so the outbound CMSG_CAST_SPELL guard sees the actual server-side known set.
         // Without this, a rank-up replaces the action-bar binding but the proxy still
         // thinks the old rank is known and never tracks the new one.
-        var knownSpellsSuperseded = GetSession().GameState.CurrentPlayerKnownSpells;
-        knownSpellsSuperseded.Remove(supercededId);
-        knownSpellsSuperseded.Add(spellId);
-        // Ban defense: clear pending state on rank-upgrade confirmation.
-        if (GetSession().GameState.PendingTrainerBuySpellId == spellId
-            || GetSession().GameState.PendingTrainerBuySpellId == supercededId)
-        {
-            GetSession().GameState.PendingTrainerBuySpellId = 0u;
-            GetSession().GameState.PendingTrainerBuyRemovedPredecessor = 0u;
-        }
+        // Ban defense: the server really removed the old rank — drop it and confirm (clear
+        // without restore) any matching pending speculative removal.
+        GetSession().GameState.ApplySupercededSpellKnownState(spellId, supercededId);
         // Clear in-flight trainer-buy on rank-upgrade response too — match on either
         // the new or the superseded id so we don't strand stale in-flight state.
         if (GetSession().GameState.InFlightTrainerBuySpellId == spellId
@@ -172,15 +171,18 @@ public partial class WorldClient
         LearnedSpells spells = new LearnedSpells();
         uint spellId = packet.ReadUInt32();
         spells.Spells.Add(spellId);
-        // JimsProxy (cast-block-unknown-spells): track newly-learned spells so the
-        // outbound CMSG_CAST_SPELL guard doesn't false-positive on trainer/talent grants.
-        GetSession().GameState.CurrentPlayerKnownSpells.Add(spellId);
-        // Ban defense: clear pending state on confirmed learn — predecessor
-        // stays removed (server actually removed it, proxy state now matches).
-        if (GetSession().GameState.PendingTrainerBuySpellId == spellId)
+        // JimsProxy (cast-block-unknown-spells + racial-downrank restore): records the learn and,
+        // for the pending trainer buy, restores the speculatively-removed predecessor — a learn
+        // with no SUPERCEDED_SPELLS means the server kept the lower rank (see the op's doc for
+        // the supersede-ordering and no-response ban-safety analysis).
+        uint restoredPredecessor = GetSession().GameState.ApplyLearnedSpellKnownState(spellId);
+        if (restoredPredecessor != 0)
         {
-            GetSession().GameState.PendingTrainerBuySpellId = 0u;
-            GetSession().GameState.PendingTrainerBuyRemovedPredecessor = 0u;
+            Log.Event("spell.trainer_buy.predecessor_restored_on_learn", new
+            {
+                learned_spell_id = spellId,
+                predecessor_spell_id = restoredPredecessor,
+            });
         }
         // Clear in-flight trainer-buy on confirmed learn so the next CMSG
         // for the same spell isn't dropped as a stale duplicate.
@@ -355,6 +357,19 @@ public partial class WorldClient
                         trailing_hex = ReadTrailingBytesHex(packet),
                     });
 
+                // JimsProxy (#442): this discard used to be INVISIBLE in the JSONL — a rejection
+                // swallowed here is the difference between a leaked queue entry self-healing and
+                // jamming the whole session, and the 2026-07 silent-lockout investigation lost days
+                // to not being able to see it. Ungated: bounded by the rate of own-cast RESULT
+                // packets — rejections plus proc-driven status!=2 results (e.g. Defensive State
+                // 5302, ~2 s cadence in the 2026-07-17 stuck-stun capture) — a few lines a minute
+                // in heavy combat at worst.
+                Log.Event("cast.result.discarded", new
+                {
+                    spell_id = spellId,
+                    status = status,
+                });
+
                 // JimsProxy (engineering-malfunction jam): a discarded CAST_FAILED can be a
                 // server-side substitute (e.g. Goblin Mortar -> Malfunction Explosion 13261) that
                 // preempted a forwarded item-use cast (13237). The item-use then never starts and
@@ -452,7 +467,13 @@ public partial class WorldClient
         // SpellInProgress = cast bar active). Useful with Low Latency Mode where mid-GCD
         // presses reach the server and bounce back. The 1.14 client's "Suppress Error Speech"
         // setting covers audio but not the red error text; this covers both.
-        if (Settings.SuppressSpellCastErrors && isTransientReason)
+        // JimsProxy (raptor-strike-wedge): a suppressed transient failure matching a special slot must fall through to the special-cast branch below — returning early leaves the slot occupied forever and HandleCastSpell locally rejects every later press until relog.
+        bool suppressTransient = Settings.SuppressSpellCastErrors && isTransientReason;
+        bool matchesSpecialSlot =
+            GetSession().GameState.CurrentClientNextMeleeCast?.SpellId == spellId ||
+            GetSession().GameState.CurrentClientAutoRepeatCast?.SpellId == spellId;
+
+        if (suppressTransient && !matchesSpecialSlot)
         {
             // JimsProxy (suppress-ack-stuck-button): suppress the red error text, but STILL ack
             // the client so the action-button pending/lit state clears. Under LowLatencyMode the
@@ -501,7 +522,10 @@ public partial class WorldClient
             CastFailed failed = new();
             failed.SpellID = specialCast.SpellId;
             failed.SpellXSpellVisualID = specialCast.SpellXSpellVisualId;
-            failed.Reason = LegacyVersion.ConvertSpellCastResult(reason);
+            // JimsProxy (raptor-strike-wedge): keep the error text suppressed for transient bounces.
+            failed.Reason = suppressTransient
+                ? (uint)SpellCastResultClassic.DontReport
+                : LegacyVersion.ConvertSpellCastResult(reason);
             failed.CastID = specialCast.ServerGUID;
             failed.FailedArg1 = arg1;
             failed.FailedArg2 = arg2;
@@ -517,6 +541,21 @@ public partial class WorldClient
             }
             else
                 GetSession().GameState.CurrentClientNextMeleeCast = null;
+
+            // JimsProxy (gated at merge, diagnostics policy): fires on EVERY special-slot
+            // failure — including each Auto Shot out-of-range bounce while kiting — so it
+            // must not reach DebugOutput-off field logs.
+            if (Framework.Settings.DebugOutput)
+            {
+                Log.Event("cast.special_slot_failure_resolved", new
+                {
+                    spell_id = spellId,
+                    reason_id = reason,
+                    slot = isAutoRepeat ? "auto_repeat" : "next_melee",
+                    suppressed = suppressTransient,
+                    retry_scheduled = isAutoRepeat && IsRetryableAutoRepeatFailure(reason),
+                });
+            }
         }
         // Look up pending normal cast by SpellId (queue-based, FIFO order). A transient
         // duplicate-rejection (NotReady/SpellInProgress reaching here with suppression off)
@@ -879,12 +918,15 @@ public partial class WorldClient
         // SMSG_SPELL_FAILED_OTHER 5+/sec while a target is out of range / dying;
         // forwarding each one chains CancelSpellVisuals into a stuck cast sound on
         // the 1.14.2 client. The first failure carries all the state the client
-        // needs; subsequent same-(caster, spell) failures within 500ms add nothing.
+        // needs; subsequent same-(caster, spell) failures within 500ms add nothing —
+        // UNLESS the failure terminates a live tracked cast instance
+        // (GameSessionData.ShouldDedupSpellFailedOther): that one is the instance's
+        // only terminator and must always be forwarded, or the cast-hold kit strands
+        // on the 1.14.2 client (2026-08-14 observed-skinning capture).
         const long DedupWindowMs = 500;
         long nowMs = Time.GetMSTime();
         var dedupKey = (casterUnit, spellId);
-        if (GetSession().GameState.RecentlyForwardedSpellFailedOther.TryGetValue(dedupKey, out var lastMs) &&
-            nowMs - lastMs < DedupWindowMs)
+        if (GetSession().GameState.ShouldDedupSpellFailedOther(casterUnit, spellId, nowMs, DedupWindowMs, out long msSinceLastForwarded))
         {
             // JimsProxy (warlock-pet-gcd-on-failure): the visual/SpellFailure storm is deduped, but a double-clicked pet-bar press is a distinct failed cast whose predicted GCD sweep must still be released. Gated to unqueued presses (CMSG_PET_ACTION, deterministic seed CastID).
             bool dedupReleasePetGcd = GetSession().GameState.CurrentPetGuid == casterUnit && !HasQueuedPetCast(spellId);
@@ -895,11 +937,21 @@ public partial class WorldClient
                 spellId,
                 reason,
                 casterCounter = casterUnit.GetCounter(),
-                ms_since_last = nowMs - lastMs,
+                ms_since_last = msSinceLastForwarded,
                 sentPetCastFailed = dedupReleasePetGcd,
             });
             return;
         }
+        // Gated: this is the fix-working breadcrumb, not an unexpected-edge signature
+        // (2026-08-18 review rubric — devs/testers run DebugOutput on).
+        if (msSinceLastForwarded >= 0 && Framework.Settings.DebugOutput)
+            Log.Event("spell.failed_other.dedup_bypassed_live_cast", new
+            {
+                spellId,
+                reason,
+                casterCounter = casterUnit.GetCounter(),
+                ms_since_last = msSinceLastForwarded,
+            });
         GetSession().GameState.RecentlyForwardedSpellFailedOther[dedupKey] = nowMs;
 
         WowGuid128 castId;
@@ -1045,6 +1097,12 @@ public partial class WorldClient
             castIdCounter = castId.GetCounter(),
             casterIsPlayer,
             casterIsPet,
+            // JimsProxy (2026-08-16): decoded guid kind (Player/Creature/Pet/...). casterIsPlayer
+            // above means "caster is the LOCAL player" (CurrentPlayerGuid compare) — every OTHER
+            // player logs false, so any caster-kind split keyed on the flag buckets other players
+            // as mobs. Both corpora were mis-swept on exactly that this week. The flag stays for
+            // tooling compatibility; new sweeps must key on casterKind.
+            casterKind = casterUnit.GetHighType().ToString(),
             sentInterruptLog,
             sentCancelVisual,
             sentPetCastFailed,
@@ -1056,6 +1114,22 @@ public partial class WorldClient
             cancelVisualSourceLow,
             playerGuidLow = GetSession().GameState.CurrentPlayerGuid.GetCounter(),
         });
+    }
+
+    /// <summary>
+    /// JimsProxy (strafe cancel-gap presentation parity): the client-bound SpellFailure
+    /// reason for a movement-cancelled cast's trailing failure, or null to keep today's
+    /// suppression. Forward/back/jump cancels are predicted client-side — the 1.14 client
+    /// already flashed the red "Interrupted" on its own cast bar, so the broadcast stays
+    /// suppressed (null). Strafe cancels are synthesized by the proxy (the client never
+    /// sends nor predicts one), so return the interrupt reason to forward SMSG_SPELL_FAILURE
+    /// and reproduce that same "Interrupted" render instead of a silent fizzle. Pure /
+    /// deterministic — decided solely by the tracked cast's StrafeSynthCancelled flag, which
+    /// is only ever set when the StrafeCancelPreempt synth fired.
+    /// </summary>
+    internal static SpellCastResultClassic? ResolveMovementCancelInterruptReason(ClientCastRequest cast)
+    {
+        return cast.StrafeSynthCancelled ? SpellCastResultClassic.Interrupted : null;
     }
 
     // JimsProxy: SMSG_SPELL_FAILURE handler. Block 2 gameplay testing on Kronos
@@ -1164,6 +1238,12 @@ public partial class WorldClient
         // reason and renders the correct popup.
         bool overrideReasonForLocalBroadcast = false;
         bool skipBroadcastFailure = false;
+        // JimsProxy (strafe cancel-gap presentation parity): when set, the broadcast
+        // SpellFailure is forwarded with THIS classic reason instead of being
+        // suppressed — used for strafe-synth-cancelled casts so the client renders
+        // the red "Interrupted" it never predicted locally. Null leaves the existing
+        // suppress / reason-override behavior untouched.
+        byte? forcedBroadcastReason = null;
         // JimsProxy (transient-no-dismiss-started): under LowLatencyMode, defer a STARTED local
         // cast's bar-dismiss AND visual-cancel to the caller-aware trailing CAST_FAILED (which
         // knows the real reason — spare a dup-rejection, dismiss a real failure). Set in the
@@ -1225,8 +1305,23 @@ public partial class WorldClient
             // prediction. Suppress the broadcast SpellFailure entirely —
             // emitting it would surface a misleading "You are in combat" popup
             // (Spell::SendInterrupted hardcodes the wire reason to 0).
+            //
+            // JimsProxy (strafe cancel-gap presentation parity): EXCEPT when the
+            // proxy synthesized the cancel itself (strafe). The 1.14 client never
+            // sends nor predicts a cancel on strafe, so it never rendered the red
+            // "Interrupted" — suppressing here would leave a silent fizzle. Forward
+            // the interrupt instead (SMSG_SPELL_FAILURE for the local caster is read
+            // as "in-flight cast interrupted"), keyed purely on the tracked cast, so
+            // the bar matches the forward/back/jump presentation. Inert when the
+            // strafe synth (StrafeCancelPreempt) never fired.
             if (pendingNormal.MovementCancelled)
-                skipBroadcastFailure = true;
+            {
+                var strafeInterruptReason = ResolveMovementCancelInterruptReason(pendingNormal);
+                if (strafeInterruptReason.HasValue)
+                    forcedBroadcastReason = (byte)strafeInterruptReason.Value;
+                else
+                    skipBroadcastFailure = true;
+            }
             // Instant cast that wasn't a ranged auto-attack: SPELL_START was
             // never forwarded, so there's no cast bar to dismiss. Skip the misleading
             // broadcast SpellFailure entirely. The trailing SMSG_CAST_FAILED via
@@ -1308,7 +1403,8 @@ public partial class WorldClient
                 });
         }
 
-        byte broadcastReason = overrideReasonForLocalBroadcast ? (byte)SpellCastResultClassic.DontReport : reason;
+        byte broadcastReason = forcedBroadcastReason
+            ?? (overrideReasonForLocalBroadcast ? (byte)SpellCastResultClassic.DontReport : reason);
         if (!skipBroadcastFailure)
         {
             SpellFailure spell = new SpellFailure();
@@ -1438,6 +1534,9 @@ public partial class WorldClient
             is_ranged_auto_attack = isRangedAutoAttack,
             isCaster = GetSession().GameState.CurrentPlayerGuid == casterUnit,
             isPetCaster = GetSession().GameState.CurrentPetGuid == casterUnit,
+            // JimsProxy (2026-08-16): decoded guid kind — see spell.failed_other.routed. isCaster
+            // above is a LOCAL-player compare, not a kind test.
+            casterKind = casterUnit.GetHighType().ToString(),
             dequeued,
             wasStarted,
             foundActiveCastId,
@@ -1566,6 +1665,13 @@ public partial class WorldClient
 
         bool casterIsLocalPlayer = GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit;
         bool casterIsLocalPet    = GetSession().GameState.CurrentPetGuid    == spell.Cast.CasterUnit;
+
+        // JimsProxy (feared-while-sitting, issue #479): the fear-lands stand-up moved from
+        // here (SPELL_START) to the SPELL_GO path in HandleSpellGo — see that trigger and
+        // FearStandSynth.ShouldStandOnFearGoHit. Standing at START breaks the drink of a
+        // seated player even when the fear cast is then interrupted / the caster dies / it
+        // fails at completion (no GO ever arrives); standing at GO-with-self-in-hit fires
+        // only when the fear actually lands.
 
         // Mark pending cast as started (queue-based, FIFO order)
         if (casterIsLocalPlayer &&
@@ -1868,7 +1974,7 @@ public partial class WorldClient
         // Send cast-time sideband for non-self casters so the addon gets
         // the server-reported cast time instead of GetSpellInfo() which
         // returns the observer's own modified value (wrong rank/talents).
-        if (GetSession().GameState.JimsPlusSideband &&
+        if (GetSession().GameState.IsJimsPlusSidebandActive() &&
             spell.Cast.CasterUnit != GetSession().GameState.CurrentPlayerGuid &&
             spell.Cast.CasterUnit != GetSession().GameState.CurrentPetGuid &&
             spell.Cast.CastTime > 0)
@@ -1902,6 +2008,34 @@ public partial class WorldClient
             LogSpellStartGoParseFailure(packet, e, isSpellGo: true);
             DrainOrphanedStartedNormalCastsOnParseFailure(isSpellGo: true);
             return;
+        }
+
+        // JimsProxy (feared-while-sitting, issue #479): a fear-aura cast has GONE with the
+        // seated local player in its HIT list — the fear actually LANDS. Synthesize a legacy
+        // CMSG_STAND_STATE_CHANGE(STAND) now, at the GO, not at the START. Standing at START
+        // was field-rejected: a started fear that is interrupted / whose caster dies / that
+        // fails at completion never GOes, so standing at START broke the player's drink for
+        // nothing. Gated on the HIT list only — a resisted/immune fear lists the player in
+        // the MISS list and must NOT stand them. This runs for casts by OTHER units targeting
+        // us (a fear is never self-cast): CasterUnit != local player, so the SoM remap in the
+        // dequeue block below never touches SpellID — the raw legacy id read here is correct,
+        // and this insertion is independent of that local-caster remap. Timing: the stand
+        // races the aura application inside Kronos's ~400ms batching window; win → the fear
+        // lands on a standing player and fear-break items pass NOT_STANDING both sides; lose →
+        // it degrades to a harmless mid-fear stand attempt, the same packet the CC-onset
+        // fallback (trigger 2, UpdateHandler) would send. Instant fears carry no victim-side
+        // GO and fall to that fallback. The (cheap) hit-list scan is gated behind the FrozenSet
+        // spell-id lookup so the common non-fear SPELL_GO path stays scan-free.
+        if (Framework.Settings.SynthStandOnFear &&
+            FearStandSynth.FearAuraSpellIds.Contains((uint)spell.Cast.SpellID))
+        {
+            var fearVictimGuid = GetSession().GameState.CurrentPlayerGuid;
+            bool selfInFearHitTargets = !fearVictimGuid.IsEmpty() &&
+                                        spell.Cast.HitTargets.Contains(fearVictimGuid);
+            if (FearStandSynth.ShouldStandOnFearGoHit(Framework.Settings.SynthStandOnFear,
+                    (uint)spell.Cast.SpellID, selfInFearHitTargets,
+                    GetSession().GameState.GetLocalPlayerStandState()))
+                SendSynthStandUp("fear_go_hit", (uint)spell.Cast.SpellID);
         }
 
         // JimsProxy (#383): a Summoning Portal (GameObject) casting a participant's
@@ -2615,8 +2749,12 @@ public partial class WorldClient
             spell_visual_id = dbdata.SpellXSpellVisualID,
             visual_lookup_missing = dbdata.SpellXSpellVisualID == 0,
             caster_guid = dbdata.CasterGUID.ToString(),
+            // JimsProxy (2026-08-16): caster_is_player means "caster is the LOCAL player" (guid
+            // compare against CurrentPlayerGuid) — other players log false. caster_kind is the
+            // decoded guid kind (Player/Creature/Pet/...); observed-caster sweeps must key on it.
             caster_is_player = dbdata.CasterGUID == GetSession().GameState.CurrentPlayerGuid,
             caster_is_pet = dbdata.CasterUnit == GetSession().GameState.CurrentPetGuid,
+            caster_kind = dbdata.CasterUnit.GetHighType().ToString(),
             cast_time = dbdata.CastTime,
             cast_flags = dbdata.CastFlags,
             casterCounter = dbdata.CasterUnit.GetCounter(), //MIRASU - lets us correlate with spell.failed_other.routed
@@ -3391,6 +3529,13 @@ public partial class WorldClient
         channel.SpellID = packet.ReadUInt32();
         channel.SpellXSpellVisualID = GameData.GetSpellVisual(channel.SpellID);
         channel.Duration = packet.ReadUInt32();
+        // JimsProxy (#244 emote channel guard): record our own channel window
+        // so text-emote forwards hold off while it is open.
+        if (channel.CasterGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            GetSession().GameState.LocalChannelSpellId = channel.Duration > 0 ? channel.SpellID : 0;
+            GetSession().GameState.LocalChannelEndTickMs = Environment.TickCount64 + channel.Duration;
+        }
         SendPacketToClient(channel);
     }
 
@@ -3403,6 +3548,10 @@ public partial class WorldClient
         else
             channel.CasterGUID = GetSession().GameState.CurrentPlayerGuid;
         channel.TimeRemaining = packet.ReadInt32();
+        // JimsProxy (#244 emote channel guard): the server ends a channel by
+        // sending an update with no time remaining — close our window early.
+        if (channel.TimeRemaining <= 0 && channel.CasterGUID == GetSession().GameState.CurrentPlayerGuid)
+            GetSession().GameState.LocalChannelSpellId = 0;
         SendPacketToClient(channel);
     }
 
@@ -3544,6 +3693,7 @@ public partial class WorldClient
 
         GetSession().GameState.StoreAuraDurationLeft(guid, slot, duration, (int)packet.GetReceivedTime());
         GetSession().GameState.StoreAuraDurationFull(guid, slot, duration);
+        GetSession().GameState.StoreAuraDurationPushTime(guid, slot, (int)packet.GetReceivedTime());
         if (duration <= 0)
             return;
 
@@ -3560,6 +3710,9 @@ public partial class WorldClient
         aura.AuraData.Flags |= AuraFlagsModern.Duration;
         aura.AuraData.Duration = duration;
         aura.AuraData.Remaining = duration;
+        // Server-authoritative self duration — keep the durable expiry map in sync so a
+        // later relog doesn't restore a stale CSV-guessed value for our own buffs.
+        GetSession().GameState.RecordAuraExpiry(guid, (int)aura.AuraData.SpellID, duration);
 
         //MIRASU: Populate CastUnit and set NoCaster when caster is unknown — same rule as
         //MIRASU: the UpdateHandler aura loop. SMSG_UPDATE_AURA_DURATION arrives during login
@@ -3596,6 +3749,7 @@ public partial class WorldClient
 
         GetSession().GameState.StoreAuraDurationFull(guid, slot, durationFull);
         GetSession().GameState.StoreAuraDurationLeft(guid, slot, durationLeft, (int)packet.GetReceivedTime());
+        GetSession().GameState.StoreAuraDurationPushTime(guid, slot, (int)packet.GetReceivedTime());
 
         if (packet.GetUniversalOpcode(false) == Opcode.SMSG_SET_EXTRA_AURA_INFO_NEED_UPDATE)
             GetSession().GameState.StoreAuraCaster(guid, slot, GetSession().GameState.CurrentPlayerGuid);
@@ -3784,6 +3938,9 @@ public partial class WorldClient
 
                 GetSession().GameState.StoreAuraDurationLeft(target, slot, durationFull, Environment.TickCount);
                 GetSession().GameState.StoreAuraDurationFull(target, slot, durationFull);
+                // Mirror the cache seed above (recast → duration restarts at full), not the
+                // possibly-decayed Remaining, so the durable map never lags the cache.
+                GetSession().GameState.RecordAuraExpiry(target, (int)spellId, durationFull);
             }
         }
 

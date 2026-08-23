@@ -13,16 +13,17 @@ public partial class WorldSocket
         var victim64 = attack.Victim.To64();
         var state = GetSession().GameState;
 
-        if (state.CurrentAttackTarget == victim64)
+        // De-dupe guard + handshake bookkeeping live on GameSessionData so they can be
+        // unit-tested without a socket. False means we already believe we are auto-attacking
+        // this exact victim, so the swing is swallowed rather than forwarded.
+        if (!state.TryBeginLocalPlayerAttackSwing(victim64))
             return;
 
-        // If we had a pending stop (STOP→SWING sequence), cancel it — just send the new SWING
-        // The server handles target switching within ATTACK_SWING without needing an explicit STOP
-        if (state.DeferredAttackStop)
-            state.DeferredAttackStop = false;
+        // TEMP-DIAG (#464 follow-up) — REMOVE with the breadcrumb in Client/PacketHandlers/CombatHandler.cs.
+        // Diagnostics only: lets the empty-victim breadcrumb report how long
+        // after our swing the server's refusal arrived (219ms in the capture that found the bug).
+        state.LastAttackSwingSentTick = System.Environment.TickCount64;
 
-        state.CurrentAttackTarget = victim64;
-        state.WaitingForAttackStart = true;
         WorldPacket packet = new WorldPacket(Opcode.CMSG_ATTACK_SWING);
         packet.WriteGuid(victim64);
         SendPacketToServer(packet);

@@ -50,6 +50,7 @@ public static partial class GameData
     public static FrozenDictionary<uint, uint> Gems = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, CreatureDisplayInfo> CreatureDisplayInfos = FrozenDictionary<uint, CreatureDisplayInfo>.Empty;
     public static FrozenDictionary<uint, CreatureModelCollisionHeight> CreatureModelCollisionHeights = FrozenDictionary<uint, CreatureModelCollisionHeight>.Empty;
+    public static FrozenDictionary<uint, float> HotfixCreatureDisplayScales = FrozenDictionary<uint, float>.Empty;
     public static FrozenDictionary<int, CreatureFamilyData> CreatureFamilies = FrozenDictionary<int, CreatureFamilyData>.Empty;
     public static FrozenDictionary<uint, float> VanillaCreatureModelScales = FrozenDictionary<uint, float>.Empty;
     public static FrozenDictionary<uint, uint[]> TalentRankPredecessors = FrozenDictionary<uint, uint[]>.Empty;
@@ -85,6 +86,12 @@ public static partial class GameData
     // SMSG_SPELL_START forwarded so the modern client can initialize the channel bar.
     // Sourced from SpellMisc DBC (Attributes_1 & 0x44), same data as JimsPlus castbars.
     public static FrozenSet<uint> ChanneledSpells = FrozenSet<uint>.Empty;
+    // JimsProxy (strafe cancel-gap): vanilla 1.12 spells whose in-progress cast the server
+    // cancels when the caster moves — Spell.dbc InterruptFlags & SPELL_INTERRUPT_FLAG_MOVEMENT
+    // (0x01, cmangos-classic SpellDefines.h; checked in Spell::update). Gates the strafe
+    // cancel synth: ranged shots (Arcane Shot, Serpent Sting) and novelty item casts lack
+    // the flag and must NOT receive a synthesized deliberate cancel.
+    public static FrozenSet<uint> MovementInterruptibleSpells = FrozenSet<uint>.Empty;
 
     public static FrozenSet<uint> AuraSpells = FrozenSet<uint>.Empty;
     public static FrozenDictionary<uint, int> AuraDurations = FrozenDictionary<uint, int>.Empty;
@@ -426,6 +433,17 @@ public static partial class GameData
     }
 
     /// <summary>
+    /// JimsProxy (strafe cancel-gap): true if the 1.12 server cancels this spell's
+    /// in-progress cast when the caster moves (Spell.dbc InterruptFlags movement bit).
+    /// Keyed by LEGACY spell id. False for unknown ids (server-custom spells) so the
+    /// strafe cancel synth safely falls back to the server's own movement detection.
+    /// </summary>
+    public static bool IsMovementInterruptible(uint spellId)
+    {
+        return MovementInterruptibleSpells.Contains(spellId);
+    }
+
+    /// <summary>
     /// Returns the GCD duration in milliseconds triggered by the given spell on vanilla
     /// 1.12 servers. Defaults to 1500ms; rogue energy abilities and feral-druid cat-form
     /// abilities use 1000ms (loaded from Spell1sGcd1.csv). JimsProxy issue #43.
@@ -729,6 +747,18 @@ public static partial class GameData
         return new CreatureDisplayInfo(0, 1.0f);
     }
 
+    // JimsProxy (collision-visual-parity #359): the CMS the modern client actually renders
+    // with — the hotfix override when we push one (CSV/Hotfix/CreatureDisplayInfo*.csv,
+    // e.g. tauren 59/60 carry the K=0.75 render correction), else the stock DB2 value.
+    // Proxy math that must agree with the on-screen model (synthesized collision height)
+    // reads this, never the stock table alone.
+    public static float GetClientEffectiveDisplayScale(uint displayId)
+    {
+        if (HotfixCreatureDisplayScales.TryGetValue(displayId, out var hotfixScale))
+            return hotfixScale;
+        return GetDisplayInfo(displayId).DisplayScale;
+    }
+
     public static CreatureModelCollisionHeight GetModelData(uint modelId)
     {
         if (CreatureModelCollisionHeights.TryGetValue(modelId, out var info))
@@ -959,6 +989,7 @@ public static partial class GameData
             LoadOffGcdSpells,
             LoadSpell1sGcd,
             LoadChanneledSpells,
+            LoadMovementInterruptSpells,
             LoadAuraSpells,
             LoadAuraDurations,
             LoadTaxiPaths,
@@ -1481,7 +1512,11 @@ public static partial class GameData
 
     public static void LoadCreatureModelCollisionHeights()
     {
-        var path = Path.Combine("CSV", $"CreatureModelCollisionHeightsModern{LegacyVersion.ExpansionVersion}.csv");
+        LoadCreatureModelCollisionHeights(Path.Combine("CSV", $"CreatureModelCollisionHeightsModern{LegacyVersion.ExpansionVersion}.csv"));
+    }
+
+    public static void LoadCreatureModelCollisionHeights(string path)
+    {
         using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
         var dict = new Dictionary<uint, CreatureModelCollisionHeight>(EstimateRowCount<CreatureModelCollisionHeight>(path));
 
@@ -2227,6 +2262,33 @@ public static partial class GameData
         ChanneledSpells = set.ToFrozenSet();
     }
 
+    // JimsProxy (strafe cancel-gap): 1.12 Spell.dbc rows with the movement interrupt bit,
+    // extracted from the cmangos-classic original_data Spell.dbc-to-SQL conversion
+    // (InterruptFlags & 0x01). Missing file leaves the set empty, which disables the
+    // strafe cancel synth entirely (safe fallback to server-side movement detection).
+    public static void LoadMovementInterruptSpells()
+    {
+        if (LegacyVersion.ExpansionVersion > 1)
+            return;
+
+        var path = Path.Combine("CSV", $"SpellMovementInterrupt{LegacyVersion.ExpansionVersion}.csv");
+        if (!File.Exists(path))
+        {
+            Log.Print(LogType.Storage, $"WARNING: {path} not found — the strafe cancel synth " +
+                                       "is disabled. Strafe cast-cancels fall back to server-side detection.");
+            return;
+        }
+
+        using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+        var set = new HashSet<uint>(EstimateRowCount(path, 8));
+        foreach (var row in reader)
+        {
+            uint spellId = uint.Parse(row[0].Span);
+            set.Add(spellId);
+        }
+        MovementInterruptibleSpells = set.ToFrozenSet();
+    }
+
     public static void LoadAuraSpells()
     {
         var path = Path.Combine("CSV", $"AuraSpells{LegacyVersion.ExpansionVersion}.csv");
@@ -2481,12 +2543,21 @@ public static partial class GameData
     }
     public static bool IsItemEntryAlias(uint id) => id >= ItemEntryAliasBegin && id < ItemEntryAliasEnd;
 
+    // JimsProxy (Kronos Chronoboon): Kronos's custom Chronoboon Displacer item entry (dynamic server-side tooltip).
+    public const uint KronosChronoboonEntry = 25007;
+
+    // JimsProxy (chronoboon-chat-link): 25007's static proto name — Kronos V's chat anti-hack silently drops any boon link whose [name] doesn't match it, so outbound links must carry this, not the dynamic charged name.
+    public const string KronosChronoboonBaseName = "Chronoboon Displacer";
+
     // JimsProxy (Kronos Chronoboon): item GUID -> current alias entry, applied to the outgoing
     // OBJECT_FIELD_ENTRY in StoreObjectUpdateInternal. STATIC (not per-session GameState) so it SURVIVES
     // a relogin — else the alias map is wiped, the item reverts to base 25007, and the client renders its
     // stale empty-Chronoboon cache (the reported bank+relog "bugged out"). Keyed by the stable item GUID;
     // the alias records it points at also live in static stores, so the client's cached alias still renders.
     public static System.Collections.Concurrent.ConcurrentDictionary<WowGuid128, uint> ItemEntryAlias = new();
+
+    // JimsProxy (chronoboon-chat-link): latest alias minted for the local player's boon — our own echoed 25007 link rewrites to it so it renders (the client never re-queries 25007). 0 = none.
+    public static uint CurrentChronoboonAlias;
 
     // JimsProxy (Kronos Chronoboon): free a no-longer-presented alias's records so they don't accumulate
     // forever (these stores are static — across all players + whole proxy uptime). Called on the WC thread
@@ -5060,8 +5131,17 @@ public static partial class GameData
 
     public static void LoadCreatureDisplayInfoHotfixes()
     {
-        var path = Path.Combine("CSV", "Hotfix", $"CreatureDisplayInfo{ModernVersion.ExpansionVersion}.csv");
+        LoadCreatureDisplayInfoHotfixes(Path.Combine("CSV", "Hotfix", $"CreatureDisplayInfo{ModernVersion.ExpansionVersion}.csv"));
+    }
+
+    public static void LoadCreatureDisplayInfoHotfixes(string path)
+    {
         using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+        // JimsProxy (collision-visual-parity #359): retain the hotfixed CMS values in parsed
+        // form. The client renders with these (the hotfix overrides its DB2), so any proxy
+        // math that must agree with what is on screen — the synthesized player collision
+        // height — has to read the same values, not the stock CreatureDisplayInfo.csv ones.
+        var displayScales = new Dictionary<uint, float>();
         uint counter = 0;
         foreach (var row in reader)
         {
@@ -5094,6 +5174,8 @@ public static partial class GameData
             int textureVariationFileDataId1 = row[24].Parse<int>();
             int textureVariationFileDataId2 = row[25].Parse<int>();
             int textureVariationFileDataId3 = row[26].Parse<int>();
+
+            displayScales[id] = creatureModelScale;
 
             HotfixRecord record = new HotfixRecord();
             record.TableHash = DB2Hash.CreatureDisplayInfo;
@@ -5130,6 +5212,8 @@ public static partial class GameData
             record.HotfixContent.WriteInt32(textureVariationFileDataId3);
             Hotfixes.Add(record.HotfixId, record);
         }
+
+        HotfixCreatureDisplayScales = displayScales.ToFrozenDictionary();
     }
     public static void LoadCreatureDisplayInfoExtraHotfixes()
     {

@@ -64,6 +64,13 @@ public sealed class WorldSocketManager : SocketManager<WorldSocket>
                 sock.SendBufferSize = _socketSendBufferSize;
 
             // Set TCP_NODELAY.
+            // JimsProxy WARNING (2026-07-25): this class is DEAD CODE — nothing has instantiated
+            // WorldSocketManager since upstream 55e9fca8 (2022-11-26) replaced it with the generic
+            // SocketManager<T> in Server.StartServer<T>, which sets no socket options. The
+            // _tcpNoDelay=true below never executes; reading it as live configuration is exactly how
+            // the client sockets ran Nagle for 3.5 years while everyone believed they were NODELAY.
+            // The live client-socket policy is Settings.ClientTcpNoDelay, applied in the WorldSocket
+            // constructor. Candidate for deletion in a cleanup pass.
             sock.NoDelay = _tcpNoDelay;
         }
         catch (SocketException ex)

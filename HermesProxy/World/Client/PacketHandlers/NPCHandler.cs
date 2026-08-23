@@ -338,27 +338,19 @@ public partial class WorldClient
             GetSession().GameState.InFlightTrainerBuyTickMs = 0;
         }
 
+        // Server may echo either the real spell id or the learn-wrapper id depending
+        // on legacy expansion; the op matches on either.
         uint pendingSpellId = GetSession().GameState.PendingTrainerBuySpellId;
-        uint removedPredecessor = GetSession().GameState.PendingTrainerBuyRemovedPredecessor;
-        if (pendingSpellId != 0 && removedPredecessor != 0)
+        uint restoredOnFailed = GetSession().GameState.ApplyTrainerBuyFailedKnownState(buy.SpellID);
+        if (restoredOnFailed != 0)
         {
-            uint failedSpellId = buy.SpellID;
-            uint failedLearnSpellId = GetSession().GameState.GetLearnSpellFromRealSpell(pendingSpellId);
-            // Server may echo either the real spell id or the learn-wrapper id depending
-            // on legacy expansion. Match on either to be safe.
-            if (failedSpellId == pendingSpellId || failedSpellId == failedLearnSpellId)
+            Log.Event("spell.trainer_buy.predecessor_restored_on_failed", new
             {
-                GetSession().GameState.CurrentPlayerKnownSpells.Add(removedPredecessor);
-                Log.Event("spell.trainer_buy.predecessor_restored_on_failed", new
-                {
-                    real_spell_id = pendingSpellId,
-                    failed_spell_id = failedSpellId,
-                    predecessor_restored = removedPredecessor,
-                    reason = buy.TrainerFailedReason,
-                });
-            }
-            GetSession().GameState.PendingTrainerBuySpellId = 0u;
-            GetSession().GameState.PendingTrainerBuyRemovedPredecessor = 0u;
+                real_spell_id = pendingSpellId,
+                failed_spell_id = buy.SpellID,
+                predecessor_restored = restoredOnFailed,
+                reason = buy.TrainerFailedReason,
+            });
         }
     }
 

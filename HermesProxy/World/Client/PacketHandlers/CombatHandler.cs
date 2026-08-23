@@ -34,30 +34,51 @@ public partial class WorldClient
         var state = GetSession().GameState;
         if (attack.Attacker == state.CurrentPlayerGuid)
         {
-            if (state.DeferredAttackStop)
+            // JimsProxy (#450): the server's own player stop arrived while our preemptive stop
+            // was still armed. This packet forwards below — consume the armed one so the drain
+            // flush can't follow it with a duplicate.
+            state.TryConsumePreemptAttackStop(attack.Attacker, attack.Victim);
+
+            // All handshake bookkeeping lives in GameSessionData.ApplyLocalPlayerAttackStop
+            // (pure, unit-tested). We only own the socket side: forwarding a stop that was
+            // deferred behind an in-flight swing handshake.
+            var pinnedBefore = state.CurrentAttackTarget;
+            var outcome = state.ApplyLocalPlayerAttackStop(rawVictim);
+
+            if (outcome == PlayerAttackStopOutcome.FlushDeferredStop)
             {
-                state.DeferredAttackStop = false;
-                state.CurrentAttackTarget = default;
                 WorldPacket stopPacket = new WorldPacket(Opcode.CMSG_ATTACK_STOP);
                 SendPacketToServer(stopPacket, Opcode.MSG_NULL_ACTION);
             }
-            else if (!state.WaitingForAttackStart)
+            else if (outcome == PlayerAttackStopOutcome.ClearRejectedHandshake &&
+                     rawVictim == WowGuid64.Empty)
             {
-                // Server-initiated stop without our SWING: Gouge / Cheap Shot / Blind /
-                // Feign Death / stealth / Vanish. Must clear CurrentAttackTarget here or
-                // the next CMSG_ATTACK_SWING gets eaten by the dedupe guard at Server/CombatHandler.cs:16.
-                state.CurrentAttackTarget = default;
+                // TEMP-DIAG (#464 follow-up) — REMOVE once the trigger has a clean repro.
+                // Until then this measures how often the condition fires during DEV testing;
+                // delete this block, LastAttackSwingSentTick, and its stamp in
+                // Server/PacketHandlers/CombatHandler.cs together.
+                //
+                // JimsProxy (#464 follow-up): the exact condition #464 fixes — the legacy server
+                // refused our swing with a victim-less SMSG_ATTACKSTOP while the swing handshake
+                // was still in flight. Before #464 this pinned CurrentAttackTarget forever and the
+                // de-dupe guard ate every retry, so the player could never auto-attack that unit
+                // again (wire-confirmed 2026-08-12: a full fight with zero player swings).
+                //
+                // DebugOutput-gated per the diagnostics policy: this is a dev-testing
+                // instrument (devs run DebugOutput on), not field telemetry. ms_since_swing
+                // ~200ms = the charge race; a large value would be a different animal.
+                if (Framework.Settings.DebugOutput)
+                {
+                    Framework.Logging.Log.Event("combat.attack_stop_empty_victim_cleared", new
+                    {
+                        pinned_victim_low = pinnedBefore.GetCounter(),
+                        ms_since_swing = state.LastAttackSwingSentTick != 0
+                            ? Environment.TickCount64 - state.LastAttackSwingSentTick
+                            : -1,
+                        now_dead = attack.NowDead,
+                    });
+                }
             }
-            else if (rawVictim == state.CurrentAttackTarget)
-            {
-                // Server rejected our SWING with ATTACK_STOP (no prior ATTACK_START):
-                // target died or became invalid between our SWING and server processing.
-                // Clear the state so the de-dupe guard doesn't eat future attacks.
-                state.WaitingForAttackStart = false;
-                state.CurrentAttackTarget = default;
-            }
-            // else: WaitingForAttackStart is true but victim != CurrentAttackTarget —
-            // target-switch sequence, the new SWING already set CurrentAttackTarget.
         }
 
         SendPacketToClient(attack);
@@ -137,6 +158,13 @@ public partial class WorldClient
         }
 
         SendPacketToClient(attack);
+
+        // JimsProxy (#450): if this hit is the local player's killing blow on the victim whose
+        // preemptive stop is armed (Kronos sends the blow AFTER PARTY_KILL_LOG), release the
+        // stop now — hit first, then stop — so the modern client folds the blow into the swing
+        // it's already playing instead of re-swinging at the corpse seconds later.
+        if (GetSession().GameState.TryConsumePreemptAttackStop(attack.AttackerGUID, attack.VictimGUID))
+            SendPreemptAttackStop(attack.VictimGUID, "asu");
 
         // JimsProxy (#320): on a real swing for the local player, record the swing time
         // and flush any deferred BASEATTACKTIME so the speed change reaches the addon at
@@ -306,27 +334,51 @@ public partial class WorldClient
         // attack state so a swing-start handshake / target-switch (owned by PR #321's
         // SMSG_ATTACK_STOP handling) is never disturbed; the real stop ~200ms later is a no-op.
         // Same shape as the movement-cancel preempt (Server/PacketHandlers/MovementHandler.cs).
+        //
+        // JimsProxy (#450): the stop is ARMED here, not emitted. Kronos sends the melee killing
+        // blow's SMSG_ATTACKER_STATE_UPDATE *after* PARTY_KILL_LOG in the same burst, and a stop
+        // emitted between the kill and that hit makes the modern client re-play the hit as a
+        // fresh swing on the corpse — floating text + swing sound seconds late, after the loot
+        // window is already open. HandleAttackerStateUpdate flushes the armed stop right after
+        // forwarding the trailing hit; the receive loop flushes at socket drain when no hit trails.
         if (state.TryClearSettledAttackTargetOnDeath(rawVictim))
         {
-            SAttackStop stop = new();
-            stop.Attacker = state.CurrentPlayerGuid;
-            stop.Victim = log.Victim;
-            stop.NowDead = true; // proven by PARTY_KILL_LOG
-            SendPacketToClient(stop);
-
-            Framework.Logging.Log.Event("combat.attack_stop_preempted", new
-            {
-                victim_low = log.Victim.GetCounter(),
-                trigger = "party_kill_log",
-            });
+            var priorArmed = state.ArmPreemptAttackStop(log.Victim);
+            if (priorArmed != default)
+                SendPreemptAttackStop(priorArmed, "rearm"); // multi-kill burst: flush the older stop before re-arming
         }
 
         // Mob just died — drop its threat list immediately so the modern
         // client's threat APIs go quiet on this unit instead of waiting for
-        // the corpse-despawn SMSG_DESTROY_OBJECT.
-        GetSession().ThreatTracker.ClearMob(log.Victim);
+        // the corpse-despawn SMSG_DESTROY_OBJECT. OnMobKilled also tombstones
+        // the guid so the trailing killing-blow ASU can't resurrect the dead
+        // mob's threat list (#450).
+        GetSession().ThreatTracker.OnMobKilled(log.Victim);
 
         // JimsProxy (observed-bow retract): the victim's death is a terminal stop edge — lower the bow of any observed shooter aimed at it (a corpse can't be shot, so this can't be contradicted).
         RetractObservedShootersOnUnitDeath(log.Victim);
+    }
+
+    // JimsProxy (#450): emit the armed preemptive player SMSG_ATTACK_STOP (see
+    // HandlePartyKillLog for why it's held). flush names the trigger that released it:
+    //   "asu"   — right after forwarding the trailing killing-blow ATTACKER_STATE_UPDATE
+    //             (the common Kronos melee-kill shape)
+    //   "drain" — legacy socket had no more buffered packets (no trailing hit, e.g. a
+    //             spell killing blow)
+    //   "rearm" — a second kill armed before the first flushed (multi-kill burst)
+    internal void SendPreemptAttackStop(WowGuid128 victim, string flush)
+    {
+        SAttackStop stop = new();
+        stop.Attacker = GetSession().GameState.CurrentPlayerGuid;
+        stop.Victim = victim;
+        stop.NowDead = true; // proven by PARTY_KILL_LOG
+        SendPacketToClient(stop);
+
+        Framework.Logging.Log.Event("combat.attack_stop_preempted", new
+        {
+            victim_low = victim.GetCounter(),
+            trigger = "party_kill_log",
+            flush,
+        });
     }
 }

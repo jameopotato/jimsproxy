@@ -75,6 +75,23 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
 
     public WorldSocket(Socket socket) : base(socket)
     {
+        // JimsProxy (client-socket delivery restore): apply the NoDelay policy HERE, on the live
+        // accept path — the generic SocketManager<T> accept chain sets no socket options, and
+        // WorldSocketManager (which reads as if it applies NoDelay=true) is dead code that nothing
+        // instantiates since upstream 55e9fca8 (2022-11-26). The prior value is logged so every
+        // session carries runtime proof of the socket state — this exact belief-vs-reality gap went
+        // unnoticed for 3.5 years because nothing ever measured it. See Settings.ClientTcpNoDelay.
+        try
+        {
+            bool prior = socket.NoDelay;
+            socket.NoDelay = Framework.Settings.ClientTcpNoDelay;
+            Framework.Logging.Log.Event("client_socket.nodelay", new { prior, now = socket.NoDelay });
+        }
+        catch (Exception e)
+        {
+            Framework.Logging.Log.Event("client_socket.nodelay_error", new { error = e.Message });
+        }
+
         _connectType = ConnectionType.Realm;
         _serverChallenge = Array.Empty<byte>().GenerateRandomKey(16);
         _worldCrypt = new WorldCrypt();
@@ -349,10 +366,23 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
 
                 break;
             case Opcode.CMSG_ENABLE_NAGLE:
-                // Ignore: the proxy always needs TCP_NODELAY=true for low-latency
-                // forwarding. The packet is still processed (AES-GCM nonce stays in
-                // sync) but we don't obey the client's request to re-enable Nagle.
-                // Sent when the user unchecks "Optimize Network for Speed" in WoW.
+                // Deliberately process-without-obeying — with the CORRECT rationale this time
+                // (2026-07-25). The old comment claimed "the proxy always needs TCP_NODELAY=true",
+                // which described configuration dead since upstream 55e9fca8 (2022-11); ignoring was
+                // then a no-op. But ignore IS the right policy for this leg: the checkbox's intent
+                // ("Optimize Network for Speed" unchecked = trade latency for less traffic on MY
+                // internet link) maps to the WAN leg in our topology — proxy->server, which keeps
+                // its own pinned NODELAY (WorldClient; the preserved half of 73ba505d). This socket
+                // is the LOOPBACK leg: Nagle conserves nothing on 127.0.0.1 and only re-enters the
+                // kernel-batched delivery regime that shipped the 2022-2026 bad era — silently, for
+                // exactly the users fiddling with network settings because something already feels
+                // off. The opcode is advisory (TCP options are not negotiated on the wire), so the
+                // client cannot observe non-compliance. The legitimate "I want batched delivery"
+                // escape hatch is ClientTcpNoDelay=false — explicit and logged — not a client
+                // checkbox that means something else in a proxied setup. The packet still flows
+                // through decryption so the AES-GCM nonce counter stays in sync (Xian55 2960e779),
+                // and receipt is logged for visibility into how many users actually uncheck the box.
+                Log.Event("client_socket.nagle_requested", new { honored = false, connection = _connectType.ToString() });
                 break;
             case Opcode.CMSG_CONNECT_TO_FAILED:
                 ConnectToFailed connectToFailed = new(packet);
@@ -551,6 +581,22 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         if (GetSession() != null)
             packet.LogPacket(ref GetSession().ModernSniff);
 
+        // JimsProxy (worldentry stage-0 tripwire 2026-08-02): record everything sent
+        // to the modern client while a world-transfer loading screen is up
+        // (TRANSFER_PENDING → WORLD_PORT_RESPONSE). The client silently discards
+        // state addressed to movers it hasn't created yet (documented precedent:
+        // stuck-logout-stun create-baked root), so the window's contents are the
+        // candidate discard set for the whole stuck-state family. Cost when idle is
+        // the DebugOutput check plus two bool reads; this is the sole choke point
+        // for every packet to the modern client (legacy-forwarded, synthesized, and
+        // the pre-instance-socket queue flush all end here).
+        if (Framework.Settings.DebugOutput && GetSession() != null)
+        {
+            var gameState = GetSession().GameState;
+            if (gameState != null && (gameState.IsWaitingForNewWorld || gameState.IsWaitingForWorldPortAck))
+                LogWorldEntryWindowForward(gameState, packet);
+        }
+
         lock (_sendLock)
         {
             var data = packet.GetData()!;
@@ -596,6 +642,76 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
 
             AsyncWrite(byteBuffer.GetData());
         }
+    }
+
+    // JimsProxy (worldentry stage-0 tripwire): per-window cap on individual forward
+    // lines; window.closed reports how many were suppressed so the truncation is
+    // never silent. Keeps a pathological window from flooding the JSONL.
+    internal const int WorldEntryForwardLineCap = 1000;
+
+    // Cached per-packet-type lookup of the conventional `public WowGuid128 MoverGUID`
+    // field carried by the movement/force packet classes. Reflection runs once per
+    // type, and only inside a transfer window with DebugOutput on — never on the
+    // normal-play hot path.
+    static readonly ConcurrentDictionary<Type, FieldInfo?> _worldEntryMoverGuidFields = new();
+
+    void LogWorldEntryWindowForward(GameSessionData gameState, ServerPacket packet)
+    {
+        int line = Interlocked.Increment(ref gameState.WorldEntryWindowForwardCount);
+        if (line > WorldEntryForwardLineCap)
+        {
+            if (line == WorldEntryForwardLineCap + 1)
+            {
+                Log.Event("worldentry.window.forward_cap", new
+                {
+                    seq = gameState.WorldEntryWindowSeq,
+                    cap = WorldEntryForwardLineCap,
+                });
+            }
+            return;
+        }
+
+        bool preNewWorld = gameState.IsWaitingForNewWorld;
+        long anchor = preNewWorld ? gameState.WorldEntryTransferPendingTick : gameState.WorldEntryNewWorldTick;
+
+        var moverField = _worldEntryMoverGuidFields.GetOrAdd(packet.GetType(),
+            static t => t.GetField("MoverGUID", BindingFlags.Public | BindingFlags.Instance));
+        WowGuid128? mover = moverField?.GetValue(packet) is WowGuid128 guid ? guid : null;
+
+        Log.Event("worldentry.window.forward", new
+        {
+            seq = gameState.WorldEntryWindowSeq,
+            phase = preNewWorld ? "pre_new_world" : "awaiting_ack",
+            conn = packet.GetConnection().ToString(),
+            opcode = packet.GetUniversalOpcode().ToString(),
+            size = packet.GetData()?.Length ?? 0,
+            ms = anchor != 0 ? Environment.TickCount64 - anchor : -1,
+            mover_low = mover?.GetCounter(),
+            mover_is_self = mover.HasValue ? mover.Value == gameState.CurrentPlayerGuid : (bool?)null,
+        });
+    }
+
+    // JimsProxy (worldentry stage-0 tripwire): client-side readiness signals with
+    // window-relative timing — answers whether WORLD_PORT_RESPONSE is the right
+    // replay trigger for a future hold-and-replay contract, or whether readiness
+    // actually lands later (LOADING_SCREEN_NOTIFY / INIT_ACTIVE_MOVER_COMPLETE).
+    internal void LogWorldEntryClientSignal(string signal, object? detail = null)
+    {
+        if (!Framework.Settings.DebugOutput)
+            return;
+        var gameState = GetSession()?.GameState;
+        if (gameState == null)
+            return;
+        Log.Event("worldentry.client_signal", new
+        {
+            signal,
+            seq = gameState.WorldEntryWindowSeq,
+            window_open = gameState.IsWaitingForNewWorld || gameState.IsWaitingForWorldPortAck,
+            ms_since_new_world = gameState.WorldEntryNewWorldTick != 0
+                ? Environment.TickCount64 - gameState.WorldEntryNewWorldTick
+                : -1,
+            detail,
+        });
     }
 
     public uint CompressPacket(byte[] data, ushort opcode, out byte[] outData)

@@ -100,7 +100,21 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_LOADING_SCREEN_NOTIFY)]
     void HandleLoadScreen(LoadingScreenNotify loadingScreenNotify)
     {
-        if (loadingScreenNotify.MapID >= 0)
+        LogWorldEntryClientSignal("loading_screen_notify", new
+        {
+            showing = loadingScreenNotify.Showing,
+            map_id = loadingScreenNotify.MapID,
+        });
+
+        // JimsProxy (camp login-eviction merge follow-up): only take the client's
+        // word for the map when we have nothing better. The notify echoes the map
+        // the client OPENED its loading screen with (char-list map at login), not
+        // where the server actually put it — on a merged eviction login (map 36
+        // login rewritten to the map 0 destination) this write was clobbering the
+        // correct server-derived CurrentMapId with the stale instance map. Server
+        // sources (LOGIN_VERIFY_WORLD / NEW_WORLD / INIT_WORLD_STATES) are
+        // authoritative and always follow.
+        if (loadingScreenNotify.MapID >= 0 && GetSession().GameState.CurrentMapId == null)
             GetSession().GameState.CurrentMapId = loadingScreenNotify.MapID;
 
         //MIRASU: /reload on the 1.14.2 client fires CMSG_LOADING_SCREEN_NOTIFY(Showing=true)
@@ -310,7 +324,11 @@ public partial class WorldSocket
         GetSession().GameState.StuckStunDetectedThisLogin = false;
         GetSession().GameState.StuckStunCancelArmed = false;
         GetSession().GameState.AwaitingSynthLogoutCancelAck = false;
+        // JimsProxy (feared-while-sitting, #479): fresh login → CC-onset edge tracker restarts.
+        GetSession().GameState.LastLocalFearConfuseFlags = 0;
         GetSession().GameState.CurrentPlayerGuid = playerLogin.Guid;
+        // JimsProxy (chronoboon-chat-link): static global survives char switches — reset so no char inherits the previous char's boon alias; this char's boon re-mints and re-sets it at login item-create.
+        GameData.CurrentChronoboonAlias = 0;
         GetSession().GameState.CurrentPlayerInfo = GetSession().GameState.OwnCharacters.Single(x => x.CharacterGuid == playerLogin.Guid);
         GetSession().GameState.CurrentPlayerStorage.LoadCurrentPlayer();
 

@@ -284,6 +284,11 @@ public partial class WorldClient
         failure.Item[1] = packet.ReadGuid().To128(GetSession().GameState);
         failure.ContainerBSlot = packet.ReadUInt8();
 
+        // JimsProxy (#442): the fallback pairing below must see whether the WIRE carried an empty
+        // GUID — the move-backfill next rewrites failure.Item[0], and gating on the rewritten
+        // value would silently disable the fallback for 2 s after every forwarded bag move.
+        bool wireItem0Empty = failure.Item[0].IsEmpty();
+
         // JimsProxy: Kronos sends invalid-slot rejections (e.g. the modern client's phantom
         // keyring slots 13-32 that the server lacks) with empty item GUIDs, so the client
         // can't unlock the item the player picked up and it stays stuck until relog. Backfill
@@ -304,6 +309,33 @@ public partial class WorldClient
         if (GetSession().GameState.TryDequeueItemCast(failure.Item[0], out var pendingCast))
         {
             GetSession().InstanceSocket.SendCastRequestFailed(pendingCast!, false);
+            Log.Event("cast.item_use_rejected_by_inventory", new
+            {
+                result = (uint)failure.BagResult,
+                dequeued_via = "guid",
+                evicted_spell_id = pendingCast!.SpellId,
+            });
+        }
+        // JimsProxy (#442): Kronos also rejects USE_ITEM itself this way — with EMPTY item GUIDs
+        // (observed live 2026-07-29: a duplicate use straddling its predecessor's SPELL_GO,
+        // rejected with result 23/ItemNotFound, both GUIDs zero). The GUID dequeue above can't
+        // match those, and the orphaned entry then jams HasForwardedPendingCast (every on-GCD
+        // press silently parked until relog/map change) and keeps that item unusable via
+        // HasInFlightNormalCastForSpell. Pair the anonymous rejection with the oldest unresolved
+        // item-use entry instead and release its button silently. See
+        // TryDequeueOldestUnstartedItemCast for the FIFO rationale and the two-items edge.
+        // Gated on the pre-backfill wire GUID (wireItem0Empty), NOT failure.Item[0] — see above.
+        else if (wireItem0Empty &&
+                 GetSession().GameState.TryDequeueOldestUnstartedItemCast(out var orphanedItemCast))
+        {
+            GetSession().InstanceSocket.SendCastRequestFailed(orphanedItemCast!, false, SpellCastResultClassic.DontReport);
+            Log.Event("cast.item_use_rejected_by_inventory", new
+            {
+                result = (uint)failure.BagResult,
+                dequeued_via = "fifo_fallback",
+                evicted_spell_id = orphanedItemCast!.SpellId,
+                evicted_item_guid = orphanedItemCast.ItemGUID.ToString(),
+            });
         }
     }
     [PacketHandler(Opcode.SMSG_INVENTORY_CHANGE_FAILURE, ClientVersionBuild.V2_0_1_6180)]
@@ -341,6 +373,25 @@ public partial class WorldClient
         if (GetSession().GameState.TryDequeueItemCast(failure.Item[0], out var pendingCast))
         {
             GetSession().InstanceSocket.SendCastRequestFailed(pendingCast!, false);
+            Log.Event("cast.item_use_rejected_by_inventory", new
+            {
+                result = (uint)failure.BagResult,
+                dequeued_via = "guid",
+                evicted_spell_id = pendingCast!.SpellId,
+            });
+        }
+        // JimsProxy (#442): same empty-GUID rejection fallback as the vanilla handler above.
+        else if (failure.Item[0].IsEmpty() &&
+                 GetSession().GameState.TryDequeueOldestUnstartedItemCast(out var orphanedItemCast))
+        {
+            GetSession().InstanceSocket.SendCastRequestFailed(orphanedItemCast!, false, SpellCastResultClassic.DontReport);
+            Log.Event("cast.item_use_rejected_by_inventory", new
+            {
+                result = (uint)failure.BagResult,
+                dequeued_via = "fifo_fallback",
+                evicted_spell_id = orphanedItemCast!.SpellId,
+                evicted_item_guid = orphanedItemCast.ItemGUID.ToString(),
+            });
         }
     }
     [PacketHandler(Opcode.SMSG_DURABILITY_DAMAGE_DEATH)]
@@ -368,14 +419,67 @@ public partial class WorldClient
         sell.Reason = packet.ReadUInt8();
         SendPacketToClient(sell);
     }
+    // (temp-enchant-0s-after-relogin): legacy Prop slots sit at different indices than
+    // the modern layout (vanilla 3.., TBC 6.., WotLK 7.. → modern 8..); every slot
+    // below the Prop block (Perm/Temp/Sock/Bonus/Prismatic) shares its index. Timed
+    // enchants live in Temp=1, so the old raw passthrough happened to work for them.
+    internal static uint TranslateEnchantmentSlotToModern(uint legacySlot)
+    {
+        int firstProp, max;
+        if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+        {
+            firstProp = Enums.Vanilla.EnchantmentSlot.Prop0;
+            max = Enums.Vanilla.EnchantmentSlot.Max;
+        }
+        else if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V3_0_2_9056))
+        {
+            firstProp = Enums.TBC.EnchantmentSlot.Prop0;
+            max = Enums.TBC.EnchantmentSlot.Max;
+        }
+        else
+        {
+            firstProp = Enums.WotLK.EnchantmentSlot.Prop0;
+            max = Enums.WotLK.EnchantmentSlot.Max;
+        }
+
+        if (legacySlot >= firstProp && legacySlot < max)
+            return (uint)(Enums.Classic.EnchantmentSlot.Prop0 + ((int)legacySlot - firstProp));
+        return legacySlot;
+    }
+
     [PacketHandler(Opcode.SMSG_ITEM_ENCHANT_TIME_UPDATE)]
     void HandleItemEnchantTimeUpdate(WorldPacket packet)
     {
         ItemEnchantTimeUpdate enchant = new ItemEnchantTimeUpdate();
         enchant.ItemGuid = packet.ReadGuid().To128(GetSession().GameState);
-        enchant.Slot = packet.ReadUInt32();
+        uint legacySlot = packet.ReadUInt32();
+        enchant.Slot = TranslateEnchantmentSlotToModern(legacySlot);
         enchant.DurationLeft = packet.ReadUInt32();
         enchant.OwnerGuid = packet.ReadGuid().To128(GetSession().GameState);
+
+        // (temp-enchant-0s-after-relogin): at login vanilla cores push this BEFORE the
+        // item's create block — it is the only carrier of the enchant's remaining time
+        // (the create's duration field is zero) and the modern client discards updates
+        // for guids it has not constructed, leaving the buff flashing a permanent "0s".
+        // Stash pre-create pushes only; the item-create translation consumes them into
+        // the create's duration field. Forward when the item already exists client-side —
+        // the forward path never needs the stash, and storing there would leave a
+        // never-consumed entry per enchanted item until logout.
+        if (GetSession().GameState.GetCachedObjectFieldsLegacy(enchant.ItemGuid) == null)
+        {
+            GetSession().GameState.StorePendingItemEnchantDuration(enchant.ItemGuid, legacySlot, enchant.DurationLeft, Environment.TickCount);
+            if (Framework.Settings.DebugOutput)
+            {
+                Log.Event("enchant.duration.stashed_precreate", new
+                {
+                    item_guid = enchant.ItemGuid.ToString(),
+                    legacy_slot = legacySlot,
+                    duration_seconds = enchant.DurationLeft,
+                });
+            }
+            return;
+        }
+
         SendPacketToClient(enchant);
     }
 

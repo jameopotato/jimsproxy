@@ -363,6 +363,28 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_SEND_TEXT_EMOTE)]
     void HandleSendTextEmote(CTextEmote emote)
     {
+        // JimsProxy (#244): vanilla HandleTextEmoteOpcode interrupts channels
+        // and strips auras flagged ANIM_CANCELS for every anim-bearing text
+        // emote (vmangos ChatHandler.cpp — only sleep/sit/kneel/none are
+        // exempt). The 1.14 client happily sends /clap mid-channel; forwarding
+        // it cancels bandage-class channels on Kronos (wire-verified: channel
+        // dies one RTT after the emote). Drop text emotes while our channel
+        // window is open — the proxy can't tell anim-bearing from chat-only
+        // (no EmotesText anim mapping loaded), and a few seconds of silence
+        // beats a canceled channel. NOTE: silently DROPPED, not queued — the
+        // emote never fires, even after the channel ends. Whether true 1.14
+        // behavior wants queue-and-release instead is an open question on
+        // #244 (awaiting a Blizzard Classic Era test); revisit if answered.
+        if (GetSession().GameState.IsLocalChannelWindowOpen())
+        {
+            Log.Event("emote.text.dropped_channeling", new
+            {
+                text_emote_id = emote.EmoteID,
+                channel_spell = GetSession().GameState.LocalChannelSpellId,
+            });
+            return;
+        }
+
         var target = emote.Target;
 
         if (emote.EmoteID == TEXTEMOTE_SPIT && target.IsEmpty())
@@ -533,7 +555,10 @@ public partial class WorldSocket
 
         if (body == "0" || body == "1")
         {
-            GetSession().GameState.JimsPlusSideband = body == "1";
+            var gs = GetSession().GameState;
+            gs.JimsPlusSideband = body == "1";
+            if (body == "1")
+                gs.JimsPlusSidebandAffirmedMs = Environment.TickCount64;
             return;
         }
 

@@ -124,17 +124,14 @@ public partial class WorldSocket
             GameData.SpellRankPredecessor.TryGetValue(realSpellId, out uint predecessor) &&
             predecessor != 0)
         {
-            var known = GetSession().GameState.CurrentPlayerKnownSpells;
-            bool removed = known.Remove(predecessor);
-            GetSession().GameState.PendingTrainerBuySpellId = realSpellId;
-            GetSession().GameState.PendingTrainerBuyRemovedPredecessor = removed ? predecessor : 0u;
+            bool removed = GetSession().GameState.ApplyTrainerBuyPredecessorRemoval(realSpellId, predecessor);
             Log.Event("spell.trainer_buy.predecessor_speculatively_removed", new
             {
                 real_spell_id = realSpellId,
                 learn_spell_id = buy.SpellID,
                 predecessor_spell_id = predecessor,
                 was_in_known_set = removed,
-                known_count = known.Count,
+                known_count = GetSession().GameState.CurrentPlayerKnownSpells.Count,
             });
         }
         else

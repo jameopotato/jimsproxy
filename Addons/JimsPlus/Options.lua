@@ -164,6 +164,11 @@ y = y - 28
 local cbMoonkinSound = CreateCheckbox(panel, y,
     "Moonkin Form sound  |cFF888888(Druid only)|r",
     "Gives Moonkin Form a distinct transformation sound instead\nof reusing the Bear Form sound.\n\nOnly affects Druid characters.")
+y = y - 28
+
+local cbBowSheathe = CreateCheckbox(panel, y,
+    "Show 2H weapon on back with a bow",
+    "Fixes a 1.14 client bug where a sheathed two-handed weapon\n(and your quiver) disappears from your back after combat while\na bow is equipped (guns and crossbows are unaffected).\n\nYour character puts the bow away a few seconds after combat\nends; if the client sheathes on its own first, the addon instantly\nre-sheathes to restore the models.\n\nTakes effect immediately.")
 y = y - 40
 
 ---------------------------------------------------------------------------
@@ -187,6 +192,12 @@ for _, info in ipairs(castbarUnits) do
     castbarCBs[info.key] = CreateCheckbox(panel, y, info.label, info.tooltip)
     y = y - 28
 end
+
+y = y - 4
+local cbPerf = CreateCheckbox(panel, y,
+    "Performance Mode  |cFFFFD100(suspends cast bars)|r",
+    "For crowded fights (battlegrounds, big pulls) where FPS tanks: fully suspends the\ncast-bar engine — stops rendering, stops per-event tracking, and tells the proxy to\nstop sending cast data entirely. Toggle on when it's a zerg, off when it clears.\n\nAll other JimsPlus fixes stay active. Shortcut: /jp perf")
+y = y - 32
 
 ---------------------------------------------------------------------------
 -- Tools
@@ -213,6 +224,7 @@ local function RefreshCheckboxes()
     local db = namespace.db or JimsPlusDB or {}
     cbTooltipFix:SetChecked(db.tooltipFix == true)
     cbMoonkinSound:SetChecked(db.moonkinSound ~= false)
+    cbBowSheathe:SetChecked(db.bowSheatheFix ~= false)
     cbBagSort:SetChecked(db.bagSortOrder ~= false)
 
     local cdb = JimsPlusCastbars and JimsPlusCastbars.db
@@ -222,6 +234,8 @@ local function RefreshCheckboxes()
             castbarCBs[info.key]:SetChecked(unitDB and unitDB.enabled and true or false)
         end
     end
+
+    cbPerf:SetChecked((namespace.db and namespace.db.performanceMode) and true or false)
 end
 panel:SetScript("OnShow", RefreshCheckboxes)
 panel.refresh = RefreshCheckboxes
@@ -254,12 +268,25 @@ cbMoonkinSound:SetScript("OnClick", function(self)
     print("|cFF00FF00[JimsPlus]|r Moonkin Form sound " .. (enabled and "enabled" or "disabled") .. ". Type /reload to apply.")
 end)
 
+-- JimsProxy (bow sheathe fix): purely addon-side (BowSheatheFix.lua re-sheathe nudge), read live from db
+cbBowSheathe:SetScript("OnClick", function(self)
+    local enabled = self:GetChecked() and true or false
+    if namespace.db then
+        namespace.db.bowSheatheFix = enabled
+    end
+    print("|cFF00FF00[JimsPlus]|r Bow 2H-sheathe fix " .. (enabled and "enabled" or "disabled") .. ".")
+end)
+
 cbBagSort:SetScript("OnClick", function(self)
     local enabled = self:GetChecked() and true or false
     if namespace.db then
         namespace.db.bagSortOrder = enabled
     end
     print("|cFF00FF00[JimsPlus]|r Custom bag sort order " .. (enabled and "enabled" or "disabled") .. ".")
+end)
+
+cbPerf:SetScript("OnClick", function(self)
+    namespace:SetPerformanceMode(self:GetChecked() and true or false)
 end)
 
 for _, info in ipairs(castbarUnits) do
@@ -284,7 +311,13 @@ InterfaceOptions_AddCategory(panel)
 
 SLASH_JIMSPLUS1 = "/jimsplus"
 SLASH_JIMSPLUS2 = "/jp"
-SlashCmdList["JIMSPLUS"] = function()
+SlashCmdList["JIMSPLUS"] = function(msg)
+    msg = (msg or ""):lower():gsub("%s+", "")
+    if msg == "perf" or msg == "performance" then
+        namespace:SetPerformanceMode(not (namespace.db and namespace.db.performanceMode))
+        if panel.refresh then panel.refresh() end
+        return
+    end
     InterfaceOptionsFrame_OpenToCategory(panel)
     InterfaceOptionsFrame_OpenToCategory(panel)
 end

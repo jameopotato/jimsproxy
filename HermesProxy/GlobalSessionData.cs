@@ -69,6 +69,21 @@ public enum DeferredTransportSynthMode
     Login = 2,
 }
 
+// JimsProxy (empty-victim wedge): what an SMSG_ATTACK_STOP naming the local player did to the
+// auto-attack handshake state. Returned by GameSessionData.ApplyLocalPlayerAttackStop so the
+// socket layer only has to decide whether to forward a CMSG_ATTACK_STOP.
+public enum PlayerAttackStopOutcome
+{
+    /// A CMSG_ATTACK_STOP was deferred behind an in-flight swing handshake — caller forwards it now.
+    FlushDeferredStop = 0,
+    /// Settled auto-attack stopped by the server (Gouge, Blind, Vanish, ...) — target cleared.
+    ClearSettledTarget = 1,
+    /// The server rejected our swing (matching victim, or an empty victim) — handshake cleared.
+    ClearRejectedHandshake = 2,
+    /// Stop for the OLD target mid target-switch — the newer swing's target is preserved.
+    PreserveTargetSwitch = 3,
+}
+
 public sealed class GameSessionData
 {
     public bool HasWsgHordeFlagCarrier;
@@ -86,6 +101,11 @@ public sealed class GameSessionData
     // haven't forwarded one yet this session — first request always passes.
     public long LastForwardedPvpLogDataTickMs;
     public bool JimsPlusSideband;
+    // JimsProxy (Performance Mode / handshake expiry): Environment.TickCount64 of the last "JP"/"1"
+    // affirmation from the addon (0 = never). The JimsPlus addon heartbeats the handshake every
+    // ~30s; if we stop hearing it (addon disabled or crashed) the sideband expires, so we don't
+    // keep streaming raw JP_ chat that the now-absent client-side filter can no longer suppress.
+    public long JimsPlusSidebandAffirmedMs;
     public bool ChannelDisplayList;
     public bool ShowPlayedTime;
     public bool IsInFarSight;
@@ -111,6 +131,15 @@ public sealed class GameSessionData
     // by hardcoding 7.0f. Default true: a player who has never been CC'd is
     // always in control, so the natural login state is "has control already."
     public bool LastObservedHasControl = true;
+    // JimsProxy (feared-while-sitting, issue #479): the local player's stand state
+    // (UNIT_FIELD_BYTES_1 byte 0) as last written by the legacy server, read from the
+    // legacy field cache. Gate input for the synthesized stand-up on incoming fear.
+    public uint GetLocalPlayerStandState() =>
+        GetLegacyFieldValueUInt32(CurrentPlayerGuid, UnitField.UNIT_FIELD_BYTES_1) & 0xFF;
+    // JimsProxy (feared-while-sitting, issue #479): rising-edge tracker for the CC-onset
+    // fallback — the Fleeing|Confused bits of the local player's UNIT_FIELD_FLAGS as of
+    // the last FLAGS write. Reset at CMSG_PLAYER_LOGIN.
+    public uint LastLocalFearConfuseFlags;
     // JimsProxy (speed-stuck-after-fear-while-mounted): cached for reassert; see memory.
     public float LastKnownPlayerRunSpeed = 7.0f;
     // JimsProxy (speed-stuck-after-bg-end-while-mounted): deferred reassert flag; see memory.
@@ -131,9 +160,58 @@ public sealed class GameSessionData
     // a stop SMSG_EMOTE on the first movement-start packet.
     public uint LastLoopingEmoteId; // 0 means no active loop
     public long LastLoopingEmoteTickMs;
+    // JimsProxy (#244 emote channel guard): the local player's active channel
+    // window, tracked from MSG_CHANNEL_START / MSG_CHANNEL_UPDATE (vanilla
+    // sends both only to the caster). Text-emote forwards are dropped while it
+    // is open — vanilla's HandleTextEmoteOpcode interrupts channels and strips
+    // auras flagged ANIM_CANCELS for every anim-bearing text emote (vmangos
+    // ChatHandler.cpp), which is how /clap killed bandages. End-time bounded by
+    // the start's own duration so a missed 0-update can never wedge the guard
+    // permanently.
+    public uint LocalChannelSpellId; // 0 means not channeling
+    public long LocalChannelEndTickMs;
+
+    /// <summary>True while the local player's channel window (tracked from
+    /// MSG_CHANNEL_START/UPDATE) is open, with a small grace margin. Used to
+    /// drop c2s text-emote forwards — mangos-family emote handlers interrupt
+    /// channels and strip auras flagged ANIM_CANCELS (#244).</summary>
+    public bool IsLocalChannelWindowOpen()
+    {
+        return LocalChannelSpellId != 0 &&
+               Environment.TickCount64 < LocalChannelEndTickMs + 2000;
+    }
     public string? TaxiAttemptId;
     public bool IsWaitingForNewWorld;
     public bool IsWaitingForWorldPortAck;
+    // JimsProxy (worldentry stage-0 tripwire 2026-08-02): telemetry anchors for the
+    // world-transfer loading-screen window (SMSG_TRANSFER_PENDING → SMSG_NEW_WORLD →
+    // CMSG_WORLD_PORT_RESPONSE). Everything forwarded to the modern client inside
+    // this window is suspected of being silently discarded for movers the client has
+    // not created yet (documented precedent: the stuck-logout-stun create-baked root,
+    // UpdateHandler.cs). The tripwire in WorldSocket.SendPacket records the window's
+    // contents; these anchors give every line a phase-relative timestamp and a
+    // per-transfer correlation id. Anchors are maintained unconditionally (two long
+    // writes per transfer); all Log.Event emission is DebugOutput-gated. See
+    // WORLD-ENTRY-CONTRACT-INVESTIGATION.md.
+    public int WorldEntryWindowSeq;            // increments at each SMSG_TRANSFER_PENDING
+    public long WorldEntryTransferPendingTick; // TickCount64 at transfer-pending; 0 = no window open
+    public long WorldEntryNewWorldTick;        // TickCount64 at NEW_WORLD forward; 0 = not reached
+    public int WorldEntryWindowForwardCount;   // packets sent to the modern client in-window (DebugOutput only)
+    // JimsProxy (worldentry root-ceremony breadcrumb 2026-08-03): per-arrival
+    // ROOT/UNROOT ceremony leg + ack counting (always-on unclosed breadcrumb).
+    // See World/Client/WorldEntryCeremony.cs for the model and evidence.
+    public readonly WorldEntryCeremonyTracker WorldEntryCeremony = new();
+    // JimsProxy (carried-root cure 2026-08-03): the proxy's model of whether the
+    // MODERN CLIENT currently believes it is rooted — set when a self root
+    // (either family) is forwarded, cleared when any self unroot is forwarded
+    // (live-verified: the client accepts either family as clearing). A /reload
+    // clears the client without our knowledge; the resulting stale-true only ever
+    // costs one harmless no-op synth unroot at the next arrival (fail-safe
+    // direction).
+    public bool ClientBelievesRooted;
+    public bool WorldEntryPendingCarriedRootCheck;   // set at NEW_WORLD; consumed at the player's first destination update
+    public bool WorldEntryCarriedRootCureArmed;      // dispatcher → end-of-UPDATE_OBJECT synth handoff (stuck-stun pattern)
+    public bool WorldEntryCureAfterTeleportAck;      // same-map teleport variant: armed at the self MoveTeleport, fired at its CMSG_MOVE_TELEPORT_ACK
     // JimsProxy (zep-stuck-no-move 2026-05-14): set to a sentinel MoveCounter when
     // HandleNewWorld emits a synthesized SMSG_MOVE_TELEPORT to clear the modern
     // client's stale MOVEMENTFLAG_ONTRANSPORT after a cross-continent transport
@@ -178,6 +256,14 @@ public sealed class GameSessionData
     public Queue<ServerPacket> PendingUninstancedPackets = new(); // Here packets are queued while IsConnectedToInstance = false;
     public readonly Lock PendingUninstancedPacketsLock = new();
     public bool IsInWorld;
+    // JimsProxy (camp login-eviction merge): hold-and-merge state for instanced-map
+    // logins — see World/Client/LoginEvictionHold.cs. Lives on GameSessionData so a
+    // hold can never survive a relogin (fresh instance per login), and is NOT
+    // carried over by CarryOverRealmScopedCaches by design.
+    public readonly LoginEvictionHold LoginEvictionHold = new();
+    // JimsProxy (camp stun lock, step 2): pre-create self-op hold — see
+    // World/Client/PreCreateOpHold.cs. Same lifetime rules as LoginEvictionHold.
+    public readonly PreCreateOpHold PreCreateOpHold = new();
     public uint? CurrentMapId;
     public uint CurrentZoneId;
     public uint CurrentTaxiNode;
@@ -297,6 +383,14 @@ public sealed class GameSessionData
     // so we always send a valid family, cleared only on explicit pet dismiss.
     public ConcurrentDictionary<WowGuid128, ushort> CachedPetCreatureFamily = new();
     public Dictionary<uint, WowGuid128> CachedPetNumbers = new();
+    // Pet names learned from party member stats, keyed by pet number — lets us answer
+    // pet name queries for out-of-range party pets the legacy server returns empty for.
+    public Dictionary<uint, string> PartyPetNames = new();
+    // Last known pet stats / member level per party member guid. The legacy server only
+    // re-sends fields when they change, but the modern client expires party data it
+    // hasn't seen refreshed — these snapshots get re-attached to forwarded updates.
+    public Dictionary<WowGuid128, World.Server.Packets.PartyMemberPetStats> PartyPetStats = new();
+    public Dictionary<WowGuid128, ushort> PartyMemberLevels = new();
     // Tracks quest ids the proxy has issued its own CMSG_QUERY_QUEST_INFO for.
     public HashSet<uint> ProxyIssuedQuestInfoQueries = new();
     // JimsProxy: client-originated CMSG_QUERY_QUEST_INFO gating. Questie's filter-toggle
@@ -353,6 +447,15 @@ public sealed class GameSessionData
     private readonly ConcurrentDictionary<WowGuid128, long> _recentlyDestroyedObjects = new();
     private const long RecentlyDestroyedSweepAgeMs = 600_000;
     private const int RecentlyDestroyedSweepThreshold = 4096;
+
+    // JimsProxy (Performance Mode / handshake expiry): the sideband is live only while the addon
+    // keeps re-affirming "1" (it heartbeats every ~30s). A disabled/crashed addon can't send "0",
+    // so we time the handshake out — otherwise the proxy would keep emitting raw JP_ chat that the
+    // now-absent addon filter no longer suppresses (the reported "JP_CS:Player-..." spam).
+    public const long JimsPlusSidebandExpiryMs = 100_000;
+    public bool IsJimsPlusSidebandActive()
+        => JimsPlusSideband
+           && (Environment.TickCount64 - JimsPlusSidebandAffirmedMs) <= JimsPlusSidebandExpiryMs;
 
     public void MarkObjectRecentlyDestroyed(WowGuid128 guid)
     {
@@ -443,6 +546,8 @@ public sealed class GameSessionData
     public WowGuid64 CurrentAttackTarget;        // active CMSG_ATTACK_SWING victim, cleared on ATTACK_STOP/CANCEL_COMBAT
     public bool WaitingForAttackStart;           // true between CMSG_ATTACK_SWING and SMSG_ATTACK_START
     public bool DeferredAttackStop;              // CMSG_ATTACK_STOP received while waiting for SMSG_ATTACK_START
+    public long LastAttackSwingSentTick;         // TEMP-DIAG (#464 follow-up, REMOVE with the breadcrumb): TickCount64 when we last forwarded CMSG_ATTACK_SWING — feeds ms_since_swing
+    public WowGuid128 PendingPreemptAttackStopVictim; // #450: preempt stop armed by SMSG_PARTY_KILL_LOG, flushed after the trailing killing-blow ASU or at socket drain
     public uint[] CurrentArenaTeamIds = new uint[3];
     public ConcurrentQueue<ClientCastRequest> PendingNormalCasts = new();  // regular spell casts (queue for proper FIFO handling)
     public ClientCastRequest? CurrentClientNextMeleeCast; // next melee spells (Raptor Strike, Heroic Strike, etc.)
@@ -687,6 +792,33 @@ public sealed class GameSessionData
     // overridden with ServerGUID downstream → the auto-cast map entry is a harmless
     // orphan in that case.
     public ConcurrentDictionary<(WowGuid128 caster, uint spellId), WowGuid128> PetAutoCastActiveCastIds = new();
+
+    // JimsProxy (observed-pose strand, 2026-08-14): decide whether an incoming
+    // SMSG_SPELL_FAILED_OTHER may be dropped by the retry-storm dedup. A failure whose
+    // (caster, spell) has a live tracked cast instance (OtherCasterActiveCastIds /
+    // PetAutoCastActiveCastIds) is that instance's ONLY terminator — the next
+    // SPELL_START overwrites the tracked entry, so a skipped cancel permanently
+    // strands the cast-hold kit on the 1.14.2 client (observed player frozen in the
+    // skinning "crafting hands" pose until despawn; same for mob casting poses).
+    // The storm the dedup was built for (repeat failures with NO intervening
+    // SPELL_START) still dedups: the first routed failure removes the tracked entry,
+    // so storm repeats find no live instance.
+    // Returns true = skip this failure. msSinceLastForwarded: -1 when outside the
+    // window / first failure; >= 0 when within the window (callers log the
+    // live-cast bypass case). Callers record forwarded failures in
+    // RecentlyForwardedSpellFailedOther.
+    public bool ShouldDedupSpellFailedOther(WowGuid128 caster, uint spellId, long nowMs, long dedupWindowMs, out long msSinceLastForwarded)
+    {
+        msSinceLastForwarded = -1;
+        var key = (caster, spellId);
+        if (!RecentlyForwardedSpellFailedOther.TryGetValue(key, out var lastMs) || nowMs - lastMs >= dedupWindowMs)
+            return false;
+        msSinceLastForwarded = nowMs - lastMs;
+        if (OtherCasterActiveCastIds.ContainsKey(key) || PetAutoCastActiveCastIds.ContainsKey(key))
+            return false; // live cast instance: this failure is its terminator, never a duplicate
+        return true;
+    }
+
     // JimsProxy (cast-go-castid-recovery): per-spell FIFO of the client-facing CastIDs
     // forwarded to the modern client at the LOCAL PLAYER's SMSG_SPELL_START, keyed by spellId.
     // HandleSpellGo recalls the oldest when no PendingNormalCast / melee / auto-repeat entry
@@ -746,7 +878,28 @@ public sealed class GameSessionData
     public Dictionary<WowGuid128, Dictionary<byte, int>> UnitAuraDurationUpdateTime = [];
     public Dictionary<WowGuid128, Dictionary<byte, int>> UnitAuraDurationLeft = [];
     public Dictionary<WowGuid128, Dictionary<byte, int>> UnitAuraDurationFull = [];
+    // JimsProxy (res-sickness-swap-race): TickCount of the most recent server duration
+    // PUSH per (unit, slot) — written ONLY by the SMSG_UPDATE_AURA_DURATION /
+    // SMSG_SET_EXTRA_AURA_INFO handlers, never by emit-path stores (finisher snapshot,
+    // expiry restore). Distinguishes "a server-authoritative duration for this slot just
+    // raced ahead of its field update" from "stale duration left by the slot's previous
+    // occupant", which the swap-wipe guard in the UpdateHandler aura loop cannot tell
+    // apart by spell ID alone.
+    public Dictionary<WowGuid128, Dictionary<byte, int>> UnitAuraDurationPushTime = [];
+    // JimsProxy (temp-enchant-0s-after-relogin): remaining-time pushes from
+    // SMSG_ITEM_ENCHANT_TIME_UPDATE, keyed item guid → (legacy enchantment slot →
+    // seconds + receipt tick). At login vanilla cores send the push BEFORE the item's
+    // create block (the only carrier of remaining time — the create's duration field is
+    // zero), and the modern client discards updates for guids it has not constructed.
+    // The push is stashed here and consumed into the item's create block when it is
+    // translated. Not carried across sessions: each login gets fresh pushes.
+    public Dictionary<WowGuid128, Dictionary<uint, (uint Seconds, int Tick)>> PendingItemEnchantDurations = [];
     public Dictionary<WowGuid128, Dictionary<byte, WowGuid128>> UnitAuraCaster = [];
+    // Wall-clock aura expiry per (unit, spell). Unlike the per-slot caches above this
+    // survives unit destroys AND relogs (carried over in CreateNewGameSessionData), so a
+    // buff re-seen on a group member resumes its real remaining time instead of
+    // restarting at full duration (PallyPower blessing timers after relog/stealth).
+    public Dictionary<(WowGuid128, int), long> UnitAuraExpiryTick = [];
 
     // MIRASU (stack-aura-decrement): last AuraDataInfo emitted for each (unit, slot).
     // Used to detect AURAAPPLICATIONS-quad-only updates where a single slot's app
@@ -859,6 +1012,32 @@ public sealed class GameSessionData
     // HandleShowBank can repaint their cooldown without scanning the global (all-players) alias map. WC only.
     public HashSet<WowGuid128> ChronoboonItemGuids = new();
 
+    // JimsProxy (Kronos Chronoboon): boon GUIDs whose login-time tooltip refresh already ran this login,
+    // so re-creates of the same item (same real entry) can't re-trigger an infinite refresh loop. WC only.
+    public HashSet<WowGuid128> ChronoboonLoginRefreshFired = new();
+
+    // JimsProxy (Kronos Chronoboon): the per-player boon template Kronos PUSHES unsolicited during login
+    // (a solicited entry query answers with the BASE template — 2026-07-30 log — so this push is the only
+    // correct login-time source). Latest push wins; per-login. WC only.
+    // Known edge (latest-wins): a solicited BASE-template reply landing while ChronoboonLoginBoonGuids
+    // are parked would re-mint from the base (empty tooltip). Nothing solicits the real entry in the
+    // normal login flow (the client only ever sees alias ids) and a wrong mint self-heals on the next
+    // use/relog — accepted.
+    public ItemTemplate? ChronoboonLoginPushTemplate = null;
+
+    // JimsProxy (Kronos Chronoboon): boon GUIDs created before the login push arrived, awaiting refresh
+    // when it does (ordering fallback — observed order is push first, creates after). WC only.
+    public HashSet<WowGuid128> ChronoboonLoginBoonGuids = new();
+
+    // JimsProxy (Kronos Chronoboon): SEND_KNOWN_SPELLS item cooldowns keyed by ITEM entry — store and
+    // restore are different spells, so a spell-keyed lookup misses when the boon's current on-use isn't
+    // the spell that's cooling down. WC only.
+    public Dictionary<uint, (uint SpellId, long EndMs)> LoginItemCooldownByItemEntry = new();
+
+    // JimsProxy (Kronos Chronoboon): boon GUID whose remaining-cooldown repaint must go out AFTER the
+    // current update packet (carrying its aliased create) is forwarded. WC only.
+    public WowGuid128? ChronoboonRepaintPendingGuid = null;
+
     // Mobs we've seen send Flying spline or FixedZ movement flags. Vanilla servers
     // don't populate UNIT_FIELD_HOVERHEIGHT consistently (Twinstar e.g. leaves it at 0),
     // so we need a server-agnostic hover signal. Once a guid lands here, all subsequent
@@ -886,18 +1065,20 @@ public sealed class GameSessionData
     // circle around already-doused runes on reload; the proxy destroys those client-side (paired rune has InUse). WC only.
     public Dictionary<uint, WowGuid128> McCirclesSeen = new();
 
-    // JimsProxy (#382 observer lockup): players we observe being CHARMED by another PLAYER
-    // (Gnomish Mind Control Cap 13181 = vanilla MOD_CHARM on a player). NPC charmers (raid
-    // MCs like Lucifron's Dominate Mind) are excluded — long-stable content, no lockup reports.
-    // Vanilla charm reaches observers as PLAYER_CONTROLLED + CHARMEDBY with no POSSESSED bit,
-    // and the 1.14 client has no representation for a charmed PLAYER (modern can't charm
-    // players; possess — priest MC 605 — renders fine, which is why priest MC never locks
-    // observers). While a guid is in here, the UNIT_FIELD_FLAGS translation forces
-    // UNIT_FLAG_POSSESSED so observing clients render their known possess path instead.
-    // Scoped to third-party observers only: the charmer keeps its real charm/pet bar and
-    // the target is untouched. Self-clears when CHARMEDBY empties (charm end) or on a
-    // fresh create block (re-appearance after an out-of-range charm end).
-    public HashSet<WowGuid128> ObservedCharmedPlayers = [];
+// JimsProxy (#382 PetInCombat charm strip): players currently charmed by ANOTHER PLAYER,
+    // tracked from ALL perspectives (no self/charmer exclusion — the victim's own client
+    // drops too, and the charm+0x800 hybrid is wrong from every viewpoint). Maintained in
+    // the CHARMEDBY translation; cleared when CHARMEDBY empties or on a create block without
+    // CHARMEDBY (out-of-range charm end). While a guid is in here, UNIT_FIELD_FLAGS's
+    // UNIT_FLAG_PET_IN_COMBAT is stripped from its forwarded flags (Charm382StripPetInCombat).
+    public HashSet<WowGuid128> PlayerCharmedByPlayer = [];
+
+    // JimsProxy (#382): last RAW vanilla UNIT_FIELD_FLAGS seen per PLAYER guid — always the
+    // server's value, never the stripped presentation. Feeds the charm-edge flags re-sync:
+    // a pet-class player can enter a charm already carrying a legitimate pet-owner 0x800
+    // while the charm apply block carries no flags write at all, so the re-sync needs the
+    // pre-charm value to strip from (and to restore from at charm end).
+    public Dictionary<WowGuid128, uint> LastKnownPlayerUnitFlags = new();
 
     // JimsProxy (Tallstrider-Fix): per-GUID last-known facing orientation, populated from
     // any MovementInfo we observe (spawn, heartbeat, ObjectUpdate movement block). Used by
@@ -925,12 +1106,18 @@ public sealed class GameSessionData
         // satisfied the unit-frame name without issuing a fresh CMSG_QUERY_PLAYER_NAME —
         // the proxy then had no entry to fill the inspect Name/Class/Race/Sex fields.
         if (previous != null)
-        {
-            self.CachedPlayers = previous.CachedPlayers;
-            self.PlayerGuildIds = previous.PlayerGuildIds;
-            self.IgnoredPlayers = previous.IgnoredPlayers;
-        }
+            CarryOverRealmScopedCaches(previous, self);
         return self;
+    }
+
+    private static void CarryOverRealmScopedCaches(GameSessionData previous, GameSessionData self)
+    {
+        self.CachedPlayers = previous.CachedPlayers;
+        self.PlayerGuildIds = previous.PlayerGuildIds;
+        self.IgnoredPlayers = previous.IgnoredPlayers;
+        // Buff expiries are wall-clock facts about other units — a /camp doesn't
+        // change when the rogue's blessing runs out.
+        self.UnitAuraExpiryTick = previous.UnitAuraExpiryTick;
     }
 
     /// <summary>
@@ -938,9 +1125,12 @@ public sealed class GameSessionData
     /// the GCD hold state machine (issue #43) can construct a bare GameSessionData without
     /// standing up a full GlobalSessionData graph.
     /// </summary>
-    internal static GameSessionData CreateForTesting()
+    internal static GameSessionData CreateForTesting(GameSessionData? previous = null)
     {
-        return new GameSessionData();
+        var self = new GameSessionData();
+        if (previous != null)
+            CarryOverRealmScopedCaches(previous, self);
+        return self;
     }
     
     public uint GetCurrentGroupSize()
@@ -1369,6 +1559,30 @@ public sealed class GameSessionData
         dict ??= [];
         dict[slot] = duration;
     }
+    // JimsProxy (res-sickness-swap-race): vanilla cores send SMSG_UPDATE_AURA_DURATION
+    // immediately at aura apply, while the field update installing the aura is batched
+    // to the end of the server tick. On a direct slot swap (Ghost → Resurrection
+    // Sickness at a spirit-healer res: same tick, no empty pass) the new occupant's
+    // duration therefore lands a few ms BEFORE the swap. Recording the push time lets
+    // the swap-wipe guard keep that fresh value instead of discarding it as the previous
+    // occupant's leftover.
+    public const int AuraDurationPushFreshnessMs = 1000;
+    public void StoreAuraDurationPushTime(WowGuid128 guid, byte slot, int currentTime)
+    {
+        ref var dict = ref CollectionsMarshal.GetValueRefOrAddDefault(UnitAuraDurationPushTime, guid, out _);
+        dict ??= [];
+        dict[slot] = currentTime;
+    }
+    public bool HasFreshAuraDurationPush(WowGuid128 guid, byte slot, int currentTime)
+    {
+        if (UnitAuraDurationPushTime.TryGetValue(guid, out var dict) &&
+            dict.TryGetValue(slot, out var pushedAt))
+        {
+            int age = unchecked(currentTime - pushedAt);
+            return age >= 0 && age <= AuraDurationPushFreshnessMs;
+        }
+        return false;
+    }
     public void ClearAuraDuration(WowGuid128 guid, byte slot)
     {
         if (UnitAuraDurationUpdateTime.TryGetValue(guid, out var timeDict))
@@ -1379,6 +1593,9 @@ public sealed class GameSessionData
 
         if (UnitAuraDurationFull.TryGetValue(guid, out var fullDict))
             fullDict.Remove(slot);
+
+        if (UnitAuraDurationPushTime.TryGetValue(guid, out var pushDict))
+            pushDict.Remove(slot);
     }
     public void GetAuraDuration(WowGuid128 guid, byte slot, out int left, out int full)
     {
@@ -1396,6 +1613,40 @@ public sealed class GameSessionData
             UnitAuraDurationUpdateTime.TryGetValue(guid, out var timeDict) &&
             timeDict.TryGetValue(slot, out var time))
             left -= Environment.TickCount - time;
+    }
+    public void StorePendingItemEnchantDuration(WowGuid128 itemGuid, uint legacySlot, uint durationSeconds, int nowTick)
+    {
+        if (durationSeconds == 0)
+            return;
+
+        ref var slots = ref CollectionsMarshal.GetValueRefOrAddDefault(PendingItemEnchantDurations, itemGuid, out _);
+        slots ??= [];
+        slots[legacySlot] = (durationSeconds, nowTick);
+    }
+    public List<(uint LegacySlot, uint DurationMs)>? ConsumePendingItemEnchantDurations(WowGuid128 itemGuid, int nowTick)
+    {
+        if (!PendingItemEnchantDurations.Remove(itemGuid, out var slots) || slots.Count == 0)
+            return null;
+
+        List<(uint LegacySlot, uint DurationMs)> result = new(slots.Count);
+        foreach (var (slot, push) in slots)
+        {
+            // TickCount skew safety — a receipt tick "in the future" decays nothing.
+            int elapsed = unchecked(nowTick - push.Tick);
+            if (elapsed < 0)
+                elapsed = 0;
+
+            long remainingMs = (long)push.Seconds * 1000 - elapsed;
+            if (remainingMs > 0)
+                result.Add((slot, (uint)remainingMs));
+        }
+        return result.Count > 0 ? result : null;
+    }
+    // Inject only where the create shows a live enchant whose duration field the
+    // server left empty (vanilla's login shape); a server-provided duration wins.
+    public static bool ShouldInjectEnchantDuration(HermesProxy.World.Objects.ItemEnchantment? enchantment)
+    {
+        return enchantment is { ID: > 0 } && (enchantment.Duration == null || enchantment.Duration == 0);
     }
     public void StoreAuraCaster(WowGuid128 target, byte slot, WowGuid128 caster)
     {
@@ -1420,9 +1671,58 @@ public sealed class GameSessionData
         UnitAuraDurationUpdateTime.Remove(guid);
         UnitAuraDurationLeft.Remove(guid);
         UnitAuraDurationFull.Remove(guid);
+        UnitAuraDurationPushTime.Remove(guid);
         UnitAuraCaster.Remove(guid);
         UnitAuraLastEmitted.Remove(guid);
+        // UnitAuraExpiryTick deliberately survives — it restores remaining buff time
+        // when the unit re-enters view.
         return evicted;
+    }
+
+    public void RecordAuraExpiry(WowGuid128 guid, int spellId, int remainingMs)
+    {
+        if (remainingMs <= 0)
+            return;
+        if (UnitAuraExpiryTick.Count > 4096)
+        {
+            long now = Environment.TickCount64;
+            List<(WowGuid128, int)> expired = [];
+            foreach (var kvp in UnitAuraExpiryTick)
+                if (kvp.Value <= now)
+                    expired.Add(kvp.Key);
+            foreach (var key in expired)
+                UnitAuraExpiryTick.Remove(key);
+        }
+        UnitAuraExpiryTick[(guid, spellId)] = Environment.TickCount64 + remainingMs;
+    }
+
+    public int? TryGetAuraRemainingMs(WowGuid128 guid, int spellId)
+    {
+        if (!UnitAuraExpiryTick.TryGetValue((guid, spellId), out var expiry))
+            return null;
+        long remaining = expiry - Environment.TickCount64;
+        if (remaining <= 0)
+        {
+            UnitAuraExpiryTick.Remove((guid, spellId));
+            return null;
+        }
+        return (int)Math.Min(remaining, int.MaxValue);
+    }
+
+    public void ClearAuraExpiry(WowGuid128 guid, int spellId)
+    {
+        UnitAuraExpiryTick.Remove((guid, spellId));
+    }
+    // A single values update can move an aura to a lower free slot (set at B, clear at
+    // old A, B < A). The clear must not delete the expiry the set just recorded.
+    public bool IsSpellEmittedInAnotherSlot(WowGuid128 guid, byte exceptSlot, uint spellId)
+    {
+        if (!UnitAuraLastEmitted.TryGetValue(guid, out var dict))
+            return false;
+        foreach (var kvp in dict)
+            if (kvp.Key != exceptSlot && kvp.Value.SpellID == spellId)
+                return true;
+        return false;
     }
     public void StoreLastEmittedAura(WowGuid128 guid, byte slot, AuraDataInfo data)
     {
@@ -1827,6 +2127,127 @@ public sealed class GameSessionData
     }
 
     /// <summary>
+    /// JimsProxy (empty-victim wedge): the modern client sent CMSG_ATTACK_SWING. Returns false when
+    /// the de-dupe guard should swallow it — we already believe we are auto-attacking that exact
+    /// victim, so forwarding again would be redundant. Otherwise records the new handshake and
+    /// returns true so the caller forwards the swing to the legacy server.
+    /// Pure data operation — no socket dependency, easy to unit-test.
+    /// </summary>
+    public bool TryBeginLocalPlayerAttackSwing(WowGuid64 victim)
+    {
+        if (CurrentAttackTarget == victim)
+            return false;
+
+        // A pending stop (STOP→SWING target switch) is cancelled by the new swing — the legacy
+        // server handles the switch inside CMSG_ATTACK_SWING without an explicit stop.
+        DeferredAttackStop = false;
+        CurrentAttackTarget = victim;
+        WaitingForAttackStart = true;
+        return true;
+    }
+
+    /// <summary>
+    /// JimsProxy (empty-victim wedge): apply an SMSG_ATTACK_STOP that names the LOCAL PLAYER as
+    /// attacker to the auto-attack handshake state, and tell the caller whether it must forward a
+    /// CMSG_ATTACK_STOP to the legacy server. Pure data operation — no socket dependency.
+    /// </summary>
+    public PlayerAttackStopOutcome ApplyLocalPlayerAttackStop(WowGuid64 stopVictim)
+    {
+        if (DeferredAttackStop)
+        {
+            DeferredAttackStop = false;
+            CurrentAttackTarget = default;
+            return PlayerAttackStopOutcome.FlushDeferredStop;
+        }
+
+        if (!WaitingForAttackStart)
+        {
+            // Server-initiated stop without our SWING: Gouge / Cheap Shot / Blind /
+            // Feign Death / stealth / Vanish. Must clear CurrentAttackTarget here or
+            // the next CMSG_ATTACK_SWING gets eaten by the de-dupe guard.
+            CurrentAttackTarget = default;
+            return PlayerAttackStopOutcome.ClearSettledTarget;
+        }
+
+        // Server rejected our SWING with ATTACK_STOP (no prior ATTACK_START): target died or
+        // became invalid between our SWING and server processing.
+        //
+        // An EMPTY victim counts as a rejection too. A stop naming NO victim cannot be a stale
+        // stop for the OLD target of a switch — it is "you have no attack target at all". Kronos
+        // sends exactly this form when it refuses the engage, e.g. Charge at a mob that is
+        // evading/leashing back from another fight: the Charge lands, the server answers
+        // SMSG_ATTACKSTOP(player, 0) instead of SMSG_ATTACKSTART, and the client immediately
+        // re-sends CMSG_ATTACK_SWING. Before this branch covered the empty case that retry fell
+        // through, CurrentAttackTarget stayed pinned to the mob forever, and the de-dupe guard in
+        // TryBeginLocalPlayerAttackSwing ate every subsequent swing — auto-attack never recovered
+        // for the rest of the session (wire-confirmed 2026-08-12: zero player swings across the
+        // whole fight, plus a second occurrence 386s earlier in the same capture that only
+        // recovered because a second Charge produced a real ATTACK_START).
+        //
+        // Over-clearing is the safe direction: the worst case is one redundant CMSG_ATTACK_SWING
+        // forwarded, which is precisely what the client asked for.
+        if (stopVictim == CurrentAttackTarget || stopVictim == WowGuid64.Empty)
+        {
+            WaitingForAttackStart = false;
+            CurrentAttackTarget = default;
+            return PlayerAttackStopOutcome.ClearRejectedHandshake;
+        }
+
+        // WaitingForAttackStart is true but the stop names a different, non-empty victim —
+        // target-switch sequence, the new SWING already set CurrentAttackTarget. Keep it.
+        return PlayerAttackStopOutcome.PreserveTargetSwitch;
+    }
+
+    /// <summary>
+    /// JimsProxy (#450 — killing-blow ordering): arm the preemptive SMSG_ATTACK_STOP instead of
+    /// emitting it inline from the SMSG_PARTY_KILL_LOG handler. Kronos sends the melee killing
+    /// blow's SMSG_ATTACKER_STATE_UPDATE *after* PARTY_KILL_LOG in the same burst (6 of 12 kills
+    /// in the #450 capture); an inline stop lands between the kill and the hit, and the modern
+    /// client then re-plays the hit as a fresh swing on the corpse — floating text + swing sound
+    /// seconds late, after the loot window is already open. The armed stop is flushed by
+    /// WorldClient right after the trailing ASU for this victim is forwarded, or at socket drain
+    /// when no ASU trails (spell killing blows). Returns the previously armed victim so a
+    /// multi-kill burst can flush the older stop immediately — default when none was armed.
+    /// Pure data operation — no socket dependency, easy to unit-test.
+    /// </summary>
+    public WowGuid128 ArmPreemptAttackStop(WowGuid128 victim)
+    {
+        var prior = PendingPreemptAttackStopVictim;
+        PendingPreemptAttackStopVictim = victim;
+        return prior;
+    }
+
+    /// <summary>
+    /// JimsProxy (#450): pairing trigger for the armed preempt stop. Clears and returns true when
+    /// (attacker, victim) is the local player's hit on the armed victim. Two call sites: the
+    /// SMSG_ATTACKER_STATE_UPDATE handler (emit the stop right after forwarding the killing blow)
+    /// and the SMSG_ATTACK_STOP handler (the server's own player stop was just forwarded — cancel
+    /// the armed one so the drain flush can't send a duplicate). Pure data operation.
+    /// </summary>
+    public bool TryConsumePreemptAttackStop(WowGuid128 attacker, WowGuid128 victim)
+    {
+        if (PendingPreemptAttackStopVictim == default)
+            return false;
+        if (attacker != CurrentPlayerGuid || victim != PendingPreemptAttackStopVictim)
+            return false;
+
+        PendingPreemptAttackStopVictim = default;
+        return true;
+    }
+
+    /// <summary>
+    /// JimsProxy (#450): drain trigger — returns the armed victim (default if none) and clears it.
+    /// Called by WorldClient's receive loop once the legacy socket has no more buffered packets,
+    /// i.e. no killing-blow ASU trailed the kill log in this burst. Pure data operation.
+    /// </summary>
+    public WowGuid128 TakePreemptAttackStopForFlush()
+    {
+        var victim = PendingPreemptAttackStopVictim;
+        PendingPreemptAttackStopVictim = default;
+        return victim;
+    }
+
+    /// <summary>
     /// JimsProxy (PR #161 follow-up): walks PendingNormalCasts and PendingPetCasts,
     /// dequeues any entry whose WatchdogDeadlineMs has expired, and returns the
     /// evicted entries via the out parameters. Caller (GlobalSessionData
@@ -1843,8 +2264,15 @@ public sealed class GameSessionData
     /// trailing failure, the leak heals at the next cast event. Returns the
     /// number of casts marked, for diagnostics. Instants and not-yet-started
     /// casts are ignored (movement doesn't cancel them in vanilla).
+    ///
+    /// JimsProxy (strafe cancel-gap): when <paramref name="newlyMarked"/> is
+    /// provided, casts whose MovementCancelled flag TRANSITIONED false→true in
+    /// this call are appended — re-marks are excluded, so the strafe cancel
+    /// synth fires at most once per cast and never for a cast an earlier
+    /// movement key (with its own client-sent cancel) already marked.
     /// </summary>
-    public int MarkStartedCastsMovementCancelled(long watchdogDeadlineMs)
+    public int MarkStartedCastsMovementCancelled(long watchdogDeadlineMs,
+        List<ClientCastRequest>? newlyMarked = null)
     {
         int marked = 0;
         long nowTick = Environment.TickCount64;
@@ -1857,6 +2285,8 @@ public sealed class GameSessionData
                 if (cast.HasStarted && cast.StartedCastTimeMs > 0
                     && !GameData.IsChanneledSpell(cast.SpellId))
                 {
+                    if (!cast.MovementCancelled)
+                        newlyMarked?.Add(cast);
                     cast.MovementCancelled = true;
                     cast.MarkedAtTickMs = nowTick;
                     if (cast.WatchdogDeadlineMs == 0)
@@ -2743,12 +3173,21 @@ public sealed class GameSessionData
 
     /// <summary>
     /// Try to find and dequeue a pending cast by ItemGUID (for item use failures).
-    /// Only matches casts that haven't started yet.
+    /// Only matches casts that haven't started yet. An empty GUID matches nothing —
+    /// anonymous rejections pair via <see cref="TryDequeueOldestUnstartedItemCast"/>.
     /// </summary>
     public bool TryDequeueItemCast(WowGuid128 itemGuid, out ClientCastRequest? cast)
     {
         var pending = new List<ClientCastRequest>();
         cast = null;
+
+        // JimsProxy (#442 review, Issue A): an empty failure GUID must match NOTHING. Normal
+        // CMSG_CAST_SPELL entries leave ItemGUID at default (WowGuid128 is a struct), so the
+        // == below would pair `empty == empty` with the oldest unstarted SPELL entry — a
+        // spurious visible CastFailed for a healthy cast, and the real item orphan surviving
+        // behind the handler's else-if (the #442 lockout, in exactly the raid shape).
+        if (itemGuid.IsEmpty())
+            return false;
 
         lock (PendingCastsLock)
         {
@@ -2765,6 +3204,52 @@ public sealed class GameSessionData
             }
 
             // Re-enqueue non-matching casts
+            foreach (var item in pending)
+            {
+                PendingNormalCasts.Enqueue(item);
+            }
+        }
+
+        return cast != null;
+    }
+
+    /// <summary>
+    /// JimsProxy (#442): dequeue the OLDEST forwarded-but-unstarted item-use cast, regardless of
+    /// item GUID. Fallback for SMSG_INVENTORY_CHANGE_FAILURE rejections that Kronos sends with
+    /// EMPTY item GUIDs (observed live 2026-07-29: a duplicate CMSG_USE_ITEM straddling its
+    /// predecessor's SPELL_GO was rejected with result 23/ItemNotFound and both GUIDs zero), which
+    /// TryDequeueItemCast can't match. Without this the rejected entry is unreapable — unstarted
+    /// (jams HasForwardedPendingCast → every on-GCD press silently parked until relog/map change),
+    /// IsOffGcd (spared by ClearNonStartedNormalCasts), never SPELL_FAILURE-peeked (no watchdog),
+    /// and a permanent HasInFlightNormalCastForSpell match (that item unusable).
+    ///
+    /// FIFO pairing: the rejection is the server's answer to SOME outstanding use; when the GUID
+    /// doesn't identify which, the oldest unresolved one is the correct pair in the single-item
+    /// case (the overwhelmingly common one — the CMSG-side dup guard keeps same-spell entries
+    /// unique). Known edge with TWO different items in flight: an unrelated empty-GUID inventory
+    /// failure inside the one-RTT window can evict the wrong (healthy) entry; its later GO then
+    /// finds no queue match and forwards unmatched — cosmetic, self-limiting, and strictly better
+    /// than the permanent lockout. See issue #442.
+    /// </summary>
+    public bool TryDequeueOldestUnstartedItemCast(out ClientCastRequest? cast)
+    {
+        var pending = new List<ClientCastRequest>();
+        cast = null;
+
+        lock (PendingCastsLock)
+        {
+            while (PendingNormalCasts.TryDequeue(out var current))
+            {
+                if (cast == null && !current.HasStarted && !current.ItemGUID.IsEmpty())
+                {
+                    cast = current;
+                }
+                else
+                {
+                    pending.Add(current);
+                }
+            }
+
             foreach (var item in pending)
             {
                 PendingNormalCasts.Enqueue(item);
@@ -2831,6 +3316,73 @@ public sealed class GameSessionData
     public uint GetLearnSpellFromRealSpell(uint spellId)
     {
         return RealSpellToLearnSpell.TryGetValue(spellId, out var learnSpell) ? learnSpell : spellId;
+    }
+
+    /// <summary>Ban defense (Kronos IsInWorld race): speculatively removes the predecessor rank
+    /// at CMSG_TRAINER_BUY_SPELL, mirroring Kronos's server-side RemoveSpell(prev) that can run
+    /// without any notification packet. Returns whether the predecessor was actually in the set.
+    /// Pure data operation — no socket dependency, easy to unit-test.</summary>
+    public bool ApplyTrainerBuyPredecessorRemoval(uint realSpellId, uint predecessor)
+    {
+        bool removed = CurrentPlayerKnownSpells.Remove(predecessor);
+        PendingTrainerBuySpellId = realSpellId;
+        PendingTrainerBuyRemovedPredecessor = removed ? predecessor : 0u;
+        return removed;
+    }
+
+    /// <summary>SMSG_LEARNED_SPELL bookkeeping: records the learn; a confirmed learn for the
+    /// pending trainer buy restores the speculatively-removed predecessor — no SUPERCEDED_SPELLS
+    /// means the server KEPT the lower rank (downrankable chain, e.g. Shadowguard). Returns the
+    /// restored predecessor id, or 0. A real supersede chain still ends removed in either arrival
+    /// order: SUPERCEDED-first clears the pending state so nothing restores; LEARNED-first
+    /// restores transiently and SUPERCEDED's unconditional remove wins. The no-response Kronos
+    /// race (the autoban this defense exists for) confirms nothing, so its removal stands.</summary>
+    public uint ApplyLearnedSpellKnownState(uint spellId)
+    {
+        CurrentPlayerKnownSpells.Add(spellId);
+        if (PendingTrainerBuySpellId != spellId)
+            return 0u;
+        uint restored = PendingTrainerBuyRemovedPredecessor;
+        if (restored != 0)
+            CurrentPlayerKnownSpells.Add(restored);
+        PendingTrainerBuySpellId = 0u;
+        PendingTrainerBuyRemovedPredecessor = 0u;
+        return restored;
+    }
+
+    /// <summary>SMSG_SUPERCEDED_SPELLS bookkeeping: the server really removed the old rank, so
+    /// the proxy's view drops it and any matching pending speculative removal is confirmed —
+    /// cleared WITHOUT restoring.</summary>
+    public void ApplySupercededSpellKnownState(uint newSpellId, uint supercededId)
+    {
+        CurrentPlayerKnownSpells.Remove(supercededId);
+        CurrentPlayerKnownSpells.Add(newSpellId);
+        if (PendingTrainerBuySpellId == newSpellId || PendingTrainerBuySpellId == supercededId)
+        {
+            PendingTrainerBuySpellId = 0u;
+            PendingTrainerBuyRemovedPredecessor = 0u;
+        }
+    }
+
+    /// <summary>SMSG_TRAINER_BUY_FAILED bookkeeping: an explicit rejection means the server never
+    /// removed the predecessor — restore it when the failure names the pending buy (real id or
+    /// learn-wrapper id). Returns the restored predecessor id, or 0. Preserves the shipped
+    /// fail-safe: a non-matching failure clears the pending state WITHOUT restoring (the removal
+    /// stands, the cast guard keeps blocking — over-blocking is recoverable, a ban is not).</summary>
+    public uint ApplyTrainerBuyFailedKnownState(uint failedSpellId)
+    {
+        if (PendingTrainerBuySpellId == 0 || PendingTrainerBuyRemovedPredecessor == 0)
+            return 0u;
+        uint restored = 0u;
+        if (failedSpellId == PendingTrainerBuySpellId ||
+            failedSpellId == GetLearnSpellFromRealSpell(PendingTrainerBuySpellId))
+        {
+            restored = PendingTrainerBuyRemovedPredecessor;
+            CurrentPlayerKnownSpells.Add(restored);
+        }
+        PendingTrainerBuySpellId = 0u;
+        PendingTrainerBuyRemovedPredecessor = 0u;
+        return restored;
     }
     public void StoreCreatureClass(uint entry, Class classId)
     {
@@ -3091,6 +3643,18 @@ public class ClientCastRequest
     // popup) and the trailing SMSG_CAST_FAILED forwards as DontReport so the
     // client gets its CMSG_CANCEL_CAST ack without a popup.
     public bool MovementCancelled;
+
+    // JimsProxy (strafe cancel-gap presentation parity): set true (alongside
+    // MovementCancelled) ONLY for casts the strafe branch synthesized a
+    // CMSG_CANCEL_CAST for — i.e. the ones the 1.14 client did NOT cancel itself.
+    // The client renders the red "Interrupted" locally when IT initiates the
+    // cancel (forward/back/jump), but it never sends nor predicts a cancel on
+    // strafe, so a strafe-synth-cancelled cast's trailing SMSG_SPELL_FAILURE must
+    // be FORWARDED with the interrupt reason (not suppressed like the
+    // client-predicted case) to reproduce that "Interrupted" render. Only ever set
+    // when Settings.StrafeCancelPreempt is on (the synth's sole trigger), so it is
+    // structurally inert when the kill switch is off.
+    public bool StrafeSynthCancelled;
 
     // DIAGNOSTIC (stuck-spell investigation): TickCount64 when MovementCancelled
     // was set. Used by cast.movement_resolved debug events to measure how long

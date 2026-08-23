@@ -821,7 +821,8 @@ class PartyMemberPartialState : ServerPacket
     public uint? WmoDoodadPlacementID;
     public Vector3_UInt16 Position = null!;
     public uint? VehicleSeatRecID;
-    public List<PartyMemberAuraStates> Auras = new();
+    // Null means "no aura change" — a non-null empty list wipes the member's aura display.
+    public List<PartyMemberAuraStates> Auras = null!;
     public PartyMemberPetStats Pet = null!;
     public PartyMemberPhaseStates Phase = null!;
     public UnkStruct901_2 Unk901_2 = null!;
@@ -993,21 +994,24 @@ public class PartyMemberPetStats
 {
     public void WritePartial(WorldPacket data)
     {
-        data.WriteBit(NewPetGuid != default);
-        data.WriteBit(NewPetName != null);
+        // NewPetName defaults to "" — writing the name bit with an empty string renames
+        // the pet to nothing client-side, so only send it when we actually have a name.
+        // ExplicitClear forces an empty guid on the wire to signal a dismissed pet.
+        data.WriteBit(NewPetGuid != default || ExplicitClear);
+        data.WriteBit(!string.IsNullOrEmpty(NewPetName));
         data.WriteBit(DisplayID.HasValue);
         data.WriteBit(MaxHealth.HasValue);
         data.WriteBit(Health.HasValue);
         data.WriteBit(Auras != null);
         data.FlushBits();
 
-        if (NewPetName != null)
+        if (!string.IsNullOrEmpty(NewPetName))
         {
             data.WriteBits(NewPetName.GetByteCount(), 8);
             data.WriteString(NewPetName);
         }
-        if (NewPetGuid != default)
-            data.WritePackedGuid128(NewPetGuid);
+        if (NewPetGuid != default || ExplicitClear)
+            data.WritePackedGuid128(NewPetGuid == default ? WowGuid128.Empty : NewPetGuid);
         if (DisplayID.HasValue)
             data.WriteUInt32(DisplayID.Value);
         if (MaxHealth.HasValue)
@@ -1054,7 +1058,10 @@ public class PartyMemberPetStats
     public uint? DisplayID;
     public uint? MaxHealth;
     public uint? Health;
-    public List<PartyMemberAuraStates> Auras = new();
+    // Null means "no aura change" — a non-null empty list wipes the pet's aura display.
+    public List<PartyMemberAuraStates> Auras = null!;
+    // Partial-only: write an empty pet guid to tell the client the pet was dismissed.
+    public bool ExplicitClear;
 }
 
 class MinimapPingClient : ClientPacket

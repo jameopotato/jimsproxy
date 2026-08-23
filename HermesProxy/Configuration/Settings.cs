@@ -63,6 +63,60 @@ public static class Settings
     // block so input isn't locked client-side even if the server ignores the cancel.
     public static bool StuckLogoutStunCancelFix;
     public static bool StuckLogoutStunClientStrip;
+    // JimsProxy (camp instance-reset bad login): merge a login-time server eviction
+    // (LOGIN_VERIFY_WORLD into an instanced map immediately followed by
+    // TRANSFER_PENDING + NEW_WORLD out of it — Kronos's over-cap instance-reset
+    // denial) into ONE clean client-facing login to the eviction destination. The
+    // raw two-step permanently hangs the 1.14 client's loading screen (the aborted
+    // login-load's loading-screen enable is never unwound). Instanced-map logins
+    // only; no timers — release is packet-driven (transfer, first UPDATE_OBJECT,
+    // or legacy disconnect fail-open). See World/Client/LoginEvictionHold.cs.
+    // Key = kill switch. Default-init true so paths that bypass LoadAndVerifyFrom
+    // (tests) get the fix.
+    public static bool LoginEvictionMerge = true;
+    // JimsProxy (camp instance-reset stun lock, step 2): hold self-addressed control
+    // ops (MOVE_ROOT/MOVE_UNROOT/CONTROL_UPDATE/MOVE_TELEPORT) that arrive between
+    // login-verify and the first self create block, and release them right after the
+    // create forwards. The wedge login's create is server-stalled ~600-800ms, so
+    // those ops otherwise reach the client BEFORE the player object exists and the
+    // client constructs it input-locked (turn/cast dead until relog — no later flag
+    // value clears it). Wire-proven ordering: every healthy login/transfer delivers
+    // creates before control ops; the wedge login is the sole exception. General
+    // per-login rule (the wedge is only detectable AT the create, after the ops
+    // passed); zero-cost on healthy logins (nothing is ever held). See
+    // World/Client/PreCreateOpHold.cs. Key = kill switch. Default-init true so paths
+    // that bypass LoadAndVerifyFrom (tests) get the fix.
+    public static bool LoginPreCreateOpHold = true;
+    // JimsProxy (BG-exit movement lockup #328): synthesize the missing unroot for a
+    // player who crosses a loading boundary (NEW_WORLD or same-map teleport) still
+    // believing itself force-rooted — the departure-side unroot is dropped
+    // server-side for out-of-world players (cmangos Unit.cpp:751), stranding the
+    // root client-side. Belief-gated and no-op when wrong (a legitimately rooted
+    // cross-map arrival is re-rooted by the server's own arrival ceremony). Key =
+    // kill switch for the cure synth only; the always-on ceremony breadcrumb stays
+    // active regardless (instrument, not cure). See World/Client/WorldEntryCeremony.cs.
+    // Default-init true so paths that bypass LoadAndVerifyFrom (tests) get the fix.
+    public static bool WorldEntryCarriedRootCure = true;
+    // JimsProxy (#382 MC-cap BG FPS drop): strip UNIT_FLAG_PET_IN_COMBAT (0x800) from a
+    // PLAYER for exactly the duration of a player-on-player charm (Gnomish MC Cap 13181,
+    // priest MC 605). Vanilla cores set that flag on the charmed unit itself; modern
+    // servers set it on the CHARMER — so charm state + 0x800 on one player is a hybrid no
+    // modern server produces, and the 1.14 client FPS-locking on charmed players (victim
+    // AND bystanders, BG-scale, native 1.12 clients unaffected) is suspected to be its
+    // cost. Includes a charm-edge flags re-sync for pet-class victims whose legitimate
+    // pet-owner 0x800 predates the charm (a charm apply can carry no flags write at all).
+    // NPC charmers (raid MC — Lucifron) are untouched. Default ON; key = kill switch.
+    // Default-init true so paths that bypass LoadAndVerifyFrom (tests) get the fix.
+    public static bool Charm382StripPetInCombat = true;
+    // JimsProxy (feared-while-sitting, issue #479): when a fear targets the seated local
+    // player, synthesize a legacy CMSG_STAND_STATE_CHANGE(STAND) — at incoming-cast start
+    // (honored unconditionally: the player still has control), with a CC-onset fallback
+    // for instant fears. Without it a player feared mid-drink stays seated for the whole
+    // fear and fear-break items (PvP insignia) die on NOT_STANDING on both sides — the
+    // 1.14 client surrenders all input on control loss and cannot stand itself. Key =
+    // kill switch. Default-init true so paths that bypass LoadAndVerifyFrom (tests) get
+    // the fix.
+    public static bool SynthStandOnFear = true;
     // JimsProxy (clean handshake teardown): bound the realmd auth handshake. If realmd accepts
     // the TCP connection but never sends LOGON_CHALLENGE (half-accepting login server, load-shed,
     // firewall), the login thread would otherwise block forever ("stuck on Connecting..."). On
@@ -135,6 +189,13 @@ public static class Settings
     // renders first. Covers the client-side model-swap render time (frame-rate dependent, ~30ms
     // on a fast machine), NOT latency — do not tune per-connection. 0 disables.
     public static int FormExitStartDeferMs;
+    // JimsProxy (strafe cancel-gap): the 1.14 client emits CMSG_CANCEL_CAST atomically with
+    // forward/back/jump movement starts but never on strafe (wire-measured 5/5), so a strafe
+    // cast-cancel waits ~700ms for the legacy server's heartbeat-position movement detection
+    // instead of the ~190ms cancel-ack round trip. When on, the proxy synthesizes the missing
+    // legacy CMSG_CANCEL_CAST for started cast-time casts on strafe starts, gated on the 1.12
+    // movement-interrupt flag (SpellMovementInterrupt CSV). Kill switch — leave ON.
+    public static bool StrafeCancelPreempt;
     // JimsProxy (#313): width (ms) of the spell-queue hold window. A press arriving in the
     // last SpellQueueWindowMs of an active GCD or cast bar is held and fired at expiry; earlier
     // presses are forwarded and the server arbitrates (NOT_READY / SpellInProgress). Mirrors the
@@ -161,6 +222,21 @@ public static class Settings
     // vmangos, Twinstar) have subtly different wire formats for some CMSGs.
     // Default Kronos since this launcher is built for Kronos.
     public static ServerFork ServerType = ServerFork.Kronos;
+
+    // JimsProxy (client-socket delivery restore, 2026-07-25): TCP_NODELAY on the CLIENT-facing world
+    // sockets. TRUE restores the original design: HermesProxy applied NoDelay=true at birth
+    // (WorldSocketManager, ratkosrb 2022-02) until upstream's 2022-11-26 "Cleanup service start
+    // procedure" (55e9fca8) replaced the manager with the generic StartServer<T> — which sets no
+    // socket options — silently flipping every client socket to the .NET default (Nagle ON) for 3.5
+    // years while the dead class kept reading as live configuration. Our 2026-04-29 73ba505d then
+    // "kept TCP_NODELAY=true permanently" — defending a state that no longer existed. Ground truth
+    // was established empirically (runtime probe logged prior=false on accept), and delivery-spread
+    // A/B rounds at peak cast-collision intensity produced zero looping-cast incidents alongside a
+    // better reported cast feel. Config-key-only escape hatch (no launcher UI): set false to return
+    // to the kernel-batched (Nagle) delivery this bug era shipped with. The LEGACY (proxy->server)
+    // socket is unaffected either way — it has its own explicit NoDelay=true (WorldClient).
+    // Default-init true so paths that bypass LoadAndVerifyFrom get the restored behavior.
+    public static bool ClientTcpNoDelay = true;
 
     public static bool LoadAndVerifyFrom(ConfigurationParser config)
     {
@@ -191,8 +267,14 @@ public static class Settings
         UnplannedReconnectTimeoutMs = Math.Clamp(config.GetInt("UnplannedReconnectTimeoutMs", 5000), 1000, 30000);
         StuckLogoutStunCancelFix = config.GetBoolean("StuckLogoutStunCancelFix", true);
         StuckLogoutStunClientStrip = config.GetBoolean("StuckLogoutStunClientStrip", true);
+        LoginEvictionMerge = config.GetBoolean("LoginEvictionMerge", true);
+        LoginPreCreateOpHold = config.GetBoolean("LoginPreCreateOpHold", true);
+        WorldEntryCarriedRootCure = config.GetBoolean("WorldEntryCarriedRootCure", true);
+        Charm382StripPetInCombat = config.GetBoolean("Charm382StripPetInCombat", true);
+        SynthStandOnFear = config.GetBoolean("SynthStandOnFear", true);
         AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);
+        ClientTcpNoDelay = config.GetBoolean("ClientTcpNoDelay", true);
         LowLatencyMode = config.GetBoolean("LowLatencyMode", false);
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);
         IdentityPinnedCastIds = config.GetBoolean("IdentityPinnedCastIds", false);
@@ -202,6 +284,7 @@ public static class Settings
             : rttPrefireStr.Equals("knocker", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Knocker
             : RttPrefireMode.Off;
         FormExitStartDeferMs = Math.Clamp(config.GetInt("FormExitStartDeferMs", 100), 0, 300);
+        StrafeCancelPreempt = config.GetBoolean("StrafeCancelPreempt", true);
         SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 400), 0, 1300);
         ThreatEngine = config.GetBoolean("ThreatEngine", false);
         var serverTypeStr = config.GetString("ServerType", "Kronos");
