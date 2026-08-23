@@ -13,6 +13,52 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-08-22 — Repair the Release workflow (Windows-only) so releases carry assets
+
+**Issue:** `.github/workflows/Release.yml` already builds and attaches packaged binaries plus
+checksums — but it had **failed every one of its 10 runs** and had not run at all since
+2026-05-20. That is why every release, including v5.1.9, all four v5.2.0 betas and v5.2.0 itself,
+shipped with **zero assets** and had to be cut by hand. Two causes, both from inheriting the
+workflow unchanged across the fork:
+
+1. **Binary name.** `HermesProxy.csproj` sets `<AssemblyName>JimsProxy</AssemblyName>`, so publish
+   emits `JimsProxy.exe`. The workflow still referenced `publish/HermesProxy` when marking the
+   binary executable, in the MacOS `lipo` step, and in the verify step's smoke run. `chmod` on a
+   non-existent file exits non-zero, killing the Ubuntu leg first and letting fail-fast cancel
+   Windows and MacOS — exactly the job pattern in the final run.
+2. **RuntimeIdentifier conflict.** `HermesProxy.csproj` pins
+   `<RuntimeIdentifier>win-x64</RuntimeIdentifier>` whenever `UsePublishBuildSettings` is set,
+   which all three matrix legs passed. The Ubuntu leg (`--use-current-runtime`) and the MacOS leg
+   (`--runtime osx-arm64`) were each fighting a csproj hardcoded to Windows.
+
+Run logs are past GitHub's retention (HTTP 410), so the diagnosis is from source rather than logs.
+
+**Change:** `.github/workflows/Release.yml` — dropped the Ubuntu and MacOS matrix legs and made
+`build` a single `windows-latest` job. JimsProxy is a Windows-only fork (csproj pins `win-x64`,
+the launcher is Windows-only, and `WowClassic_ForCustomServers.exe` exists only on Windows), so
+those legs could never have produced a usable artifact. Publish now writes straight to `-o publish`
+instead of globbing `bin/Release/*/publish`. Added an explicit publish-output assertion for
+`JimsProxy.exe` + `HermesProxy.config` + `CSV/` so a rename breaks the build loudly instead of
+silently producing an empty archive. The verify job asserts on **archive contents** (binary,
+config, setup notes, and a full CSV set) rather than executing the binary, which an Ubuntu runner
+cannot do. Assets are renamed `JimsProxy-<tag>-win-x64.zip`. The release step now uploads into an
+existing release instead of failing on create, since tags are frequently cut by hand.
+
+New file `scripts/release-README.txt`, packaged into the archive as `README.txt`: what the
+download contains, the client requirement (Classic Era 1.14.2 build 42597,
+`WowClassic_ForCustomServers.exe`, user-supplied), the four setup steps, and the common failure
+modes.
+
+**Verification:** YAML structure checked (5 jobs, single `windows-latest` build job, no tabs); no
+stale binary references remain. The packaged layout matches the
+`JimsProxy-v5.2.0-beta.4-win-x64.zip` asset built by hand and attached to the v5.2.0-beta.4
+release on 2026-08-22, whose contents were field-tested against Kronos on 2026-08-20. **Field gate
+pending:** the workflow itself has not been run since the fix — the first `workflow_dispatch` will
+prove it end to end. Note that `workflow_dispatch` only becomes available once this file is on the
+**default branch**, so attaching assets to an already-published tag requires it to reach `master`.
+
+---
+
 ## 2026-08-20 — Correct the shipped config defaults for standalone (non-launcher) use
 
 **Issue:** `HermesProxy/HermesProxy.config` is what anyone building from source or running the

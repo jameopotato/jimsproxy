@@ -7,14 +7,22 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag override (e.g. v4.2.1). Leave empty for auto-increment.'
+        description: 'Version tag override (e.g. v5.2.1, or v5.2.0-beta.5). Leave empty for auto-increment.'
         required: false
         type: string
+
+# JimsProxy is a Windows-only fork: HermesProxy.csproj pins
+# <RuntimeIdentifier>win-x64</RuntimeIdentifier> whenever UsePublishBuildSettings
+# is set, the launcher is Windows-only, and WowClassic_ForCustomServers.exe only
+# exists on Windows. The inherited Ubuntu/MacOS matrix legs could therefore never
+# produce a usable artifact, and were the direct cause of this workflow failing
+# every run since it was inherited. See CHANGES.md 2026-08-22.
 
 env:
   DOTNET_VERSION: '10.0.x'
   DOTNET_NOLOGO: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
+  ASSET_BASENAME: JimsProxy
 
 jobs:
   version:
@@ -78,19 +86,7 @@ jobs:
   build:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     needs: version
-    strategy:
-      matrix:
-        include:
-          - os: windows
-            artifact: Windows
-            runtime: ''
-          - os: ubuntu
-            artifact: Ubuntu
-            runtime: ''
-          - os: macos
-            artifact: MacOS
-            runtime: ''
-    runs-on: ${{ matrix.os }}-latest
+    runs-on: windows-latest
 
     steps:
       - name: Checkout repository content
@@ -118,50 +114,44 @@ jobs:
           semver="${semver#v}"
           echo "semver=$semver" >> "$GITHUB_OUTPUT"
 
+      # -o publish avoids globbing bin/Release/*/publish, which broke when the
+      # RuntimeIdentifier subdirectory name changed.
       - name: Publish
-        if: matrix.os != 'macos'
-        run: dotnet publish HermesProxy --configuration Release --use-current-runtime -p:UsePublishBuildSettings=true -p:UpdateVersionProperties=false -p:Version=${{ steps.ver.outputs.semver }} -p:AssemblyVersion=${{ steps.ver.outputs.semver }} -p:FileVersion=${{ steps.ver.outputs.semver }} -p:InformationalVersion=${{ steps.ver.outputs.semver }}
+        run: dotnet publish HermesProxy --configuration Release --use-current-runtime -p:UsePublishBuildSettings=true -p:UpdateVersionProperties=false -p:Version=${{ steps.ver.outputs.semver }} -p:AssemblyVersion=${{ steps.ver.outputs.semver }} -p:FileVersion=${{ steps.ver.outputs.semver }} -p:InformationalVersion=${{ steps.ver.outputs.semver }} -o publish
 
-      - name: Publish (MacOS x86_64 and arm64)
-        if: matrix.os == 'macos'
+      - name: Verify publish output
+        shell: bash
         run: |
-          dotnet publish HermesProxy --configuration Release --runtime osx-arm64 -p:UsePublishBuildSettings=true -p:UpdateVersionProperties=false -p:Version=${{ steps.ver.outputs.semver }} -p:AssemblyVersion=${{ steps.ver.outputs.semver }} -p:FileVersion=${{ steps.ver.outputs.semver }} -p:InformationalVersion=${{ steps.ver.outputs.semver }}
-          dotnet publish HermesProxy --configuration Release --runtime osx-x64 -p:UsePublishBuildSettings=true -p:UpdateVersionProperties=false -p:Version=${{ steps.ver.outputs.semver }} -p:AssemblyVersion=${{ steps.ver.outputs.semver }} -p:FileVersion=${{ steps.ver.outputs.semver }} -p:InformationalVersion=${{ steps.ver.outputs.semver }}
-          lipo ./HermesProxy/bin/Release/osx-arm64/publish/HermesProxy ./HermesProxy/bin/Release/osx-x64/publish/HermesProxy -create -output ./HermesProxy/bin/Release/osx-x64/publish/HermesProxy_universal
-          mv ./HermesProxy/bin/Release/osx-x64/publish/HermesProxy_universal ./HermesProxy/bin/Release/osx-x64/publish/HermesProxy
-          rm -rf ./HermesProxy/bin/Release/osx-arm64
+          # AssemblyName is JimsProxy (HermesProxy.csproj), so the binary is
+          # JimsProxy.exe. The old workflow looked for "HermesProxy" here and
+          # failed every run.
+          for f in publish/JimsProxy.exe publish/HermesProxy.config publish/CSV; do
+            if [ ! -e "$f" ]; then
+              echo "FAIL: expected $f in publish output"
+              ls -la publish
+              exit 1
+            fi
+          done
+          echo "OK: JimsProxy.exe + HermesProxy.config + CSV/ present"
 
-      - name: Copy files
-        run: cp -r ./HermesProxy/bin/Release/*/publish/ publish
+      - name: Add standalone setup notes
+        shell: bash
+        run: cp scripts/release-README.txt publish/README.txt
 
-      - name: Mark as executable
-        if: matrix.os != 'windows'
-        run: chmod a+x publish/HermesProxy
-
-      - name: Package (tar.gz for Linux)
-        if: matrix.os == 'ubuntu'
-        run: |
-          mv publish HermesProxy-${{ matrix.artifact }}-${{ needs.version.outputs.tag }}
-          tar -czvf HermesProxy-${{ matrix.artifact }}-${{ needs.version.outputs.tag }}.tar.gz HermesProxy-${{ matrix.artifact }}-${{ needs.version.outputs.tag }}
-
-      - name: Package (zip for Windows)
-        if: matrix.os == 'windows'
+      # Files sit at the archive root (no wrapper directory) to match the
+      # layout the launcher bundle and the manual setup docs both assume.
+      - name: Package
         shell: pwsh
         run: |
-          Rename-Item publish "HermesProxy-${{ matrix.artifact }}-${{ needs.version.outputs.tag }}"
-          Compress-Archive -Path "HermesProxy-${{ matrix.artifact }}-${{ needs.version.outputs.tag }}" -DestinationPath "HermesProxy-${{ matrix.artifact }}-${{ needs.version.outputs.tag }}.zip"
-
-      - name: Package (zip for MacOS)
-        if: matrix.os == 'macos'
-        run: |
-          mv publish HermesProxy-${{ matrix.artifact }}-${{ needs.version.outputs.tag }}
-          zip -r HermesProxy-${{ matrix.artifact }}-${{ needs.version.outputs.tag }}.zip HermesProxy-${{ matrix.artifact }}-${{ needs.version.outputs.tag }}
+          $name = "${{ env.ASSET_BASENAME }}-${{ needs.version.outputs.tag }}-win-x64"
+          Compress-Archive -Path "publish\*" -DestinationPath "$name.zip" -CompressionLevel Optimal
+          Get-Item "$name.zip" | Select-Object Name, Length
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HermesProxy-${{ matrix.artifact }}-${{ needs.version.outputs.tag }}
-          path: HermesProxy-${{ matrix.artifact }}-${{ needs.version.outputs.tag }}.*
+          name: ${{ env.ASSET_BASENAME }}-${{ needs.version.outputs.tag }}-win-x64
+          path: ${{ env.ASSET_BASENAME }}-${{ needs.version.outputs.tag }}-win-x64.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
@@ -188,34 +178,41 @@ jobs:
         with:
           path: artifacts
 
-      - name: Verify artifacts exist
+      - name: Verify artifact contents
         run: |
-          echo "=== Downloaded artifacts ==="
-          find artifacts -type f -name "HermesProxy-*" | sort
-          echo ""
+          zip=$(find artifacts -name "JimsProxy-*-win-x64.zip" -type f | head -1)
+          if [ -z "$zip" ]; then
+            echo "FAIL: no Windows artifact found"
+            find artifacts -type f | sort
+            exit 1
+          fi
 
-          for platform in Windows Ubuntu MacOS; do
-            files=$(find artifacts -name "HermesProxy-${platform}-*" -type f | head -1)
-            if [ -z "$files" ]; then
-              echo "FAIL: Missing artifact for $platform"
-              exit 1
-            fi
-            size=$(stat --printf="%s" "$files")
-            echo "OK: $files (${size} bytes)"
-            if [ "$size" -lt 1000 ]; then
-              echo "FAIL: Artifact too small — likely empty or corrupt"
+          size=$(stat --printf="%s" "$zip")
+          echo "Artifact: $zip (${size} bytes)"
+          # A self-contained single-file publish is tens of MB; anything much
+          # smaller means the exe or the CSV tree is missing.
+          if [ "$size" -lt 10000000 ]; then
+            echo "FAIL: artifact is only ${size} bytes — likely missing the binary or CSV data"
+            exit 1
+          fi
+
+          # The Windows binary cannot be executed on this runner, so assert on
+          # archive contents instead.
+          for entry in JimsProxy.exe HermesProxy.config README.txt; do
+            if ! unzip -l "$zip" | grep -q "$entry"; then
+              echo "FAIL: $entry missing from archive"
+              unzip -l "$zip" | head -30
               exit 1
             fi
           done
 
-      - name: Verify Linux binary executes
-        run: |
-          tarball=$(find artifacts -name "HermesProxy-Ubuntu-*.tar.gz" -type f | head -1)
-          tar -xzf "$tarball"
-          dir=$(find . -maxdepth 1 -name "HermesProxy-Ubuntu-*" -type d | head -1)
-          chmod +x "$dir/HermesProxy"
-          "$dir/HermesProxy" --help || true
-          echo "OK: Linux binary executes"
+          csv_count=$(unzip -l "$zip" | grep -c "CSV/" || true)
+          if [ "$csv_count" -lt 20 ]; then
+            echo "FAIL: only $csv_count CSV entries in archive — expected the full data set"
+            exit 1
+          fi
+
+          echo "OK: archive contains the binary, config, setup notes and $csv_count CSV entries"
 
   release:
     needs: [version, test, build, verify]
@@ -236,24 +233,32 @@ jobs:
       - name: Collect release assets and generate checksums
         run: |
           mkdir release-assets
-          find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec cp {} release-assets/ \;
+          find artifacts -type f -name "*.zip" -exec cp {} release-assets/ \;
           cp scripts/verify-checksums.sh release-assets/
           cp scripts/verify-checksums.ps1 release-assets/
           cd release-assets
-          sha256sum *.zip *.tar.gz > checksums-sha256.txt
+          sha256sum *.zip > checksums-sha256.txt
           echo "=== Release assets ==="
           ls -lh
           echo ""
           echo "=== Checksums ==="
           cat checksums-sha256.txt
 
-      - name: Create release
+      # Beta/prerelease tags are cut by hand, so the release often already
+      # exists. Upload into it rather than failing on create.
+      - name: Create release or attach assets to an existing one
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ needs.version.outputs.tag }}"
           date=$(date +%Y-%m-%d)
-          gh release create "$tag" \
-            --title "Release $tag ($date)" \
-            --generate-notes \
-            release-assets/*
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists — uploading assets into it"
+            gh release upload "$tag" release-assets/* --clobber
+          else
+            echo "Creating release $tag"
+            gh release create "$tag" \
+              --title "Release $tag ($date)" \
+              --generate-notes \
+              release-assets/*
+          fi
