@@ -143,6 +143,10 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
+          # Debug symbols are not useful to end users and add ~1.5 MB. Dropping
+          # them keeps the CI artifact identical in shape to the hand-built
+          # JimsProxy-v5.2.0-win-x64.zip attached to that release.
+          Remove-Item publish\*.pdb -Force -ErrorAction SilentlyContinue
           $name = "${{ env.ASSET_BASENAME }}-${{ needs.version.outputs.tag }}-win-x64"
           Compress-Archive -Path "publish\*" -DestinationPath "$name.zip" -CompressionLevel Optimal
           Get-Item "$name.zip" | Select-Object Name, Length
