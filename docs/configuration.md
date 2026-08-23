@@ -159,10 +159,6 @@ If you find these in an old config, they are ignored and can be deleted: **`Over
 
 ## Minimum working config
 
-The proxy has a compiled-in default for everything, but four keys are hard-required and validated at startup:
+Every key has a compiled-in default, so the proxy will start from a sparse file — but not always with the values you want (see the `PacketsLog` and `ClientBuild` fallback notes above). The config file itself must exist, or the proxy exits at startup. Startup validation checks that `ClientSeed` is well-formed, `ClientBuild` / `ServerBuild` are supported versions, and the five ports are in range; failures print the reason and exit. `ServerAddress` is **not** validated — a wrong address just fails to connect.
 
-```
-ServerAddress    ServerPort    BNetPort    ExternalAddress
-```
-
-In practice, ship the full file and change `ServerAddress`.
+In practice: ship the full file and change `ServerAddress`.
