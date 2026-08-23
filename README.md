@@ -42,7 +42,7 @@ See [CHANGES.md](CHANGES.md) for the full changelog.
 
 ## Configuration
 
-The proxy reads `HermesProxy.config` (XML format) from the working directory. The JimsProxy Launcher manages this automatically.
+The proxy reads `HermesProxy.config` (XML format) from the folder containing the executable — it switches its working directory there at startup, so it does not matter where you launch it from. The JimsProxy Launcher manages this automatically.
 
 For advanced use, CLI arguments override config values:
 
@@ -77,9 +77,9 @@ Output: `build/JimsProxy.exe` + `build/CSV/` + `build/HermesProxy.config`
 
 To test locally, copy the build output to your game's `Hermes/` directory:
 
-```bash
-cp build/JimsProxy.exe <game_dir>/Hermes/JimsProxy.exe
-cp -r build/CSV/* <game_dir>/Hermes/CSV/
+```
+copy build\JimsProxy.exe <game_dir>\Hermes\JimsProxy.exe
+xcopy /E /Y build\CSV <game_dir>\Hermes\CSV\
 ```
 
 .NET 6 will not work — the target framework is `net10.0` (set centrally in `Directory.Packages.props`).
