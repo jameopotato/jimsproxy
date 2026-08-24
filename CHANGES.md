@@ -59,6 +59,29 @@ prove it end to end. Note that `workflow_dispatch` only becomes available once t
 
 ---
 
+## 2026-08-22 — Retire the tracked `build-single/` distribution
+
+**Issue:** `build-single/` was a prebuilt copy of the proxy committed into the repo — 100 files,
+~115 MB, of which the exe alone was 80,146,765 bytes. It was stale (`5.0.6-latency-fixes.1`,
+April 30), referenced nowhere in this repo or the launcher repo, and undownloadable: GitHub cannot
+serve a directory, so using it meant cloning the whole repository. Every clone and every launcher
+`git submodule update` paid for it.
+
+**Change:** removed `build-single/` and added it to `.gitignore`, so a local publish into that path
+is never re-committed. The prebuilt proxy ships as a release asset instead —
+`JimsProxy-<tag>-win-x64.zip`, currently on v5.2.0 and v5.2.0-beta.4. Supersedes #458, which
+proposed refreshing the directory rather than retiring it. Existing clones do not shrink: the blob
+stays reachable in history, and rewriting the history of a public repo with forks is not worth it.
+This stops the growth rather than reversing it.
+
+**Verification:** `git grep build-single` returns no hits outside the directory itself, in this repo
+or the launcher repo. Nothing unique is removed — all 98 CSVs under `build-single/CSV/` exist in
+`HermesProxy/CSV/`, and the only other files were the stale exe and a stale `HermesProxy.config`
+(pre-#490 `ClientBuild=40618`, `PacketsLog=true`). `git check-ignore -v` matches both
+`build-single/JimsProxy.exe` and `build-single/CSV/*`.
+
+---
+
 ## 2026-08-20 — Correct the shipped config defaults for standalone (non-launcher) use
 
 **Issue:** `HermesProxy/HermesProxy.config` is what anyone building from source or running the
