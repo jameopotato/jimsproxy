@@ -3038,6 +3038,14 @@ public sealed class GameSessionData
         int otherCount = ClearObservedCastIds();
         PetAutoCastActiveCastIds.Clear();
         ClearForwardedStartCastIds();
+        // JimsProxy (dup-failure frame hold): drop held dup failures with the session state —
+        // their anchors were just cleared, and the client resets its own cast/button state
+        // across a reconnect or load screen. Delivering them into the new session would ship
+        // stale-CastID packets and pollute the held_ms field-gate metric.
+        lock (_heldDupFailuresLock)
+        {
+            _heldDupFailures.Clear();
+        }
         // Single-slot trackers for melee + auto-repeat (Auto Shot, Shoot Wand)
         // — same lifecycle as PendingNormalCasts; if a tracker was set when
         // the DC fired, it never gets cleared by the SPELL_GO/CAST_FAILED
