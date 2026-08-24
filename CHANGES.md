@@ -40,14 +40,14 @@ those legs could never have produced a usable artifact. Publish now writes strai
 instead of globbing `bin/Release/*/publish`. Added an explicit publish-output assertion for
 `JimsProxy.exe` + `HermesProxy.config` + `CSV/` so a rename breaks the build loudly instead of
 silently producing an empty archive. The verify job asserts on **archive contents** (binary,
-config, setup notes, and a full CSV set) rather than executing the binary, which an Ubuntu runner
+config, and a full CSV set) rather than executing the binary, which an Ubuntu runner
 cannot do. Assets are renamed `JimsProxy-<tag>-win-x64.zip`. The release step now uploads into an
 existing release instead of failing on create, since tags are frequently cut by hand.
 
-New file `scripts/release-README.txt`, packaged into the archive as `README.txt`: what the
-download contains, the client requirement (Classic Era 1.14.2 build 42597,
-`WowClassic_ForCustomServers.exe`, user-supplied), the four setup steps, and the common failure
-modes.
+An in-archive `README.txt` with setup notes was drafted for this change but split out
+(2026-08-23): packaged prose belongs to the parked standalone-docs effort and ships only after
+its own review. The archive is the three pieces the manual setup needs: `JimsProxy.exe`,
+`HermesProxy.config`, `CSV/`.
 
 **Verification:** YAML structure checked (5 jobs, single `windows-latest` build job, no tabs); no
 stale binary references remain. The packaged layout matches the

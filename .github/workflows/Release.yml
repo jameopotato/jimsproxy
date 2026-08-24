@@ -134,10 +134,6 @@ jobs:
           done
           echo "OK: JimsProxy.exe + HermesProxy.config + CSV/ present"
 
-      - name: Add standalone setup notes
-        shell: bash
-        run: cp scripts/release-README.txt publish/README.txt
-
       # Files sit at the archive root (no wrapper directory) to match the
       # layout the launcher bundle and the manual setup docs both assume.
       - name: Package
@@ -202,7 +198,7 @@ jobs:
 
           # The Windows binary cannot be executed on this runner, so assert on
           # archive contents instead.
-          for entry in JimsProxy.exe HermesProxy.config README.txt; do
+          for entry in JimsProxy.exe HermesProxy.config; do
             if ! unzip -l "$zip" | grep -q "$entry"; then
               echo "FAIL: $entry missing from archive"
               unzip -l "$zip" | head -30
@@ -216,7 +212,7 @@ jobs:
             exit 1
           fi
 
-          echo "OK: archive contains the binary, config, setup notes and $csv_count CSV entries"
+          echo "OK: archive contains the binary, config and $csv_count CSV entries"
 
   release:
     needs: [version, test, build, verify]
