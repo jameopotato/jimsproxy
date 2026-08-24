@@ -735,7 +735,31 @@ public partial class WorldClient
                     });
             }
             else
+            {
                 SendPacketToClient(failed);
+
+                // JimsProxy (#485 self-side measurement): the forwarded CastFailed is the packet
+                // that dismisses the LOCAL player's own cast bar — the one client-bound
+                // terminator with no log event, which left "did our own bar die and the cast
+                // fire anyway" unanswerable from field logs (observed casters have
+                // spell.failed_other.routed / spell.failure.routed; this had nothing).
+                // DebugOutput-gated per the diagnostics rubric: fires on every real local cast
+                // failure, normal flow. Emitted on the IMMEDIATE-delivery path only: a held
+                // dup's later delivery is logged by cast.fail.dup_flushed, and a
+                // was_started=true failure is never held (the hold predicate requires an
+                // unstarted dup), so the killed-then-fired sweep population always lands here
+                // with a delivery-accurate timestamp.
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("cast.failed.routed", new
+                    {
+                        spell_id = pendingCast.SpellId,
+                        reason_raw = reason,
+                        reason_effective = effectiveReason,
+                        cast_id_low = failed.CastID.GetCounter(),
+                        was_started = pendingCast.HasStarted,
+                        movement_suppressed = movementSuppressed,
+                    });
+            }
 
             // JimsProxy (transient-no-dismiss-started): under LowLatencyMode the SPELL_FAILURE
             // deferred the caster-side visual-cancel to here so the REAL reason drives it. A real
