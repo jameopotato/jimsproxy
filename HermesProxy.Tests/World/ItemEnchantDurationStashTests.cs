@@ -7,14 +7,16 @@ using Xunit;
 
 namespace HermesProxy.Tests.World;
 
-// JimsProxy (temp-enchant-0s-after-relogin): at login vanilla cores send
+// JimsProxy (temp-enchant-0s-after-relogin): Kronos can send
 // SMSG_ITEM_ENCHANT_TIME_UPDATE — the only carrier of a temp enchant's remaining
-// time — BEFORE the item's create block (2026-08-14 logs: both logins pre-create,
-// one pre-login-verify). The 1.14 client discards updates for guids it has not
-// constructed, and the create's enchantment duration field is zero, so the buff
-// renders as a permanently flashing "0s". The handler stashes the push in
-// GameSessionData and the item-create translation consumes it into the create
-// block's duration field, decayed by the time it spent stashed.
+// time that the client's weapon-buff countdown reads — BEFORE the item's create
+// block (2026-08-14 and 2026-08-28 logs). The client discards the push for a guid
+// it has not constructed, and the create's enchantment duration field is a stale
+// save-time snapshot no client generation uses for the timer, so the buff renders
+// as a permanently flashing "0s". The handler stashes the pre-create push in
+// GameSessionData (decay-tracked); the item-create translation arms a re-emit,
+// which HandleUpdateObject sends AFTER the create's packet has gone out — the
+// proxy-layer equivalent of the servers' "must be after add to map" ordering.
 public class ItemEnchantDurationStashTests
 {
     private static WowGuid128 Item(ulong counter) =>
@@ -153,26 +155,94 @@ public class ItemEnchantDurationStashTests
         Assert.Null(state.ConsumePendingItemEnchantDurations(guid, nowTick: 100_000));
     }
 
-    // --- injection gate ---
+    // --- post-create re-emit ---
 
-    // Inject only where the create shows a live enchant whose duration the server
-    // left empty (vanilla's login shape). A real duration in the field wins.
-    [Theory]
-    [InlineData(2504, null, true)]   // enchant ID, no duration field → the bug shape, inject
-    [InlineData(2504, 0u, true)]     // explicit zero duration → inject
-    [InlineData(2504, 1_800_000u, false)] // server provided a real duration → keep it
-    [InlineData(0, null, false)]     // no enchant in the slot → nothing to time
-    public void ShouldInjectEnchantDuration_GateShapes(int enchantId, uint? duration, bool expected)
+    // 2026-08-28 model correction (.pkt-proven): the client's weapon-buff timer is
+    // driven ONLY by SMSG_ITEM_ENCHANT_TIME_UPDATE — the create block's enchantment
+    // duration field is a stale save-time snapshot that no client generation reads
+    // for the countdown (every mangos-lineage core ships the stale field AND sends
+    // the packet from SendInitialPacketsAfterAddToMap: "must be after add to map").
+    // So the consume site arms a re-emit, and HandleUpdateObject flushes it to the
+    // client AFTER the update packet carrying the item's create has gone out —
+    // replicating canon server ordering at the proxy layer.
+
+    [Fact]
+    public void ArmEnchantTimeReemit_ThenTake_ReturnsSecondsFromMs()
     {
-        var enchantment = new ItemEnchantment { ID = enchantId, Duration = duration };
+        var state = GameSessionData.CreateForTesting();
+        var guid = Item(61878924); // the MH weapon low from jimsproxy-20260828-104459.jsonl
 
-        Assert.Equal(expected, GameSessionData.ShouldInjectEnchantDuration(enchantment));
+        state.ArmEnchantTimeReemit(guid, TempSlot, durationMs: 1_304_000);
+        var reemits = state.TakeEnchantTimeReemits();
+
+        Assert.NotNull(reemits);
+        var entry = Assert.Single(reemits);
+        Assert.Equal(guid, entry.ItemGuid);
+        Assert.Equal(TempSlot, entry.ModernSlot);
+        Assert.Equal(1304u, entry.DurationSeconds);
+    }
+
+    // Canon wire unit is whole seconds (leftduration / 1000) — truncate, don't round.
+    [Fact]
+    public void ArmEnchantTimeReemit_SubSecondRemainder_TruncatesToWholeSeconds()
+    {
+        var state = GameSessionData.CreateForTesting();
+
+        state.ArmEnchantTimeReemit(Item(1), TempSlot, durationMs: 1_999);
+        var reemits = state.TakeEnchantTimeReemits();
+
+        Assert.Equal(1u, Assert.Single(reemits!).DurationSeconds);
+    }
+
+    // A sub-second remainder would truncate to 0 — the exact broken display value,
+    // and 0 doubles as the client's removal signal. Never emit it; the enchant is
+    // about to expire server-side anyway.
+    [Fact]
+    public void ArmEnchantTimeReemit_UnderOneSecond_NotArmed()
+    {
+        var state = GameSessionData.CreateForTesting();
+
+        state.ArmEnchantTimeReemit(Item(1), TempSlot, durationMs: 999);
+
+        Assert.Null(state.TakeEnchantTimeReemits());
+    }
+
+    // Take is grab-and-clear: the flush at the end of one HandleUpdateObject must
+    // not replay into the next update packet.
+    [Fact]
+    public void TakeEnchantTimeReemits_SecondTake_ReturnsNull()
+    {
+        var state = GameSessionData.CreateForTesting();
+
+        state.ArmEnchantTimeReemit(Item(1), TempSlot, durationMs: 60_000);
+        state.TakeEnchantTimeReemits();
+
+        Assert.Null(state.TakeEnchantTimeReemits());
     }
 
     [Fact]
-    public void ShouldInjectEnchantDuration_NullEntry_False()
+    public void TakeEnchantTimeReemits_NothingArmed_ReturnsNull()
     {
-        Assert.False(GameSessionData.ShouldInjectEnchantDuration(null));
+        var state = GameSessionData.CreateForTesting();
+
+        Assert.Null(state.TakeEnchantTimeReemits());
+    }
+
+    // Both weapons stoned in one login update: both arms survive to the flush.
+    [Fact]
+    public void ArmEnchantTimeReemit_MultipleItems_AllReturnedInOrder()
+    {
+        var state = GameSessionData.CreateForTesting();
+
+        state.ArmEnchantTimeReemit(Item(1), TempSlot, durationMs: 600_000);
+        state.ArmEnchantTimeReemit(Item(2), TempSlot, durationMs: 300_000);
+        var reemits = state.TakeEnchantTimeReemits();
+
+        Assert.Equal(2, reemits!.Count);
+        Assert.Equal(Item(1), reemits[0].ItemGuid);
+        Assert.Equal(600u, reemits[0].DurationSeconds);
+        Assert.Equal(Item(2), reemits[1].ItemGuid);
+        Assert.Equal(300u, reemits[1].DurationSeconds);
     }
 
     // --- slot translation (vanilla server pinned by TestEnvironmentInitializer) ---

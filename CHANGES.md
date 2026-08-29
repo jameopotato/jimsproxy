@@ -13,6 +13,40 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-08-28 — Re-emit pre-create enchant time pushes after the item create (temp-enchant 0s, round 2)
+
+**Issue:** the sharpening-stone "flashing 0s" buff recurred on 5.2.1-beta.1
+(`jimsproxy-20260828-104459.jsonl`) despite the 2026-08-14 stash-and-inject fix (#473). Decoding
+the modern .pkt (`modern_42597_1787939107.pkt`) disproved #473's mechanism: the client's
+weapon-buff countdown is driven **only** by `SMSG_ITEM_ENCHANT_TIME_UPDATE` — the create block's
+enchantment duration field is a stale save-time snapshot that no client generation reads for the
+timer (the bad login's create carried 1,440,292 ms ≈ 24 min in the field and the client still
+rendered flashing 0s). #473's inject never fired in any field log; every "working" login worked
+because Kronos happens to send the push 1–5× per login and one usually lands after the creates.
+The 10:45 login got exactly one push, pre-create — the stash swallowed it and the client never
+received any enchant timer. This matches server canon: cmangos-classic, vmangos, and TrinityCore
+master all send enchant durations from `SendInitialPacketsAfterAddToMap` with the comment
+"must be after add to map" — the post-create requirement is client-imposed and predates 1.14.
+
+**Change:** `World/Client/PacketHandlers/UpdateHandler.cs` — the item-create consume site no
+longer writes the create's duration field; it arms a re-emit
+(`GameSessionData.ArmEnchantTimeReemit`), and `HandleUpdateObject` flushes armed re-emits as
+modern `ItemEnchantTimeUpdate` packets (whole seconds, matching canon `leftduration / 1000`)
+right after the update packet carrying the create — replicating the servers' own ordering at the
+proxy layer. `GlobalSessionData.cs` — `PendingEnchantTimeReemits` + arm/take (grab-and-clear;
+sub-second remainders dropped: 0 is both the broken display value and the client's removal
+signal). Removed the now-dead `ShouldInjectEnchantDuration` gate. The pre-create stash, decay
+tracking, and the forward path for post-create pushes are unchanged. Diags (DebugOutput-gated):
+`enchant.duration.reemitted_post_create` joins `enchant.duration.stashed_precreate`.
+
+**Verification:** red-first — 6 new arm/take tests failed on throwing stubs, green after
+implementation; suite 962/962. Field gate: relogin with an active stone on a login where Kronos's
+only push lands pre-create → expect `stashed_precreate` + `reemitted_post_create` and a real
+countdown (per-login coin flip on Kronos's send pattern, may need several relogs; any login
+showing stash events without a wrong display is a pass for that login).
+
+---
+
 ## 2026-08-22 — Repair the Release workflow (Windows-only) so releases carry assets
 
 **Issue:** `.github/workflows/Release.yml` already builds and attaches packaged binaries plus
