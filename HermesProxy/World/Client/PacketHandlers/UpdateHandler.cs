@@ -652,6 +652,33 @@ public partial class WorldClient
         foreach (var auraUpdate in auraUpdates)
             SendPacketToClient(auraUpdate);
 
+        // (temp-enchant-0s-after-relogin): deliver enchant timers whose server push
+        // beat the item's create — the client dropped (or would have dropped) the
+        // original, so re-emit now that the create is out. Seconds on the wire,
+        // matching SendItemEnchantTimeUpdate in every mangos-lineage core.
+        var enchantReemits = GetSession().GameState.TakeEnchantTimeReemits();
+        if (enchantReemits != null)
+        {
+            foreach (var (itemGuid, modernSlot, durationSeconds) in enchantReemits)
+            {
+                ItemEnchantTimeUpdate enchant = new ItemEnchantTimeUpdate();
+                enchant.ItemGuid = itemGuid;
+                enchant.DurationLeft = durationSeconds;
+                enchant.Slot = modernSlot;
+                enchant.OwnerGuid = GetSession().GameState.CurrentPlayerGuid;
+                SendPacketToClient(enchant);
+                if (Settings.DebugOutput)
+                {
+                    Log.Event("enchant.duration.reemitted_post_create", new
+                    {
+                        item_guid = itemGuid.ToString(),
+                        modern_slot = modernSlot,
+                        duration_seconds = durationSeconds,
+                    });
+                }
+            }
+        }
+
         // JimsProxy (camp stun lock, step 2): this update carried the login's first
         // self create block (marked in DetectStuckLogoutStunAtSelfCreate) — release
         // any control ops held from before it, in arrival order, now that the create
@@ -2627,37 +2654,23 @@ public partial class WorldClient
                     updateData.ItemData.Enchantment[Enums.Classic.EnchantmentSlot.Prop4] = ReadEnchantData(Enums.WotLK.EnchantmentSlot.Prop4);
                 }
 
-                // (temp-enchant-0s-after-relogin): consume stashed pre-create
-                // SMSG_ITEM_ENCHANT_TIME_UPDATE pushes into this create. At login the
-                // push beats the item's create block and the modern client discards it
-                // for an unbuilt guid — the enchant then renders with the create's zero
-                // duration field as a permanently flashing "0s" buff. The handler
-                // stashed the push (decay-tracked); write it into the create's duration
-                // field so the countdown starts at the real remaining time.
+                // (temp-enchant-0s-after-relogin): a stashed pre-create
+                // SMSG_ITEM_ENCHANT_TIME_UPDATE means this item's enchant timer never
+                // reached the client — it discards the push for an unbuilt guid, and
+                // that push is the ONLY carrier the weapon-buff countdown reads (the
+                // create's duration field is a stale save-time snapshot no client
+                // generation uses for the timer; .pkt-proven 2026-08-28: a create
+                // carrying 24min in the field still rendered flashing "0s"). Arm a
+                // re-emit here; HandleUpdateObject flushes it AFTER this create's
+                // packet is sent — the same "must be after add to map" ordering every
+                // mangos-lineage core enforces server-side.
                 if (isCreate)
                 {
                     var pendingEnchants = GetSession().GameState.ConsumePendingItemEnchantDurations(guid, Environment.TickCount);
                     if (pendingEnchants != null)
                     {
                         foreach (var (legacySlot, durationMs) in pendingEnchants)
-                        {
-                            int modernSlot = (int)TranslateEnchantmentSlotToModern(legacySlot);
-                            if (modernSlot >= updateData.ItemData.Enchantment.Length)
-                                continue;
-                            var enchantment = updateData.ItemData.Enchantment[modernSlot];
-                            if (enchantment == null || !GameSessionData.ShouldInjectEnchantDuration(enchantment))
-                                continue;
-                            enchantment.Duration = durationMs;
-                            if (Framework.Settings.DebugOutput)
-                            {
-                                Log.Event("enchant.duration.injected_at_create", new
-                                {
-                                    item_guid = guid.ToString(),
-                                    legacy_slot = legacySlot,
-                                    duration_ms = durationMs,
-                                });
-                            }
-                        }
+                            GetSession().GameState.ArmEnchantTimeReemit(guid, TranslateEnchantmentSlotToModern(legacySlot), durationMs);
                     }
                 }
 

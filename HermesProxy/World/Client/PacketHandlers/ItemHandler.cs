@@ -457,14 +457,17 @@ public partial class WorldClient
         enchant.DurationLeft = packet.ReadUInt32();
         enchant.OwnerGuid = packet.ReadGuid().To128(GetSession().GameState);
 
-        // (temp-enchant-0s-after-relogin): at login vanilla cores push this BEFORE the
-        // item's create block — it is the only carrier of the enchant's remaining time
-        // (the create's duration field is zero) and the modern client discards updates
-        // for guids it has not constructed, leaving the buff flashing a permanent "0s".
-        // Stash pre-create pushes only; the item-create translation consumes them into
-        // the create's duration field. Forward when the item already exists client-side —
-        // the forward path never needs the stash, and storing there would leave a
-        // never-consumed entry per enchanted item until logout.
+        // (temp-enchant-0s-after-relogin): Kronos can push this BEFORE the item's
+        // create block — it is the only carrier of the enchant's remaining time the
+        // client's weapon-buff timer reads (the create's duration field is a stale
+        // save-time snapshot no client generation uses for the countdown), and the
+        // client discards it for guids it has not constructed, leaving the buff
+        // flashing a permanent "0s". Stash pre-create pushes only; the item-create
+        // translation re-emits them to the client after the create is forwarded
+        // ("must be after add to map", per every mangos-lineage core). Forward when
+        // the item already exists client-side — the forward path never needs the
+        // stash, and storing there would leave a never-consumed entry per enchanted
+        // item until logout.
         if (GetSession().GameState.GetCachedObjectFieldsLegacy(enchant.ItemGuid) == null)
         {
             GetSession().GameState.StorePendingItemEnchantDuration(enchant.ItemGuid, legacySlot, enchant.DurationLeft, Environment.TickCount);

@@ -1140,12 +1140,20 @@ public sealed class GameSessionData
     public Dictionary<WowGuid128, Dictionary<byte, int>> UnitAuraDurationPushTime = [];
     // JimsProxy (temp-enchant-0s-after-relogin): remaining-time pushes from
     // SMSG_ITEM_ENCHANT_TIME_UPDATE, keyed item guid → (legacy enchantment slot →
-    // seconds + receipt tick). At login vanilla cores send the push BEFORE the item's
-    // create block (the only carrier of remaining time — the create's duration field is
-    // zero), and the modern client discards updates for guids it has not constructed.
-    // The push is stashed here and consumed into the item's create block when it is
-    // translated. Not carried across sessions: each login gets fresh pushes.
+    // seconds + receipt tick). Kronos can send the push BEFORE the item's create
+    // block (the only carrier the client's weapon-buff timer reads — the create's
+    // duration field is a stale save-time snapshot no client uses for the countdown),
+    // and the client discards it for guids it has not constructed ("must be after
+    // add to map" in every mangos-lineage core). The push is stashed here when it
+    // arrives pre-create and re-emitted (PendingEnchantTimeReemits) once the item's
+    // create has been forwarded. Not carried across sessions: each login gets fresh
+    // pushes.
     public Dictionary<WowGuid128, Dictionary<uint, (uint Seconds, int Tick)>> PendingItemEnchantDurations = [];
+    // Re-emits armed while an item create block is being translated (stash consumed),
+    // flushed by HandleUpdateObject AFTER the update packet carrying the create has
+    // been sent to the client — the proxy-layer equivalent of the servers' own
+    // SendEnchantmentDurations-after-add-to-map ordering.
+    public List<(WowGuid128 ItemGuid, uint ModernSlot, uint DurationSeconds)>? PendingEnchantTimeReemits;
     public Dictionary<WowGuid128, Dictionary<byte, WowGuid128>> UnitAuraCaster = [];
     // Wall-clock aura expiry per (unit, spell). Unlike the per-slot caches above this
     // survives unit destroys AND relogs (carried over in CreateNewGameSessionData), so a
@@ -1894,11 +1902,23 @@ public sealed class GameSessionData
         }
         return result.Count > 0 ? result : null;
     }
-    // Inject only where the create shows a live enchant whose duration field the
-    // server left empty (vanilla's login shape); a server-provided duration wins.
-    public static bool ShouldInjectEnchantDuration(HermesProxy.World.Objects.ItemEnchantment? enchantment)
+    // Sub-second remainders are dropped: they truncate to 0, which is both the
+    // broken display value and the client's removal signal — and the server's own
+    // expiry is due within the second anyway.
+    public void ArmEnchantTimeReemit(WowGuid128 itemGuid, uint modernSlot, uint durationMs)
     {
-        return enchantment is { ID: > 0 } && (enchantment.Duration == null || enchantment.Duration == 0);
+        uint durationSeconds = durationMs / 1000;
+        if (durationSeconds == 0)
+            return;
+
+        PendingEnchantTimeReemits ??= [];
+        PendingEnchantTimeReemits.Add((itemGuid, modernSlot, durationSeconds));
+    }
+    public List<(WowGuid128 ItemGuid, uint ModernSlot, uint DurationSeconds)>? TakeEnchantTimeReemits()
+    {
+        var reemits = PendingEnchantTimeReemits;
+        PendingEnchantTimeReemits = null;
+        return reemits;
     }
     public void StoreAuraCaster(WowGuid128 target, byte slot, WowGuid128 caster)
     {
