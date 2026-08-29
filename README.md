@@ -23,6 +23,8 @@ Download the **JimsProxy Launcher** from [jimothy.cc/install](https://jimothy.cc
 See [CHANGES.md](CHANGES.md) for the full changelog.
 
 ## Supported Versions
+### Recommended Client Version and Build
+1.14.2 build 42597
 
 ### Modern Client (what you play with)
 
