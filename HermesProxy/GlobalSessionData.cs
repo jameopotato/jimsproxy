@@ -212,6 +212,18 @@ public sealed class GameSessionData
     public bool WorldEntryPendingCarriedRootCheck;   // set at NEW_WORLD; consumed at the player's first destination update
     public bool WorldEntryCarriedRootCureArmed;      // dispatcher → end-of-UPDATE_OBJECT synth handoff (stuck-stun pattern)
     public bool WorldEntryCureAfterTeleportAck;      // same-map teleport variant: armed at the self MoveTeleport, fired at its CMSG_MOVE_TELEPORT_ACK
+    // JimsProxy (charge strafe-latch cure 2026-08-28, re-anchored 2026-08-29):
+    // one-shot armed when the charge-GO CHANGE_TRANSPORT carries a pending strafe
+    // start (the wire-proven orphan signature — see ChargePendLatchCure), fired as
+    // a synthetic force ROOT+UNROOT pulse on the first client movement packet
+    // showing the pend APPLIED (real strafe bit set, pend bit gone) — both sites
+    // live in HandlePlayerMove, same thread. 0 = disarmed; TTL-guarded so an arm
+    // whose pend never applies (client resolved it) expires silently. Disarmed by
+    // any real self force-root: the root itself wipes the client's movement flags
+    // (the natural cure), and pulsing an unroot under a live server root would
+    // free the player early.
+    public long ChargePendLatchArmedAtMs;
+    public uint ChargePendLatchArmedFlags;           // the arming packet's modern movement flags, for the cure breadcrumb
     // JimsProxy (zep-stuck-no-move 2026-05-14): set to a sentinel MoveCounter when
     // HandleNewWorld emits a synthesized SMSG_MOVE_TELEPORT to clear the modern
     // client's stale MOVEMENTFLAG_ONTRANSPORT after a cross-continent transport

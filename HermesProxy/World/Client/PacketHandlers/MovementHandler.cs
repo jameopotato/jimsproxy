@@ -1049,7 +1049,15 @@ public partial class WorldClient
         if (ceremony.Active && selfUnroot)
             System.Threading.Interlocked.Increment(ref ceremony.UnrootsForwarded);
         if (selfRoot)
+        {
             GetSession().GameState.ClientBelievesRooted = true;
+            // JimsProxy (charge strafe-latch cure 2026-08-28): a real self force-root
+            // between arm and fire disarms the cure — the root itself wipes the
+            // client's movement flags (the orphan is already gone, corpus-proven),
+            // and pulsing an unroot under a live server root would free the player
+            // early.
+            GetSession().GameState.ChargePendLatchArmedAtMs = 0;
+        }
         else if (selfUnroot)
             GetSession().GameState.ClientBelievesRooted = false;
 
