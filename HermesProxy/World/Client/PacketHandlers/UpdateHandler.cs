@@ -1989,6 +1989,27 @@ public partial class WorldClient
         return flags;
     }
 
+    // JimsProxy (map exploration reset 2026-09-01): compose modern 64-bit explored-zone
+    // elements from the legacy 32-bit field pair. The modern builder always writes the WHOLE
+    // ulong element, and a mid-session discovery dirties exactly ONE legacy field — so the
+    // paired half must come from the cumulative `updates` dict (the values path merges into
+    // the session's cached fields in place), never from the outgoing update being staged.
+    // Composing against the outgoing update zeroed the paired 32 zones on every new
+    // discovery, wiping chunks of the explored map until relog (#331's revert, still
+    // reachable through partial updates).
+    internal static void TranslateExploredZones(int legacyBaseField, int legacyFieldCount, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, ulong?[] modernExploredZones)
+    {
+        for (int i = 0; i < legacyFieldCount; i += 2)
+        {
+            if (updateMaskArray[legacyBaseField + i] || updateMaskArray[legacyBaseField + i + 1])
+            {
+                uint low = updates.TryGetValue(legacyBaseField + i, out var lowField) ? lowField.UInt32Value : 0;
+                uint high = updates.TryGetValue(legacyBaseField + i + 1, out var highField) ? highField.UInt32Value : 0;
+                modernExploredZones[i / 2] = ((ulong)high << 32) | low;
+            }
+        }
+    }
+
     public void StoreObjectUpdate(WowGuid128 guid, ObjectType objectType, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, AuraUpdate auraUpdate, PowerUpdate? powerUpdate, bool isCreate, ObjectUpdate updateData, BitArray actuallyChangedValuesMaskArray)
     {
         StoreObjectUpdateInternal(guid, objectType, updateMaskArray, updates, auraUpdate, powerUpdate, isCreate, updateData);
@@ -4362,24 +4383,9 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
             int PLAYER_EXPLORED_ZONES_1 = LegacyVersion.GetUpdateField(PlayerField.PLAYER_EXPLORED_ZONES_1);
             if (PLAYER_EXPLORED_ZONES_1 >= 0)
             {
+                // JimsProxy (map exploration reset 2026-09-01): see TranslateExploredZones.
                 int maxZones = LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180) ? 128 : 64;
-                for (int i = 0; i < maxZones; i++)
-                {
-                    if (updateMaskArray[PLAYER_EXPLORED_ZONES_1 + i])
-                    {
-                        // Two legacy uint32 zone fields pack into one modern ulong: even i → low 32,
-                        // odd i → high 32. On a partial UPDATE_FIELDS we must replace only the
-                        // targeted half and PRESERVE the other half — otherwise the paired field's
-                        // explored bits get clobbered, causing previously-explored areas to revert
-                        // to unexplored on the world map (WowLegacyCore/HermesProxy#331).
-                        ulong existing = updateData.ActivePlayerData.ExploredZones[i / 2] ?? 0UL;
-                        uint newValue = updates[PLAYER_EXPLORED_ZONES_1 + i].UInt32Value;
-                        if ((i & 1) != 0)
-                            updateData.ActivePlayerData.ExploredZones[i / 2] = (existing & 0xFFFFFFFFUL) | ((ulong)newValue << 32);
-                        else
-                            updateData.ActivePlayerData.ExploredZones[i / 2] = (existing & 0xFFFFFFFF00000000UL) | (ulong)newValue;
-                    }
-                }
+                TranslateExploredZones(PLAYER_EXPLORED_ZONES_1, maxZones, updateMaskArray, updates, updateData.ActivePlayerData.ExploredZones);
             }
             int PLAYER_FIELD_COINAGE = LegacyVersion.GetUpdateField(PlayerField.PLAYER_FIELD_COINAGE);
             if (PLAYER_FIELD_COINAGE >= 0 && updateMaskArray[PLAYER_FIELD_COINAGE])
