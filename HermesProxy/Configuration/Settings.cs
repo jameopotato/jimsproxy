@@ -176,9 +176,16 @@ public static class Settings
     // frame; the 1.14 client can drop the coalesced SPELL_GO, so the cast never closes — a stuck
     // cast pose + looping cast sound + lit action button that persists until logout (survives
     // /reload). When set, on a local instant's first SPELL_GO re-fire a stripped duplicate SPELL_GO
-    // (~8ms later, in a clean frame, visual suppressed, no targets/log) so the client processes it
+    // (RefireSpellGoDeferMs later, in a clean frame, visual suppressed, no targets/log) so the client processes it
     // and closes the cast. No-op on clean casts. Independent of LowLatencyMode. Default OFF — opt-in.
+    // Also covers OBSERVED casters (other players / NPCs, incl. cast-time spells like Flash of Light) on any
+    // SPELL_GO that paired with a seen SPELL_START — most stuck precast sounds are observed, not local.
     public static bool RefireSpellGo;
+    // JimsProxy (RefireSpellGo defer): ms the stripped duplicate GO lands after the original. Must exceed ONE
+    // client frame so it processes in a clean frame, separate from the coalesced START+GO — else it's useless.
+    // 50ms clears down to ~20fps (crowds, where the bug is worst); the duplicate is inert so a late land is
+    // UX-free. Frame-clearing via a conservative fixed margin, not per-frame FPS estimation. Tune to your FPS floor.
+    public static int RefireSpellGoDeferMs;
     // JimsProxy (#379 form-exit): the 1.14 client auto-shifts out of a form to cast
     // (CMSG_CANCEL_AURA + CMSG_CAST_SPELL ~1ms apart), but the 1.12 server emits the cast's
     // SMSG_SPELL_START ~20ms BEFORE the form-removal SMSG_UPDATE_OBJECT. The cast's visual kit
@@ -279,6 +286,7 @@ public static class Settings
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);
         IdentityPinnedCastIds = config.GetBoolean("IdentityPinnedCastIds", false);
         RefireSpellGo = config.GetBoolean("RefireSpellGo", false);
+        RefireSpellGoDeferMs = config.GetInt("RefireSpellGoDeferMs", 50);
         var rttPrefireStr = config.GetString("RttPrefire", "off");
         RttPrefire = rttPrefireStr.Equals("timer", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Timer
             : rttPrefireStr.Equals("knocker", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Knocker

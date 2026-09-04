@@ -24,9 +24,10 @@ public partial class WorldClient
     private const int AutoRepeatRetryMinDelayMs = 500;
     private const int AutoRepeatRetryMaxDelayMs = 3500;
 
-    // JimsProxy (Spell Success Kit Reset): defer (ms) before re-firing the cast-finish, so it lands
-    // in a clean client frame past the coalesced START+GO burst. A couple of frames at 60fps.
-    private const int SpellSuccessRefireDeferMs = 8;
+    // JimsProxy (Spell Success Kit Reset): the duplicate-GO defer now lives in Settings.RefireSpellGoDeferMs (frame-clearing, was a fixed 8ms = under one frame = same-frame as the original, defeating the point).
+
+    // JimsProxy (observed-refire): HandleSpellStartOrGo sets this when an observed caster's SPELL_GO paired with a seen START; HandleSpellGo reads it once to schedule the clean-frame refire (single-threaded WC thread).
+    private bool _observedGoStartPaired;
 
     // JimsProxy (dup-failure frame hold): deliver a batch of held dup failures, in hold order.
     // Runs on the WorldClient receive thread at a release site — always AFTER the started
@@ -2462,12 +2463,15 @@ public partial class WorldClient
             // looping cast sound + lit action button, persisting until logout (survives /reload). Seen on
             // Blade Flurry, Sunder, Battle Shout, holy casts. (Natural trigger appears to be the client
             // coalescing the GO with the same-frame START, but that's inferred — we reproduce it with the
-            // injector, not yet captured in the wild.) We re-fire the cast-finish ~8ms later as a
+            // injector, not yet captured in the wild.) We re-fire the cast-finish a frame-clearing delay later (RefireSpellGoDeferMs) as a
             // DUPLICATE SPELL_GO in a CLEAN frame (visual suppressed, no targets/log): the client
             // processes the clean-frame copy and closes the cast. No effect/CLEU replay, cancels nothing,
-            // no-op on clean casts. Original GO forwards first (below). Local-player instants only.
+            // no-op on clean casts. Original GO forwards first (below).
             // Caveat: needs the server to send the first GO — a server-missing GO wouldn't trigger this.
-            if (Settings.RefireSpellGo && pendingCast.StartedCastTimeMs == 0)
+            // JimsProxy (observed-refire / Option 1b): now covers local CAST-TIME spells too, not just instants — a spammed heal (Flash of Light, the live-caught culprit) coalesces GO(N) with the next cast's START(N+1), the same end-event drop. Channels excluded (refiring their GO would restart the channel visual); auto-repeat + charge-stun sub-effects never reach here (no PendingNormalCast entry).
+            // JimsProxy (crafting-regression): NEVER refire off-GCD spells (any cast time). Off-GCD is the client's double-send / re-issue-on-GO class — crafting (3275/3276) auto-repeats on GO so a duplicate GO desyncs the craft-all queue (stops early), and the same re-issue risk applies to off-GCD instants (untested — the refire was never field-active before). Every known loop target (FoL, Shadow Bolt, holy/combat casts) is on-GCD.
+            if (Settings.RefireSpellGo && !GameData.IsChanneledSpell(gcdLookupId) &&
+                !GameData.IsOffGcd(gcdLookupId))
             {
                 var rfCasterGuid = spell.Cast.CasterGUID;
                 var rfCasterUnit = spell.Cast.CasterUnit;
@@ -2478,7 +2482,7 @@ public partial class WorldClient
                 uint rfCastFlagsEx = spell.Cast.CastFlagsEx;
                 _ = Task.Run(async () =>
                 {
-                    await Task.Delay(SpellSuccessRefireDeferMs);
+                    await Task.Delay(Settings.RefireSpellGoDeferMs);
                     try
                     {
                         var refire = new SpellGo();
@@ -2496,7 +2500,7 @@ public partial class WorldClient
                             Log.Event("cast.success_refire", new
                             {
                                 spell_id = rfSpellId,
-                                defer_ms = SpellSuccessRefireDeferMs,
+                                defer_ms = Settings.RefireSpellGoDeferMs,
                             });
                     }
                     catch
@@ -2669,6 +2673,49 @@ public partial class WorldClient
             // Bind the sweep's cancel callback lazily to this live WorldClient (mirrors OnGcdHeldCastFire); also gates the quiescence timer on in NoteObservedAutoRepeatActivity.
             GetSession().GameState.OnObservedAutoRepeatExpire ??= SendObservedAutoRepeatCancel;
             GetSession().GameState.NoteObservedAutoRepeatActivity(spell.Cast.CasterUnit, shotTarget);
+        }
+
+        // JimsProxy (observed-refire): extend RefireSpellGo to OBSERVED casters — the stuck precast sound is mostly other players/NPCs (live-caught on Flash of Light, a cast-time heal), which our local-only, instants-only refire never covered. Gate on the seen START↔GO pair (loop precondition, set in HandleSpellStartOrGo) so it fires only for a real observed cast; exclude auto-repeat (its GO is handled above and a duplicate would double the shot visual). Re-fire the GO a frame-clearing delay later (RefireSpellGoDeferMs) as a clean-frame duplicate (visual suppressed, empty targets/log) so a coalesced START+GO whose kit end-event dropped still closes. No-op on cleanly-closed casts; opt-in via RefireSpellGo (default off).
+        if (Settings.RefireSpellGo && _observedGoStartPaired &&
+            !GameData.AutoRepeatSpells.Contains((uint)spell.Cast.SpellID) &&
+            !GameData.IsOffGcd((uint)spell.Cast.SpellID))
+        {
+            var rfCasterGuid = spell.Cast.CasterGUID;
+            var rfCasterUnit = spell.Cast.CasterUnit;
+            var rfCastId = spell.Cast.CastID;
+            var rfOriginalCastId = spell.Cast.OriginalCastID;
+            int rfSpellId = spell.Cast.SpellID;
+            uint rfCastFlags = spell.Cast.CastFlags;
+            uint rfCastFlagsEx = spell.Cast.CastFlagsEx;
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(Settings.RefireSpellGoDeferMs);
+                try
+                {
+                    var refire = new SpellGo();
+                    refire.Cast.CasterGUID = rfCasterGuid;
+                    refire.Cast.CasterUnit = rfCasterUnit;
+                    refire.Cast.CastID = rfCastId;
+                    refire.Cast.OriginalCastID = rfOriginalCastId;
+                    refire.Cast.SpellID = rfSpellId;
+                    refire.Cast.SpellXSpellVisualID = 0; // suppress visual so nothing replays
+                    refire.Cast.CastFlags = rfCastFlags;
+                    refire.Cast.CastFlagsEx = rfCastFlagsEx;
+                    // targets + LogData left empty: a pure cast-finish, no effect/CLEU replay
+                    SendPacketToClient(refire);
+                    if (Framework.Settings.DebugOutput)
+                        Log.Event("cast.observed_success_refire", new
+                        {
+                            spell_id = rfSpellId,
+                            caster_low = rfCasterUnit.GetCounter(),
+                            defer_ms = Settings.RefireSpellGoDeferMs,
+                        });
+                }
+                catch
+                {
+                    // session/socket may have torn down during the defer — best-effort
+                }
+            });
         }
 
         // JimsProxy (#379 form-exit): this GO completes the instant cast whose START was stashed
@@ -2849,6 +2896,7 @@ public partial class WorldClient
     SpellCastData HandleSpellStartOrGo(WorldPacket packet, bool isSpellGo)
     {
         SpellCastData dbdata = new SpellCastData();
+        _observedGoStartPaired = false; // set below only for an observed GO that pairs with a seen START
 
         dbdata.CasterGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
         dbdata.CasterUnit = packet.ReadPackedGuid().To128(GetSession().GameState);
@@ -2881,6 +2929,8 @@ public partial class WorldClient
                 // Pairs with the NEWEST tracked entry — only the live cast can complete;
                 // an older entry is a superseded predecessor this GO purges (#484).
                 dbdata.CastID = existingCastId;
+                // JimsProxy (observed-refire): a seen START↔GO pair on an observed caster is the stuck-precast-sound precondition; flag it so HandleSpellGo can re-fire the GO in a clean frame.
+                _observedGoStartPaired = true;
             }
             // JimsProxy (#485 killed-then-fired): a terminator already consumed the tracked
             // entry but the cast completed anyway (Kronos broadcasts SPELL_FAILED_OTHER for
