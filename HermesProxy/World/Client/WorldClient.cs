@@ -390,22 +390,37 @@ public partial class WorldClient
         var state = GetSession()?.GameState;
         if (state == null || state.PendingPreemptAttackStopVictim == default)
             return;
-
-        bool drained;
-        try
-        {
-            drained = _clientSocket.Available == 0;
-        }
-        catch
-        {
-            drained = true; // socket torn down — flush rather than leak the armed stop
-        }
-        if (!drained)
+        if (!LegacySocketDrained())
             return;
 
         var victim = state.TakePreemptAttackStopForFlush();
         if (victim != default)
             SendPreemptAttackStop(victim, "drain");
+    }
+
+    // JimsProxy (fishing recast wedge): same drain rule for the held channel zero-update —
+    // the previous bobber's teardown anchors arrive in the same read pass as the stale
+    // zero-update or not at all, so drain is the release point for a genuine one.
+    private void FlushHeldChannelZeroUpdateAtDrain()
+    {
+        var state = GetSession()?.GameState;
+        if (state == null || (state.HeldLocalChannelZeroUpdate == null && !state.StaleBobberTeardownSeenThisPass))
+            return;
+        if (!LegacySocketDrained())
+            return;
+        ReleaseHeldChannelZeroUpdateAtDrain();
+    }
+
+    private bool LegacySocketDrained()
+    {
+        try
+        {
+            return _clientSocket.Available == 0;
+        }
+        catch
+        {
+            return true; // socket torn down — flush rather than leak what is armed
+        }
     }
 
     private async Task ReceiveLoop()
@@ -448,6 +463,7 @@ public partial class WorldClient
                 packet.SetReceiveTime(Environment.TickCount);
                 HandlePacket(packet);
                 FlushPreemptAttackStopAtDrain();
+                FlushHeldChannelZeroUpdateAtDrain();
             }
         }
         catch(Exception e)

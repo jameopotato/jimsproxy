@@ -170,6 +170,14 @@ public sealed class GameSessionData
     // permanently.
     public uint LocalChannelSpellId; // 0 means not channeling
     public long LocalChannelEndTickMs;
+    // JimsProxy (fishing recast wedge 2026-09-01): packet-anchored guard state for the
+    // previous bobber's channel zero-update — see OnLocalChannelStart below.
+    public WowGuid128 LocalFishingBobberGuid;     // newest bobber the server created for us
+    public WowGuid128 StaleZeroUpdateBobberGuid;  // armed while set: the bobber whose teardown is still owed
+    public bool LocalChannelBreakActionSeen;
+    public bool StaleBobberTeardownSeenThisPass;
+    public SpellChannelUpdate? HeldLocalChannelZeroUpdate;
+    public WowGuid128 OrphanedClientChannelBobberGuid; // set after a drop: the client's channel outlives the server's; the proxy ends it when this bobber goes
 
     /// <summary>True while the local player's channel window (tracked from
     /// MSG_CHANNEL_START/UPDATE) is open, with a small grace margin. Used to
@@ -180,6 +188,145 @@ public sealed class GameSessionData
         return LocalChannelSpellId != 0 &&
                Environment.TickCount64 < LocalChannelEndTickMs + 2000;
     }
+
+    /// <summary>
+    /// JimsProxy (fishing recast wedge 2026-09-01): MSG_CHANNEL_START bookkeeping for the
+    /// local player. A fishing bobber outlives its channel by a couple of seconds, and on
+    /// mangos-family cores the bobber's timeout finishes whatever channel the player has
+    /// at that moment (Unit::FinishSpell sends a channel update with no time remaining
+    /// for CURRENT_CHANNELED_SPELL without checking that the bobber belongs to it). So a
+    /// recast inside that window has its NEW channel ended by the server ~100ms after it
+    /// opened, while the new bobber lives on and stays lootable. Vanilla's channel update
+    /// carries no spell id, so the modern client faithfully ends the channel it just
+    /// opened: the char stands idle, the bobber floats out its full life, and every recast
+    /// from then on repeats the race. The guard keeps the client's channel open so the
+    /// bobber can be waited out. It arms only when the previous bobber is still in the
+    /// object cache at the new CHANNEL_START, and it acts only on the zero-update that
+    /// shares a read pass with that bobber's SMSG_DESTROY_OBJECT / SMSG_FISH_NOT_HOOKED.
+    /// Scoped to fishing because eating a genuine early interrupt of a combat channel
+    /// would wedge the cast bar the other way.
+    /// </summary>
+    public void OnLocalChannelStart(uint spellId, uint durationMs)
+    {
+        LocalChannelSpellId = durationMs > 0 ? spellId : 0;
+        LocalChannelEndTickMs = Environment.TickCount64 + durationMs;
+        LocalChannelBreakActionSeen = false;
+        StaleBobberTeardownSeenThisPass = false;
+        HeldLocalChannelZeroUpdate = null; // a new START supersedes anything still held
+        StaleZeroUpdateBobberGuid = default;
+        OrphanedClientChannelBobberGuid = default;
+        if (!GameData.IsFishingChannelSpell(LocalChannelSpellId) || LocalFishingBobberGuid == default)
+            return;
+        // The new bobber's create block trails this START in the same batch, so the newest
+        // bobber we know of is still the previous cast's — armed iff it is not destroyed yet.
+        bool previousBobberAlive;
+        lock (ObjectCacheLock)
+            previousBobberAlive = ObjectCacheLegacy.ContainsKey(LocalFishingBobberGuid);
+        if (previousBobberAlive)
+            StaleZeroUpdateBobberGuid = LocalFishingBobberGuid;
+    }
+
+    public enum LocalChannelZeroUpdateDisposition { Forward, Held, Dropped }
+
+    /// <summary>
+    /// JimsProxy (fishing recast wedge 2026-09-01): decision for a MSG_CHANNEL_UPDATE with
+    /// no time remaining for the local player. Forward = genuine end (the #244 emote-guard
+    /// window is closed here). Held = the previous bobber's teardown may follow in this
+    /// read pass: the caller parks the packet until that bobber's destroy drops it or the
+    /// socket drains and releases it. Dropped = the teardown already passed this pass.
+    /// </summary>
+    public LocalChannelZeroUpdateDisposition ClassifyLocalChannelZeroUpdate(SpellChannelUpdate update)
+    {
+        if (StaleZeroUpdateBobberGuid == default || LocalChannelBreakActionSeen)
+        {
+            // JimsProxy (#244 emote channel guard): the server ends a channel by sending an
+            // update with no time remaining — close our window early.
+            LocalChannelSpellId = 0;
+            StaleZeroUpdateBobberGuid = default;
+            OrphanedClientChannelBobberGuid = default;
+            return LocalChannelZeroUpdateDisposition.Forward;
+        }
+        if (StaleBobberTeardownSeenThisPass)
+        {
+            StaleBobberTeardownSeenThisPass = false;
+            StaleZeroUpdateBobberGuid = default;
+            OrphanedClientChannelBobberGuid = LocalFishingBobberGuid;
+            return LocalChannelZeroUpdateDisposition.Dropped;
+        }
+        HeldLocalChannelZeroUpdate = update;
+        return LocalChannelZeroUpdateDisposition.Held;
+    }
+
+    /// <summary>
+    /// JimsProxy (fishing recast wedge 2026-09-01): SMSG_DESTROY_OBJECT for the armed
+    /// bobber, or SMSG_FISH_NOT_HOOKED (guid-less; only a bobber's teardown or a bobber
+    /// click sends it, and a click is a break action). True = a held zero-update was
+    /// dropped. With nothing held, the anchor is remembered for the rest of this read pass.
+    /// </summary>
+    public bool OnFishingBobberTeardownAnchor(WowGuid128 destroyedGuid = default)
+    {
+        if (destroyedGuid != default && destroyedGuid == LocalFishingBobberGuid)
+            LocalFishingBobberGuid = default;
+        if (StaleZeroUpdateBobberGuid == default)
+            return false;
+        if (destroyedGuid != default && destroyedGuid != StaleZeroUpdateBobberGuid)
+            return false;
+        if (HeldLocalChannelZeroUpdate == null)
+        {
+            StaleBobberTeardownSeenThisPass = true;
+            return false;
+        }
+        HeldLocalChannelZeroUpdate = null;
+        StaleZeroUpdateBobberGuid = default;
+        OrphanedClientChannelBobberGuid = LocalFishingBobberGuid;
+        return true;
+    }
+
+    /// <summary>
+    /// JimsProxy (fishing recast wedge 2026-09-01): after a drop the server has no channel
+    /// but the client still does, so nothing on the wire will ever end it. The new bobber's
+    /// SMSG_DESTROY_OBJECT (catch looted, fish escaped, or timed out) is where the server
+    /// would have ended a channel of its own — true = the caller ends the client's now.
+    /// </summary>
+    public bool TakeOrphanedClientChannelEnd(WowGuid128 destroyedGuid)
+    {
+        if (OrphanedClientChannelBobberGuid == default || destroyedGuid != OrphanedClientChannelBobberGuid)
+            return false;
+        OrphanedClientChannelBobberGuid = default;
+        LocalChannelSpellId = 0;
+        return true;
+    }
+
+    /// <summary>
+    /// JimsProxy (fishing recast wedge 2026-09-01): the legacy socket has no more buffered
+    /// packets, so the read pass is over. Returns a held zero-update for forwarding (no
+    /// anchor came with it, so it was genuine) and closes the channel window; an anchor
+    /// seen without a zero-update disarms the guard — nothing is owed any more.
+    /// </summary>
+    public SpellChannelUpdate? TakeHeldLocalChannelZeroUpdateAtDrain()
+    {
+        if (StaleBobberTeardownSeenThisPass)
+        {
+            StaleBobberTeardownSeenThisPass = false;
+            StaleZeroUpdateBobberGuid = default;
+        }
+        var held = HeldLocalChannelZeroUpdate;
+        if (held == null)
+            return null;
+        HeldLocalChannelZeroUpdate = null;
+        StaleZeroUpdateBobberGuid = default;
+        OrphanedClientChannelBobberGuid = default;
+        LocalChannelSpellId = 0;
+        return held;
+    }
+
+    /// <summary>
+    /// JimsProxy (fishing recast wedge 2026-09-01): the client did something that can
+    /// legitimately end its channel early (cancel cast/channel, GO use, another cast) —
+    /// any zero-update after this is genuine, so the guard stands down until the next
+    /// channel start.
+    /// </summary>
+    public void RecordLocalChannelBreakAction() => LocalChannelBreakActionSeen = true;
     public string? TaxiAttemptId;
     public bool IsWaitingForNewWorld;
     public bool IsWaitingForWorldPortAck;

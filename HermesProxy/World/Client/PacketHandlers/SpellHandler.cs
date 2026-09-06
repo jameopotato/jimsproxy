@@ -2,6 +2,7 @@
 using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
+using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
 using System;
 using System.Collections.Generic;
@@ -3785,10 +3786,7 @@ public partial class WorldClient
         // JimsProxy (#244 emote channel guard): record our own channel window
         // so text-emote forwards hold off while it is open.
         if (channel.CasterGUID == GetSession().GameState.CurrentPlayerGuid)
-        {
-            GetSession().GameState.LocalChannelSpellId = channel.Duration > 0 ? channel.SpellID : 0;
-            GetSession().GameState.LocalChannelEndTickMs = Environment.TickCount64 + channel.Duration;
-        }
+            GetSession().GameState.OnLocalChannelStart(channel.SpellID, channel.Duration);
         SendPacketToClient(channel);
     }
 
@@ -3801,11 +3799,80 @@ public partial class WorldClient
         else
             channel.CasterGUID = GetSession().GameState.CurrentPlayerGuid;
         channel.TimeRemaining = packet.ReadInt32();
-        // JimsProxy (#244 emote channel guard): the server ends a channel by
-        // sending an update with no time remaining — close our window early.
         if (channel.TimeRemaining <= 0 && channel.CasterGUID == GetSession().GameState.CurrentPlayerGuid)
-            GetSession().GameState.LocalChannelSpellId = 0;
+        {
+            // JimsProxy (fishing recast wedge 2026-09-01): on a fresh fishing recast the
+            // server ends the NEW channel when the previous bobber times out (its timeout
+            // finishes whatever channel is current). Keep the client's channel open so the
+            // new bobber can be waited out: park this zero-update until the old bobber's
+            // teardown in this read pass drops it, or the socket drains and releases it.
+            // See GameSessionData.ClassifyLocalChannelZeroUpdate.
+            switch (GetSession().GameState.ClassifyLocalChannelZeroUpdate(channel))
+            {
+                case GameSessionData.LocalChannelZeroUpdateDisposition.Held:
+                    return;
+                case GameSessionData.LocalChannelZeroUpdateDisposition.Dropped:
+                    OnStaleChannelZeroUpdateDropped("teardown_before_update");
+                    return;
+            }
+        }
         SendPacketToClient(channel);
+    }
+
+    // JimsProxy (fishing recast wedge): SMSG_DESTROY_OBJECT / SMSG_FISH_NOT_HOOKED are the
+    // anchors that identify a held zero-update as the previous bobber's teardown.
+    private void DropHeldChannelZeroUpdateIfAnchored(WowGuid128 destroyedGuid, string anchor)
+    {
+        if (GetSession().GameState.OnFishingBobberTeardownAnchor(destroyedGuid))
+            OnStaleChannelZeroUpdateDropped(anchor);
+    }
+
+    // The same server tick that sends the zero-update also clears the player's channel
+    // spell and channel object fields, and that values block was already forwarded ahead
+    // of it — without the fields the client drops the fishing pose, refuses the bobber and
+    // refuses a recast. Point them at the new bobber again so the client's channel is whole.
+    private void OnStaleChannelZeroUpdateDropped(string anchor)
+    {
+        var state = GetSession().GameState;
+        UpdateObject updateObject = new UpdateObject(state);
+        ObjectUpdate update = new ObjectUpdate(state.CurrentPlayerGuid, UpdateTypeModern.Values, GetSession());
+        update.UnitData.ChannelData = new UnitChannel((int)state.LocalChannelSpellId, (int)GameData.GetSpellVisual(state.LocalChannelSpellId));
+        update.UnitData.ChannelObject = state.OrphanedClientChannelBobberGuid;
+        updateObject.ObjectUpdates.Add(update);
+        SendPacketToClient(updateObject);
+        if (Settings.DebugOutput)
+            Log.Event("spell.channel.stale_zero_update_dropped", new
+            {
+                spell_id = state.LocalChannelSpellId,
+                anchor,
+                bobber = state.OrphanedClientChannelBobberGuid.ToString(),
+            });
+    }
+
+    // The server never ends a channel it no longer has, so the new bobber's destroy is
+    // where the client's kept-alive channel must end instead.
+    private void EndOrphanedClientChannelIfBobber(WowGuid128 destroyedGuid)
+    {
+        var state = GetSession().GameState;
+        uint spellId = state.LocalChannelSpellId;
+        if (!state.TakeOrphanedClientChannelEnd(destroyedGuid))
+            return;
+        SpellChannelUpdate end = new() { CasterGUID = state.CurrentPlayerGuid, TimeRemaining = 0 };
+        SendPacketToClient(end);
+        if (Settings.DebugOutput)
+            Log.Event("spell.channel.orphan_end_synthesized", new { spell_id = spellId, bobber = destroyedGuid.ToString() });
+    }
+
+    // JimsProxy (fishing recast wedge): the read pass ended with the zero-update still
+    // held — no bobber teardown came with it, so it was a genuine end and goes through.
+    internal void ReleaseHeldChannelZeroUpdateAtDrain()
+    {
+        uint spellId = GetSession().GameState.LocalChannelSpellId;
+        var held = GetSession().GameState.TakeHeldLocalChannelZeroUpdateAtDrain();
+        if (held == null)
+            return;
+        Log.Event("spell.channel.zero_update_released_at_drain", new { spell_id = spellId });
+        SendPacketToClient(held);
     }
 
     [PacketHandler(Opcode.SMSG_SPELL_DAMAGE_SHIELD)]

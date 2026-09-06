@@ -40,6 +40,9 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_FISH_NOT_HOOKED)]
     void HandleFishNotHooked(WorldPacket packet)
     {
+        // JimsProxy (fishing recast wedge): a bobber timeout sends this right after the
+        // channel zero-update it caused — an anchor for dropping a held one.
+        DropHeldChannelZeroUpdateIfAnchored(default, "fish_not_hooked");
         FishNotHooked fish = new FishNotHooked();
         SendPacketToClient(fish);
     }

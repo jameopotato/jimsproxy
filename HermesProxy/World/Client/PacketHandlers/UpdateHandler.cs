@@ -239,6 +239,12 @@ public partial class WorldClient
         }
         GetSession().GameState.LastAuraCasterOnTarget.Remove(guid);
 
+        // JimsProxy (fishing recast wedge): the previous bobber's destroy is the anchor
+        // that lets a held channel zero-update be dropped as its teardown, and the new
+        // bobber's destroy is where the kept-alive client channel ends.
+        DropHeldChannelZeroUpdateIfAnchored(guid, "destroy_object");
+        EndOrphanedClientChannelIfBobber(guid);
+
         // JimsProxy (PR #161 follow-up — destroy-hook fast path): if any pending
         // cast was aimed at this GUID, evict it now and emit synthetic
         // CastFailed(BadTargets). Faster than waiting up to 2.5s for the
@@ -2064,6 +2070,13 @@ public partial class WorldClient
     {
         DetectStuckLogoutStunAtSelfCreate(guid, updates, isCreate, updateData);
         SynthStandOnFearCcOnset(guid, updates);
+
+        // JimsProxy (fishing recast wedge): remember our newest bobber so a recast's
+        // CHANNEL_START can tell whether the previous one is still alive.
+        if (isCreate && objectType == ObjectType.GameObject &&
+            updateData.GameObjectData.TypeID == GameData.FishingNodeGameObjectType &&
+            updateData.GameObjectData.CreatedBy == GetSession().GameState.CurrentPlayerGuid)
+            GetSession().GameState.LocalFishingBobberGuid = guid;
 
         // JimsProxy: comprehensive pet diagnostics for the Hunter-Pet-Stealth-Stuck
         // investigation. Fires on every UPDATE_OBJECT block targeting a pet GUID
