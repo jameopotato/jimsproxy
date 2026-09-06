@@ -13,6 +13,32 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-01 — Map exploration no longer wipes on every new discovery (#511, Mirasu)
+
+**Issue:** each newly discovered subzone darkened a chunk of previously explored world map
+until relog. Two legacy 32-bit `PLAYER_EXPLORED_ZONES` fields pack into one modern 64-bit
+element and the modern update builder always writes the whole element; a mid-session discovery
+dirties exactly ONE legacy field, and `StoreObjectUpdateInternal` composed the untouched half
+from the outgoing `ObjectUpdate` being staged (a fresh object per values block, so always empty
+there), writing 32 zone bits as zero. The 2026-05-01 fix (`cfe445b0`) only corrected the
+parity asymmetry and left that null source in place, so the wipe survived for both parities.
+
+**Change:** `World/Client/PacketHandlers/UpdateHandler.cs`: new `TranslateExploredZones`
+composes each 64-bit element from BOTH 32-bit halves out of the cumulative legacy field dict.
+On the values path `ReadValuesUpdateBlock` merges every update into the session's cached fields
+in place (`ObjectCacheLegacy`, seeded at create), so that dict always holds the latest value of
+both halves. A field the server never sent is genuinely unexplored (zero at create is omitted
+from the mask); untouched pairs stay null so the builder does not resend full exploration
+state on every update. No diagnostics added.
+
+**Verification:** 6 tests (`ExploredZonesTranslationTests`): partial even/odd updates preserve
+the cached half, full-pair composition, unmasked pairs stay null, a missing partner composes as
+unexplored, multiple pairs in one update. Author-verified in-game on Kronos V (three mid-session
+discoveries with the map intact, held across a relog). Review 2026-09-05: values-path dict
+identity traced end to end; suite 967/967 on the PR head.
+
+---
+
 ## 2026-08-22 — Repair the Release workflow (Windows-only) so releases carry assets
 
 **Issue:** `.github/workflows/Release.yml` already builds and attaches packaged binaries plus

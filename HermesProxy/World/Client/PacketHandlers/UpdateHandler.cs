@@ -1995,8 +1995,8 @@ public partial class WorldClient
     // paired half must come from the cumulative `updates` dict (the values path merges into
     // the session's cached fields in place), never from the outgoing update being staged.
     // Composing against the outgoing update zeroed the paired 32 zones on every new
-    // discovery, wiping chunks of the explored map until relog (#331's revert, still
-    // reachable through partial updates).
+    // discovery, wiping chunks of the explored map until relog (the WowLegacyCore/HermesProxy#331
+    // revert, still reachable through partial updates; not this repo's #331).
     internal static void TranslateExploredZones(int legacyBaseField, int legacyFieldCount, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, ulong?[] modernExploredZones)
     {
         for (int i = 0; i < legacyFieldCount; i += 2)
