@@ -97,6 +97,14 @@ public static class Settings
     // active regardless (instrument, not cure). See World/Client/WorldEntryCeremony.cs.
     // Default-init true so paths that bypass LoadAndVerifyFrom (tests) get the fix.
     public static bool WorldEntryCarriedRootCure = true;
+    // JimsProxy (charge strafe-latch cure 2026-08-28): synthesize a force ROOT+UNROOT pulse to
+    // the client when a Charge spline exit applies an orphaned pending-strafe flag (the player
+    // comes out of the charge stuck strafing until a strafe key is touched). Key = kill switch
+    // for the cure pulse only; the arm signature still stamps `pend_latch_armed` on the
+    // change_transport.dropped event so wild frequency stays measurable with the cure off.
+    // See World/Client/ChargePendLatchCure.cs. Default-init true so paths that bypass
+    // LoadAndVerifyFrom (tests) get the fix.
+    public static bool ChargePendLatchCure = true;
     // JimsProxy (#382 MC-cap BG FPS drop): strip UNIT_FLAG_PET_IN_COMBAT (0x800) from a
     // PLAYER for exactly the duration of a player-on-player charm (Gnomish MC Cap 13181,
     // priest MC 605). Vanilla cores set that flag on the charmed unit itself; modern
@@ -270,6 +278,7 @@ public static class Settings
         LoginEvictionMerge = config.GetBoolean("LoginEvictionMerge", true);
         LoginPreCreateOpHold = config.GetBoolean("LoginPreCreateOpHold", true);
         WorldEntryCarriedRootCure = config.GetBoolean("WorldEntryCarriedRootCure", true);
+        ChargePendLatchCure = config.GetBoolean("ChargePendLatchCure", true);
         Charm382StripPetInCombat = config.GetBoolean("Charm382StripPetInCombat", true);
         SynthStandOnFear = config.GetBoolean("SynthStandOnFear", true);
         AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);

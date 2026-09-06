@@ -13,6 +13,44 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-08-29 — Cure the post-Charge stuck-strafe latch (orphaned pending-strafe flag)
+
+**Issue:** after a Charge the character sometimes came out of the spline stuck strafing —
+transmitted in every movement packet, so server-visible — until a strafe key was pressed;
+forward, backward and turn keys could not clear it. Wire-proven mechanism (.pkt movement-flag
+decode over 4 sessions / 83 charges): the 1.14.2 client queues a strafe key pressed mid-air
+during a forward-held jump as `PendingStrafeLeft/Right` instead of applying it; when the Charge
+spline hijacks the fall, the key release mid-spline is swallowed without clearing the pend, and
+the spline-exit landing applies the stale pend as a real strafe flag with no key behind it. A
+pending strafe start in the `CMSG_MOVE_CHANGE_TRANSPORT` the client emits at charge GO appeared
+on exactly the latching charges (3/3 field latches + 2/2 deliberate reproductions).
+
+**Change:** `World/Client/ChargePendLatchCure.cs` (new, pure decision logic): arm predicate
+(pending strafe starts only), fire predicate (armed pend's real bit set with the pend bit gone,
+i.e. the orphan observed), 3 s arm TTL, synth counters 0xFFFFFF03/04 inside the established
+`IsSynthCounter` swallow range. `Server/PacketHandlers/MovementHandler.cs`: arm inside the
+existing CHANGE_TRANSPORT drop (`pend_latch_armed` added to that always-on event for wild
+frequency); fire at the top of `HandlePlayerMove` on the first client packet showing the pend
+applied — a synthetic SMSG_MOVE_ROOT + SMSG_MOVE_UNROOT pulse to the client (corpus-proven: a
+force-root wipes all client movement flags and makes the client emit the matching stop opcodes,
+which forward and correct the server's view too; a force-unroot rebuilds flags from physical
+key state, so a genuinely held key resumes same-frame — safe in both worlds); dedicated ack
+branch in `HandleMoveForceAck2` swallows both acks. `Client/PacketHandlers/MovementHandler.cs`:
+a real self force-root between arm and fire disarms. Kronos's charge-bracketing spline
+root/unroot addresses the charge TARGET, never the charging player, so no server anchor exists
+and the cure fires on the orphan's own appearance. Config kill switch `ChargePendLatchCure`
+(default true) gates the pulse only. Diagnostics `charge.pend_latch.cure_sent` /
+`charge.pend_latch.cure_acked` are DebugOutput-gated (review 2026-09-05).
+
+**Verification:** 24 unit tests (`ChargePendLatchCureTests`) pin the arm/fire predicates
+against the verbatim wire shapes of every specimen plus the counter-range invariants (cure acks
+can never reach the legacy server); suite 985/985. Field-verified 2026-08-29, 5 recipe attempts:
+2 armed → 2 cures → 0 latches, both ROOT acks returned `client_flags=Root` only (the orphaned
+strafe wiped), same-frame ROOT→UNROOT applied in order, cure within ~100 ms of touchdown, no
+false-positive fires anywhere in the session.
+
+---
+
 ## 2026-08-22 — Repair the Release workflow (Windows-only) so releases carry assets
 
 **Issue:** `.github/workflows/Release.yml` already builds and attaches packaged binaries plus

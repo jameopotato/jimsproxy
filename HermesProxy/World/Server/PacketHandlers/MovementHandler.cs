@@ -78,8 +78,9 @@ public partial class WorldSocket
             {
                 GetSession().GameState.ChargePendLatchArmedAtMs = 0;
             }
-            else if (World.Client.ChargePendLatchCure.ShouldFire(
-                GetSession().GameState.ChargePendLatchArmedFlags, movement.MoveInfo.Flags))
+            else if (Framework.Settings.ChargePendLatchCure &&
+                     World.Client.ChargePendLatchCure.ShouldFire(
+                         GetSession().GameState.ChargePendLatchArmedFlags, movement.MoveInfo.Flags))
             {
                 GetSession().GameState.ChargePendLatchArmedAtMs = 0;
                 MoveSetFlag cureRoot = new MoveSetFlag(Opcode.SMSG_MOVE_ROOT);
@@ -90,13 +91,16 @@ public partial class WorldSocket
                 cureUnroot.MoverGUID = GetSession().GameState.CurrentPlayerGuid;
                 cureUnroot.MoveCounter = World.Client.ChargePendLatchCure.SynthCounterUnroot;
                 SendPacket(cureUnroot);
-                Framework.Logging.Log.Event("charge.pend_latch.cure_sent", new
-                {
-                    armed_flags = GetSession().GameState.ChargePendLatchArmedFlags,
-                    observed_flags = movement.MoveInfo.Flags,
-                    trigger_opcode = movement.GetUniversalOpcode().ToString(),
-                    armed_age_ms = nowMs - pendLatchArmedAt,
-                });
+                // DebugOutput-gated per the diagnostics rubric: this is the fix working,
+                // not an unexpected-edge signature (review 2026-09-05).
+                if (Framework.Settings.DebugOutput)
+                    Framework.Logging.Log.Event("charge.pend_latch.cure_sent", new
+                    {
+                        armed_flags = GetSession().GameState.ChargePendLatchArmedFlags,
+                        observed_flags = movement.MoveInfo.Flags,
+                        trigger_opcode = movement.GetUniversalOpcode().ToString(),
+                        armed_age_ms = nowMs - pendLatchArmedAt,
+                    });
             }
         }
 
@@ -456,15 +460,17 @@ public partial class WorldSocket
         // ROOT+UNROOT pulse. Swallowed for the same reason as the carried-root cure
         // ack below (the legacy server never sent these ops); the flags the client
         // reports in each ack are the field proof of the cure working — the root ack
-        // should show the orphaned strafe already wiped.
+        // should show the orphaned strafe already wiped. DebugOutput-gated per the
+        // diagnostics rubric (fix-working breadcrumb; review 2026-09-05).
         if (World.Client.ChargePendLatchCure.IsCureCounter(movementAck.Ack.MoveCounter))
         {
-            Log.Event("charge.pend_latch.cure_acked", new
-            {
-                opcode = universalOpcode.ToString(),
-                move_counter = movementAck.Ack.MoveCounter,
-                client_flags = movementAck.Ack.MoveInfo.Flags,
-            });
+            if (Framework.Settings.DebugOutput)
+                Log.Event("charge.pend_latch.cure_acked", new
+                {
+                    opcode = universalOpcode.ToString(),
+                    move_counter = movementAck.Ack.MoveCounter,
+                    client_flags = movementAck.Ack.MoveInfo.Flags,
+                });
             return;
         }
 
