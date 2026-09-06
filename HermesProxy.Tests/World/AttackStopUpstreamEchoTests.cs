@@ -130,4 +130,42 @@ public class AttackStopUpstreamEchoTests
         Assert.Equal(newTarget, state.CurrentAttackTarget);
         Assert.True(state.WaitingForAttackStart);
     }
+
+    [Fact]
+    public void AttackStartOnSameVictim_RetiresStalePendingEcho()
+    {
+        // Static spawns keep their low guid across respawns and a player victim's guid never
+        // changes. If the echo never came, the stale entry must not swallow a genuine later stop
+        // on the re-engaged unit: the server's own SMSG_ATTACK_START for that victim retires it.
+        var state = NewState();
+        var victim = Creature(1);
+        state.RecordSyntheticUpstreamAttackStop(victim);
+
+        state.InvalidateSyntheticUpstreamStopEcho(victim);
+
+        Assert.False(state.TryConsumeSyntheticUpstreamStopEcho(victim));
+    }
+
+    [Fact]
+    public void AttackStartOnOtherVictim_LeavesPendingEchoIntact()
+    {
+        var state = NewState();
+        var deadVictim = Creature(1);
+        state.RecordSyntheticUpstreamAttackStop(deadVictim);
+
+        state.InvalidateSyntheticUpstreamStopEcho(Creature(2));
+
+        Assert.True(state.TryConsumeSyntheticUpstreamStopEcho(deadVictim));
+    }
+
+    [Fact]
+    public void Invalidate_NothingPendingOrEmptyVictim_IsNoOp()
+    {
+        var state = NewState();
+        state.InvalidateSyntheticUpstreamStopEcho(Creature(1)); // nothing recorded yet
+        state.RecordSyntheticUpstreamAttackStop(Creature(1));
+        state.InvalidateSyntheticUpstreamStopEcho(WowGuid64.Empty); // empty never matches
+
+        Assert.True(state.TryConsumeSyntheticUpstreamStopEcho(Creature(1)));
+    }
 }

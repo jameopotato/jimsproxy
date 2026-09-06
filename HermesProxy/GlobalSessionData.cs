@@ -2505,8 +2505,13 @@ public sealed class GameSessionData
     // is ours, not an organic server stop — it must neither reach the modern client (which already
     // got the preempt stop) nor run the handshake bookkeeping, which could tear down a swing the
     // player re-started within the echo RTT (#464 wedge family). Bounded FIFO: an echo that never
-    // comes (server had already dropped its swing state) must not accumulate; a stale entry is
-    // inert because creature guids carry a spawn-unique counter. Lazily created — the test mock
+    // comes (server had already dropped its swing state) must not accumulate. A stale entry is NOT
+    // inert on its own — mangos-family cores reuse a static spawn's low guid across respawns (the
+    // respawn is the same object) and a player victim's guid never changes — so a genuine later
+    // stop naming that guid (stun, fear, Gouge) could be swallowed and the client left swinging
+    // while the server had stopped. InvalidateSyntheticUpstreamStopEcho closes that at the
+    // server's own SMSG_ATTACK_START for the same victim: a fresh confirmed engage means any
+    // older pending stop for that guid is dead. Lazily created — the test mock
     // (RuntimeHelpers.GetUninitializedObject) skips field initializers.
     private List<WowGuid64>? _pendingSyntheticUpstreamStopEchoes;
     private const int MaxPendingSyntheticUpstreamStopEchoes = 8;
@@ -2537,6 +2542,25 @@ public sealed class GameSessionData
         if (victim == WowGuid64.Empty)
             return false;
         return _pendingSyntheticUpstreamStopEchoes?.Remove(victim) ?? false;
+    }
+
+    /// <summary>
+    /// JimsProxy (post-kill upstream stop): the legacy server confirmed a NEW swing on this victim
+    /// (SMSG_ATTACK_START naming the local player). Any pending synthetic-stop echo for the same
+    /// guid is stale — a respawned static spawn or a resurrected player carries the same guid —
+    /// and must not be left to swallow a genuine later stop on the re-engaged unit. Same thread
+    /// as the echo consume. Pure data operation — no socket dependency, easy to unit-test.
+    /// </summary>
+    public void InvalidateSyntheticUpstreamStopEcho(WowGuid64 victim)
+    {
+        if (victim == WowGuid64.Empty)
+            return;
+        var pending = _pendingSyntheticUpstreamStopEchoes;
+        if (pending == null)
+            return;
+        for (int i = pending.Count - 1; i >= 0; i--)
+            if (pending[i] == victim)
+                pending.RemoveAt(i);
     }
 
     /// <summary>

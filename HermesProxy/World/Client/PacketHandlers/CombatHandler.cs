@@ -15,10 +15,18 @@ public partial class WorldClient
     {
         SAttackStart attack = new();
         attack.Attacker = packet.ReadGuid().To128(GetSession().GameState);
-        attack.Victim = packet.ReadGuid().To128(GetSession().GameState);
+        var rawVictim = packet.ReadGuid();
+        attack.Victim = rawVictim.To128(GetSession().GameState);
 
         if (attack.Attacker == GetSession().GameState.CurrentPlayerGuid)
+        {
             GetSession().GameState.WaitingForAttackStart = false;
+            // JimsProxy (post-kill upstream stop): the server just confirmed a fresh swing on this
+            // victim, so any pending synthetic-stop echo for the same guid is stale (a respawned
+            // static spawn or a resurrected player reuses it) — drop it so a genuine later stop
+            // naming this victim is never swallowed as "our echo".
+            GetSession().GameState.InvalidateSyntheticUpstreamStopEcho(rawVictim);
+        }
 
         SendPacketToClient(attack);
     }
