@@ -16,6 +16,8 @@ public partial class WorldSocket
     void HandleMailGetList(EmptyClientPacket mail)
     {
         WorldPacket packet = new WorldPacket(Opcode.MSG_QUERY_NEXT_MAIL_TIME);
+        // JimsProxy (respec cast lock): counted so the respec fence's reply is matched by ordinal.
+        GetSession().GameState.NoteMailTimeQuerySent(isRespecFence: false);
         SendPacketToServer(packet);
     }
 

@@ -88,6 +88,8 @@ public partial class WorldClient
         {
             GetSession().GameState.CurrentPlayerKnownSpells.Clear();
             GetSession().GameState.SynthesizedTalentRanks.Clear();
+            // JimsProxy (respec cast lock): a fresh spellbook is authoritative — nothing pending.
+            GetSession().GameState.ClearRespecCastLock();
         }
         for (ushort i = 0; i < spellCount; i++)
         {
@@ -331,6 +333,7 @@ public partial class WorldClient
             // JimsProxy (cast-block-unknown-spells): drop unlearned spells from the
             // proxy-side known set so the CMSG_CAST_SPELL guard matches the real server state.
             knownSpellsSendUnlearn.Remove(spellId);
+            ReleaseRespecLockedSpell(spellId);
         }
         SendPacketToClient(spells);
         ReconcileTalentRankInjection();
@@ -352,8 +355,19 @@ public partial class WorldClient
         // for unlearned spells — same autoban path Nellag confirmed (server treats CMSG_CAST_SPELL
         // for an unknown spell as cheating and bans).
         GetSession().GameState.CurrentPlayerKnownSpells.Remove(spellId);
+        ReleaseRespecLockedSpell(spellId);
         SendPacketToClient(spells);
         ReconcileTalentRankInjection();
+    }
+
+    // JimsProxy (respec cast lock): the server confirmed this spell is gone, so the known-set check
+    // now covers it — hand it back from the speculative lock. Logs the moment the wipe drains.
+    private void ReleaseRespecLockedSpell(uint spellId)
+    {
+        if (!GetSession().GameState.ReleaseRespecLockedSpell(spellId, out int remaining))
+            return;
+        if (remaining == 0)
+            Log.Event("spell.respec_lock.drained", new { last_spell_id = spellId });
     }
 
     // JimsProxy (stuck-logout-stun): drain and hex-dump whatever the server appended beyond the

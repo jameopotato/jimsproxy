@@ -227,6 +227,14 @@ public partial class WorldClient
         fail.Reason = (BuyResult)rawReason;
         SendPacketToClient(fail);
 
+        // JimsProxy (respec cast lock): the respec's insufficient-funds rejection comes through
+        // SMSG_BUY_FAILED — the server removed nothing, stand the lock down.
+        if (GetSession().GameState.IsRespecCastLockArmed)
+        {
+            int released = GetSession().GameState.ClearRespecCastLock();
+            Log.Event("spell.respec_lock.cleared", new { reason = "buy_failed", released_count = released, buy_reason = fail.Reason.ToString() });
+        }
+
         Log.Event("vendor.buy.failed", new
         {
             vendor_guid_low = fail.VendorGUID.GetCounter(),

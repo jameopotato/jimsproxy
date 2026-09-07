@@ -63,6 +63,11 @@ public static partial class GameData
     // by the IsInWorld() gate. Without this, players get autobanned for casting a
     // predecessor rank whose silent server-side removal the proxy never saw.
     public static FrozenDictionary<uint, uint> SpellRankPredecessor = FrozenDictionary<uint, uint>.Empty;
+    // JimsProxy (respec cast lock): talent-rank spell id -> Talent.dbc ClassMask, from the same
+    // TalentSpellRanks.csv as TalentRankPredecessors. Lets the respec lock pick out the local
+    // player's OWN talent spells (a spell can be a talent for one class and a trainer spell for
+    // another) without a per-class table.
+    public static FrozenDictionary<uint, uint> TalentSpellClassMask = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, uint> TransportPeriods = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, string> AreaNames = FrozenDictionary<uint, string>.Empty;
     public static FrozenDictionary<string, uint> AreaIdsByName = FrozenDictionary<string, uint>.Empty;
@@ -1593,8 +1598,10 @@ public static partial class GameData
         using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
         var predecessors = new Dictionary<uint, uint[]>(2048);
         var siblings = new Dictionary<uint, uint[]>(2048);
+        var classMasks = new Dictionary<uint, uint>(2048);
         foreach (var row in reader)
         {
+            uint.TryParse(row[1].Span, out uint classMask);
             var ranks = new System.Collections.Generic.List<uint>(5);
             for (int col = 3; col <= 7; col++)
             {
@@ -1607,6 +1614,7 @@ public static partial class GameData
                 uint thisRank = ranks[i];
                 uint[] preds = i == 0 ? Array.Empty<uint>() : ranks.GetRange(0, i).ToArray();
                 predecessors[thisRank] = preds;
+                classMasks[thisRank] = classMask;
                 var sib = new System.Collections.Generic.List<uint>(ranks.Count - 1);
                 for (int j = 0; j < ranks.Count; j++)
                     if (j != i) sib.Add(ranks[j]);
@@ -1615,6 +1623,7 @@ public static partial class GameData
         }
         TalentRankPredecessors = predecessors.ToFrozenDictionary();
         TalentRankSiblings = siblings.ToFrozenDictionary();
+        TalentSpellClassMask = classMasks.ToFrozenDictionary();
     }
 
     public static void LoadSpellRankChain()
