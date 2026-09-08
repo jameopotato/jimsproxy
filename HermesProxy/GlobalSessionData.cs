@@ -1217,6 +1217,8 @@ public sealed class GameSessionData
     // SPELL_START before the GO when no natural one was forwarded recently
     // (window: AutoShotSynthSpellStartGapMs).
     public Dictionary<uint, long> LastNaturalAutoShotSpellStartMs = [];
+    // JimsProxy: the latest auto-repeat tick GO CastID per (caster, spell), so its damage log carries the tick's CastID like a native server.
+    public Dictionary<(WowGuid128 Caster, uint SpellId), Queue<WowGuid128>> AutoRepeatTickCastIds = [];
     public TradeSession? CurrentTrade = null;
     public HashSet<uint> RequestedItemHotfixes = [];
     public HashSet<uint> RequestedItemSparseHotfixes = [];
@@ -3822,6 +3824,8 @@ public sealed class GameSessionData
 public class ClientCastRequest
 {
     public bool HasStarted;
+    // JimsProxy (ranged anim skip): auto-repeat slot only — the press's GO carries the prepared ServerGUID; later ticks keep their own per-tick CastID.
+    public bool FirstGoDelivered;
     public uint SpellId;
     public uint LegacySpellId; // 0 = same as SpellId; non-zero when modern client used a renumbered spell (e.g. SoM 1.14.1+ items)
     public uint SpellXSpellVisualId;

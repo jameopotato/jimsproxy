@@ -2296,7 +2296,12 @@ public partial class WorldClient
             if (gapMs > AutoShotSynthSpellStartGapMs)
             {
                 SpellStart synthStart = new SpellStart();
-                synthStart.Cast = spell.Cast;
+                // Mirror a native per-tick START: instant (the GO's CastTime is a proxy-uptime GCD anchor, not a cast duration) and target-list-free.
+                synthStart.Cast = spell.Cast.ShallowCopy();
+                synthStart.Cast.CastTime = 0;
+                synthStart.Cast.HitTargets = new();
+                synthStart.Cast.MissTargets = new();
+                synthStart.Cast.MissStatus = new();
                 SendPacketToClient(synthStart);
                 Log.Event("spell.start.synth_for_autoshot", new
                 {
@@ -2545,7 +2550,12 @@ public partial class WorldClient
             GetSession().GameState.CurrentClientAutoRepeatCast!.SpellId == spell.Cast.SpellID)
         {
             var current = GetSession().GameState.CurrentClientAutoRepeatCast!;
-            spell.Cast.CastID = current.ServerGUID;
+            // JimsProxy (ranged anim skip): only the press's first GO pairs with the prepared id; re-stamping it on every tick made the client hang each shot's projectile on ONE cast object, and a GO landing while that object's projectile was still in flight lost its animation (wand at 30 yd, hunter under Quick Shots).
+            if (!current.FirstGoDelivered)
+            {
+                spell.Cast.CastID = current.ServerGUID;
+                current.FirstGoDelivered = true;
+            }
             spell.Cast.SpellXSpellVisualID = current.SpellXSpellVisualId;
             // Note: Don't clear auto-repeat cast here - it stays active until cancelled
         }
@@ -2722,6 +2732,18 @@ public partial class WorldClient
         else
         {
             SendPacketToClient(spell);
+        }
+
+        // JimsProxy (ranged auto-repeat): remember this tick's CastID so its damage log carries it like a native server's; latest only (the hit lands before the next tick fires).
+        if (isRangedAutoAttack && spell.Cast.HitTargets.Count > 0)
+        {
+            var tickKey = (spell.Cast.CasterUnit, (uint)spell.Cast.SpellID);
+            if (!GetSession().GameState.AutoRepeatTickCastIds.TryGetValue(tickKey, out var tickQueue))
+                GetSession().GameState.AutoRepeatTickCastIds[tickKey] = tickQueue = new Queue<WowGuid128>();
+            tickQueue.Clear();
+            tickQueue.Enqueue(spell.Cast.CastID);
+            if (Framework.Settings.DebugOutput)
+                Log.Event("spell.go.autorepeat_sent", new { spell_id = spell.Cast.SpellID, cast_id = spell.Cast.CastID.ToString() });
         }
 
         // JimsProxy (dup-failure frame hold): the local cast's GO is on the wire — release any
@@ -3188,6 +3210,23 @@ public partial class WorldClient
             dbdata.AmmoInventoryType = packet.ReadInt32();
         }
 
+        // DIAGNOSTIC (ranged auto-repeat): per-tick composition of the local player's auto-repeat casts.
+        if (Framework.Settings.DebugOutput && isSpellGo && GameData.AutoRepeatSpells.Contains((uint)dbdata.SpellID) &&
+            dbdata.CasterUnit == GetSession().GameState.CurrentPlayerGuid)
+        {
+            Log.Event("spell.go.autorepeat_tick", new
+            {
+                spell_id = dbdata.SpellID,
+                cast_flags = dbdata.CastFlags,
+                hit_targets = string.Join(",", dbdata.HitTargets.Select(g => g.GetCounter())),
+                miss_targets = string.Join(",", dbdata.MissTargets.Select(g => g.GetCounter())),
+                miss_status = string.Join(",", dbdata.MissStatus.Select(m => m.Reason.ToString())),
+                target_unit = dbdata.Target.Unit.GetCounter(),
+                target_flags = (uint)dbdata.Target.Flags,
+                ammo_display = dbdata.AmmoDisplayId,
+            });
+        }
+
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
         {
             if (isSpellGo)
@@ -3330,6 +3369,20 @@ public partial class WorldClient
         spell.SpellID = packet.ReadUInt32();
         spell.SpellXSpellVisualID = GameData.GetSpellVisual(spell.SpellID);
         spell.CastID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, spell.SpellID, spell.SpellID + spell.CasterGUID.GetCounter());
+        // JimsProxy (ranged auto-repeat): stamp an auto-repeat hit with its tick's GO CastID so the client can pair the shot with its impact.
+        if (GameData.AutoRepeatSpells.Contains(spell.SpellID) &&
+            GetSession().GameState.AutoRepeatTickCastIds.TryGetValue((spell.CasterGUID, spell.SpellID), out var tickCastIds) &&
+            tickCastIds.Count > 0)
+        {
+            spell.CastID = tickCastIds.Dequeue();
+            if (Framework.Settings.DebugOutput)
+                Log.Event("spell.damage_log.autorepeat_castid_paired", new
+                {
+                    spell_id = spell.SpellID,
+                    cast_id = spell.CastID.ToString(),
+                    queued_remaining = tickCastIds.Count,
+                });
+        }
         spell.Damage = packet.ReadInt32();
         spell.OriginalDamage = spell.Damage;
 
@@ -3380,6 +3433,20 @@ public partial class WorldClient
         }
 
         SendPacketToClient(spell);
+
+        // DIAGNOSTIC (ranged auto-repeat): each auto-repeat damage log with its tick.
+        if (Framework.Settings.DebugOutput && GameData.AutoRepeatSpells.Contains(spell.SpellID) &&
+            spell.CasterGUID == GetSession().GameState.CurrentPlayerGuid)
+            Log.Event("spell.damage_log.autorepeat_hit", new
+            {
+                spell_id = spell.SpellID,
+                target = spell.TargetGUID.GetCounter(),
+                damage = spell.Damage,
+                absorbed = spell.Absorbed,
+                resisted = spell.Resisted,
+                hit_flags = (uint)spell.Flags,
+                cast_id = spell.CastID.ToString(),
+            });
 
         // Threat translation: feed spell damage (direct hit) into the tracker.
         // Pass the spell id so the per-ability damage multiplier (Maul x1.75,
