@@ -1482,7 +1482,7 @@ public static partial class GameData
     // Missing-tolerant like LoadSpellVisualResolved (no file => empty table => the cancel path
     // sends nothing). Regenerate with scripts/gen-windup-kits.py from the wago.tools
     // SpellVisualEvent CSV for the client build (1.14.2.42597 today): keep rows with
-    // StartEvent=3, EndEvent=13, TargetType=1 and drop any kit that also appears under a
+    // StartEvent=1, EndEvent=2, TargetType=1 (the caster kit that carries the held wind-up sound; the 2026-09-07 PTR run showed the sound-owning effect reports it, e.g. 99, never the 3->13 precast kit) and drop any kit that also appears under a
     // different (StartEvent, EndEvent, TargetType), so a cancel by kit can never hit a
     // non-wind-up effect.
     public static void LoadSpellVisualWindupKits()
