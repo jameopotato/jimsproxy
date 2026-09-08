@@ -4084,6 +4084,19 @@ public class ClientCastRequest
 
     public bool HasSentPrepare;
 
+    // JimsProxy (stuck action button, RE round 15, 2026-09-08): true once a SpellPrepare
+    // (client cast id -> server cast id) has gone to the client for this press, which is the
+    // moment the 1.14 client re-keys its cast object from the client id to the server id. That
+    // happens at SPELL_START for on-GCD casts and at forward time for off-GCD casts.
+    public bool PrepareSentToClient => HasStarted || HasSentPrepare;
+
+    // The CastID a CAST_FAILED answering this press must carry: the id the client's cast object
+    // is keyed by right now. A press that was never re-keyed stays on its client id. Re-keying it
+    // with a PREPARE only to fail it on the server id is what left the client's press object
+    // pinned in its casting state with the action button lit until relog (three live PTR
+    // specimens under the in-process harness, about one in ten rejected heal-spam frames).
+    public WowGuid128 FailureCastId => PrepareSentToClient ? ServerGUID : ClientGUID;
+
     // JimsProxy (held-aware GCD anchoring): true once this press was released from the GCD
     // hold slot by the release timer (ForwardHeldGcdCast) — i.e. the proxy RE-TIMED it.
     // The synthetic GCD-anchor packets (#124 cooldown synth, bb4bb18 GO.CastTime stamp) exist
