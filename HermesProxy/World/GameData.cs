@@ -685,6 +685,23 @@ public static partial class GameData
         15473,  // Shadowform
     }.ToFrozenSet();
 
+    // JimsProxy (fishing recast wedge): the Fishing channel spells. Scopes the held
+    // channel zero-update guard to fishing only — see GameSessionData.OnLocalChannelStart.
+    // 33095 included because TBC 2.4.3 backends are accepted by the version checker.
+    public static readonly FrozenSet<uint> FishingChannelSpells = new uint[]
+    {
+        7620,   // Fishing (Apprentice)
+        7731,   // Fishing (Journeyman)
+        7732,   // Fishing (Expert)
+        18248,  // Fishing (Artisan)
+        33095,  // Fishing (Master, TBC)
+    }.ToFrozenSet();
+
+    public static bool IsFishingChannelSpell(uint spellId) => FishingChannelSpells.Contains(spellId);
+
+    // GAMEOBJECT_TYPE_FISHINGNODE — the bobber a fishing channel spawns for its caster.
+    public const sbyte FishingNodeGameObjectType = 17;
+
     /// <summary>
     /// JimsProxy: true if the spell is a CP-scaling enemy-debuff finisher we compute
     /// duration for locally. Used by the CMSG_CAST_SPELL handler to decide whether to
