@@ -516,6 +516,8 @@ debug.*
 # Build script output
 build/
 build-test/
+# Retired 2026-08-22 — the prebuilt proxy ships as a release asset, not a tracked directory.
+build-single/
 
 # JimsAH addon — developed locally, not part of the proxy repo
 Addons/JimsAH/
