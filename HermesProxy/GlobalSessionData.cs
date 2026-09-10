@@ -2499,6 +2499,70 @@ public sealed class GameSessionData
         return victim;
     }
 
+    // JimsProxy (post-kill upstream stop): victims for which the kill-time preempt also sent the
+    // legacy server a synthetic CMSG_ATTACK_STOP. Kronos echoes that with SMSG_ATTACKSTOP naming
+    // the corpse (wire-verified 2026-08-18: retarget stops echo with the victim guid). That echo
+    // is ours, not an organic server stop — it must neither reach the modern client (which already
+    // got the preempt stop) nor run the handshake bookkeeping, which could tear down a swing the
+    // player re-started within the echo RTT (#464 wedge family). Bounded FIFO: an echo that never
+    // comes (server had already dropped its swing state) must not accumulate. A stale entry is NOT
+    // inert on its own — mangos-family cores reuse a static spawn's low guid across respawns (the
+    // respawn is the same object) and a player victim's guid never changes — so a genuine later
+    // stop naming that guid (stun, fear, Gouge) could be swallowed and the client left swinging
+    // while the server had stopped. InvalidateSyntheticUpstreamStopEcho closes that at the
+    // server's own SMSG_ATTACK_START for the same victim: a fresh confirmed engage means any
+    // older pending stop for that guid is dead. Lazily created — the test mock
+    // (RuntimeHelpers.GetUninitializedObject) skips field initializers.
+    private List<WowGuid64>? _pendingSyntheticUpstreamStopEchoes;
+    private const int MaxPendingSyntheticUpstreamStopEchoes = 8;
+
+    /// <summary>
+    /// JimsProxy (post-kill upstream stop): remember that we sent the legacy server a synthetic
+    /// CMSG_ATTACK_STOP for this dead victim, so its echo can be consumed on arrival.
+    /// Pure data operation — no socket dependency, easy to unit-test.
+    /// </summary>
+    public void RecordSyntheticUpstreamAttackStop(WowGuid64 victim)
+    {
+        if (victim == WowGuid64.Empty)
+            return;
+        var pending = _pendingSyntheticUpstreamStopEchoes ??= new List<WowGuid64>();
+        pending.Add(victim);
+        if (pending.Count > MaxPendingSyntheticUpstreamStopEchoes)
+            pending.RemoveAt(0);
+    }
+
+    /// <summary>
+    /// JimsProxy (post-kill upstream stop): pairing trigger for the synthetic upstream stop's
+    /// echo. Consumes by EXACT victim match only — an empty-victim SMSG_ATTACKSTOP can be a real
+    /// server-initiated stop (CC, death, engage refusal) and must always take the normal #464
+    /// path. Pure data operation — no socket dependency, easy to unit-test.
+    /// </summary>
+    public bool TryConsumeSyntheticUpstreamStopEcho(WowGuid64 victim)
+    {
+        if (victim == WowGuid64.Empty)
+            return false;
+        return _pendingSyntheticUpstreamStopEchoes?.Remove(victim) ?? false;
+    }
+
+    /// <summary>
+    /// JimsProxy (post-kill upstream stop): the legacy server confirmed a NEW swing on this victim
+    /// (SMSG_ATTACK_START naming the local player). Any pending synthetic-stop echo for the same
+    /// guid is stale — a respawned static spawn or a resurrected player carries the same guid —
+    /// and must not be left to swallow a genuine later stop on the re-engaged unit. Same thread
+    /// as the echo consume. Pure data operation — no socket dependency, easy to unit-test.
+    /// </summary>
+    public void InvalidateSyntheticUpstreamStopEcho(WowGuid64 victim)
+    {
+        if (victim == WowGuid64.Empty)
+            return;
+        var pending = _pendingSyntheticUpstreamStopEchoes;
+        if (pending == null)
+            return;
+        for (int i = pending.Count - 1; i >= 0; i--)
+            if (pending[i] == victim)
+                pending.RemoveAt(i);
+    }
+
     /// <summary>
     /// JimsProxy (PR #161 follow-up): walks PendingNormalCasts and PendingPetCasts,
     /// dequeues any entry whose WatchdogDeadlineMs has expired, and returns the
