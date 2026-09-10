@@ -22,6 +22,8 @@ local function Enabled()
 end
 
 local function HasBowAnd2H()
+    local _, class = UnitClass("player")
+    if class ~= "HUNTER" then return false end -- warriors/rogues with a stat-stick bow: the nudge kept drawing it
     local ranged = GetInventoryItemID("player", 18)
     if not ranged then return false end
     local classID, subclassID = select(6, GetItemInfoInstant(ranged))
