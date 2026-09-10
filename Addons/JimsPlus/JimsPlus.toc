@@ -3,7 +3,7 @@
 ## Notes: Bundled client-side fixes for JimsProxy / Classic WoW 1.14 Launcher
 ## SavedVariables: JimsPlusDB, JimsPlusCastbarsDB
 ## SavedVariablesPerCharacter: JimsPlusCastbarsCharDB
-## Author: JimsProxy Team (CastBars based on ClassicCastbars by Wardz)
+## Author: JimsProxy Team (CastBars based on ClassicCastbars by Wardz; ApiCompat based on HermesCompat by techgeekpr)
 ## Version: 1.2.2
 
 Core.lua
@@ -19,6 +19,7 @@ MailNameFix.lua
 NameDashFix.lua
 KeyringClamp.lua
 BagnonSort.lua
+ApiCompat.lua
 castbars/PoolManager.lua
 castbars/AnchorManager.lua
 castbars/Data.lua

@@ -1,8 +1,8 @@
 local ADDON_NAME, namespace = ...
 
-local function CreateCheckbox(parent, yOffset, label, tooltip)
+local function CreateCheckbox(parent, yOffset, label, tooltip, xOffset)
     local cb = CreateFrame("CheckButton", nil, parent, "InterfaceOptionsCheckButtonTemplate")
-    cb:SetPoint("TOPLEFT", parent, "TOPLEFT", 16, yOffset)
+    cb:SetPoint("TOPLEFT", parent, "TOPLEFT", xOffset or 16, yOffset)
     cb.Text:SetText(label)
     if tooltip then
         cb.tooltipText = tooltip
@@ -164,6 +164,13 @@ y = y - 28
 local cbMoonkinSound = CreateCheckbox(panel, y,
     "Moonkin Form sound  |cFF888888(Druid only)|r",
     "Gives Moonkin Form a distinct transformation sound instead\nof reusing the Bear Form sound.\n\nOnly affects Druid characters.")
+
+-- Right column, same row (the panel is already near the container's bottom edge,
+-- so new rows go sideways rather than down).
+local cbApiCompat = CreateCheckbox(panel, y,
+    "Modern addon API shims  |cFFFF6600(reload)|r",
+    "Fills in modern APIs that are missing on the 1.14.2 client so newer\naddons and WeakAuras packs stop erroring: C_Container, the\nC_Spell range check, vehicle API stubs, and a scroll-frame helper.\n\nOnly ever adds what is missing; never overrides anything the\nclient already provides.\n\nBased on HermesCompat by techgeekpr (MIT).\n\nChanges take effect after /reload.",
+    330)
 y = y - 28
 
 local cbBowSheathe = CreateCheckbox(panel, y,
@@ -224,6 +231,7 @@ local function RefreshCheckboxes()
     local db = namespace.db or JimsPlusDB or {}
     cbTooltipFix:SetChecked(db.tooltipFix == true)
     cbMoonkinSound:SetChecked(db.moonkinSound ~= false)
+    cbApiCompat:SetChecked(db.apiCompat ~= false)
     cbBowSheathe:SetChecked(db.bowSheatheFix ~= false)
     cbBagSort:SetChecked(db.bagSortOrder ~= false)
 
@@ -266,6 +274,14 @@ cbMoonkinSound:SetScript("OnClick", function(self)
         namespace.db.moonkinSound = enabled
     end
     print("|cFF00FF00[JimsPlus]|r Moonkin Form sound " .. (enabled and "enabled" or "disabled") .. ". Type /reload to apply.")
+end)
+
+cbApiCompat:SetScript("OnClick", function(self)
+    local enabled = self:GetChecked() and true or false
+    if namespace.db then
+        namespace.db.apiCompat = enabled
+    end
+    print("|cFF00FF00[JimsPlus]|r Modern addon API shims " .. (enabled and "enabled" or "disabled") .. ". Type /reload to apply.")
 end)
 
 -- JimsProxy (bow sheathe fix): purely addon-side (BowSheatheFix.lua re-sheathe nudge), read live from db

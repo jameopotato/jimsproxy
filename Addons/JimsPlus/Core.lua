@@ -36,5 +36,6 @@ f:SetScript("OnEvent", function(_, _, addon)
     if JimsPlusDB.taxiFix == nil then JimsPlusDB.taxiFix = true end
     if JimsPlusDB.bagSortOrder == nil then JimsPlusDB.bagSortOrder = false end
     if JimsPlusDB.performanceMode == nil then JimsPlusDB.performanceMode = false end
+    if JimsPlusDB.apiCompat == nil then JimsPlusDB.apiCompat = true end
     namespace.db = JimsPlusDB
 end)
