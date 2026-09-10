@@ -13,6 +13,34 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-06 — Fishing: keep the new channel open when the previous bobber's timeout ends it (#510, Mirasu)
+
+**Issue:** recasting fishing while the previous bobber still exists makes mangos-family servers run
+the old bobber's timeout against whatever channel is current: the server ends the NEW channel about
+100 ms after it opened (a trailing `MSG_CHANNEL_UPDATE(0)` behind the new `MSG_CHANNEL_START`) while
+the new bobber floats out its full lifetime. The same server tick clears `UNIT_CHANNEL_SPELL` and
+`UNIT_FIELD_CHANNEL_OBJECT`, so the 1.14 client drops the fishing pose, refuses the bobber and refuses
+a recast until it expires; every recast from then on repeats the race.
+
+**Change:** `World/Client/PacketHandlers/SpellHandler.cs`, `World/Client/WorldClient.cs`,
+`GlobalSessionData.cs`, `World/GameData.cs`, client/server `GameObjectHandler.cs`,
+`World/Client/PacketHandlers/UpdateHandler.cs`, `World/Server/PacketHandlers/SpellHandler.cs` —
+a packet-anchored guard, fishing spells only. Armed iff the player's previous bobber is still in the
+object cache at the new `MSG_CHANNEL_START` (own bobber tracked on its create block); the zero-update
+is held and dropped only when that bobber's `SMSG_DESTROY_OBJECT` or `SMSG_FISH_NOT_HOOKED` lands in
+the same read pass, and a socket drain releases it as genuine (same drain rule as the #450 preempt
+attack stop). After a drop the player's channel spell/object fields are re-asserted to the new
+bobber, and the new bobber's `SMSG_DESTROY_OBJECT` (catch looted, fish escaped, timed out) ends the
+client's channel with a synthesized zero-update. `CMSG_CAST_SPELL` now records a channel-break
+action. Diags: `spell.channel.stale_zero_update_dropped` (DebugOutput-gated);
+`spell.channel.zero_update_released_at_drain` logs unconditionally.
+
+**Verification:** author's in-game passes on the packet-anchored guard plus the field re-assert
+(recast with the old bobber up: pose kept, bite and loot on the new bobber); suite 986/986 on the
+branch (`ChannelStaleZeroUpdateTests`).
+
+---
+
 ## 2026-09-01 — Map exploration no longer wipes on every new discovery (#511, Mirasu)
 
 **Issue:** each newly discovered subzone darkened a chunk of previously explored world map
