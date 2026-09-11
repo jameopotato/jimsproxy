@@ -105,32 +105,36 @@ local function InstallShims()
     end
 
     -- 4) Vehicle API: added in Wrath, so "no vehicle" is simply the correct answer on
-    --    a vanilla server. Each is defined only when missing; on a client where these
-    --    do not exist, no secure Blizzard code path can be reading them, so
-    --    addon-defined stubs cannot taint anything.
+    --    a vanilla server. Each is defined only when missing, and the assignment itself
+    --    must only run when missing: a global written by addon code is tainted even when
+    --    the value is unchanged, and some of these DO exist on 1.14.2 and are read by secure
+    --    Blizzard code (ActionBarController_UpdateAll calls HasTempShapeshiftActionBar and
+    --    GetTempShapeshiftBarIndex on every bonus-bar update). The old "X = X or stub" form
+    --    re-assigned those and tainted the action bar paging: stance changes stopped
+    --    switching the buttons.
     local function retFalse() return false end
     local function retNil() return nil end
     local function retZero() return 0 end
     local function noop() end
 
-    UnitHasVehicleUI            = UnitHasVehicleUI            or retFalse
-    UnitHasVehiclePlayerFrameUI = UnitHasVehiclePlayerFrameUI or retFalse
-    UnitInVehicle               = UnitInVehicle               or retFalse
-    UnitControllingVehicle      = UnitControllingVehicle      or retFalse
-    UnitInVehicleControlSeat    = UnitInVehicleControlSeat    or retFalse
-    UnitTargetsVehicleInRaidUI  = UnitTargetsVehicleInRaidUI  or retFalse
-    CanExitVehicle              = CanExitVehicle              or retFalse
-    CanSwitchVehicleSeats       = CanSwitchVehicleSeats       or retFalse
-    UnitVehicleSkin             = UnitVehicleSkin             or retNil
-    UnitVehicleSeatCount        = UnitVehicleSeatCount        or retZero
-    HasVehicleActionBar         = HasVehicleActionBar         or retFalse
-    HasOverrideActionBar        = HasOverrideActionBar        or retFalse
-    HasTempShapeshiftActionBar  = HasTempShapeshiftActionBar  or retFalse
-    GetVehicleBarIndex          = GetVehicleBarIndex          or retNil
-    GetOverrideBarIndex         = GetOverrideBarIndex         or retNil
-    GetTempShapeshiftBarIndex   = GetTempShapeshiftBarIndex   or retNil
-    VehicleExit                 = VehicleExit                 or noop
-    UnitSwitchToVehicleSeat     = UnitSwitchToVehicleSeat     or noop
+    if UnitHasVehicleUI == nil then UnitHasVehicleUI = retFalse end
+    if UnitHasVehiclePlayerFrameUI == nil then UnitHasVehiclePlayerFrameUI = retFalse end
+    if UnitInVehicle == nil then UnitInVehicle = retFalse end
+    if UnitControllingVehicle == nil then UnitControllingVehicle = retFalse end
+    if UnitInVehicleControlSeat == nil then UnitInVehicleControlSeat = retFalse end
+    if UnitTargetsVehicleInRaidUI == nil then UnitTargetsVehicleInRaidUI = retFalse end
+    if CanExitVehicle == nil then CanExitVehicle = retFalse end
+    if CanSwitchVehicleSeats == nil then CanSwitchVehicleSeats = retFalse end
+    if UnitVehicleSkin == nil then UnitVehicleSkin = retNil end
+    if UnitVehicleSeatCount == nil then UnitVehicleSeatCount = retZero end
+    if HasVehicleActionBar == nil then HasVehicleActionBar = retFalse end
+    if HasOverrideActionBar == nil then HasOverrideActionBar = retFalse end
+    if HasTempShapeshiftActionBar == nil then HasTempShapeshiftActionBar = retFalse end
+    if GetVehicleBarIndex == nil then GetVehicleBarIndex = retNil end
+    if GetOverrideBarIndex == nil then GetOverrideBarIndex = retNil end
+    if GetTempShapeshiftBarIndex == nil then GetTempShapeshiftBarIndex = retNil end
+    if VehicleExit == nil then VehicleExit = noop end
+    if UnitSwitchToVehicleSeat == nil then UnitSwitchToVehicleSeat = noop end
 end
 
 local f = CreateFrame("Frame")
