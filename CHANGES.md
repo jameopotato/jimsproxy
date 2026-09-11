@@ -22,9 +22,10 @@ button lit until relog: the client's CAST_FAILED lookup on the server id misses 
 and tears down a transient stub instead (client RE, round 15). Caught live three times on the
 Kronos PTR under the in-process cast-object harness (Heal rank 4, Flash Heal), about one rejected
 heal-spam frame in ten; the same rejected-press shape is routine on a warrior (Sunder Armor
-`UnitNotInfront` / `NotReady`), so the button-only sticks on Sunder, Battle Shout and mounts share
-the trigger. The stuck button is a distinct outcome from the looping cast sound (#394): the object
-never started, so it carries no wind-up effects.
+`UnitNotInfront` / `NotReady`), so it may cover some of the Sunder and Battle Shout button sticks
+(#498 stays open: its sticks self-clear, which is not the pinned shape seen here; #497's mount stick
+is a started cast after dismount and is unaffected). The stuck button is a distinct outcome from
+the looping cast sound (#394): the object never started, so it carries no wind-up effects.
 
 **Change:** `GlobalSessionData.cs` — `ClientCastRequest.PrepareSentToClient` (`HasStarted ||
 HasSentPrepare`), `FailureCastId` (the server id once a PREPARE went out, else the client id) and
