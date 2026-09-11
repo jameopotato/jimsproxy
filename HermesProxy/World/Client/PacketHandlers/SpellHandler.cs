@@ -3336,6 +3336,16 @@ public partial class WorldClient
         return dbdata;
     }
 
+    // JimsProxy: a creature in combat with the player can resist Feign Death. The server then keeps the aura (the
+    // button greys for the cooldown) but never sets the dead flags, and this packet is the only word the client gets.
+    // Unforwarded, the player sees a greyed button and nothing else (Kronos, 2026-09-11, idle in combat at a dummy).
+    [PacketHandler(Opcode.SMSG_FEIGN_DEATH_RESISTED)]
+    void HandleFeignDeathResisted(WorldPacket packet)
+    {
+        Log.Event("spell.feign_death_resisted", new { });
+        SendPacketToClient(new FeignDeathResisted());
+    }
+
     [PacketHandler(Opcode.SMSG_CANCEL_AUTO_REPEAT)]
     void HandleCancelAutoRepeat(WorldPacket packet)
     {
