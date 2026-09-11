@@ -169,7 +169,7 @@ local cbMoonkinSound = CreateCheckbox(panel, y,
 -- so new rows go sideways rather than down).
 local cbApiCompat = CreateCheckbox(panel, y,
     "Modern addon API shims  |cFFFF6600(reload)|r",
-    "Fills in modern APIs that are missing on the 1.14.2 client so newer\naddons and WeakAuras packs stop erroring: C_Container, the\nC_Spell range check, vehicle API stubs, and a scroll-frame helper.\n\nOnly ever adds what is missing; never overrides anything the\nclient already provides.\n\nBased on HermesCompat by techgeekpr (MIT).\n\nChanges take effect after /reload.",
+    "Fills in modern APIs that are missing on the 1.14.2 client so newer\naddons and WeakAuras packs stop erroring: C_Container, the\nC_Spell range check, vehicle API stubs, and a scroll-frame helper.\n\nOnly ever adds what is missing; never overrides anything the\nclient already provides.\n\nBased on HermesCompat by techgeekpr (MIT).\n\nOff by default; turn it on only if an addon you use needs it.\nChanges take effect after /reload.",
     330)
 y = y - 28
 
@@ -231,7 +231,7 @@ local function RefreshCheckboxes()
     local db = namespace.db or JimsPlusDB or {}
     cbTooltipFix:SetChecked(db.tooltipFix == true)
     cbMoonkinSound:SetChecked(db.moonkinSound ~= false)
-    cbApiCompat:SetChecked(db.apiCompat ~= false)
+    cbApiCompat:SetChecked(db.apiCompat == true)
     cbBowSheathe:SetChecked(db.bowSheatheFix ~= false)
     cbBagSort:SetChecked(db.bagSortOrder ~= false)
 

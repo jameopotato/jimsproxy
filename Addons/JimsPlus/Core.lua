@@ -36,6 +36,14 @@ f:SetScript("OnEvent", function(_, _, addon)
     if JimsPlusDB.taxiFix == nil then JimsPlusDB.taxiFix = true end
     if JimsPlusDB.bagSortOrder == nil then JimsPlusDB.bagSortOrder = false end
     if JimsPlusDB.performanceMode == nil then JimsPlusDB.performanceMode = false end
-    if JimsPlusDB.apiCompat == nil then JimsPlusDB.apiCompat = true end
+    -- ApiCompat shims are opt-in from 1.2.4. 1.2.3 turned them on by default and wrote
+    -- apiCompat = true into every SavedVariables on first load without the player choosing
+    -- it, so a plain nil-default would leave every existing install on. Reset once to off;
+    -- after that the player's own setting sticks.
+    if JimsPlusDB.apiCompatDefaultsVersion ~= 2 then
+        JimsPlusDB.apiCompat = false
+        JimsPlusDB.apiCompatDefaultsVersion = 2
+    end
+    if JimsPlusDB.apiCompat == nil then JimsPlusDB.apiCompat = false end
     namespace.db = JimsPlusDB
 end)

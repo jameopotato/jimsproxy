@@ -18,8 +18,9 @@
 --     HermesCompat alongside JimsPlus (every shim on both sides is guarded, so
 --     whichever loads first wins and the other no-ops).
 --
--- Toggled by Options > "Modern addon API shims" (JimsPlusDB.apiCompat, default on,
--- /reload to apply). Shims install at our ADDON_LOADED, i.e. before any addon that
+-- Toggled by Options > "Modern addon API shims" (JimsPlusDB.apiCompat, OFF by default
+-- since 1.2.4: opt in only when an addon needs it; /reload to apply). Shims install at
+-- our ADDON_LOADED, i.e. before any addon that
 -- loads after JimsPlus and before PLAYER_LOGIN. Addons that loaded before us and
 -- feature-detect at their own load time are out of reach either way; in practice
 -- these APIs are called at runtime (events), where late definitions cover them.
@@ -144,6 +145,7 @@ f:SetScript("OnEvent", function(self, _, addon)
     self:UnregisterEvent("ADDON_LOADED")
     -- Core.lua registered its ADDON_LOADED handler first (earlier file in the .toc),
     -- so namespace.db is populated by the time this runs.
-    if namespace.db and namespace.db.apiCompat == false then return end
+    -- Opt-in: install only when the player turned the option on (nil or false = off).
+    if not (namespace.db and namespace.db.apiCompat == true) then return end
     InstallShims()
 end)

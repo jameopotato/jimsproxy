@@ -13,6 +13,26 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-11 — JimsPlus: the ApiCompat shims are opt-in (off by default)
+
+**Issue:** the shims shipped in v5.2.1-beta.2 on by default (#507) and one of them tainted the
+action-bar paging for every stance and form user in combat (#520). Most players run no addon that
+needs the modern APIs, so a default-on compatibility layer exposes everyone to that class of risk
+for the benefit of a few.
+
+**Change:** `Addons/JimsPlus/Core.lua` — `apiCompat` defaults to `false`, with a one-time reset:
+1.2.3 wrote `apiCompat = true` into every SavedVariables on first load without the player choosing
+it, so the defaults are re-applied once (`apiCompatDefaultsVersion = 2`) and the player's own
+choice sticks from then on. `ApiCompat.lua` installs only when the option is explicitly on;
+`Options.lua` reflects the same and the tooltip says the option is off by default. Owner's call
+(2026-09-11). Players who need the shims (WeakAuras packs or addons written for newer clients)
+turn on "Modern addon API shims" in the JimsPlus options and /reload.
+
+**Verification:** Lua 5.1 parse of the three changed files against the beta baseline; the option
+round-trip is part of the beta.3 in-game pass.
+
+---
+
 ## 2026-09-10 — ApiCompat: nil-guard the shim assignments so existing bar functions are never re-written (#520, Mirasu)
 
 **Issue:** on v5.2.1-beta.2 a warrior changing stance in combat no longer got the main bar paged; the
