@@ -1162,6 +1162,18 @@ public class SpellCastData
     public SpellHealPrediction Predict = new();
 }
 
+// JimsProxy: the server rolled a creature through Feign Death; the client shows "Feign Death resisted" on it.
+public class FeignDeathResisted : ServerPacket, ISpanWritable
+{
+    public FeignDeathResisted() : base(Opcode.SMSG_FEIGN_DEATH_RESISTED) { }
+
+    public override void Write() { }
+
+    public int MaxSize => 0;
+
+    public int WriteToSpan(Span<byte> buffer) => 0;
+}
+
 public struct SpellMissStatus
 {
     public SpellMissStatus(SpellMissInfo reason, SpellMissInfo reflectStatus)
