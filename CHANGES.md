@@ -13,6 +13,32 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-10 — ApiCompat: nil-guard the shim assignments so existing bar functions are never re-written (#520, Mirasu)
+
+**Issue:** on v5.2.1-beta.2 a warrior changing stance in combat no longer got the main bar paged; the
+buttons stayed on the previous stance's page (reported by Drek, default action bars). Any class with
+a bonus bar was affected (stances, druid forms, Shadowform). `ApiCompat.lua`'s vehicle block wrote
+every name with `X = X or stub`; the `or` protects the value, not the write, so the assignment ran
+whether or not `X` existed, and a global written by addon code is tainted regardless of the value
+stored. Two of those names exist on 1.14.2 and are read by secure Blizzard code on every bonus-bar
+update (`ActionBarController_UpdateAll` calls `HasTempShapeshiftActionBar` and
+`GetTempShapeshiftBarIndex`); after the re-assignment that path ran tainted and its protected
+`actionpage` attribute write was refused in combat (`ADDON_ACTION_BLOCKED` naming JimsPlus at
+`ActionBarController.lua:93`). Out of combat the tainted path still paged, which is why it was
+missed. Workaround on beta.2 was unticking "Modern addon API shims".
+
+**Change:** `Addons/JimsPlus/ApiCompat.lua` — the eighteen vehicle-API names are now assigned only
+when the global is nil (`if X == nil then X = stub end`), so a function the client provides is never
+written. The other three shim blocks were already guarded that way. No behaviour change for any name
+that is actually missing. JimsPlus 1.2.4.
+
+**Verification:** reproduced on a warrior with default bars, shims enabled, before and after on the
+same character in one session: stance change in combat pages the bar and no `ADDON_ACTION_BLOCKED`
+from JimsPlus. Both file versions parse as Lua 5.1. HermesCompat upstream uses the same idiom and
+has the same bug, so running it alongside still taints.
+
+---
+
 ## 2026-09-08 — Answer a never-re-keyed rejected press on its client cast id, no SpellPrepare (#517)
 
 **Issue:** a press the server rejects before it STARTs was answered with `SMSG_SPELL_PREPARE`
@@ -49,6 +75,41 @@ buttons in 28 rejected never-started presses (9 min) before; 0 in 197 (6 min, pr
 warrior Sunder, Bloodthirst, Heroic Strike spam) with the fix, every rejection on the client id
 with no PREPARE. The eviction emitters are covered by the same rule but were not exercised in that
 run; field gate on the next beta.
+
+---
+
+## 2026-09-07 — Lock talent spells at the respec confirm so a lagged press can't reach the server after the wipe (#515, Mirasu)
+
+**Issue:** a player respecced during a lag spike, pressed Shadowform while the spellbook was still
+draining, and got the Kronos "Spell not in player book" kick and ban (since lifted). The
+cast-block-unknown-spells guard (#185) is reactive: it drops a spell from `CurrentPlayerKnownSpells`
+only when the server's removal packet reaches the proxy, while the server wipes every talent spell the
+instant it processes `MSG_TALENT_WIPE_CONFIRM`. Between the confirm leaving and the removal burst
+arriving there is a full round trip in which a lingering action-bar press is forwarded for a spell the
+server no longer has. A native 1.12 client has the same race.
+
+**Change:** `GlobalSessionData.cs` — a speculative lock armed at `CMSG_CONFIRM_RESPEC_WIPE`
+(`ArmRespecCastLock` / `CollectRespecLockSpells`): every known spell that is, or descends by rank
+chain from, a talent spell of the player's class is locked, using a new
+`GameData.TalentSpellClassMask` (Talent.dbc ClassMask, from the same `TalentSpellRanks.csv`). That
+catches the talent itself and the trainer-bought higher ranks the server unlearns with it.
+`World/Server/PacketHandlers/SpellHandler.cs` — `HandleCastSpell` rejects a locked press locally with
+the guard's own `NotKnown` CastFailed (client cast id, no PREPARE), and `ForwardHeldGcdCast` re-runs
+both the known-set check and the lock at release, since a press parked for the GCD or a cast time can
+outlive a respec. Release: each real removal (`SMSG_UNLEARNED_SPELLS` / `SMSG_SEND_UNLEARN_SPELLS`)
+releases its spell; a `MSG_QUERY_NEXT_MAIL_TIME` queued right behind the confirm is processed in
+order on the server, so its reply fences the wipe (success or silent rejection) and stands down
+whatever the server kept, matched by ordinal so a reply to the client's own query cannot stand the
+lock down early; the "no talents" wipe-confirm reply and `SMSG_BUY_FAILED` clear it; a fresh spellbook
+clears it; a 120 s timeout is a backstop for a lost fence only. The known-set mirror is never
+speculatively mutated. Diags: `spell.cast.blocked_respec_pending`, `spell.cast.blocked_at_held_release`
+and `spell.respec_lock.expired` unconditional; `spell.respec_lock.armed` / `drained` / `cleared`
+DebugOutput-gated (review housekeeping).
+
+**Verification:** real respec on a paladin on Kronos (`jimsproxy-20260907-141942`): 28 locked, exactly
+28 `SMSG_UNLEARNED_SPELLS`, drained, the untalent visual, then the fence reply, all within one 172 ms
+round trip; the locked set equalled the server's wipe set. `RespecCastLockTests` (17 cases); suite
+978/978 on the branch.
 
 ---
 
