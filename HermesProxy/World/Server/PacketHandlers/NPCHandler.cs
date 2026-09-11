@@ -160,12 +160,16 @@ public partial class WorldSocket
                     GetSession().GameState.NoteMailTimeQuerySent(isRespecFence: true);
                     SendPacketToServer(new WorldPacket(Opcode.MSG_QUERY_NEXT_MAIL_TIME));
                 }
-                Log.Event("spell.respec_lock.armed", new
-                {
-                    locked_count = lockedCount,
-                    known_count = GetSession().GameState.CurrentPlayerKnownSpells.Count,
-                    player_class = GetSession().GameState.CurrentPlayerClass,
-                });
+                // Fix-working breadcrumb (with drained / cleared): DebugOutput-gated at review. The
+                // blocked_respec_pending / blocked_at_held_release / expired events stay unconditional
+                // because each marks an edge the lock exists to catch.
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("spell.respec_lock.armed", new
+                    {
+                        locked_count = lockedCount,
+                        known_count = GetSession().GameState.CurrentPlayerKnownSpells.Count,
+                        player_class = GetSession().GameState.CurrentPlayerClass,
+                    });
                 break;
             }
             case SpecResetType.PetTalents:

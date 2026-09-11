@@ -366,7 +366,7 @@ public partial class WorldClient
     {
         if (!GetSession().GameState.ReleaseRespecLockedSpell(spellId, out int remaining))
             return;
-        if (remaining == 0)
+        if (remaining == 0 && Framework.Settings.DebugOutput)
             Log.Event("spell.respec_lock.drained", new { last_spell_id = spellId });
     }
 

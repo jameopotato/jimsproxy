@@ -232,7 +232,8 @@ public partial class WorldClient
         if (GetSession().GameState.IsRespecCastLockArmed)
         {
             int released = GetSession().GameState.ClearRespecCastLock();
-            Log.Event("spell.respec_lock.cleared", new { reason = "buy_failed", released_count = released, buy_reason = fail.Reason.ToString() });
+            if (Framework.Settings.DebugOutput)
+                Log.Event("spell.respec_lock.cleared", new { reason = "buy_failed", released_count = released, buy_reason = fail.Reason.ToString() });
         }
 
         Log.Event("vendor.buy.failed", new

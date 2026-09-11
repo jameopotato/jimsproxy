@@ -365,7 +365,8 @@ public partial class WorldClient
         if (respec.TrainerGUID.IsEmpty() && GetSession().GameState.IsRespecCastLockArmed)
         {
             int released = GetSession().GameState.ClearRespecCastLock();
-            Log.Event("spell.respec_lock.cleared", new { reason = "wipe_confirm_no_talents", released_count = released });
+            if (Framework.Settings.DebugOutput)
+                Log.Event("spell.respec_lock.cleared", new { reason = "wipe_confirm_no_talents", released_count = released });
         }
         SendPacketToClient(respec);
     }

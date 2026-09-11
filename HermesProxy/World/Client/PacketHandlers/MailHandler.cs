@@ -39,7 +39,8 @@ public partial class WorldClient
         if (GetSession().GameState.NoteMailTimeReplyReachesRespecFence())
         {
             int released = GetSession().GameState.ClearRespecCastLock();
-            Log.Event("spell.respec_lock.cleared", new { reason = "fence_reply", released_count = released });
+            if (Framework.Settings.DebugOutput)
+                Log.Event("spell.respec_lock.cleared", new { reason = "fence_reply", released_count = released });
         }
 
         // Capture raw payload for diagnostics before any reads consume bytes.
