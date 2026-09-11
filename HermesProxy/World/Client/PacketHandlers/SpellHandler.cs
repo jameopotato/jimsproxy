@@ -701,7 +701,7 @@ public partial class WorldClient
             // forward time, so it keeps the old shape (the same PREPARE again, then the server
             // id); a started cast keeps the server id it was re-keyed to at START.
             SpellPrepare? dupPrepare = null;
-            if (!movementSuppressed && !pendingCast.HasStarted && pendingCast.HasSentPrepare)
+            if (!movementSuppressed && pendingCast.NeedsPrepareBeforeFailure)
             {
                 SpellPrepare prepare2 = new SpellPrepare();
                 prepare2.ClientCastID = pendingCast.ClientGUID;

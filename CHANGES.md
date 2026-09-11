@@ -13,6 +13,44 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-08 — Answer a never-re-keyed rejected press on its client cast id, no SpellPrepare (#517)
+
+**Issue:** a press the server rejects before it STARTs was answered with `SMSG_SPELL_PREPARE`
+(client cast id to server cast id) followed by `SMSG_CAST_FAILED` on the server id. On the 1.14.2
+client that re-key leaves the press's cast object pinned in its casting state with the action
+button lit until relog: the client's CAST_FAILED lookup on the server id misses the re-keyed object
+and tears down a transient stub instead (client RE, round 15). Caught live three times on the
+Kronos PTR under the in-process cast-object harness (Heal rank 4, Flash Heal), about one rejected
+heal-spam frame in ten; the same rejected-press shape is routine on a warrior (Sunder Armor
+`UnitNotInfront` / `NotReady`), so the button-only sticks on Sunder, Battle Shout and mounts share
+the trigger. The stuck button is a distinct outcome from the looping cast sound (#394): the object
+never started, so it carries no wind-up effects.
+
+**Change:** `GlobalSessionData.cs` — `ClientCastRequest.PrepareSentToClient` (`HasStarted ||
+HasSentPrepare`), `FailureCastId` (the server id once a PREPARE went out, else the client id) and
+`NeedsPrepareBeforeFailure` (only an off-GCD press re-keyed at forward time and never started
+repeats its PREPARE). Every emitter that fails a pending press reads them: `WorldSocket.
+SendCastRequestFailed` (`Server/PacketHandlers/SpellHandler.cs`; a never-re-keyed non-pet request
+goes to `SendCastFailedWithoutPrepare` with the caller's reason), the `SMSG_CAST_FAILED` handler
+(`Client/PacketHandlers/SpellHandler.cs`; the dup PREPARE is built only for the off-GCD shape, the
+#491 held item then carries just the CastFailed), and, added at review, the destroy eviction and
+the watchdog eviction (`GlobalSessionData.EvictPendingCastsForDestroyedTarget` /
+`RunWatchdogEviction`), which used the same PREPARE-then-server-id shape for never-started presses.
+The special-slot accept (Shoot / next-melee) now records its forward-time PREPARE in
+`HasSentPrepare` so the rule is complete for those requests too. Unchanged: started casts (re-keyed
+at START, failures keep the server id and the FIFO-pinned id), off-GCD presses, pets, the
+special-slot failure handler. Side change: a movement-cancelled never-started press, previously
+answered on the server id with no PREPARE, now carries the client id the client actually holds.
+
+**Verification:** `RejectedPressFailureShapeTests` (8 cases) pins the rule for every state the
+emitters see. Field A/B on the Kronos PTR, same character, same play, same harness: 3 stuck
+buttons in 28 rejected never-started presses (9 min) before; 0 in 197 (6 min, priest heal spam plus
+warrior Sunder, Bloodthirst, Heroic Strike spam) with the fix, every rejection on the client id
+with no PREPARE. The eviction emitters are covered by the same rule but were not exercised in that
+run; field gate on the next beta.
+
+---
+
 ## 2026-09-06 — Fishing: keep the new channel open when the previous bobber's timeout ends it (#510, Mirasu)
 
 **Issue:** recasting fishing while the previous bobber still exists makes mangos-family servers run

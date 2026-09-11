@@ -11,9 +11,10 @@ namespace HermesProxy.Tests.World;
 // the proxy sends at SPELL_START (on-GCD) or at forward time (off-GCD). A press that was never
 // re-keyed must fail on the CLIENT id with no PREPARE: re-keying it only to fail it on the
 // server id left the object pinned in its casting state with the action button lit until relog
-// (three live PTR specimens, about one in ten rejected heal-spam frames). Both proxy emitters
-// (WorldSocket.SendCastRequestFailed and the SMSG_CAST_FAILED handler) route through these
-// two members, so pinning them pins the wire shape.
+// (three live PTR specimens, about one in ten rejected heal-spam frames). All four proxy
+// emitters that fail a pending press (WorldSocket.SendCastRequestFailed, the SMSG_CAST_FAILED
+// handler, and the destroy and watchdog evictions in GlobalSessionData) route through
+// FailureCastId and NeedsPrepareBeforeFailure, so pinning them pins the wire shape.
 public class RejectedPressFailureShapeTests
 {
     private static readonly WowGuid128 ClientId = new WowGuid128(5, 0xBC0000000005EC02);
@@ -86,5 +87,43 @@ public class RejectedPressFailureShapeTests
         press.HasSentPrepare = true;
 
         Assert.Equal(ServerId, press.FailureCastId);
+    }
+
+    // === Eviction emitters (destroy eviction, watchdog eviction) share the shape ===
+    // Both used to send a PREPARE for any not-started press and then fail it on the server id,
+    // the exact stranding shape. They now read the same two members as the other emitters.
+
+    [Fact]
+    public void Evicted_NeverPrepared_GetsNoPrepareAndClientId()
+    {
+        // A never-started press whose target was destroyed, or whose SPELL_FAILURE armed the
+        // watchdog and whose trailing CAST_FAILED never came: the client still holds it under
+        // the client id, so no PREPARE and the client id on the failure.
+        var press = MakeCast();
+
+        Assert.False(press.NeedsPrepareBeforeFailure);
+        Assert.Equal(ClientId, press.FailureCastId);
+    }
+
+    [Fact]
+    public void Evicted_OffGcdPrepared_KeepsRepeatPrepareAndServerId()
+    {
+        // An off-GCD press was re-keyed at forward time: the emitter repeats the PREPARE (the
+        // shape that has always been used for it) and fails on the server id.
+        var press = MakeCast(started: false, prepareSent: true);
+
+        Assert.True(press.NeedsPrepareBeforeFailure);
+        Assert.Equal(ServerId, press.FailureCastId);
+    }
+
+    [Fact]
+    public void Evicted_Started_GetsNoPrepareAndServerId()
+    {
+        // A started cast was re-keyed by the START-time PREPARE; the watchdog force-close must
+        // not repeat it and must fail on the server id the FIFO release above it also uses.
+        var cast = MakeCast(started: true, prepareSent: true);
+
+        Assert.False(cast.NeedsPrepareBeforeFailure);
+        Assert.Equal(ServerId, cast.FailureCastId);
     }
 }

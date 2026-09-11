@@ -4097,6 +4097,14 @@ public class ClientCastRequest
     // specimens under the in-process harness, about one in ten rejected heal-spam frames).
     public WowGuid128 FailureCastId => PrepareSentToClient ? ServerGUID : ClientGUID;
 
+    // Whether a failure emitted for this press must be preceded by a (repeat) SpellPrepare: only
+    // an off-GCD press that was re-keyed at forward time and never started keeps that shape. A
+    // never-re-keyed press gets no PREPARE at all (the failure goes out on its client id above),
+    // and a started cast was re-keyed by the START-time PREPARE already. Every proxy emitter that
+    // fails a pending press (the request-failed helper, the CAST_FAILED handler, the destroy and
+    // watchdog evictions) reads this and FailureCastId so all four agree on the wire shape.
+    public bool NeedsPrepareBeforeFailure => !HasStarted && HasSentPrepare;
+
     // JimsProxy (held-aware GCD anchoring): true once this press was released from the GCD
     // hold slot by the release timer (ForwardHeldGcdCast) — i.e. the proxy RE-TIMED it.
     // The synthetic GCD-anchor packets (#124 cooldown synth, bb4bb18 GO.CastTime stamp) exist
@@ -4307,7 +4315,12 @@ public class GlobalSessionData
                 target_low = cast.TargetGuid.GetCounter(),
                 had_started = cast.HasStarted,
             });
-            if (!cast.HasStarted)
+            // JimsProxy (stuck action button, review of the client-id failure rule): a never-started
+            // press the client was never told to re-key is failed on its CLIENT id with no PREPARE.
+            // Re-keying it here only to fail it on the server id was the shape that pins the 1.14
+            // client's press object with the action button lit until relog. An off-GCD press that
+            // was re-keyed at forward time keeps the repeat-PREPARE shape (NeedsPrepareBeforeFailure).
+            if (cast.NeedsPrepareBeforeFailure)
             {
                 SpellPrepare prepare = new();
                 prepare.ClientCastID = cast.ClientGUID;
@@ -4318,7 +4331,7 @@ public class GlobalSessionData
             failed.SpellID = cast.SpellId;
             failed.SpellXSpellVisualID = cast.SpellXSpellVisualId;
             failed.Reason = (byte)SpellCastResultClassic.BadTargets;
-            failed.CastID = cast.ServerGUID;
+            failed.CastID = cast.FailureCastId;
             InstanceSocket.SendPacket(failed);
         }
 
@@ -4375,7 +4388,13 @@ public class GlobalSessionData
             // head). The synthetic CastFailed below already carries cast.ServerGUID == that CastID.
             if (cast.HasStarted)
                 GameState.RemoveForwardedStartCastId(cast.SpellId, cast.ServerGUID);
-            if (!cast.HasStarted)
+            // JimsProxy (stuck action button, review of the client-id failure rule): a never-started
+            // press (a SPELL_FAILURE armed the watchdog and Kronos dropped the trailing CAST_FAILED)
+            // is failed on its CLIENT id with no PREPARE, the same rule as the CAST_FAILED handler;
+            // re-keying it here only to fail it on the server id pinned the press object with the
+            // button lit. Started casts keep the server id (FailureCastId) so the FIFO release above
+            // and the failure agree; off-GCD presses keep the repeat-PREPARE shape.
+            if (cast.NeedsPrepareBeforeFailure)
             {
                 SpellPrepare prepare = new();
                 prepare.ClientCastID = cast.ClientGUID;
@@ -4386,7 +4405,7 @@ public class GlobalSessionData
             failed.SpellID = cast.SpellId;
             failed.SpellXSpellVisualID = cast.SpellXSpellVisualId;
             failed.Reason = (byte)SpellCastResultClassic.DontReport;
-            failed.CastID = cast.ServerGUID;
+            failed.CastID = cast.FailureCastId;
             InstanceSocket.SendPacket(failed);
 
             // JimsProxy (transient-no-dismiss-started): under LowLatencyMode, HandleSpellFailure

@@ -314,6 +314,11 @@ public partial class WorldSocket
                 prepare.ClientCastID = cast.Cast.CastID;
                 prepare.ServerCastID = castRequest.ServerGUID;
                 SendPacket(prepare);
+                // JimsProxy (stuck action button, client-id failure rule): this PREPARE re-keys the
+                // client's press object to the server id at forward time, exactly like the off-GCD
+                // path. Record it so any failure emitted for this request later keeps the server id
+                // (FailureCastId) instead of a client id the client no longer holds.
+                castRequest.HasSentPrepare = true;
 
                 currentCast = castRequest;
             }
