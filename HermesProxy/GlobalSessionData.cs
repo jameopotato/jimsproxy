@@ -3886,6 +3886,146 @@ public sealed class GameSessionData
         PendingTrainerBuyRemovedPredecessor = 0u;
         return restored;
     }
+    // JimsProxy (respec cast lock): the cast-block-unknown-spells guard is reactive — it learns a
+    // spell is gone only when the server's SMSG_REMOVED_SPELL reaches the proxy. A talent respec
+    // wipes every talent spell server-side the instant MSG_TALENT_WIPE_CONFIRM is processed, so
+    // between the client's confirm and the removal burst arriving (a full RTT — seconds under a
+    // lag spike) a lingering action-bar press is forwarded for a spell the server no longer has →
+    // Kronos "Spell not in player book" autoban (2026-09-06, Shadowform). Arm at the confirm:
+    // every known spell that is, or descends by rank chain from, one of this class's talent
+    // spells is locked and the guard rejects its casts locally. Each real removal releases its
+    // spell. MSG_QUERY_NEXT_MAIL_TIME queued right behind the confirm is processed in order on
+    // the server, so its reply fences the wipe — success or silent rejection — and clears
+    // whatever the server kept. The timeout is a backstop for a lost fence only.
+    private HashSet<uint>? _respecLockedSpells;
+    private object? _respecLockSync;
+    public long RespecLockArmedTickMs;
+    public const long RespecLockTimeoutMs = 120_000;
+    // The fence is matched by ordinal: the modern client sends its own mail-time queries, and a
+    // reply to one of those landing inside the window must not read as "wipe processed".
+    private long _mailTimeQueriesSent;
+    private long _mailTimeRepliesSeen;
+    private long _respecFenceOrdinal; // 0 = no fence outstanding (ordinals start at 1)
+
+    private object RespecLockSync => System.Threading.LazyInitializer.EnsureInitialized(ref _respecLockSync);
+
+    public bool IsRespecCastLockArmed
+    {
+        get { lock (RespecLockSync) return _respecLockedSpells is { Count: > 0 }; }
+    }
+
+    /// <summary>Locks every known spell rooted in a talent of the local player's class (class 0 =
+    /// not yet seen: every talent-rooted spell). Returns the locked count. Re-arming while armed
+    /// unions the sets and restarts the timeout.</summary>
+    public int ArmRespecCastLock(long nowTickMs)
+    {
+        lock (RespecLockSync)
+        {
+            _respecLockedSpells ??= new HashSet<uint>();
+            CollectRespecLockSpells(CurrentPlayerKnownSpells, CurrentPlayerClass, _respecLockedSpells);
+            RespecLockArmedTickMs = nowTickMs;
+            return _respecLockedSpells.Count;
+        }
+    }
+
+    /// <summary>Walks each known spell's rank chain down to its first rank: a talent of this class
+    /// anywhere on the chain marks the known spell. Catches the talent itself (Shadowform) and the
+    /// trainer-bought higher ranks the server unlearns with it (Mortal Strike R3 whose R1 talent
+    /// was superseded out of the known set long ago).</summary>
+    public static void CollectRespecLockSpells(IEnumerable<uint> knownSpells, byte playerClass, HashSet<uint> into)
+    {
+        uint classMask = playerClass == 0 ? 0u : 1u << (playerClass - 1);
+        foreach (uint known in knownSpells)
+        {
+            uint cur = known;
+            for (int depth = 0; depth < 16; depth++)
+            {
+                if (GameData.TalentSpellClassMask.TryGetValue(cur, out uint talentClasses)
+                    && (classMask == 0 || (talentClasses & classMask) != 0))
+                {
+                    into.Add(known);
+                    break;
+                }
+                if (!GameData.SpellRankPredecessor.TryGetValue(cur, out cur))
+                    break;
+            }
+        }
+    }
+
+    /// <summary>Every MSG_QUERY_NEXT_MAIL_TIME the proxy sends to the server — the client's own and
+    /// the fence — so the fence's reply can be told apart from a stale one by ordinal.</summary>
+    public void NoteMailTimeQuerySent(bool isRespecFence)
+    {
+        lock (RespecLockSync)
+        {
+            _mailTimeQueriesSent++;
+            if (isRespecFence)
+                _respecFenceOrdinal = _mailTimeQueriesSent;
+        }
+    }
+
+    /// <summary>Counts a MSG_QUERY_NEXT_MAIL_TIME reply; true when it is the fence's own reply (or a
+    /// later one) and the lock is still armed — the wipe has been processed either way.</summary>
+    public bool NoteMailTimeReplyReachesRespecFence()
+    {
+        lock (RespecLockSync)
+        {
+            _mailTimeRepliesSeen++;
+            return _respecFenceOrdinal != 0 && _respecLockedSpells is { Count: > 0 } && _mailTimeRepliesSeen >= _respecFenceOrdinal;
+        }
+    }
+
+    /// <summary>Whether a cast must be rejected because the wipe is still pending for this spell.
+    /// Lazily expires the whole lock past RespecLockTimeoutMs; <paramref name="expiredCount"/> is
+    /// how many spells that released (0 when nothing expired).</summary>
+    public bool IsRespecCastLocked(uint spellId, long nowTickMs, out int expiredCount)
+    {
+        expiredCount = 0;
+        lock (RespecLockSync)
+        {
+            if (_respecLockedSpells is not { Count: > 0 })
+                return false;
+            if (nowTickMs - RespecLockArmedTickMs > RespecLockTimeoutMs)
+            {
+                expiredCount = _respecLockedSpells.Count;
+                _respecLockedSpells.Clear();
+                return false;
+            }
+            return _respecLockedSpells.Contains(spellId);
+        }
+    }
+
+    /// <summary>A real removal (SMSG_REMOVED_SPELL) confirms this spell is gone — the known-set
+    /// check covers it from here, so release it. Returns whether it was locked; <paramref
+    /// name="remaining"/> is how many locked spells still await the server.</summary>
+    public bool ReleaseRespecLockedSpell(uint spellId, out int remaining)
+    {
+        lock (RespecLockSync)
+        {
+            remaining = 0;
+            if (_respecLockedSpells == null)
+                return false;
+            bool wasLocked = _respecLockedSpells.Remove(spellId);
+            remaining = _respecLockedSpells.Count;
+            return wasLocked;
+        }
+    }
+
+    /// <summary>The server is done with the wipe (fence reply, explicit rejection, fresh spellbook):
+    /// anything still locked was kept server-side and is safe to cast. Returns the released count.</summary>
+    public int ClearRespecCastLock()
+    {
+        lock (RespecLockSync)
+        {
+            if (_respecLockedSpells == null)
+                return 0;
+            int released = _respecLockedSpells.Count;
+            _respecLockedSpells.Clear();
+            _respecFenceOrdinal = 0;
+            return released;
+        }
+    }
+
     public void StoreCreatureClass(uint entry, Class classId)
     {
         CreatureClasses[entry] = classId;

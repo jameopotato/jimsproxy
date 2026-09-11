@@ -192,6 +192,27 @@ public partial class WorldSocket
             return;
         }
 
+        // JimsProxy (respec cast lock): the talent wipe is in flight — the server may already have
+        // removed this spell without the removal having reached us. Reject locally exactly like an
+        // unknown spell; the lock releases per real removal / fence reply (GameSessionData).
+        if (GetSession().GameState.IsRespecCastLocked(guardSpellId, Environment.TickCount64, out int respecLockExpired))
+        {
+            Log.Event("spell.cast.blocked_respec_pending", new
+            {
+                spell_id = guardSpellId,
+                client_cast_id = cast.Cast.CastID.ToString(),
+            });
+            CastFailed failed = new();
+            failed.SpellID = guardSpellId;
+            failed.SpellXSpellVisualID = cast.Cast.SpellXSpellVisualID;
+            failed.Reason = (uint)SpellCastResultClassic.NotKnown;
+            failed.CastID = cast.Cast.CastID;
+            SendPacket(failed);
+            return;
+        }
+        if (respecLockExpired > 0)
+            Log.Event("spell.respec_lock.expired", new { released_count = respecLockExpired });
+
         // JimsProxy (PR #161 follow-up): self-heal any leaked peek-without-CAST_FAILED
         // before HasStartedNormalCast / HasNonStartedPendingCastForSpell run their
         // gate checks below. Without this, a Kronos-style "no trailing CAST_FAILED"
@@ -868,6 +889,23 @@ public partial class WorldSocket
                 spell_id = cast.SpellId,
                 client_cast_id = cast.ClientGUID.ToString(),
             });
+            return;
+        }
+
+        // JimsProxy (respec cast lock): a press parked for the GCD / a cast time passed the
+        // spellbook guard when it arrived; a respec or a removal can land while it waits, and
+        // forwarding it now is the same autoban path. Re-run both checks at release.
+        var heldKnown = gameState.CurrentPlayerKnownSpells;
+        bool heldUnknown = heldKnown.Count > 0 && !heldKnown.Contains(cast.SpellId);
+        if (heldUnknown || gameState.IsRespecCastLocked(cast.SpellId, Environment.TickCount64, out _))
+        {
+            Log.Event("spell.cast.blocked_at_held_release", new
+            {
+                spell_id = cast.SpellId,
+                client_cast_id = cast.ClientGUID.ToString(),
+                reason = heldUnknown ? "unknown_spell" : "respec_pending",
+            });
+            SendCastFailedWithoutPrepare(cast, SpellCastResultClassic.NotKnown);
             return;
         }
 

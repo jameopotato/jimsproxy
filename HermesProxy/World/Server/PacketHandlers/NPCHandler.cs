@@ -148,9 +148,28 @@ public partial class WorldSocket
         {
             case SpecResetType.Talents:
             {
+                // JimsProxy (respec cast lock): lock this class's talent spells BEFORE the confirm
+                // leaves, then queue the in-order fence right behind it — its reply proves the
+                // server has processed the wipe (see GameSessionData.ArmRespecCastLock).
+                int lockedCount = GetSession().GameState.ArmRespecCastLock(Environment.TickCount64);
                 WorldPacket packet = new WorldPacket(Opcode.MSG_TALENT_WIPE_CONFIRM);
                 packet.WriteGuid(respec.TrainerGUID.To64());
                 SendPacketToServer(packet);
+                if (lockedCount > 0)
+                {
+                    GetSession().GameState.NoteMailTimeQuerySent(isRespecFence: true);
+                    SendPacketToServer(new WorldPacket(Opcode.MSG_QUERY_NEXT_MAIL_TIME));
+                }
+                // Fix-working breadcrumb (with drained / cleared): DebugOutput-gated at review. The
+                // blocked_respec_pending / blocked_at_held_release / expired events stay unconditional
+                // because each marks an edge the lock exists to catch.
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("spell.respec_lock.armed", new
+                    {
+                        locked_count = lockedCount,
+                        known_count = GetSession().GameState.CurrentPlayerKnownSpells.Count,
+                        player_class = GetSession().GameState.CurrentPlayerClass,
+                    });
                 break;
             }
             case SpecResetType.PetTalents:

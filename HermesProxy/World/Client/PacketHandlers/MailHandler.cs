@@ -32,6 +32,17 @@ public partial class WorldClient
     [PacketHandler(Opcode.MSG_QUERY_NEXT_MAIL_TIME)]
     void HandleQueryNextMailTime(WorldPacket packet)
     {
+        // JimsProxy (respec cast lock): the fence queued behind MSG_TALENT_WIPE_CONFIRM replies here.
+        // The server handles both in order, so by now the wipe ran and every removal it sent is
+        // already processed on this thread — whatever is still locked was kept server-side. Matched
+        // by ordinal so a reply to the client's own query from before the confirm can't stand down.
+        if (GetSession().GameState.NoteMailTimeReplyReachesRespecFence())
+        {
+            int released = GetSession().GameState.ClearRespecCastLock();
+            if (Framework.Settings.DebugOutput)
+                Log.Event("spell.respec_lock.cleared", new { reason = "fence_reply", released_count = released });
+        }
+
         // Capture raw payload for diagnostics before any reads consume bytes.
         uint rawSize = packet.GetSize();
         string rawHex = Convert.ToHexString(packet.GetData(), 0, (int)Math.Min(rawSize, 64));

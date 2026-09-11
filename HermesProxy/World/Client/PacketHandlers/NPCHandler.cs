@@ -360,6 +360,14 @@ public partial class WorldClient
         RespecWipeConfirm respec = new();
         respec.TrainerGUID = packet.ReadGuid().To128(GetSession().GameState);
         respec.Cost = packet.ReadUInt32();
+        // JimsProxy (respec cast lock): an empty guid is the server's "you have no talents" reply to
+        // our confirm — nothing was removed, so the lock can stand down before the fence lands.
+        if (respec.TrainerGUID.IsEmpty() && GetSession().GameState.IsRespecCastLockArmed)
+        {
+            int released = GetSession().GameState.ClearRespecCastLock();
+            if (Framework.Settings.DebugOutput)
+                Log.Event("spell.respec_lock.cleared", new { reason = "wipe_confirm_no_talents", released_count = released });
+        }
         SendPacketToClient(respec);
     }
 
