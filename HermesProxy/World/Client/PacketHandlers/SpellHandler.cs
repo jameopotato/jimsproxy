@@ -704,8 +704,18 @@ public partial class WorldClient
             bool holdAsDup = !pendingCast.HasStarted && !movementSuppressed &&
                 GetSession().GameState.HasStartedPendingCastForSpell(spellId);
 
+            // JimsProxy (stuck action button, RE round 15, 2026-09-08): a never-started press used
+            // to get a SpellPrepare (client id -> server id) here and then the CastFailed on the
+            // server id. That re-key left the client's press object pinned in its casting state
+            // with the action button lit until relog (three live PTR specimens under the harness,
+            // about one in ten rejected heal-spam frames, all on this path). A press the client
+            // has never been told to re-key now fails on its CLIENT id with no PREPARE, the
+            // duplicate-drop shape that has never stuck; a rejected press never gets a START or
+            // GO, so the client has no use for the server id. An off-GCD press was re-keyed at
+            // forward time, so it keeps the old shape (the same PREPARE again, then the server
+            // id); a started cast keeps the server id it was re-keyed to at START.
             SpellPrepare? dupPrepare = null;
-            if (!movementSuppressed && !pendingCast.HasStarted)
+            if (!movementSuppressed && pendingCast.NeedsPrepareBeforeFailure)
             {
                 SpellPrepare prepare2 = new SpellPrepare();
                 prepare2.ClientCastID = pendingCast.ClientGUID;
@@ -720,7 +730,7 @@ public partial class WorldClient
             failed.SpellID = pendingCast.SpellId;
             failed.SpellXSpellVisualID = pendingCast.SpellXSpellVisualId;
             failed.Reason = effectiveReason;
-            failed.CastID = pendingCast.ServerGUID;
+            failed.CastID = pendingCast.FailureCastId;
             // T1 (identity-pinned): a real failure terminates the STARTED cast — stamp it with the
             // recorded START CastID (popped FIFO) and consume the FIFO entry so a later same-spell
             // GO can't pop this now-resolved cast's CastID. Transient dup rejections resolve the

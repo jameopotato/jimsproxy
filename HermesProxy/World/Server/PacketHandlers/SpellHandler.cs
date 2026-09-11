@@ -83,6 +83,23 @@ public partial class WorldSocket
     }
     public void SendCastRequestFailed(ClientCastRequest castRequest, bool isPet, SpellCastResultClassic reason = SpellCastResultClassic.SpellInProgress)
     {
+        // JimsProxy (stuck action button, RE round 15, 2026-09-08): a player press the client has
+        // never been told to re-key (no SpellPrepare yet: not started, not an off-GCD forward) is
+        // answered on the CLIENT cast id with no SpellPrepare. Re-keying it to a server id only to
+        // fail it is what left the 1.14 client's press object pinned in its casting state with the
+        // action button lit until relog (three live specimens on the PTR under the in-process
+        // harness, about one in ten rejected heal-spam frames: the object survives CAST_FAILED on
+        // the server id because that lookup misses it and tears down a transient stub instead).
+        // The client-id shape is the one the duplicate drop has always used and it has never
+        // stuck, and a rejected press never gets a START or GO, so the client has no use for the
+        // server id. Presses already re-keyed (started, or off-GCD prepared at forward time) and
+        // pets keep the shape below unchanged.
+        if (!castRequest.PrepareSentToClient && !isPet)
+        {
+            SendCastFailedWithoutPrepare(castRequest, reason);
+            return;
+        }
+
         if (!castRequest.HasStarted)
         {
             SpellPrepare prepare2 = new SpellPrepare();
@@ -318,6 +335,11 @@ public partial class WorldSocket
                 prepare.ClientCastID = cast.Cast.CastID;
                 prepare.ServerCastID = castRequest.ServerGUID;
                 SendPacket(prepare);
+                // JimsProxy (stuck action button, client-id failure rule): this PREPARE re-keys the
+                // client's press object to the server id at forward time, exactly like the off-GCD
+                // path. Record it so any failure emitted for this request later keeps the server id
+                // (FailureCastId) instead of a client id the client no longer holds.
+                castRequest.HasSentPrepare = true;
 
                 currentCast = castRequest;
             }
