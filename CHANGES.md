@@ -13,6 +13,27 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-11 — Forward SMSG_FEIGN_DEATH_RESISTED so a resisted Feign Death is reported (#522, Mirasu)
+
+**Issue:** a creature in combat with the player can resist Feign Death. The server then keeps the
+aura, so the button greys for the cooldown, but never sets the dead flags, and the only word the
+client gets is `SMSG_FEIGN_DEATH_RESISTED`. The proxy had no handler for that opcode (it logged as
+`packet.untranslated`), so on a resist the player saw a greyed button and nothing else: no pose, no
+message, no way to tell a resist from a failed cast. Kronos, hunter at a target dummy
+(`jimsproxy-20260911-102024.jsonl`): two normal feigns with the dead dynamic flag forwarded, then
+a third press after idling in combat that arrived as the resist packet with no flag change.
+
+**Change:** `World/Client/PacketHandlers/SpellHandler.cs` — `HandleFeignDeathResisted`, a
+passthrough that sends the new `FeignDeathResisted` server packet (`World/Server/Packets/
+SpellPackets.cs`); both the legacy and the modern packet are empty (legacy opcode 0x2B4, modern
+0x273C in the 42597 table). One `spell.feign_death_resisted` event marks it in the log.
+
+**Verification:** field-tested on Kronos: the resist now shows the client's "Feign Death resisted"
+text and normal feigns are unchanged. Review: opcode present in every legacy table and in the modern
+table for 42597, empty-packet shape matches the existing empty packets, clean merge. 1075/1075.
+
+---
+
 ## 2026-09-11 — JimsPlus: the ApiCompat shims are opt-in (off by default)
 
 **Issue:** the shims shipped in v5.2.1-beta.2 on by default (#507) and one of them tainted the
