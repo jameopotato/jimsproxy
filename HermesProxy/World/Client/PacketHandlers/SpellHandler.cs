@@ -2239,6 +2239,9 @@ public partial class WorldClient
             return;
 
         SpellGo spell = new SpellGo();
+        // JimsProxy (CancelWindupKitOnGo): set only on the branch that completes a local pressed
+        // cast; consumed right before the GO is forwarded (see SendWindupKitCancels).
+        uint windupCancelXVisual = 0;
         try
         {
             spell.Cast = HandleSpellStartOrGo(packet, true);
@@ -2399,6 +2402,12 @@ public partial class WorldClient
                 GetSession().GameState.TryPopForwardedStartCastId(pendingCast.SpellId, out var pinnedGoCastId))
                 spell.Cast.CastID = pinnedGoCastId;
             spell.Cast.SpellXSpellVisualID = pendingCast.SpellXSpellVisualId;
+            // JimsProxy (CancelWindupKitOnGo): remember the visual whose wind-up this GO closes.
+            // Channels keep their own visual lifecycle and are excluded. The cancel itself goes
+            // out immediately before the GO is forwarded.
+            uint windupLookupId = pendingCast.LegacySpellId != 0 ? pendingCast.LegacySpellId : (uint)spell.Cast.SpellID;
+            if (ShouldCancelWindupKitsOnGo(Settings.CancelWindupKitOnGo, GameData.IsChanneledSpell(windupLookupId)))
+                windupCancelXVisual = spell.Cast.SpellXSpellVisualID;
             // SoM-renumbered item: rewrite the legacy spell id back to the modern one the client expects.
             if (pendingCast.LegacySpellId != 0)
                 spell.Cast.SpellID = (int)pendingCast.SpellId;
@@ -2791,6 +2800,7 @@ public partial class WorldClient
                     try
                     {
                         SendPacketToClient(formExitStart);
+                        SendWindupKitCancels(pairedGo.Cast.CasterUnit, windupCancelXVisual, pairedGo.Cast.SpellID);
                         SendPacketToClient(pairedGo);
                     }
                     catch
@@ -2812,11 +2822,13 @@ public partial class WorldClient
                 {
                     stashed_spell_id = formExitStart.Cast.SpellID,
                 });
+                SendWindupKitCancels(spell.Cast.CasterUnit, windupCancelXVisual, spell.Cast.SpellID);
                 SendPacketToClient(spell);
             }
         }
         else
         {
+            SendWindupKitCancels(spell.Cast.CasterUnit, windupCancelXVisual, spell.Cast.SpellID);
             SendPacketToClient(spell);
         }
 
@@ -2939,6 +2951,41 @@ public partial class WorldClient
                 phase = isSpellGo ? "go" : "start",
                 orphaned_count = orphanedCasts.Count,
             });
+        }
+    }
+
+    // JimsProxy (CancelWindupKitOnGo): the decision seam for the pending-cast branch of HandleSpellGo.
+    // The branch itself already guarantees "local player, pending pressed cast"; this adds the setting
+    // and the channel exclusion.
+    internal static bool ShouldCancelWindupKitsOnGo(bool enabled, bool channeled)
+    {
+        return enabled && !channeled;
+    }
+
+    // JimsProxy (CancelWindupKitOnGo): see Settings.CancelWindupKitOnGo. One packet per exclusive
+    // wind-up kit of the visual, sent immediately BEFORE the GO so the client's safe release runs
+    // before its own cast-end. No-op when the setting is off or the GO did not complete a local
+    // pressed cast (xVisual == 0), or when the visual has no exclusive wind-up kit.
+    private void SendWindupKitCancels(WowGuid128 casterUnit, uint xVisual, int spellId)
+    {
+        if (xVisual == 0)
+            return;
+        foreach (uint kit in GameData.GetWindupKitsForXSpellVisual(xVisual))
+        {
+            var cancel = new CancelSpellVisualKit
+            {
+                Source = casterUnit,
+                SpellVisualKitID = (int)kit,
+            };
+            SendPacketToClient(cancel);
+            if (Framework.Settings.DebugOutput)
+                Log.Event("cast.windup_kit_cancel", new
+                {
+                    spell_id = spellId,
+                    spell_visual_id = xVisual,
+                    kit_id = kit,
+                    caster_low = casterUnit.GetCounter(),
+                });
         }
     }
 

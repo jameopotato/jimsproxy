@@ -45,6 +45,9 @@ public static partial class GameData
     //MIRASU   Frostbolt visual), not the SpellXSpellVisual wrapper IDs we look up via
     //MIRASU   GetSpellVisual. Used to dismiss target-frame cast bars on mob interrupts.
     public static FrozenDictionary<uint, uint> SpellXSpellVisualToSpellVisual = FrozenDictionary<uint, uint>.Empty;
+    // JimsProxy (CancelWindupKitOnGo): SpellVisualID -> kits used ONLY as caster-side wind-ups
+    // (SpellVisualEvent start event 3 -> end event 13, TargetType 1) in the current client build.
+    public static FrozenDictionary<uint, uint[]> SpellVisualWindupKits = FrozenDictionary<uint, uint[]>.Empty;
     public static FrozenDictionary<uint, uint> LearnSpells = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, uint> TotemSpells = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, uint> Gems = FrozenDictionary<uint, uint>.Empty;
@@ -419,6 +422,16 @@ public static partial class GameData
         if (SpellXSpellVisualToSpellVisual.TryGetValue(spellXSpellVisualId, out uint visualId))
             return visualId;
         return 0;
+    }
+
+    // JimsProxy (CancelWindupKitOnGo): the wind-up kits to cancel for a GO's SpellXSpellVisualID.
+    // Empty when either table is missing or the visual has no exclusive wind-up kit.
+    public static ReadOnlySpan<uint> GetWindupKitsForXSpellVisual(uint spellXSpellVisualId)
+    {
+        uint visual = GetSpellVisualIdFromXSpellVisual(spellXSpellVisualId);
+        if (visual != 0 && SpellVisualWindupKits.TryGetValue(visual, out var kits))
+            return kits;
+        return ReadOnlySpan<uint>.Empty;
     }
 
     /// <summary>
@@ -989,6 +1002,7 @@ public static partial class GameData
             LoadItemEnchantVisuals,
             LoadSpellVisuals,
             LoadSpellVisualResolved,
+            LoadSpellVisualWindupKits,
             LoadLearnSpells,
             LoadTotemSpells,
             LoadGems,
@@ -1462,6 +1476,34 @@ public static partial class GameData
             dict[xVisualId] = spellVisualId;
         }
         SpellXSpellVisualToSpellVisual = dict.ToFrozenDictionary();
+    }
+
+    // JimsProxy (CancelWindupKitOnGo): SpellVisualID -> exclusive caster-side wind-up kits.
+    // Missing-tolerant like LoadSpellVisualResolved (no file => empty table => the cancel path
+    // sends nothing). Regenerate with scripts/gen-windup-kits.py from the wago.tools
+    // SpellVisualEvent CSV for the client build (1.14.2.42597 today): keep rows with
+    // StartEvent=1, EndEvent=2, TargetType=1 (the caster kit that carries the held wind-up sound; the 2026-09-07 PTR run showed the sound-owning effect reports it, e.g. 99, never the 3->13 precast kit) and drop any kit that also appears under a
+    // different (StartEvent, EndEvent, TargetType), so a cancel by kit can never hit a
+    // non-wind-up effect.
+    public static void LoadSpellVisualWindupKits()
+    {
+        var path = Path.Combine("CSV", $"SpellVisualWindupKits{ModernVersion.ExpansionVersion}.csv");
+        if (!File.Exists(path))
+            return;
+
+        using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+        var dict = new Dictionary<uint, List<uint>>(EstimateRowCount(path, 12));
+
+        foreach (var row in reader)
+        {
+            uint spellVisualId = uint.Parse(row[0].Span);
+            uint kitId = uint.Parse(row[1].Span);
+            if (!dict.TryGetValue(spellVisualId, out var kits))
+                dict[spellVisualId] = kits = new List<uint>(1);
+            if (!kits.Contains(kitId))
+                kits.Add(kitId);
+        }
+        SpellVisualWindupKits = dict.ToFrozenDictionary(kv => kv.Key, kv => kv.Value.ToArray());
     }
 
     public static void LoadLearnSpells()

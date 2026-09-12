@@ -205,6 +205,23 @@ public static class Settings
     // 50ms clears down to ~20fps (crowds, where the bug is worst); the duplicate is inert so a late land is
     // UX-free. Frame-clearing via a conservative fixed margin, not per-frame FPS estimation. Tune to your FPS floor.
     public static int RefireSpellGoDeferMs;
+    // JimsProxy (CancelWindupKitOnGo): the 1.14 client closes a cast's held wind-up kit at SPELL_GO
+    // through a cancel keyed on the caster's own display; when that resolve is skipped in the GO
+    // frame, or when the client's own cast-end parks the effect on its deferred list, the wind-up
+    // (kit + looping sound) stays live until a world load — the #394 looping cast sound. The
+    // client's handler for SMSG_CANCEL_SPELL_VISUAL_KIT runs the normal safe release on every effect
+    // of that kit on that unit, sound stop included, and needs no cast-side id. When set, immediately
+    // BEFORE forwarding the GO that completes a local pressed cast, send that cancel for the caster
+    // and each wind-up kit of the spell's visual (CSV/SpellVisualWindupKits<exp>.csv). Local player
+    // only, channels excluded. A cancel sent after an orphan park cannot reach the parked effect,
+    // which is why it precedes the GO. Default ON: the client RE (rounds 13, 14 and 22) rated the
+    // injected cancel memory-safe (the client's own kitted retire path, display-scoped, no cast-side
+    // state touched) and it is the one mechanism that reaches a wind-up whose cast object the GO
+    // cannot find; the refire (RefireSpellGo) cannot. Known collateral: the kit's pose and model
+    // effects end one frame early, and a co-active effect that merely shares the kit id can be
+    // released early (cosmetic, self-recovering). Kill switch: set false to restore the stock GO.
+    // Every send is logged under DebugOutput (cast.windup_kit_cancel).
+    public static bool CancelWindupKitOnGo;
     // JimsProxy (#379 form-exit): the 1.14 client auto-shifts out of a form to cast
     // (CMSG_CANCEL_AURA + CMSG_CAST_SPELL ~1ms apart), but the 1.12 server emits the cast's
     // SMSG_SPELL_START ~20ms BEFORE the form-removal SMSG_UPDATE_OBJECT. The cast's visual kit
@@ -308,6 +325,7 @@ public static class Settings
         RefireSpellGo = config.GetBoolean("RefireSpellGo", false);
         PreemptAttackStopUpstream = config.GetBoolean("PreemptAttackStopUpstream", true);
         RefireSpellGoDeferMs = config.GetInt("RefireSpellGoDeferMs", 50);
+        CancelWindupKitOnGo = config.GetBoolean("CancelWindupKitOnGo", true);
         var rttPrefireStr = config.GetString("RttPrefire", "off");
         RttPrefire = rttPrefireStr.Equals("timer", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Timer
             : rttPrefireStr.Equals("knocker", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Knocker
