@@ -1160,6 +1160,9 @@ public class SpellCastData
     public List<TargetLocation> TargetPoints = new();
     public CreatureImmunities Immunities;
     public SpellHealPrediction Predict = new();
+
+    // JimsProxy: field-level copy for synthesized packets that must not alias the source cast.
+    public SpellCastData ShallowCopy() => (SpellCastData)MemberwiseClone();
 }
 
 // JimsProxy: the server rolled a creature through Feign Death; the client shows "Feign Death resisted" on it.

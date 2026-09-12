@@ -1384,6 +1384,40 @@ public sealed class GameSessionData
     // SPELL_START before the GO when no natural one was forwarded recently
     // (window: AutoShotSynthSpellStartGapMs).
     public Dictionary<uint, long> LastNaturalAutoShotSpellStartMs = [];
+    // JimsProxy (ranged auto-repeat): the last two tick GO CastIDs per (caster, spell) with their send time, so a damage log carries its own shot's CastID even when the previous shot's hit lands after the next GO.
+    private readonly Dictionary<(WowGuid128 Caster, uint SpellId), Queue<(WowGuid128 CastId, long SentMs)>> _autoRepeatTickCastIds = [];
+    private const int MaxAutoRepeatTickCastIds = 2;
+    // A tick older than this never got its damage log (target died mid-flight); skipping it keeps every later pairing from shifting by one shot.
+    public const long AutoRepeatTickCastIdMaxAgeMs = 3000;
+
+    public void RecordAutoRepeatTickCastId(WowGuid128 caster, uint spellId, WowGuid128 castId, long nowMs)
+    {
+        var key = (caster, spellId);
+        if (!_autoRepeatTickCastIds.TryGetValue(key, out var ticks))
+            _autoRepeatTickCastIds[key] = ticks = new Queue<(WowGuid128, long)>(MaxAutoRepeatTickCastIds);
+        while (ticks.Count >= MaxAutoRepeatTickCastIds)
+            ticks.Dequeue();
+        ticks.Enqueue((castId, nowMs));
+    }
+
+    // Oldest tick first: hits land in shot order, so the oldest live tick is the one this damage log belongs to.
+    public bool TryPairAutoRepeatDamageLog(WowGuid128 caster, uint spellId, long nowMs, out WowGuid128 castId, out int remaining)
+    {
+        castId = default;
+        remaining = 0;
+        if (!_autoRepeatTickCastIds.TryGetValue((caster, spellId), out var ticks))
+            return false;
+        while (ticks.Count > 0)
+        {
+            var tick = ticks.Dequeue();
+            if (nowMs - tick.SentMs > AutoRepeatTickCastIdMaxAgeMs)
+                continue;
+            castId = tick.CastId;
+            remaining = ticks.Count;
+            return true;
+        }
+        return false;
+    }
     public TradeSession? CurrentTrade = null;
     public HashSet<uint> RequestedItemHotfixes = [];
     public HashSet<uint> RequestedItemSparseHotfixes = [];
@@ -4205,6 +4239,10 @@ public sealed class GameSessionData
 public class ClientCastRequest
 {
     public bool HasStarted;
+    // JimsProxy (ranged anim skip): auto-repeat slot only — the press's GO carries the prepared ServerGUID; later ticks keep their own per-tick CastID.
+    public bool FirstGoDelivered;
+    // JimsProxy (ranged anim skip): auto-repeat slot only — the CastID of a forwarded natural START (press, retarget or retry) that the next GO must carry so the pair closes.
+    public WowGuid128? PendingNaturalStartCastId;
     public uint SpellId;
     public uint LegacySpellId; // 0 = same as SpellId; non-zero when modern client used a renumbered spell (e.g. SoM 1.14.1+ items)
     public uint SpellXSpellVisualId;
