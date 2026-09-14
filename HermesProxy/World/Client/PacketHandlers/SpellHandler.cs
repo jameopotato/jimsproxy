@@ -2239,8 +2239,9 @@ public partial class WorldClient
             return;
 
         SpellGo spell = new SpellGo();
-        // JimsProxy (CancelWindupKitOnGo): set only on the branch that completes a local pressed
-        // cast; consumed right before the GO is forwarded (see SendWindupKitCancels).
+        // JimsProxy (CancelWindupKitOnGo): set only on the two branches that complete a cast the
+        // client was started on (orphan-recovery and the pending dequeue); consumed right before
+        // the GO is forwarded (see SendWindupKitCancels).
         uint windupCancelXVisual = 0;
         try
         {
@@ -2381,6 +2382,13 @@ public partial class WorldClient
             GetSession().GameState.TryPopForwardedStartCastId((uint)spell.Cast.SpellID, out var orphanGoCastId))
         {
             spell.Cast.CastID = orphanGoCastId;
+            // JimsProxy (CancelWindupKitOnGo): this GO closes a cast the client was started on (the
+            // forwarded START put the id in the FIFO), the exact shape the cancel exists for. No
+            // pending entry here, so key on the parser-resolved visual and test the channel on the
+            // wire spell id; a SoM-renumbered item cast on this branch misses the table and gets no
+            // cancel, a safe miss. The send stays at the GO's tail with the other branch's.
+            if (ShouldCancelWindupKitsOnGo(Settings.CancelWindupKitOnGo, GameData.IsChanneledSpell((uint)spell.Cast.SpellID)))
+                windupCancelXVisual = spell.Cast.SpellXSpellVisualID;
             Log.Event("cast.go.orphan_castid_recovered", new
             {
                 spell_id = spell.Cast.SpellID,
@@ -2954,8 +2962,8 @@ public partial class WorldClient
         }
     }
 
-    // JimsProxy (CancelWindupKitOnGo): the decision seam for the pending-cast branch of HandleSpellGo.
-    // The branch itself already guarantees "local player, pending pressed cast"; this adds the setting
+    // JimsProxy (CancelWindupKitOnGo): the decision seam for the two local-cast branches of HandleSpellGo.
+    // Each branch already guarantees "local player, a cast the client was started on"; this adds the setting
     // and the channel exclusion.
     internal static bool ShouldCancelWindupKitsOnGo(bool enabled, bool channeled)
     {
@@ -2965,7 +2973,7 @@ public partial class WorldClient
     // JimsProxy (CancelWindupKitOnGo): see Settings.CancelWindupKitOnGo. One packet per exclusive
     // wind-up kit of the visual, sent immediately BEFORE the GO so the client's safe release runs
     // before its own cast-end. No-op when the setting is off or the GO did not complete a local
-    // pressed cast (xVisual == 0), or when the visual has no exclusive wind-up kit.
+    // started or pressed cast (xVisual == 0), or when the visual has no exclusive wind-up kit.
     private void SendWindupKitCancels(WowGuid128 casterUnit, uint xVisual, int spellId)
     {
         if (xVisual == 0)

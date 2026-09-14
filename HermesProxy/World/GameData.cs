@@ -46,7 +46,7 @@ public static partial class GameData
     //MIRASU   GetSpellVisual. Used to dismiss target-frame cast bars on mob interrupts.
     public static FrozenDictionary<uint, uint> SpellXSpellVisualToSpellVisual = FrozenDictionary<uint, uint>.Empty;
     // JimsProxy (CancelWindupKitOnGo): SpellVisualID -> kits used ONLY as caster-side wind-ups
-    // (SpellVisualEvent start event 3 -> end event 13, TargetType 1) in the current client build.
+    // (SpellVisualEvent start event 1 -> end event 2, TargetType 1) in the current client build.
     public static FrozenDictionary<uint, uint[]> SpellVisualWindupKits = FrozenDictionary<uint, uint[]>.Empty;
     public static FrozenDictionary<uint, uint> LearnSpells = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, uint> TotemSpells = FrozenDictionary<uint, uint>.Empty;

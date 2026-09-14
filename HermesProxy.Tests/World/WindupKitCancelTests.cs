@@ -20,6 +20,7 @@ public class WindupKitCancelTests
 {
     static WindupKitCancelTests()
     {
+        GameData.LoadSpellVisuals();
         GameData.LoadSpellVisualResolved();
         GameData.LoadSpellVisualWindupKits();
     }
@@ -34,6 +35,25 @@ public class WindupKitCancelTests
     public void ReporterSpells_ResolveToTheirWindupKit(uint spellXSpellVisualId, uint expectedKit)
     {
         var kits = GameData.GetWindupKitsForXSpellVisual(spellXSpellVisualId);
+        Assert.Equal(1, kits.Length);
+        Assert.Equal(expectedKit, kits[0]);
+    }
+
+    // The orphan-recovery branch of HandleSpellGo has no pending entry to take the press's visual from;
+    // it keys the cancel on the parser's resolution of the wire spell id. Pin that this second key
+    // reaches the same kit as the press key for the reporter spells.
+    [Theory]
+    [InlineData(19943u, 99u)] // Flash of Light -> 246910 -> 6623 -> 99
+    [InlineData(2061u, 99u)]  // Flash Heal -> 237160 -> 3077 -> 99
+    [InlineData(686u, 114u)]  // Shadow Bolt -> 236865 -> 64 -> 114
+    [InlineData(1454u, 217u)] // Life Tap -> 237177 -> 1225 -> 217
+    [InlineData(348u, 60u)]   // Immolate -> 237005 -> 46 -> 60
+    [InlineData(133u, 30u)]   // Fireball -> 236677 -> 67 -> 30
+    public void OrphanBranchKey_ParserVisualForWireSpellId_ResolvesToTheWindupKit(uint spellId, uint expectedKit)
+    {
+        uint xVisual = GameData.GetSpellVisual(spellId);
+        Assert.NotEqual(0u, xVisual);
+        var kits = GameData.GetWindupKitsForXSpellVisual(xVisual);
         Assert.Equal(1, kits.Length);
         Assert.Equal(expectedKit, kits[0]);
     }

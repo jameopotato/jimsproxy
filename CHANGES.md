@@ -25,9 +25,11 @@ wrong occupant: in the reporter's 92-minute warlock session of 2026-09-11 the re
 
 **Change:** `HermesProxy/Configuration/Settings.cs` — `CancelWindupKitOnGo`, default on, `false`
 restores the stock GO. `HermesProxy/World/Client/PacketHandlers/SpellHandler.cs` — in
-`HandleSpellGo`, on the branch that completes a local pressed cast and only for non-channeled
-spells, send `SMSG_CANCEL_SPELL_VISUAL_KIT` for the caster and each wind-up kit of the spell's
-visual immediately before the GO (`SendWindupKitCancels`; the deferred form-exit path included).
+`HandleSpellGo`, on the two branches that complete a cast the client was started on (the pending
+dequeue, and the orphan-recovery branch that stamps a GO from the forwarded-START FIFO, keyed on
+the parser-resolved visual) and only for non-channeled spells, send `SMSG_CANCEL_SPELL_VISUAL_KIT`
+for the caster and each wind-up kit of the spell's visual immediately before the GO
+(`SendWindupKitCancels`; the deferred form-exit path included).
 The client's handler for that packet walks the caster's own display effects by kit id and runs its
 normal release on each, sound stop included, without needing the cast object. `HermesProxy/
 GameData.cs` and `HermesProxy/CSV/SpellVisualWindupKits1.csv` — the table (791 visuals, 176 kits),
