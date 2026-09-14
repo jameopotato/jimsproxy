@@ -1115,6 +1115,20 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CANCEL_CAST)]
     void HandleCancelCast(CancelCast cast)
     {
+        // JimsProxy (cast-id breadcrumbs): name the object an Esc press cancels and whether we still hold its press.
+        var cancelled = GetSession().GameState.FindPendingCastByCastId(cast.CastID);
+        Log.Event("spell.cancel_cast", new
+        {
+            spell_id = cast.SpellID,
+            cast_id = cast.CastID.ToString(),
+            cast_id_hex = CastIdBreadcrumbs.Hex(cast.CastID),
+            cast_id_counter = cast.CastID.GetCounter(),
+            cast_id_empty = cast.CastID.IsEmpty(),
+            pending_match = cancelled == null ? null : (cancelled.ClientGUID == cast.CastID ? "client_id" : "server_id"),
+            pending_spell_id = cancelled?.SpellId,
+            pending_started = cancelled?.HasStarted,
+        });
+
         // JimsProxy (issue #43): if the client cancels while we have a held cast waiting for
         // GCD expiry, drop the held cast so it doesn't fire after the cancel. Resolve the
         // client's button state with DontReport.

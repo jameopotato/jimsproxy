@@ -13,6 +13,35 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-13 — Cast-id breadcrumbs: name the object an Esc press cancels (#394 looping cast, Mirasu)
+
+**Issue:** a looping cast leaves a stale cast object on the client, and the only trace of it in a
+JSONL is the `CMSG_CANCEL_CAST` the player sends when they press Escape on it. The cancel handler
+logged nothing, so a reporter's log only gave the packet size, which narrows the id to a family
+(press id, server id, sequenced GO id) but never names the spell or the object. Warlock session
+`jimsproxy-20260911-183649.jsonl` (Kronos, refire on): ten Escape presses that hit no live cast,
+spread over four loop moments, none attributable to a spell.
+
+**Change:** `World/Server/PacketHandlers/SpellHandler.cs` — `HandleCancelCast` emits
+`spell.cancel_cast` with the spell id, the full cast id, and whether a pending press still owns
+that id (`pending_match` = `client_id` / `server_id` / null, via the new
+`GameSessionData.FindPendingCastByCastId`). Ungated, one line per Escape, like its siblings
+`spell.cancel_channelling` and `spell.cancel_aura`. `World/Server/WorldSocket.cs` — at the send
+choke point, DebugOutput on, every local-player `SMSG_SPELL_PREPARE` (client id to server id),
+`SMSG_SPELL_START`, `SMSG_SPELL_GO`, `SMSG_CAST_FAILED` and `SMSG_SPELL_FAILURE` emits `cast.wire`
+with the cast id exactly as written to the wire (`World/CastIdBreadcrumbs.cs`). Together an Escape
+press in a log points at the exact cast and says whether its id ever matched anything we sent.
+No behaviour change. Review notes: the shipped config has DebugOutput off, so a reporter's log
+carries the Escape line only; the wire trail needs DebugOutput on. Ids are written in the record
+form every other cast event uses (`cast_id`) with a fixed-width hex twin (`cast_id_hex`), and the
+pending lookup walks the cast queues under `PendingCastsLock` like every other read walk, so a
+rebuild in flight on the other thread cannot make a live press read as absent.
+
+**Verification:** `HermesProxy.Tests/World/CastIdBreadcrumbsTests.cs` (6 tests: hex format,
+per-packet payloads, local-caster gating, pending lookup across all six slots); suite 1081/1081.
+
+---
+
 ## 2026-09-11 — Cancel a local cast's wind-up kit right before its SPELL_GO (#525)
 
 **Issue:** the looping cast sound and held casting pose (#394). Every loop cast on record is a

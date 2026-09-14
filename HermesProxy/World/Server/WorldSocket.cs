@@ -595,6 +595,9 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             var gameState = GetSession().GameState;
             if (gameState != null && (gameState.IsWaitingForNewWorld || gameState.IsWaitingForWorldPortAck))
                 LogWorldEntryWindowForward(gameState, packet);
+            // JimsProxy (cast-id breadcrumbs): every local cast id as it leaves for the client, at the sole send choke point.
+            if (gameState != null && CastIdBreadcrumbs.Describe(packet, gameState.CurrentPlayerGuid) is { } breadcrumb)
+                Log.Event("cast.wire", breadcrumb);
         }
 
         lock (_sendLock)
