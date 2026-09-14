@@ -1386,6 +1386,9 @@ public sealed class GameSessionData
     public Dictionary<uint, uint> RealSpellToLearnSpell = [];
     public Dictionary<uint, ArenaTeamData> ArenaTeams = [];
     public World.Server.Packets.MailListResult? PendingMailListPacket;
+    // JimsProxy (#508): MailID -> attachment slot of the in-flight CMSG_MAIL_TAKE_ITEM, echoed back on the
+    // error result because the legacy server omits it there and the 1.14 client keys its pending take on it.
+    public Dictionary<uint, uint> PendingMailTakeAttachId = [];
     public HashSet<uint> RequestedItemTextIds = [];
     public Dictionary<uint, string> ItemTexts = [];
     public Dictionary<uint, uint> BattleFieldQueueTypes = [];

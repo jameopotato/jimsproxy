@@ -1,4 +1,5 @@
 ﻿using Framework.Logging;
+using HermesProxy;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
@@ -284,6 +285,14 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_MAIL_COMMAND_RESULT)]
     void HandleMailCommandResult(WorldPacket packet)
     {
+        SendPacketToClient(ParseMailCommandResult(packet, GetSession().GameState));
+    }
+
+    // JimsProxy (#508): the legacy SMSG_SEND_MAIL_RESULT -> modern SMSG_MAIL_COMMAND_RESULT
+    // translation, split out of the handler so the legacy byte layouts can be driven through it
+    // in tests. MailActionType.AttachmentExpired is the (misnamed) value 2 = MAIL_ITEM_TAKEN.
+    internal static MailCommandResult ParseMailCommandResult(WorldPacket packet, GameSessionData gameState)
+    {
         MailCommandResult mail = new MailCommandResult();
         mail.MailID = packet.ReadUInt32();
         mail.Command = (MailActionType)packet.ReadUInt32();
@@ -299,6 +308,23 @@ public partial class WorldClient
             if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
                 mail.AttachID = 1;
         }
-        SendPacketToClient(mail);
+
+        if (mail.Command == MailActionType.AttachmentExpired)
+        {
+            // JimsProxy (#508): on the error path the legacy server writes only the equip error and
+            // never the attachment id (vmangos/cmangos SendMailResult). The 1.14 client keys its
+            // pending take-command on that id, so AttachID=0 leaves the take stuck for the rest of
+            // the session: bag-full, free a slot, take again, nothing happens. Echo the slot the
+            // client asked for; a vanilla mail carries exactly one, so slot 1 is the fallback.
+            if (mail.AttachID == 0)
+            {
+                if (gameState.PendingMailTakeAttachId.TryGetValue(mail.MailID, out uint requestedAttachId))
+                    mail.AttachID = requestedAttachId;
+                else if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+                    mail.AttachID = 1;
+            }
+            gameState.PendingMailTakeAttachId.Remove(mail.MailID);
+        }
+        return mail;
     }
 }

@@ -74,6 +74,12 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MAIL_TAKE_ITEM)]
     void HandleMailTakeItem(MailTakeItem mail)
     {
+        // JimsProxy (#508): remember which slot the client is taking. The legacy result omits it on
+        // the error path and the 1.14 client needs it back to release its pending take-command.
+        // Pre-TBC mails carry a single attachment the proxy lists as slot 1.
+        GetSession().GameState.PendingMailTakeAttachId[mail.MailID] =
+            LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180) ? mail.AttachID : 1u;
+
         WorldPacket packet = new WorldPacket(Opcode.CMSG_MAIL_TAKE_ITEM);
         packet.WriteGuid(mail.Mailbox.To64());
         packet.WriteUInt32(mail.MailID);
