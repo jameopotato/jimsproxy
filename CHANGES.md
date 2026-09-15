@@ -13,6 +13,65 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-14 — Ranged auto-repeat: one cast object per shot, the press START left open, duplicate presses answered after the tick GO (#516, Mirasu)
+
+**Issue:** three faults in how Auto Shot and wand Shoot reached the 1.14 client. (1) Every tick's
+`SPELL_GO` was re-stamped with the prepared press id while the synthesized `SPELL_START` ahead of it
+carried a per-packet id, so the two never paired: in an 86-minute wand session 161 of 162 wand START
+objects never closed on the client, and only the shot whose id happened to match animated. At max
+range, where a whole tick is in flight, shots stopped animating and the wand fired at half speed.
+(2) The first GO on the press id closed the press object, which the client's `!` test reads
+(`/cast !Auto Shot` walks the current-cast list, while the toggle test reads the active-spell
+global), so after the first arrow the macro saw no live cast and toggled auto-shot off. A native
+server never GOes the press: its object stays open until the client's own cancel path ends it.
+(3) A duplicate press for the running series (the `!` macro re-sends on every key repeat) was
+answered on arrival with a client-id `CAST_FAILED`, which swing-timer addons read as the 0.5 s
+re-arm delay; dropping duplicates silently instead left each one's client object in the client's
+100-entry cast ring until the series ended, and a held key filled it in 20 s, after which no
+instant pressed during the series got a client object at all (`jimsproxy-20260914-055933.jsonl`:
+presses 3..107, then every instant on a diverted id).
+
+**Change:** `World/Client/PacketHandlers/SpellHandler.cs` (`HandleSpellStart`, `HandleSpellGo`):
+every tick GO keeps its parse-minted id and gets a synthesized START on the same id; the press START
+keeps the prepared id and is never paired; the one exception is the wand: its aim sound lives on the
+press object and plays for as long as that object is open (it plays even when the press START is never
+forwarded), so a wand press left open hummed for the whole series, where a bow's only holds the draw
+pose; the wand's first tick GO therefore carries the prepared id and closes the press object, the way
+Blizzard's own wire closes every aim START with its GO, and later wand ticks pair as usual; a natural START after the first tick (retarget, retry) is
+remembered on the slot and its GO carries that id; damage logs are paired two ticks deep so a hit
+that lands after the next GO still carries its own shot's id (`RecordAutoRepeatTickCastId` /
+`TryPairAutoRepeatDamageLog`, 3 s max age). `GlobalSessionData.cs`: `EndAutoRepeatSlot` releases
+the press START's forwarded-START FIFO copy on client cancel, server cancel and non-retryable
+failure; `HoldAutoRepeatDuplicatePress` / `TakeHeldAutoRepeatDuplicatePresses` hold duplicate
+presses on the slot (cap 40, past which one answers on arrival) and `HandleSpellGo` answers them on
+their client ids (`DontReport`, no `SpellPrepare`, the #517 shape) right after each tick GO, when
+the swing has just reset and the failure lands outside the swing-timer aim window; each answer
+frees that press's client object. `World/Server/PacketHandlers/SpellHandler.cs` (`HandleCastSpell`):
+a duplicate auto-repeat press is never forwarded (a forwarded one makes the 1.12 server interrupt
+the series). Events, all DebugOutput-gated: `spell.start.synth_for_autoshot`,
+`spell.go.autorepeat_tick`, `spell.go.autorepeat_sent`, `spell.start.autorepeat_natural`,
+`spell.damage_log.autorepeat_hit`, `spell.damage_log.autorepeat_castid_paired`,
+`cast.autorepeat_duplicate_press_held`, `cast.autorepeat_duplicate_press_answered_on_arrival`,
+`cast.autorepeat_duplicate_presses_answered_after_go`.
+
+**Verification:** Kronos, 1.14.2 hunter and priest. Wand at range with target changes, some with a
+bolt in flight: 4 presses, 35 ticks, 31/31 damage logs paired, 25 of them landing after the next
+tick's GO. Auto Shot under Quick Shots: 45 ticks in one series, 45 distinct cast ids, every shot
+animated. `/cast !Auto Shot` held on key repeat for a minute (`jimsproxy-20260914-063428.jsonl`):
+159 presses, 158 held and answered across 22 ticks (at most 15 per tick, none on arrival), no
+diverted client ids, Arcane Shot, Multi-Shot and Aimed Shot cast normally throughout, swing timer
+clean. Tests: `AutoRepeatTickCastIdPairingTests`, `AutoRepeatSlotEndTests`,
+`AutoRepeatDuplicatePressTests`; 1087/1087.
+
+**Open:** the client's `!` test (`/cast !Auto Shot`) walks its current-cast ring for a live object of
+the spell and does not find the press object through the proxy in any shape tried (a closed or
+never-started press object makes the client cancel the series; an open started one makes it re-send
+the press, which the hold above answers). The step that takes the press object out of the walked ring
+is not yet identified; once it is, the re-sends stop as they do natively and the wand exception above
+can go.
+
+---
+
 ## 2026-09-13 — Cast-id breadcrumbs: name the object an Esc press cancels (#394 looping cast, Mirasu)
 
 **Issue:** a looping cast leaves a stale cast object on the client, and the only trace of it in a

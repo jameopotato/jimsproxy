@@ -81,6 +81,8 @@ public static partial class GameData
     public static FrozenSet<uint> MountAuras = FrozenSet<uint>.Empty;
     public static FrozenSet<uint> NextMeleeSpells = FrozenSet<uint>.Empty;
     public static FrozenSet<uint> AutoRepeatSpells = FrozenSet<uint>.Empty;
+    // JimsProxy (ranged auto-repeat): the wand auto-repeat spell; its first tick GO closes the press object (HandleSpellGo).
+    public const uint WandShootSpellId = 5019;
     // JimsProxy (issue #43): spells that don't trigger the global cooldown. These must
     // bypass the GCD hold-and-fire path so the 1.14 client can fire them immediately
     // (during a cast bar or during a GCD) exactly like a real 1.12 client would.
