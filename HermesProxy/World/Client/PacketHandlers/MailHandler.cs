@@ -323,7 +323,7 @@ public partial class WorldClient
                 else if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
                     mail.AttachID = 1;
             }
-            gameState.PendingMailTakeAttachId.Remove(mail.MailID);
+            gameState.PendingMailTakeAttachId.TryRemove(mail.MailID, out _);
         }
         return mail;
     }

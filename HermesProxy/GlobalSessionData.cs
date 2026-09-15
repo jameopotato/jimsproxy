@@ -1388,7 +1388,10 @@ public sealed class GameSessionData
     public World.Server.Packets.MailListResult? PendingMailListPacket;
     // JimsProxy (#508): MailID -> attachment slot of the in-flight CMSG_MAIL_TAKE_ITEM, echoed back on the
     // error result because the legacy server omits it there and the 1.14 client keys its pending take on it.
-    public Dictionary<uint, uint> PendingMailTakeAttachId = [];
+    // Written on the client-socket thread (the take), read and removed on the world-client thread (the
+    // result); concurrent like the other cross-thread session maps, even though the client's own
+    // pending-command gate serializes a take and its result in practice.
+    public ConcurrentDictionary<uint, uint> PendingMailTakeAttachId = new();
     public HashSet<uint> RequestedItemTextIds = [];
     public Dictionary<uint, string> ItemTexts = [];
     public Dictionary<uint, uint> BattleFieldQueueTypes = [];
