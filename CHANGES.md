@@ -60,8 +60,9 @@ original client-casting commit.
 The spell-visual cancels stay on instance (native puts them on realm) because the #525 kit cancel is
 emitted immediately before the GO and depends on arriving first; `SMSG_CANCEL_AUTO_REPEAT` stays on
 realm, as native. A prepare now shares its START's path through the login-eviction hold, the
-pending-uninstanced queue and the instance-socket wait. Follow-up audit, not this change: the three
-threat packets still default to realm where native uses instance.
+pending-uninstanced queue and the instance-socket wait. Follow-up audit, not this change: three of the
+four threat packets still default to realm where native uses instance (the fourth, ThreatClear, is
+realm natively too).
 
 **Verification:** `HermesProxy.Tests/World/CastLifecycleConnectionTests.cs` (3: prepare on instance;
 every cast-lifecycle packet on one connection; the kit cancel on the GO's connection); suite
@@ -91,11 +92,14 @@ so every later click is a silent client-side no-op until the world session ends.
 **Change:** `World/Server/PacketHandlers/MailHandler.cs` — when `CMSG_MAIL_TAKE_ITEM` is forwarded,
 remember the slot the client asked for (always 1 pre-TBC) per mail id. `World/Client/PacketHandlers/
 MailHandler.cs` — on any item-taken result that arrives without an attachment id, put the remembered
-slot back, falling back to slot 1 on vanilla; the record is consumed by its result so the map cannot
-grow; the success path is unchanged. The result parse is split into
+slot back, falling back to slot 1 on vanilla; the record is consumed by its result, and one whose
+result never arrives lives only until the session data is rebuilt (bounded by distinct mail ids); the
+success path is unchanged. The result parse is split into
 `WorldClient.ParseMailCommandResult` so the legacy byte layouts can be driven through it in tests.
 `GlobalSessionData.cs` — `PendingMailTakeAttachId`, a `ConcurrentDictionary` like the other
 cross-thread session maps (written on the client-socket thread, consumed on the world-client thread).
+On a 1.12 server the recorded slot is always 1 and the vanilla fallback yields the same value, so on
+Kronos the fallback is the fix; the map changes the result only on a TBC-or-later legacy server.
 The idea is from Novivy's fork (fe9adaca, 2026-05-17); it was never in this lineage.
 
 **Verification:** `HermesProxy.Tests/World/MailTakeItemAttachIdTests.cs` (6: bag-full echo, vanilla
@@ -166,7 +170,8 @@ self-recovering). The stranded cast object is untouched, so a loop that would ha
 still leave the action button lit until relog (the button is #517's fix). Every send is logged
 under DebugOutput as `cast.windup_kit_cancel`.
 
-**Verification:** `WindupKitCancelTests` (20: the decision seam and the table). Suite 1095/1095.
+**Verification:** `WindupKitCancelTests` (26: the decision seam, the table, the orphan-branch key and
+the packet writer). Suite 1095/1095 at the PR, 1101/1101 with the review commit.
 Under the in-process cast-object harness on the PTR: 40 of 40 and then 46 of 46 pressed holy GOs
 cancelled in the same tick, every sound-owning held effect on the caster's display carried kit 99,
 released and collected at the GO, nothing cut short; live realm, 86 minutes: 272 of 272 table-kit
