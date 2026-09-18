@@ -13,6 +13,42 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-17 — Send SMSG_SPELL_PREPARE on the instance connection, like the rest of the cast lifecycle (#528)
+
+**Issue:** the looping cast sound, held casting pose and stuck action button (#394) were a stranded
+duplicate cast object on the client. `SMSG_SPELL_PREPARE` declared no connection type, so the
+one-argument `ServerPacket` constructor gave it `ConnectionType.Realm` and the client-bound send path
+routed every on-GCD cast's prepare down the realm socket while its `SMSG_SPELL_START`, `SMSG_SPELL_GO`
+and `SMSG_CAST_FAILED` went down the instance socket. Two TCP connections carry no ordering between
+them, and the client decodes both into one shared event queue, so a START could be handled before the
+prepare's re-key had written the server id onto the press object; the START's lookup then missed it,
+minted a second object under the same id and hung the wind-up kit on it; the GO later resolved and
+freed the press object and the duplicate stranded with its kit. TrinityCore declares all of these on
+`CONNECTION_TYPE_INSTANCE`, which is why a native realm never produces it. Off-GCD and special-slot
+presses already sent their prepare on the receiving (instance) socket and have never stranded; every
+specimen on record came from the on-GCD population routed by the declaration. Inherited from upstream's
+original client-casting commit.
+
+**Change:** `World/Server/Packets/SpellPackets.cs` — `SpellPrepare` passes `ConnectionType.Instance`.
+The spell-visual cancels stay on instance (native puts them on realm) because the #525 kit cancel is
+emitted immediately before the GO and depends on arriving first; `SMSG_CANCEL_AUTO_REPEAT` stays on
+realm, as native. A prepare now shares its START's path through the login-eviction hold, the
+pending-uninstanced queue and the instance-socket wait. Follow-up audit, not this change: the three
+threat packets still default to realm where native uses instance.
+
+**Verification:** `HermesProxy.Tests/World/CastLifecycleConnectionTests.cs` (3: prepare on instance;
+every cast-lifecycle packet on one connection; the kit cancel on the GO's connection); suite
+1128/1128. Seen live with the in-process harness on both builds, solo: on the stock build every
+PREPARE coincided with a 34-byte arrival on the realm socket and a 105-byte arrival on the instance
+socket, 7/7 casts; on this branch every PREPARE coincided with a 139-byte arrival on the instance
+socket and the realm socket carried no prepare-sized arrival all session, 5/5. In-game on the branch:
+68 casts across a session with world transitions and 40 across a regression pass, zero prepares queued
+or delayed, zero stranded objects. No reproduction exists; verification in the field is the absence of
+recurring stuck action buttons across group play, judged against #525, which releases the sound and
+pose and leaves the button.
+
+---
+
 ## 2026-09-14 — Ranged auto-repeat: one cast object per shot, the press START left open, duplicate presses answered after the tick GO (#516, Mirasu)
 
 **Issue:** three faults in how Auto Shot and wand Shoot reached the 1.14 client. (1) Every tick's
@@ -63,12 +99,50 @@ diverted client ids, Arcane Shot, Multi-Shot and Aimed Shot cast normally throug
 clean. Tests: `AutoRepeatTickCastIdPairingTests`, `AutoRepeatSlotEndTests`,
 `AutoRepeatDuplicatePressTests`; 1087/1087.
 
-**Open:** the client's `!` test (`/cast !Auto Shot`) walks its current-cast ring for a live object of
-the spell and does not find the press object through the proxy in any shape tried (a closed or
-never-started press object makes the client cancel the series; an open started one makes it re-send
-the press, which the hold above answers). The step that takes the press object out of the walked ring
-is not yet identified; once it is, the re-sends stop as they do natively and the wand exception above
-can go.
+**Open:** the client's `!` test (`/cast !Auto Shot`) is a composite guard: a walk of its current-cast
+ring plus a spell-id-keyed index, with the active-repeat global set locally at press and never the
+discriminator. What decides between a re-send (the hold above answers it) and a toggle-off is whether a
+STARTED object of the spell is open at the moment the re-press is processed. Natively each tick's START
+precedes its GO by about half a second, so a started object is open for most of every swing; through
+the proxy the synthesized START and GO share one flush, so the tick's object is open for zero frames,
+and the press START left open does not count as started for that read. The PREPARE rebind, the START
+handler and the GO's sibling walk were each refuted as the step that removes the press object; the
+remaining candidate is an aim-timer recompute, decided by a harness sweep of the press object's state,
+ring, timers and index membership at press, PREPARE, START and first GO. A native no-op needs per-tick
+START-to-GO spacing, not a second always-open START (which trips the client's not-ready gate and clips
+the shot sound). SugarProxy synthesizes nothing for auto-repeat and relays the 1.12 wire one to one, so
+it should show the same toggle-off. Once the step is found, the re-sends stop as they do natively and
+the wand exception above can go.
+
+---
+
+## 2026-09-14 — Echo the requested attachment id on a rejected mail take so the 1.14 client releases the slot (#527)
+
+**Issue:** #508. Bags full, open a mail with an item attachment, take it: rejected with "Inventory is
+full", correctly. Free a bag slot and take again: nothing happens, no message, no packet, and the
+attachment stays greyed out for the rest of the world session. The 1.12 server writes the error path of
+`SMSG_SEND_MAIL_RESULT` as `[mailId][MAIL_ITEM_TAKEN][MAIL_ERR_EQUIP_ERROR][equipError]` with no item
+guid or count, so the proxy forwarded the modern `SMSG_MAIL_COMMAND_RESULT` with `AttachID = 0`. The
+1.14 client keys the attachment's pending take on that id; a result for slot 0 never releases slot 1,
+so every later click is a silent client-side no-op until the world session ends. Stock capture
+2026-09-14 09:09: one `CMSG_MAIL_TAKE_ITEM`, the InvFull result with attach id 0, a
+`CMSG_DESTROY_ITEM`, then no further take until logout.
+
+**Change:** `World/Server/PacketHandlers/MailHandler.cs` — when `CMSG_MAIL_TAKE_ITEM` is forwarded,
+remember the slot the client asked for (always 1 pre-TBC) per mail id. `World/Client/PacketHandlers/
+MailHandler.cs` — on any item-taken result that arrives without an attachment id, put the remembered
+slot back, falling back to slot 1 on vanilla; the record is consumed by its result so the map cannot
+grow; the success path is unchanged. The result parse is split into
+`WorldClient.ParseMailCommandResult` so the legacy byte layouts can be driven through it in tests.
+`GlobalSessionData.cs` — `PendingMailTakeAttachId`, a `ConcurrentDictionary` like the other
+cross-thread session maps (written on the client-socket thread, consumed on the world-client thread).
+The idea is from Novivy's fork (fe9adaca, 2026-05-17); it was never in this lineage.
+
+**Verification:** `HermesProxy.Tests/World/MailTakeItemAttachIdTests.cs` (6: bag-full echo, vanilla
+fallback with no record, untouched success path, record consumption on both outcomes, money-take
+scope guard; four red on the unfixed code); suite 1113/1113. Fix build, same recipe, 2026-09-14 09:08:
+the InvFull result carries attach id 1, the client retries twice, an item is mailed away, the take
+succeeds. Both session logs re-read at review: one take in the stock log, four in the fix log.
 
 ---
 
