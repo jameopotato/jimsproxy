@@ -631,7 +631,7 @@ public partial class WorldClient
             }
             else if (isAutoRepeat)
             {
-                GetSession().GameState.EndAutoRepeatSlot();
+                GetSession().GameState.CurrentClientAutoRepeatCast = null;
             }
             else
                 GetSession().GameState.CurrentClientNextMeleeCast = null;
@@ -2049,24 +2049,11 @@ public partial class WorldClient
                 caster_is_player = casterIsLocalPlayer,
                 caster_is_pet = casterIsLocalPet,
             });
+            // Track the natural SPELL_START so HandleSpellGo can decide
+            // whether to synthesize one for subsequent auto-repeat ticks
+            // that arrive without a preceding START.
             if (casterIsLocalPlayer)
-            {
-                var autoRepeatSlot = GetSession().GameState.CurrentClientAutoRepeatCast;
-                if (autoRepeatSlot != null && autoRepeatSlot.SpellId == spell.Cast.SpellID)
-                {
-                    // JimsProxy (ranged auto-repeat): a START after the first tick (retarget, retry) gets a fresh id and the next GO carries it (HandleSpellGo). The press START keeps the prepared id the client already holds and is never paired with a GO: like a native server's, that object stays open for the series so the client's own "is this spell active" test (`/cast !Auto Shot`) keeps finding it; the client ends it itself when its auto-repeat state clears.
-                    if (autoRepeatSlot.FirstGoDelivered)
-                    {
-                        uint seq = (uint)Interlocked.Increment(ref GetSession().GameState.PlayerChildCastSequence);
-                        spell.Cast.CastID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, (uint)spell.Cast.SpellID, ((ulong)seq << 32) | (uint)((uint)spell.Cast.SpellID + spell.Cast.CasterUnit.GetCounter()));
-                        autoRepeatSlot.PendingNaturalStartCastId = spell.Cast.CastID;
-                    }
-                    else
-                        spell.Cast.CastID = autoRepeatSlot.ServerGUID;
-                    if (Framework.Settings.DebugOutput)
-                        Log.Event("spell.start.autorepeat_natural", new { spell_id = spell.Cast.SpellID, cast_id = spell.Cast.CastID.ToString(), role = autoRepeatSlot.FirstGoDelivered ? "retarget" : "press" });
-                }
-            }
+                GetSession().GameState.LastNaturalAutoShotSpellStartMs[(uint)spell.Cast.SpellID] = Time.GetMSTime();
         }
         if (isChanneled && (casterIsLocalPlayer || casterIsLocalPet) && spell.Cast.CastTime == 0)
         {
@@ -2349,32 +2336,26 @@ public partial class WorldClient
         // SPELL_GO. Modern Classic 1.14 servers emit SPELL_START per tick,
         // so addons that listen for COMBAT_LOG_EVENT SPELL_CAST_START
         // (Kaedin's swing timer, Quartz, etc.) only fire once per series
-        // through the proxy. Synthesize a SPELL_START before every tick's GO
-        // on the tick's own CastID, so each shot is one START + GO pair.
+        // through the proxy. Synthesize a SPELL_START before the GO when
+        // no natural one was forwarded within AutoShotSynthSpellStartGapMs.
         bool isRangedAutoAttack = GameData.AutoRepeatSpells.Contains((uint)spell.Cast.SpellID);
         if (isRangedAutoAttack &&
             spell.Cast.CasterUnit == GetSession().GameState.CurrentPlayerGuid)
         {
-            var autoRepeatSlot = GetSession().GameState.CurrentClientAutoRepeatCast;
-            bool slotMatches = autoRepeatSlot != null && autoRepeatSlot.SpellId == spell.Cast.SpellID;
-            // JimsProxy (ranged auto-repeat): every tick, the first included, is its own START + GO pair on the id minted at parse time; the press START is never that pair (it stays open for the series, see HandleSpellStart). The one exception is a forwarded retarget/retry START still waiting for this GO.
-            bool naturalStartPending = slotMatches && autoRepeatSlot!.PendingNaturalStartCastId != null;
-            // JimsProxy (ranged auto-repeat, wand): the wand's aim sound lives on the press object and plays for as long as it is open (it plays even when the press START is never forwarded), so a wand press object left open for the series hums until the series ends, where a bow's only holds the draw pose. The wand's first tick therefore closes the press object the way Blizzard's own wire closes every aim START with its GO: the press START is its START and this GO carries the prepared id (slot branch below); later ticks pair as usual.
-            bool wandPressPair = slotMatches && !autoRepeatSlot!.FirstGoDelivered && (uint)spell.Cast.SpellID == GameData.WandShootSpellId;
-            if (!naturalStartPending && !wandPressPair)
+            long now = Time.GetMSTime();
+            long lastNaturalMs = GetSession().GameState.LastNaturalAutoShotSpellStartMs
+                .GetValueOrDefault((uint)spell.Cast.SpellID, 0);
+            long gapMs = now - lastNaturalMs;
+            const long AutoShotSynthSpellStartGapMs = 1000;
+            if (gapMs > AutoShotSynthSpellStartGapMs)
             {
                 SpellStart synthStart = new SpellStart();
-                // Mirror a native per-tick START: instant (the GO's CastTime is a proxy-uptime GCD anchor, not a cast duration) and target-list-free.
-                synthStart.Cast = spell.Cast.ShallowCopy();
-                synthStart.Cast.CastTime = 0;
-                synthStart.Cast.HitTargets = new();
-                synthStart.Cast.MissTargets = new();
-                synthStart.Cast.MissStatus = new();
+                synthStart.Cast = spell.Cast;
                 SendPacketToClient(synthStart);
                 Log.Event("spell.start.synth_for_autoshot", new
                 {
                     spell_id = spell.Cast.SpellID,
-                    cast_id = spell.Cast.CastID.ToString(),
+                    gap_ms = gapMs,
                 });
             }
         }
@@ -2634,21 +2615,7 @@ public partial class WorldClient
             GetSession().GameState.CurrentClientAutoRepeatCast!.SpellId == spell.Cast.SpellID)
         {
             var current = GetSession().GameState.CurrentClientAutoRepeatCast!;
-            // JimsProxy (ranged auto-repeat): a tick GO keeps the id minted at parse time (its synthesized START carries the same one) and is never stamped with the prepared id — that closed the press object the client keeps as the series' active cast (`/cast !Auto Shot` then read it as inactive and toggled auto-shot off), and re-stamping every tick hung each shot's projectile on one object (the lost animation at wand range / under Quick Shots).
-            if (current.PendingNaturalStartCastId is { } naturalStartCastId)
-            {
-                // JimsProxy (ranged auto-repeat): this GO completes a forwarded retarget/retry START, so it carries that START's id; its FIFO copy is consumed here like any other START a GO closes.
-                spell.Cast.CastID = naturalStartCastId;
-                current.PendingNaturalStartCastId = null;
-                GetSession().GameState.RemoveForwardedStartCastId((uint)spell.Cast.SpellID, naturalStartCastId);
-            }
-            else if (!current.FirstGoDelivered && (uint)spell.Cast.SpellID == GameData.WandShootSpellId)
-            {
-                // JimsProxy (ranged auto-repeat, wand): the first tick closes the press object (see the synth START above), so this GO carries the prepared id and consumes the press START's FIFO copy.
-                spell.Cast.CastID = current.ServerGUID;
-                GetSession().GameState.RemoveForwardedStartCastId((uint)spell.Cast.SpellID, current.ServerGUID);
-            }
-            current.FirstGoDelivered = true;
+            spell.Cast.CastID = current.ServerGUID;
             spell.Cast.SpellXSpellVisualID = current.SpellXSpellVisualId;
             // Note: Don't clear auto-repeat cast here - it stays active until cancelled
         }
@@ -2871,26 +2838,6 @@ public partial class WorldClient
         {
             SendWindupKitCancels(spell.Cast.CasterUnit, windupCancelXVisual, spell.Cast.SpellID);
             SendPacketToClient(spell);
-        }
-
-        // JimsProxy (ranged auto-repeat): remember this tick's CastID so its damage log carries it like a native server's; two deep, because a max-range hit can land after the next tick's GO.
-        if (isRangedAutoAttack && spell.Cast.HitTargets.Count > 0)
-        {
-            GetSession().GameState.RecordAutoRepeatTickCastId(spell.Cast.CasterUnit, (uint)spell.Cast.SpellID, spell.Cast.CastID, Time.GetMSTime());
-            if (Framework.Settings.DebugOutput)
-                Log.Event("spell.go.autorepeat_sent", new { spell_id = spell.Cast.SpellID, cast_id = spell.Cast.CastID.ToString() });
-        }
-        // JimsProxy (ranged auto-repeat): the tick GO just reset the swing, so the duplicate presses held for the series are answered now, as far from the swing-timer aim window as a quiet failure can land; each answer frees that press's client object.
-        if (isRangedAutoAttack && spell.Cast.CasterUnit == GetSession().GameState.CurrentPlayerGuid)
-        {
-            var heldDuplicates = GetSession().GameState.TakeHeldAutoRepeatDuplicatePresses();
-            if (heldDuplicates != null)
-            {
-                foreach (var duplicate in heldDuplicates)
-                    GetSession().InstanceSocket.SendCastRequestFailed(duplicate, false, SpellCastResultClassic.DontReport);
-                if (Framework.Settings.DebugOutput)
-                    Log.Event("cast.autorepeat_duplicate_presses_answered_after_go", new { spell_id = spell.Cast.SpellID, cast_id = spell.Cast.CastID.ToString(), count = heldDuplicates.Count });
-            }
         }
 
         // JimsProxy (dup-failure frame hold): the local cast's GO is on the wire — release any
@@ -3395,23 +3342,6 @@ public partial class WorldClient
             dbdata.AmmoInventoryType = packet.ReadInt32();
         }
 
-        // DIAGNOSTIC (ranged auto-repeat): per-tick composition of the local player's auto-repeat casts.
-        if (Framework.Settings.DebugOutput && isSpellGo && GameData.AutoRepeatSpells.Contains((uint)dbdata.SpellID) &&
-            dbdata.CasterUnit == GetSession().GameState.CurrentPlayerGuid)
-        {
-            Log.Event("spell.go.autorepeat_tick", new
-            {
-                spell_id = dbdata.SpellID,
-                cast_flags = dbdata.CastFlags,
-                hit_targets = string.Join(",", dbdata.HitTargets.Select(g => g.GetCounter())),
-                miss_targets = string.Join(",", dbdata.MissTargets.Select(g => g.GetCounter())),
-                miss_status = string.Join(",", dbdata.MissStatus.Select(m => m.Reason.ToString())),
-                target_unit = dbdata.Target.Unit.GetCounter(),
-                target_flags = (uint)dbdata.Target.Flags,
-                ammo_display = dbdata.AmmoDisplayId,
-            });
-        }
-
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
         {
             if (isSpellGo)
@@ -3474,8 +3404,8 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_CANCEL_AUTO_REPEAT)]
     void HandleCancelAutoRepeat(WorldPacket packet)
     {
-        // Clear the auto-repeat cast tracking; the client's own handler ends the series' cast objects, so the press START's FIFO copy goes with the slot.
-        GetSession().GameState.EndAutoRepeatSlot();
+        // Clear the auto-repeat cast tracking
+        GetSession().GameState.CurrentClientAutoRepeatCast = null;
 
         CancelAutoRepeat cancel = new CancelAutoRepeat();
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
@@ -3564,19 +3494,6 @@ public partial class WorldClient
         spell.SpellID = packet.ReadUInt32();
         spell.SpellXSpellVisualID = GameData.GetSpellVisual(spell.SpellID);
         spell.CastID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Normal, (uint)GetSession().GameState.CurrentMapId!, spell.SpellID, spell.SpellID + spell.CasterGUID.GetCounter());
-        // JimsProxy (ranged auto-repeat): stamp an auto-repeat hit with its tick's GO CastID so the client can pair the shot with its impact.
-        if (GameData.AutoRepeatSpells.Contains(spell.SpellID) &&
-            GetSession().GameState.TryPairAutoRepeatDamageLog(spell.CasterGUID, spell.SpellID, Time.GetMSTime(), out var tickCastId, out var ticksRemaining))
-        {
-            spell.CastID = tickCastId;
-            if (Framework.Settings.DebugOutput)
-                Log.Event("spell.damage_log.autorepeat_castid_paired", new
-                {
-                    spell_id = spell.SpellID,
-                    cast_id = spell.CastID.ToString(),
-                    queued_remaining = ticksRemaining,
-                });
-        }
         spell.Damage = packet.ReadInt32();
         spell.OriginalDamage = spell.Damage;
 
@@ -3627,20 +3544,6 @@ public partial class WorldClient
         }
 
         SendPacketToClient(spell);
-
-        // DIAGNOSTIC (ranged auto-repeat): each auto-repeat damage log with its tick.
-        if (Framework.Settings.DebugOutput && GameData.AutoRepeatSpells.Contains(spell.SpellID) &&
-            spell.CasterGUID == GetSession().GameState.CurrentPlayerGuid)
-            Log.Event("spell.damage_log.autorepeat_hit", new
-            {
-                spell_id = spell.SpellID,
-                target = spell.TargetGUID.GetCounter(),
-                damage = spell.Damage,
-                absorbed = spell.Absorbed,
-                resisted = spell.Resisted,
-                hit_flags = (uint)spell.Flags,
-                cast_id = spell.CastID.ToString(),
-            });
 
         // Threat translation: feed spell damage (direct hit) into the tracker.
         // Pass the spell id so the per-ability damage multiplier (Maul x1.75,

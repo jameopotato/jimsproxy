@@ -1414,85 +1414,16 @@ public sealed class GameSessionData
     // is merged against state the client no longer has, and the previous
     // buff bar lingers stale until reload.
     public HashSet<WowGuid128> NeedsFullAuraRefresh = [];
-    // JimsProxy (ranged auto-repeat): the last two tick GO CastIDs per (caster, spell) with their send time, so a damage log carries its own shot's CastID even when the previous shot's hit lands after the next GO.
-    private readonly Dictionary<(WowGuid128 Caster, uint SpellId), Queue<(WowGuid128 CastId, long SentMs)>> _autoRepeatTickCastIds = [];
-    private const int MaxAutoRepeatTickCastIds = 2;
-    // A tick older than this never got its damage log (target died mid-flight); skipping it keeps every later pairing from shifting by one shot.
-    public const long AutoRepeatTickCastIdMaxAgeMs = 3000;
-
-    public void RecordAutoRepeatTickCastId(WowGuid128 caster, uint spellId, WowGuid128 castId, long nowMs)
-    {
-        var key = (caster, spellId);
-        if (!_autoRepeatTickCastIds.TryGetValue(key, out var ticks))
-            _autoRepeatTickCastIds[key] = ticks = new Queue<(WowGuid128, long)>(MaxAutoRepeatTickCastIds);
-        while (ticks.Count >= MaxAutoRepeatTickCastIds)
-            ticks.Dequeue();
-        ticks.Enqueue((castId, nowMs));
-    }
-
-    // Oldest tick first: hits land in shot order, so the oldest live tick is the one this damage log belongs to.
-    public bool TryPairAutoRepeatDamageLog(WowGuid128 caster, uint spellId, long nowMs, out WowGuid128 castId, out int remaining)
-    {
-        castId = default;
-        remaining = 0;
-        if (!_autoRepeatTickCastIds.TryGetValue((caster, spellId), out var ticks))
-            return false;
-        while (ticks.Count > 0)
-        {
-            var tick = ticks.Dequeue();
-            if (nowMs - tick.SentMs > AutoRepeatTickCastIdMaxAgeMs)
-                continue;
-            castId = tick.CastId;
-            remaining = ticks.Count;
-            return true;
-        }
-        return false;
-    }
-
-    // JimsProxy (ranged auto-repeat): the press START stays open for the whole series like a native server's (the client ends it itself when its auto-repeat state clears), so its forwarded-START FIFO copy is released with the slot, never by a GO; a retarget START still waiting for its GO goes with it.
-    public void EndAutoRepeatSlot()
-    {
-        var slot = CurrentClientAutoRepeatCast;
-        if (slot == null)
-            return;
-        RemoveForwardedStartCastId(slot.SpellId, slot.ServerGUID);
-        if (slot.PendingNaturalStartCastId is { } pendingStartCastId)
-            RemoveForwardedStartCastId(slot.SpellId, pendingStartCastId);
-        CurrentClientAutoRepeatCast = null;
-    }
-
-    // JimsProxy (ranged auto-repeat): a duplicate press for the running series is never forwarded, but each one leaves a client-minted cast object that only an answer or the series end frees, and the client's ring holds 100 of them; past that an instant pressed during the series gets no object at all (a held `/cast !Auto Shot` filled it in 20 s). Answering every duplicate as it arrives is what swing-timer addons object to: the quiet failure reads as the 0.5 s re-arm delay, but only when it lands inside the aim window at the end of the swing. So the duplicates are held and answered together right after the next tick GO, when the swing has just reset and nothing is further from that window. The hold is capped so a series that never fires (a key held through a line-of-sight bounce) still answers every press past the cap on arrival.
-    private readonly object _autoRepeatDuplicateLock = new();
-    public const int MaxHeldAutoRepeatDuplicatePresses = 40;
-
-    // True when the duplicate was held for the next tick GO; false when it must be answered now (no series, or the hold is full).
-    public bool HoldAutoRepeatDuplicatePress(ClientCastRequest duplicate)
-    {
-        lock (_autoRepeatDuplicateLock)
-        {
-            var slot = CurrentClientAutoRepeatCast;
-            if (slot == null)
-                return false;
-            slot.HeldDuplicatePresses ??= new List<ClientCastRequest>();
-            if (slot.HeldDuplicatePresses.Count >= MaxHeldAutoRepeatDuplicatePresses)
-                return false;
-            slot.HeldDuplicatePresses.Add(duplicate);
-            return true;
-        }
-    }
-
-    // The duplicates held for the running series, oldest first, or null when none; called once the tick GO is on the wire.
-    public List<ClientCastRequest>? TakeHeldAutoRepeatDuplicatePresses()
-    {
-        lock (_autoRepeatDuplicateLock)
-        {
-            var slot = CurrentClientAutoRepeatCast;
-            if (slot?.HeldDuplicatePresses is not { Count: > 0 } held)
-                return null;
-            slot.HeldDuplicatePresses = null;
-            return held;
-        }
-    }
+    // JimsProxy (synth-spell-start-for-autoshot): timestamp of the most recent
+    // natural SMSG_SPELL_START forwarded for the local player's ranged auto
+    // attack (Auto Shot 75 / Shoot 5019). The 1.12 server only emits SPELL_START
+    // at toggle/retarget — every subsequent auto-repeat tick arrives as a bare
+    // SPELL_GO. Modern Classic 1.14 servers emit SPELL_START per tick, so any
+    // CAST_START-driven swing-timer addon (e.g. Kaedin's swing timer) only
+    // fires once per series via the proxy. HandleSpellGo synthesizes a
+    // SPELL_START before the GO when no natural one was forwarded recently
+    // (window: AutoShotSynthSpellStartGapMs).
+    public Dictionary<uint, long> LastNaturalAutoShotSpellStartMs = [];
     public TradeSession? CurrentTrade = null;
     public HashSet<uint> RequestedItemHotfixes = [];
     public HashSet<uint> RequestedItemSparseHotfixes = [];
@@ -4314,12 +4245,6 @@ public sealed class GameSessionData
 public class ClientCastRequest
 {
     public bool HasStarted;
-    // JimsProxy (ranged auto-repeat): auto-repeat slot only — set by the series' first tick GO; a natural START after it is a retarget or retry START, not the press.
-    public bool FirstGoDelivered;
-    // JimsProxy (ranged auto-repeat): auto-repeat slot only — the CastID of a forwarded natural START after the first tick (retarget, retry) that the next GO must carry so the pair closes; never the press START, which stays open for the series.
-    public WowGuid128? PendingNaturalStartCastId;
-    // JimsProxy (ranged auto-repeat): auto-repeat slot only — duplicate presses for the running series waiting to be answered after the next tick GO; see HoldAutoRepeatDuplicatePress.
-    public List<ClientCastRequest>? HeldDuplicatePresses;
     public uint SpellId;
     public uint LegacySpellId; // 0 = same as SpellId; non-zero when modern client used a renumbered spell (e.g. SoM 1.14.1+ items)
     public uint SpellXSpellVisualId;
