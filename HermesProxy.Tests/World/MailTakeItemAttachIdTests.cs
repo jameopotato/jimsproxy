@@ -39,12 +39,13 @@ public class MailTakeItemAttachIdTests
         return session;
     }
 
-    // The #508 wire: take rejected for a full inventory. The client asked for slot 1 (the only
-    // slot a vanilla mail has) and must get slot 1 back, not 0.
+    // The #508 wire: take rejected for a full inventory. The client asked for a slot and must get that
+    // slot back, not 0. Slot 3 is recorded here so the test cannot pass through the vanilla slot-1
+    // fallback below the echo (the test build pins a 1.12 server, where the fallback also yields 1).
     [Fact]
     public void BagFullTake_EchoesRequestedAttachmentSlot()
     {
-        var session = SessionWithRecordedTake(MailId, 1);
+        var session = SessionWithRecordedTake(MailId, 3);
 
         var result = WorldClient.ParseMailCommandResult(
             LegacyResult(MailId, ItemTaken, EquipError, VanillaInvFull), session);
@@ -53,7 +54,7 @@ public class MailTakeItemAttachIdTests
         Assert.Equal(MailActionType.AttachmentExpired, result.Command);
         Assert.Equal(MailErrorType.Equip, result.ErrorCode);
         Assert.Equal(InventoryResult.InvFull, result.BagResult);
-        Assert.Equal(1u, result.AttachID);
+        Assert.Equal(3u, result.AttachID);
     }
 
     // No recorded take (e.g. the result outlived a reconnect): a vanilla mail still has exactly

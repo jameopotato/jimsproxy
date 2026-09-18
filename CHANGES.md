@@ -60,8 +60,9 @@ original client-casting commit.
 The spell-visual cancels stay on instance (native puts them on realm) because the #525 kit cancel is
 emitted immediately before the GO and depends on arriving first; `SMSG_CANCEL_AUTO_REPEAT` stays on
 realm, as native. A prepare now shares its START's path through the login-eviction hold, the
-pending-uninstanced queue and the instance-socket wait. Follow-up audit, not this change: the three
-threat packets still default to realm where native uses instance.
+pending-uninstanced queue and the instance-socket wait. Follow-up audit, not this change: three of the
+four threat packets still default to realm where native uses instance (the fourth, ThreatClear, is
+realm natively too).
 
 **Verification:** `HermesProxy.Tests/World/CastLifecycleConnectionTests.cs` (3: prepare on instance;
 every cast-lifecycle packet on one connection; the kit cancel on the GO's connection); suite
@@ -73,73 +74,6 @@ socket and the realm socket carried no prepare-sized arrival all session, 5/5. I
 or delayed, zero stranded objects. No reproduction exists; verification in the field is the absence of
 recurring stuck action buttons across group play, judged against #525, which releases the sound and
 pose and leaves the button.
-
----
-
-## 2026-09-14 — Ranged auto-repeat: one cast object per shot, the press START left open, duplicate presses answered after the tick GO (#516, Mirasu)
-
-**Issue:** three faults in how Auto Shot and wand Shoot reached the 1.14 client. (1) Every tick's
-`SPELL_GO` was re-stamped with the prepared press id while the synthesized `SPELL_START` ahead of it
-carried a per-packet id, so the two never paired: in an 86-minute wand session 161 of 162 wand START
-objects never closed on the client, and only the shot whose id happened to match animated. At max
-range, where a whole tick is in flight, shots stopped animating and the wand fired at half speed.
-(2) The first GO on the press id closed the press object, which the client's `!` test reads
-(`/cast !Auto Shot` walks the current-cast list, while the toggle test reads the active-spell
-global), so after the first arrow the macro saw no live cast and toggled auto-shot off. A native
-server never GOes the press: its object stays open until the client's own cancel path ends it.
-(3) A duplicate press for the running series (the `!` macro re-sends on every key repeat) was
-answered on arrival with a client-id `CAST_FAILED`, which swing-timer addons read as the 0.5 s
-re-arm delay; dropping duplicates silently instead left each one's client object in the client's
-100-entry cast ring until the series ended, and a held key filled it in 20 s, after which no
-instant pressed during the series got a client object at all (`jimsproxy-20260914-055933.jsonl`:
-presses 3..107, then every instant on a diverted id).
-
-**Change:** `World/Client/PacketHandlers/SpellHandler.cs` (`HandleSpellStart`, `HandleSpellGo`):
-every tick GO keeps its parse-minted id and gets a synthesized START on the same id; the press START
-keeps the prepared id and is never paired; the one exception is the wand: its aim sound lives on the
-press object and plays for as long as that object is open (it plays even when the press START is never
-forwarded), so a wand press left open hummed for the whole series, where a bow's only holds the draw
-pose; the wand's first tick GO therefore carries the prepared id and closes the press object, the way
-Blizzard's own wire closes every aim START with its GO, and later wand ticks pair as usual; a natural START after the first tick (retarget, retry) is
-remembered on the slot and its GO carries that id; damage logs are paired two ticks deep so a hit
-that lands after the next GO still carries its own shot's id (`RecordAutoRepeatTickCastId` /
-`TryPairAutoRepeatDamageLog`, 3 s max age). `GlobalSessionData.cs`: `EndAutoRepeatSlot` releases
-the press START's forwarded-START FIFO copy on client cancel, server cancel and non-retryable
-failure; `HoldAutoRepeatDuplicatePress` / `TakeHeldAutoRepeatDuplicatePresses` hold duplicate
-presses on the slot (cap 40, past which one answers on arrival) and `HandleSpellGo` answers them on
-their client ids (`DontReport`, no `SpellPrepare`, the #517 shape) right after each tick GO, when
-the swing has just reset and the failure lands outside the swing-timer aim window; each answer
-frees that press's client object. `World/Server/PacketHandlers/SpellHandler.cs` (`HandleCastSpell`):
-a duplicate auto-repeat press is never forwarded (a forwarded one makes the 1.12 server interrupt
-the series). Events, all DebugOutput-gated: `spell.start.synth_for_autoshot`,
-`spell.go.autorepeat_tick`, `spell.go.autorepeat_sent`, `spell.start.autorepeat_natural`,
-`spell.damage_log.autorepeat_hit`, `spell.damage_log.autorepeat_castid_paired`,
-`cast.autorepeat_duplicate_press_held`, `cast.autorepeat_duplicate_press_answered_on_arrival`,
-`cast.autorepeat_duplicate_presses_answered_after_go`.
-
-**Verification:** Kronos, 1.14.2 hunter and priest. Wand at range with target changes, some with a
-bolt in flight: 4 presses, 35 ticks, 31/31 damage logs paired, 25 of them landing after the next
-tick's GO. Auto Shot under Quick Shots: 45 ticks in one series, 45 distinct cast ids, every shot
-animated. `/cast !Auto Shot` held on key repeat for a minute (`jimsproxy-20260914-063428.jsonl`):
-159 presses, 158 held and answered across 22 ticks (at most 15 per tick, none on arrival), no
-diverted client ids, Arcane Shot, Multi-Shot and Aimed Shot cast normally throughout, swing timer
-clean. Tests: `AutoRepeatTickCastIdPairingTests`, `AutoRepeatSlotEndTests`,
-`AutoRepeatDuplicatePressTests`; 1087/1087.
-
-**Open:** the client's `!` test (`/cast !Auto Shot`) is a composite guard: a walk of its current-cast
-ring plus a spell-id-keyed index, with the active-repeat global set locally at press and never the
-discriminator. What decides between a re-send (the hold above answers it) and a toggle-off is whether a
-STARTED object of the spell is open at the moment the re-press is processed. Natively each tick's START
-precedes its GO by about half a second, so a started object is open for most of every swing; through
-the proxy the synthesized START and GO share one flush, so the tick's object is open for zero frames,
-and the press START left open does not count as started for that read. The PREPARE rebind, the START
-handler and the GO's sibling walk were each refuted as the step that removes the press object; the
-remaining candidate is an aim-timer recompute, decided by a harness sweep of the press object's state,
-ring, timers and index membership at press, PREPARE, START and first GO. A native no-op needs per-tick
-START-to-GO spacing, not a second always-open START (which trips the client's not-ready gate and clips
-the shot sound). SugarProxy synthesizes nothing for auto-repeat and relays the 1.12 wire one to one, so
-it should show the same toggle-off. Once the step is found, the re-sends stop as they do natively and
-the wand exception above can go.
 
 ---
 
@@ -158,11 +92,14 @@ so every later click is a silent client-side no-op until the world session ends.
 **Change:** `World/Server/PacketHandlers/MailHandler.cs` — when `CMSG_MAIL_TAKE_ITEM` is forwarded,
 remember the slot the client asked for (always 1 pre-TBC) per mail id. `World/Client/PacketHandlers/
 MailHandler.cs` — on any item-taken result that arrives without an attachment id, put the remembered
-slot back, falling back to slot 1 on vanilla; the record is consumed by its result so the map cannot
-grow; the success path is unchanged. The result parse is split into
+slot back, falling back to slot 1 on vanilla; the record is consumed by its result, and one whose
+result never arrives lives only until the session data is rebuilt (bounded by distinct mail ids); the
+success path is unchanged. The result parse is split into
 `WorldClient.ParseMailCommandResult` so the legacy byte layouts can be driven through it in tests.
 `GlobalSessionData.cs` — `PendingMailTakeAttachId`, a `ConcurrentDictionary` like the other
 cross-thread session maps (written on the client-socket thread, consumed on the world-client thread).
+On a 1.12 server the recorded slot is always 1 and the vanilla fallback yields the same value, so on
+Kronos the fallback is the fix; the map changes the result only on a TBC-or-later legacy server.
 The idea is from Novivy's fork (fe9adaca, 2026-05-17); it was never in this lineage.
 
 **Verification:** `HermesProxy.Tests/World/MailTakeItemAttachIdTests.cs` (6: bag-full echo, vanilla
@@ -233,7 +170,8 @@ self-recovering). The stranded cast object is untouched, so a loop that would ha
 still leave the action button lit until relog (the button is #517's fix). Every send is logged
 under DebugOutput as `cast.windup_kit_cancel`.
 
-**Verification:** `WindupKitCancelTests` (20: the decision seam and the table). Suite 1095/1095.
+**Verification:** `WindupKitCancelTests` (26: the decision seam, the table, the orphan-branch key and
+the packet writer). Suite 1095/1095 at the PR, 1101/1101 with the review commit.
 Under the in-process cast-object harness on the PTR: 40 of 40 and then 46 of 46 pressed holy GOs
 cancelled in the same tick, every sound-owning held effect on the caster's display carried kit 99,
 released and collected at the GO, nothing cut short; live realm, 86 minutes: 272 of 272 table-kit
