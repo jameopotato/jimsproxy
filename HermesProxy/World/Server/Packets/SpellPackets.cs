@@ -824,7 +824,16 @@ class CancelChannelling : ClientPacket
 
 class SpellPrepare : ServerPacket, ISpanWritable
 {
-    public SpellPrepare() : base(Opcode.SMSG_SPELL_PREPARE) { }
+    // JimsProxy (#394 looping cast kit): SMSG_SPELL_PREPARE must ride the SAME connection as
+    // SMSG_SPELL_START / SMSG_SPELL_GO / SMSG_CAST_FAILED. Without the explicit ConnectionType the
+    // one-argument ServerPacket ctor defaults to ConnectionType.Realm (Packet.cs:70), which is meant
+    // for character-select traffic, so PREPARE went out on the realm socket while the rest of the
+    // cast lifecycle went out on the instance socket. TCP orders bytes within a connection and
+    // guarantees nothing between two, so the client could handle the START before the PREPARE's
+    // re-key and mint a duplicate cast object that strands holding the wind-up kit. TrinityCore puts
+    // all four opcodes on CONNECTION_TYPE_INSTANCE, which is why native realms never produce this.
+    // Inherited from upstream's original "Add spell casting by client" commit; every fork has it.
+    public SpellPrepare() : base(Opcode.SMSG_SPELL_PREPARE, ConnectionType.Instance) { }
 
     public override void Write()
     {
