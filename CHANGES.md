@@ -13,6 +13,33 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-18 — SMSG_FEATURE_SYSTEM_STATUS: leave the RaceClassExpansionLevels list absent instead of sending an empty one (Linux client crash at world entry)
+
+**Issue:** a player on Linux reported the 1.14.2 client crashing at world entry on the proxy, 6 of 6
+runs, and 0 of 4 runs with one bit cleared. `SMSG_FEATURE_SYSTEM_STATUS` carries an optional
+`RaceClassExpansionLevels` list behind a has-bit (`WriteBit(RaceClassExpansionLevels != null)`). The
+proxy never fills the list, and upstream shipped the field null for years, so the bit was clear.
+Xian55's nullable sweep (97e431a1, 2026-04-02, inherited in the 04-18 rebase) defaulted the field to
+`new()`, so every v5 build has sent the bit set with a count of 0. The Windows client tolerates that
+(the reporter's theory, not measured: the parse reads its own stack and usually corrupts silently);
+the Linux client faults on it.
+
+**Change:** `World/Server/Packets/SystemPackets.cs` — `RaceClassExpansionLevels` is `List<byte>?` with
+a null default, the pre-sweep shape. A per-class audit of every `WriteBit(x != null)` in the server
+packets found no other has-bit field left with a non-null default; `PartyMemberPartialState.Auras`
+and `PartyMemberPetStats.Auras`, which the same sweep also changed, were restored to null by #435
+(the `= new()` on `PartyMemberFullState.Auras` is correct: that writer has no has-bit). Rule for the
+codebase: a field that feeds a `WriteBit(x != null)` is a protocol signal and stays `T?` with a null
+default, never `= new()`.
+
+**Verification:** `HermesProxy.Tests/World/FeatureSystemStatusTests.cs` (the default field is null;
+the default packet is 4 bytes shorter than one with an empty list and 7 shorter than one with three
+entries, so no count is written). Reporter, on v5.2.0 plus this line, Linux: the fixed build enters
+the world and plays normally with everything else unchanged. Windows: the bit-clear shape is what
+upstream HermesProxy sent to the same client from 2022 until the sweep.
+
+---
+
 ## 2026-09-17 — Send SMSG_SPELL_PREPARE on the instance connection, like the rest of the cast lifecycle (#528)
 
 **Issue:** the looping cast sound, held casting pose and stuck action button (#394) were a stranded
