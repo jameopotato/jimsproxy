@@ -290,14 +290,17 @@ start the client from your Wine setup, and `Ctrl+C` the proxy after you quit the
 `AesGcm is not supported on your platform`, it prints the fix on the next lines
 (`brew install openssl@3`, then start it with `DYLD_LIBRARY_PATH=/opt/homebrew/opt/openssl@3/lib`).
 `scripts/play.sh` works on macOS for the proxy side; pass the command that starts your game
-with `--game-cmd`.
+with `--game-cmd`. (Stone Tavern's macOS and Linux packages, below, each contain a natively
+built JimsProxy as well, configured for their realm.)
 
-**Game client:** there is no confirmed way to run the custom-servers client on macOS at the
-time of writing. People either run the Windows client through CrossOver or Wine on the Mac,
-or play from a Windows machine with the launcher. Stone Tavern's "better client" page at
-[stonetavern.app/betterclient](https://stonetavern.app/betterclient), with its macOS launcher, is
-the closest reference for running a 1.14 client on a Mac. If you get it working against Kronos, open an issue with
-your steps and this section will be updated.
+**Game client:** this project has not tested a macOS route, but one exists. Stone Tavern's
+experimental [Better Client](https://stonetavern.app/betterclient) ships a macOS package
+(about 8 GB) that runs the same Windows 1.14.2 client through Apple's free Game Porting
+Toolkit, with JimsProxy built natively for macOS behind it. Reproducing that for Kronos means
+the Game Porting Toolkit (or a Wine-based tool such as CrossOver or Whisky), your own client,
+and this proxy pointed at Kronos. The alternative is to play from a Windows machine with the
+launcher. If you get the Mac route working against Kronos, open an issue with your steps and
+this section will be updated.
 
 ---
 
