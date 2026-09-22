@@ -1,145 +1,192 @@
-# Running JimsProxy without the launcher
+# Manual install: run JimsProxy without the launcher
 
-This is the manual path: you run the proxy yourself and start the game yourself. It is the
-only path on Linux and macOS, and the right one for custom setups on Windows.
+This guide takes you from the download link to the login screen, one step at a time, with the
+exact things to click and the exact commands to paste. It assumes you have never done this
+before. It is written for Windows; Linux and macOS are in the
+[appendix](#appendix-linux-and-macos-community-supported).
 
-If you are on Windows and just want to play, use the **Classic WoW Launcher** instead. It
-downloads or repairs the game client, installs and updates the proxy, and manages addons.
-Get it from [jimothy.cc/install](https://jimothy.cc/install); the full guide is
-[classic-114-launcher/docs/INSTALL.md](https://github.com/jameopotato/classic-114-launcher/blob/master/docs/INSTALL.md).
-
-| | Launcher (Windows) | Manual (this page) |
-|---|---|---|
-| Setup | Guided wizard | Edit one config value and one `Config.wtf` line |
-| Proxy updates | Automatic, stable or beta | You re-download |
-| Game client | Downloaded, copied or repaired for you | **You supply it** |
-| Addons, keybind import, repair, multibox | Included | Not included (JimsPlus can be installed by hand) |
-| Linux / macOS | Not supported | Community-supported |
-
-**Support status.** Windows is the tested platform. Linux and macOS are community-supported:
-the proxy builds and runs natively on both, the game client does not, and the project does
-not test either. Reports from Linux players have led to real fixes (see the changelog), so
-they are welcome, but expect to do some of the work yourself.
+> **The easy way.** On Windows, the **Classic WoW Launcher** at
+> [jimothy.cc/install](https://jimothy.cc/install) does everything on this page for you, and
+> also downloads or repairs the game client, keeps the proxy updated and manages addons. If you
+> just want to play, use that and stop reading here.
 
 Contents
 
-- [What you need](#what-you-need)
-- [Windows](#windows)
-- [Linux (community-supported)](#linux-community-supported)
-- [macOS (community-supported)](#macos-community-supported)
-- [The launch scripts](#the-launch-scripts)
-- [Keeping it updated](#keeping-it-updated)
-- [The JimsPlus addon](#the-jimsplus-addon)
-- [Command line flags](#command-line-flags)
-- [Chat commands](#chat-commands)
-- [Files and ports](#files-and-ports)
+- [Before you start](#before-you-start)
+- [Step 1: Set up the folders](#step-1-set-up-the-folders)
+- [Step 2: Download the proxy](#step-2-download-the-proxy)
+- [Step 3: Get the config file](#step-3-get-the-config-file)
+- [Step 4: Point the proxy at Kronos](#step-4-point-the-proxy-at-kronos)
+- [Step 5: Get the play scripts](#step-5-get-the-play-scripts)
+- [Step 6: Play](#step-6-play)
+- [Running it by hand (without the scripts)](#running-it-by-hand-without-the-scripts)
+- [The JimsPlus addon (optional)](#the-jimsplus-addon-optional)
+- [Updating](#updating)
 - [Troubleshooting](#troubleshooting)
+- [Appendix: Linux and macOS (community-supported)](#appendix-linux-and-macos-community-supported)
+- [Reference](#reference)
 - [Reporting a bug](#reporting-a-bug)
 
 ---
 
-## What you need
+## Before you start
 
-### 1. The proxy
+You need three things.
 
-A folder containing:
+**1. A WoW Classic Era 1.14.2 client, build 42597. You supply this.** JimsProxy does not
+distribute game files and this guide does not link to any. The build must be exactly 42597 or
+login fails. To check: right-click the game's `.exe`, choose *Properties*, open the *Details*
+tab and read *File version*; it should say `1.14.2.42597`.
 
-```
-JimsProxy.exe          (Windows)  /  JimsProxy  (Linux, macOS)
-HermesProxy.config
-CSV/                   game data tables, required
-```
+The client also has to be willing to talk to a custom server. On its own, the stock
+`WowClassic.exe` from Battle.net only talks to Blizzard. You need one of:
 
-All three must sit **in the same folder**. The proxy switches its working directory to
-wherever its executable lives, so it always reads the config and `CSV/` from beside itself,
-however you start it.
-
-> The config file is named **`HermesProxy.config`**, not `JimsProxy.config`, even though the
-> binary is `JimsProxy`. The project kept upstream's filename for compatibility.
-
-Where to get it:
-
-- **Windows, direct download.** The same bundle the launcher installs, straight from
-  jimothy.cc:
-
-  | Channel | Link |
-  |---|---|
-  | Latest stable | <https://jimothy.cc/proxy/stable/latest> |
-  | Latest beta | <https://jimothy.cc/proxy/beta/latest> |
-
-  The bundle contains `JimsProxy.exe`, `CSV/`, the JimsPlus addon under `Addons/JimsPlus/`,
-  and a `manifest.json` with the version. **It does not contain `HermesProxy.config`**: the
-  launcher writes its own, so the bundle ships without one and the proxy stops with
-  `Config loading failed` if it is missing. Download the config from the repository,
-  [`HermesProxy/HermesProxy.config`](https://raw.githubusercontent.com/jameopotato/jimsproxy/master/HermesProxy/HermesProxy.config)
-  (right-click, *Save as*), and put it beside `JimsProxy.exe`.
-- **Windows, GitHub release.** [The latest release](https://github.com/jameopotato/jimsproxy/releases/latest)
-  has `JimsProxy-v<version>-win-x64.zip` plus `checksums-sha256.txt`; verify the download with
-  `scripts/verify-checksums.ps1` or `Get-FileHash`. If the zip has no `HermesProxy.config`,
-  fetch it as above.
-- **Linux and macOS:** [build from source](../README.md#building-from-source). Releases do
-  not ship Linux or macOS binaries yet. CI does build them on every push (the *Build Proxy*
-  workflow produces `HermesProxy-ubuntu-*` and `HermesProxy-macos-universal-*` artifacts),
-  but workflow artifacts need a GitHub login and expire, so treat them as a convenience,
-  not a distribution channel.
-
-### 2. A game client, which you supply
-
-JimsProxy does not distribute game files, and this guide does not link to any.
-
-| | |
-|---|---|
-| Version | **WoW Classic Era 1.14.2** |
-| Build | **42597** |
-| Executable | **`WowClassic_ForCustomServers.exe`**, or the stock `WowClassic.exe` started through the Arctium Launcher |
-
-On its own, the stock `WowClassic.exe` from Battle.net only talks to Blizzard's servers, and
-no proxy changes that. Two things make it accept a custom server:
-
-- **`WowClassic_ForCustomServers.exe`**, a patched build of the client. This is what the
-  launcher installs and what the rest of this guide assumes.
+- **`WowClassic_ForCustomServers.exe`**, a patched build of the client. This guide assumes it.
 - **The [Arctium WoW Launcher](https://github.com/Arctium/WoW-Launcher)** with the unpatched
-  `WowClassic.exe`. It patches the client in memory at start. Put it in the main game folder
-  (the one that contains `_classic_era_`) and start it with
-  `--staticseed --version=ClassicEra`. `--staticseed` makes the client use the fixed auth seed
-  that the proxy's shipped `ClientSeed` value matches, so leave that key alone.
+  `WowClassic.exe`. It patches the client in memory each time it starts it. Put it in the game
+  folder that contains `_classic_era_` and start it with `--staticseed --version=ClassicEra`.
+  Where this guide says "start `WowClassic_ForCustomServers.exe`", start Arctium instead.
 
-Either way the client's build must match `ClientBuild` in the proxy config exactly (`42597`),
-or login fails. Other 1.14 builds are listed in the config's comments but are not tested.
+**2. A Kronos account.** Create one at [kronos-wow.com](https://www.kronos-wow.com). You will
+type its name and password into the normal WoW login screen.
 
-The examples below use the launcher's folder layout, which the scripts auto-detect. Any
-layout works if you pass the paths explicitly.
+**3. Windows 10 or 11, 64-bit**, with a few hundred MB free next to the game.
 
-```
-<root>/
-├── Hermes/                              the proxy folder from step 1
-└── World of Warcraft/
-    └── _classic_era_/
-        ├── WowClassic_ForCustomServers.exe
-        ├── Data/
-        ├── Interface/AddOns/
-        └── WTF/Config.wtf
-```
+**About the commands in this guide.** Some steps offer a PowerShell block as an alternative to
+clicking around. To open PowerShell: press the Windows key, type `powershell`, press Enter.
+Paste a whole block at once (right-click pastes) and press Enter. Nothing here needs
+administrator rights.
 
-### 3. A Kronos account
-
-Create one at [kronos-wow.com](https://www.kronos-wow.com). You log in with the account name
-and password at the normal WoW login screen.
+**About the paths.** The examples use `C:\Games\Kronos` as the folder that holds everything,
+with the game client inside it at `C:\Games\Kronos\World of Warcraft\_classic_era_\`. Wherever
+you see those paths, use your own.
 
 ---
 
-## Windows
+## Step 1: Set up the folders
 
-### Step 1: Point the proxy at the server
+The proxy lives in a folder called `Hermes`, next to your `World of Warcraft` folder. This is
+the layout the launcher uses too, and the play scripts find the game by it:
 
-Open `HermesProxy.config` in a text editor and set `ServerAddress`:
-
-```xml
-<add key="ServerAddress" value="login.twinstar-wow.com" />
+```
+C:\Games\Kronos\
+├── Hermes\                                  ← you create this; the proxy goes here
+└── World of Warcraft\                       ← your game client
+    └── _classic_era_\
+        ├── WowClassic_ForCustomServers.exe
+        ├── Data\
+        ├── Interface\
+        └── WTF\
 ```
 
-Kronos runs more than one realm cluster. Use the host of the one you play on, the same
-thing the launcher's *Server* dropdown picks:
+1. Open File Explorer and go to the folder that contains your `World of Warcraft` folder
+   (`C:\Games\Kronos` in the example).
+2. Right-click an empty spot, choose *New → Folder*, and name it `Hermes`.
+
+Or in PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force "C:\Games\Kronos\Hermes"
+```
+
+If your client folder is not called `World of Warcraft` but contains `_classic_era_` directly,
+that works too: put `Hermes` next to `_classic_era_`. Any other layout also works; you will
+just tell the play script where the game is (see [Step 5](#step-5-get-the-play-scripts)).
+
+**Check:** `C:\Games\Kronos\Hermes` exists and is empty, and
+`C:\Games\Kronos\World of Warcraft\_classic_era_\WowClassic_ForCustomServers.exe` exists.
+
+---
+
+## Step 2: Download the proxy
+
+The proxy comes as one zip file, the same bundle the launcher installs:
+
+| Channel | Link |
+|---|---|
+| **Latest stable** (use this) | <https://jimothy.cc/proxy/stable/latest> |
+| Latest beta (newest fixes, less tested) | <https://jimothy.cc/proxy/beta/latest> |
+
+**With the browser**
+
+1. Click the stable link. Your browser saves a zip file (named like `hermes-bundle-5.2.0.zip`)
+   in your *Downloads* folder.
+2. Right-click the zip and choose *Extract All…*.
+3. In the *Files will be extracted to this folder* box, delete what is there and type
+   `C:\Games\Kronos\Hermes`. Click *Extract*.
+
+**Or with PowerShell** (downloads and extracts in one go):
+
+```powershell
+Invoke-WebRequest -Uri "https://jimothy.cc/proxy/stable/latest" -OutFile "$env:TEMP\jimsproxy-bundle.zip"
+Expand-Archive -Path "$env:TEMP\jimsproxy-bundle.zip" -DestinationPath "C:\Games\Kronos\Hermes" -Force
+```
+
+**Check:** `C:\Games\Kronos\Hermes` now contains `JimsProxy.exe`, a `CSV` folder, an `Addons`
+folder and `manifest.json`. If instead you see a single sub-folder in there (for example
+`Hermes\hermes-bundle-5.2.0\JimsProxy.exe`), *Extract All* added a folder level: move
+everything from that sub-folder up into `Hermes` and delete the empty sub-folder.
+
+> `JimsProxy.exe` is a large, unsigned program that opens network ports, which is exactly the
+> shape antivirus tools dislike. If yours quarantines it, restore it and add the whole `Hermes`
+> folder as an exception; restoring the one file usually does not hold. If Windows SmartScreen
+> shows "Windows protected your PC" when it first runs, click *More info*, then *Run anyway*.
+
+---
+
+## Step 3: Get the config file
+
+The proxy reads its settings from a file called **`HermesProxy.config`** (the name comes from
+the project JimsProxy was forked from). The bundle does not include one, because the launcher
+writes its own. Without it the proxy stops with `Config loading failed`. Get it from the
+repository:
+
+**With PowerShell** (recommended; it puts the file in the right place with the right name):
+
+```powershell
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jameopotato/jimsproxy/master/HermesProxy/HermesProxy.config" -OutFile "C:\Games\Kronos\Hermes\HermesProxy.config"
+```
+
+**Or with the browser:** open
+[HermesProxy.config](https://raw.githubusercontent.com/jameopotato/jimsproxy/master/HermesProxy/HermesProxy.config),
+press `Ctrl+S`, pick `C:\Games\Kronos\Hermes` as the folder, set *Save as type* to *All files*,
+make sure the file name is exactly `HermesProxy.config` (not `HermesProxy.config.txt`), and save.
+
+**Check:** `C:\Games\Kronos\Hermes\HermesProxy.config` exists, next to `JimsProxy.exe`.
+
+---
+
+## Step 4: Point the proxy at Kronos
+
+Out of the box the config points at `127.0.0.1` (your own PC). Change one line so it points at
+Kronos.
+
+**With Notepad**
+
+1. Right-click `C:\Games\Kronos\Hermes\HermesProxy.config`, choose *Open with → Notepad*.
+2. Find this line (it is near the top, after a comment about *ServerAddress*):
+
+   ```xml
+   <add key="ServerAddress" value="127.0.0.1" />
+   ```
+
+3. Change it to:
+
+   ```xml
+   <add key="ServerAddress" value="login.twinstar-wow.com" />
+   ```
+
+4. Save with `Ctrl+S` and close Notepad.
+
+**Or with PowerShell:**
+
+```powershell
+$cfg = "C:\Games\Kronos\Hermes\HermesProxy.config"
+(Get-Content $cfg) -replace '(<add key="ServerAddress" value=")[^"]*(")', '${1}login.twinstar-wow.com$2' | Set-Content $cfg
+```
+
+`login.twinstar-wow.com` is the Kronos realm cluster the launcher calls *Kronos*. If you play
+on another one, use its address instead:
 
 | Launcher name | `ServerAddress` |
 |---|---|
@@ -147,71 +194,203 @@ thing the launcher's *Server* dropdown picks:
 | Kronos 2 | `login2.twinstar-wow.com` |
 | Kronos 3 | `login3.twinstar-wow.com` |
 
-For any other vanilla 1.12 server, use its logon address, the same thing you would put in
-`SET REALMLIST`.
+Change nothing else. `ClientBuild` is already `42597`, `ServerBuild` is `auto` (it picks 1.12.1
+for a 1.14 client), `ClientSeed` is a fallback the proxy overrides, and `ServerType` is already
+`Kronos`. If you are curious what the other keys do, every one of them is explained in the
+[configuration reference](configuration.md).
 
-Everything else ships ready to go. In particular, do **not** touch `ClientBuild` (already
-`42597`), `ServerBuild` (`auto` picks 1.12.1 for a 1.14 client; the launcher pins `5875`,
-which is the same thing), or `ClientSeed` (a fallback; the real per-build seeds load from
-`CSV/BuildAuthSeeds.csv`). Leave `ServerType` on `Kronos`. Every key is explained in
-[configuration.md](configuration.md).
+**Check:** open the file again and confirm the `ServerAddress` line now says
+`login.twinstar-wow.com`.
 
-### Step 2: Point the client at the proxy
+---
 
-Edit `World of Warcraft\_classic_era_\WTF\Config.wtf` (create the `WTF` folder and the file
-if they do not exist yet) so it contains:
+## Step 5: Get the play scripts
+
+Two small files turn the whole start-and-stop routine into one double-click: they check that
+nothing else is using the proxy's ports, point the game at the proxy, start the proxy, wait
+until it is ready, start the game, and shut the proxy down cleanly when you quit the game.
+Put them next to `JimsProxy.exe`:
+
+```powershell
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jameopotato/jimsproxy/master/scripts/play.bat" -OutFile "C:\Games\Kronos\Hermes\play.bat"
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jameopotato/jimsproxy/master/scripts/play.ps1" -OutFile "C:\Games\Kronos\Hermes\play.ps1"
+```
+
+(Without PowerShell: open each link in the browser, `Ctrl+S`, save into `Hermes` with *Save as
+type* set to *All files* and the names exactly `play.bat` and `play.ps1`.)
+
+The scripts find the game by the folder layout from Step 1. **If your game is somewhere else**,
+tell them where: open `play.bat` in Notepad and add the path to the end of the `powershell`
+line, so it reads
 
 ```
-SET portal "127.0.0.1:1119"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0play.ps1" %* -GameExe "D:\Somewhere\_classic_era_\WowClassic_ForCustomServers.exe"
 ```
 
-`1119` is the proxy's `BNetPort`. If you change one, change both; a mismatch is the single
-most common "it just won't connect". Classic Era has no `realmlist.wtf`; the portal line is
-the whole story. The launch script in step 3 checks and fixes this line for you.
+For the Arctium route, point it at the Arctium executable and add its arguments:
+`-GameExe "C:\Games\Kronos\World of Warcraft\Arctium WoW Launcher.exe" -GameArgs "--staticseed --version=ClassicEra"`.
 
-### Step 3: Start the proxy, then the game
+**Check:** `C:\Games\Kronos\Hermes` contains `play.bat` and `play.ps1`.
 
-**With the script (recommended).** Copy `scripts\play.ps1` and `scripts\play.bat` from this
-repository into your `Hermes\` folder and double-click `play.bat`. It checks that the
-proxy's ports are free, fixes the portal line, starts the proxy, waits for it to be ready,
-starts the game, and shuts the proxy down cleanly when you close the game. Details in
-[The launch scripts](#the-launch-scripts).
+---
 
-**By hand.**
+## Step 6: Play
 
-1. Run `JimsProxy.exe`. A console window opens. Wait for this line:
+1. Double-click `C:\Games\Kronos\Hermes\play.bat`.
+2. A black window opens and prints what it is doing. The first time, Windows may show
+   SmartScreen for the proxy (*More info → Run anyway*) or your antivirus may object (see the
+   note in Step 2). Wait for this line:
+
+   ```
+   [play] proxy is ready on 127.0.0.1:1119
+   ```
+
+   The game starts by itself right after it. Leave the black window open; it is holding the
+   proxy.
+3. At the WoW login screen, type your Kronos account name and password and press Enter. Pick
+   your realm, pick a character, play.
+4. When you are done, quit the game normally (*Exit Game* from the menu). The black window
+   prints `[play] stopping the proxy...` and closes itself.
+
+The first run also did two things you would otherwise do by hand: it wrote
+`SET portal "127.0.0.1:1119"` into the game's `WTF\Config.wtf` (keeping a `Config.wtf.bak`),
+which is what tells the game to connect to the proxy instead of Blizzard, and it checked that no
+old proxy was still running. From now on, playing is just: double-click `play.bat`.
+
+The proxy's console output is also saved to `Hermes\play-console.log`; attach it if you ever
+need to report a problem.
+
+---
+
+## Running it by hand (without the scripts)
+
+The scripts do nothing you cannot do yourself.
+
+1. **Point the game at the proxy.** Open
+   `C:\Games\Kronos\World of Warcraft\_classic_era_\WTF\Config.wtf` in Notepad. If there is a
+   line starting with `SET portal`, change it; otherwise add a line. It must read:
+
+   ```
+   SET portal "127.0.0.1:1119"
+   ```
+
+   If there is no `WTF` folder yet, create it and create `Config.wtf` inside it with just that
+   line. (`1119` is the proxy's `BNetPort`; if you ever change one, change both.)
+2. **Start the proxy.** Double-click `C:\Games\Kronos\Hermes\JimsProxy.exe`. A console window
+   opens. Wait for this line, which is the last of its four listeners coming up:
 
    ```
    Starting WorldSocket service
    ```
 
-   It is the last of the four listeners to come up, so once you see it everything is bound.
    Do not start the game before it appears.
-2. Start `WowClassic_ForCustomServers.exe` (or the Arctium Launcher with
-   `--staticseed --version=ClassicEra`).
-3. Log in with your Kronos account name and password, pick your realm and character.
-4. When you are done playing, close the game first, then close the proxy's console window.
-   The proxy handles the window close, `Ctrl+C` and a normal `taskkill` gracefully and
-   flushes its diagnostic log. Only `taskkill /F` skips that.
-
-**SmartScreen and antivirus.** `JimsProxy.exe` is a large, unsigned, self-contained .NET
-program that opens listening sockets, a shape that draws false positives. If SmartScreen
-blocks it, click *More info*, then *Run anyway*. If an antivirus quarantines it, add the
-`Hermes\` folder as an exception rather than restoring the one file; a restore on its own
-often does not hold. Build from source if you would rather not take anyone's word for it.
+3. **Start the game.** Double-click `WowClassic_ForCustomServers.exe` (or the Arctium Launcher).
+4. **Log in** with your Kronos account name and password.
+5. **When done,** quit the game first, then close the proxy's console window. A normal close,
+   `Ctrl+C`, or `taskkill` without `/F` all let the proxy finish writing its log; only
+   `taskkill /F` does not.
 
 ---
 
-## Linux (community-supported)
+## The JimsPlus addon (optional)
 
-The proxy runs natively. The game client runs under Wine or Proton. Nothing on the network
-side needs configuring: the proxy listens on `127.0.0.1`, and Wine shares the host's
-loopback interface, so the client reaches it exactly as on Windows.
+JimsPlus is a small in-game addon that ships in the bundle (the `Addons\JimsPlus` folder from
+Step 2). It pairs with the proxy: client-side fixes for cast bars, mail and name display, taxi
+and pet quirks, plus an options panel (`/jp` in game) for proxy features. The launcher installs
+it automatically; by hand, copy the folder into the game's addon folder:
 
-### Step 1: Build the proxy
+```powershell
+Copy-Item -Recurse -Force "C:\Games\Kronos\Hermes\Addons\JimsPlus" "C:\Games\Kronos\World of Warcraft\_classic_era_\Interface\AddOns\JimsPlus"
+```
 
-Install the [.NET 10 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0) for your
-distribution, then:
+(Or drag the `JimsPlus` folder from `Hermes\Addons` into `_classic_era_\Interface\AddOns`.)
+
+It must match the proxy version: re-copy it every time you update the proxy. The proxy switches
+the addon channel off if the versions disagree, so nothing breaks, you just lose its fixes.
+
+---
+
+## Updating
+
+A manual install does not update itself. When a new version is out (see the
+[releases page](https://github.com/jameopotato/jimsproxy/releases) or the launcher's patch
+notes on Discord):
+
+1. Quit the game and make sure the proxy is stopped (no `JimsProxy.exe` in Task Manager).
+2. Download the new bundle over the old one. Your `HermesProxy.config` is not in the zip, so it
+   is not touched, and neither is `AccountData` (per-account state the game expects the proxy
+   to remember; keep it):
+
+   ```powershell
+   Invoke-WebRequest -Uri "https://jimothy.cc/proxy/stable/latest" -OutFile "$env:TEMP\jimsproxy-bundle.zip"
+   Expand-Archive -Path "$env:TEMP\jimsproxy-bundle.zip" -DestinationPath "C:\Games\Kronos\Hermes" -Force
+   Copy-Item -Recurse -Force "C:\Games\Kronos\Hermes\Addons\JimsPlus" "C:\Games\Kronos\World of Warcraft\_classic_era_\Interface\AddOns\JimsPlus"
+   ```
+
+   (For the beta channel, use the beta link from Step 2 instead.)
+3. Double-click `play.bat` as usual.
+
+To see which version you have: open `Hermes\manifest.json` in Notepad, or read the `Version`
+line the proxy prints when it starts. New versions occasionally add config keys; every key has a
+built-in default, so an older config keeps working. The
+[configuration reference](configuration.md) lists them if you want to add one.
+
+---
+
+## Troubleshooting
+
+**"World Server is Down", or the game never shows the realm list.**
+The game is not talking to the proxy. `WTF\Config.wtf` must contain
+`SET portal "127.0.0.1:1119"` and the number must match `BNetPort` in `HermesProxy.config`
+(`play.bat` fixes this for you). Also confirm the proxy printed `Starting WorldSocket service`
+(or the script printed `proxy is ready`) before the game started.
+
+**The proxy window closes at once, or says a port is in use.**
+It needs four free ports on your PC: **1119, 8081, 8084, 8086**. Almost always an old proxy is
+still running. Open Task Manager (`Ctrl+Shift+Esc`), find `JimsProxy.exe` (or `HermesProxy.exe`
+from an old install), end it, try again. `play.bat` names the program holding the port. A
+Windows `WSAEACCES (10013)` means something else owns the port: another program, a Windows port
+reservation, or a proxy running with higher privileges than you.
+
+**`Config loading failed`.**
+`HermesProxy.config` is not next to `JimsProxy.exe`, or it was saved as
+`HermesProxy.config.txt`. Redo [Step 3](#step-3-get-the-config-file). If it says
+`The verification of the config failed` instead, the line just above names the problem
+(a malformed `ClientSeed`, an unsupported build, a port outside 1-65535).
+
+**Login fails, or `Unsupported ClientBuild`.**
+Your client is not build 42597, or you started the plain `WowClassic.exe`. Check the build as in
+[Before you start](#before-you-start), and start `WowClassic_ForCustomServers.exe` (or Arctium
+with `--staticseed`).
+
+**A yellow "update available" banner in the proxy window.**
+Harmless; it compares against the archived upstream project. `play.bat` already starts the
+proxy with `--no-version-check`, which skips it.
+
+**Quest progress or settings look wrong after updating.**
+You deleted the `Hermes` folder and lost `AccountData`. Restore it from wherever the old folder
+went; next time update as in [Updating](#updating), which keeps it.
+
+**Antivirus or SmartScreen.** See the note in [Step 2](#step-2-download-the-proxy).
+
+> Unlike upstream HermesProxy, JimsProxy ignores the game's *Optimize Network for Speed*
+> setting on the local connection (it is a no-op over loopback), so you do not need to keep it
+> enabled to avoid disconnects.
+
+---
+
+## Appendix: Linux and macOS (community-supported)
+
+The project tests Windows only. The proxy builds and runs natively on Linux and macOS; the
+game client does not, and this project does not test either platform. Reports from Linux
+players have led to real fixes, so they are welcome, but expect to do some of the work
+yourself. There are no prebuilt Linux or macOS proxy binaries yet, so both start with a build
+from source.
+
+### Linux (community-supported)
+
+**Proxy.** Install the [.NET 10 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0)
+for your distribution, then:
 
 ```bash
 git clone https://github.com/jameopotato/jimsproxy.git
@@ -220,166 +399,66 @@ dotnet publish HermesProxy --configuration Release --use-current-runtime -p:UseP
 chmod +x ~/kronos/Hermes/JimsProxy
 ```
 
-That produces a self-contained, single-file `JimsProxy` with `CSV/` and `HermesProxy.config`
-beside it. No .NET runtime is needed on the machine that runs it. Check that it starts:
+That produces a self-contained `JimsProxy` with `CSV/` and `HermesProxy.config` beside it (the
+source build includes the config, so Step 3 is not needed). Set `ServerAddress` as in Step 4:
 
 ```bash
-cd ~/kronos/Hermes && ./JimsProxy --no-version-check
+sed -i 's|<add key="ServerAddress" value="[^"]*"|<add key="ServerAddress" value="login.twinstar-wow.com"|' ~/kronos/Hermes/HermesProxy.config
 ```
 
-You should see `Starting WorldSocket service`. Stop it with `Ctrl+C`.
+Test it: `cd ~/kronos/Hermes && ./JimsProxy --no-version-check` should print
+`Starting WorldSocket service`; stop it with `Ctrl+C`.
 
-### Step 2: Configure
-
-Same two edits as on Windows: `ServerAddress` in `HermesProxy.config`
-([step 1](#step-1-point-the-proxy-at-the-server)) and `SET portal "127.0.0.1:1119"` in the
-client's `WTF/Config.wtf` ([step 2](#step-2-point-the-client-at-the-proxy)). The launch
-script fixes the portal line for you.
-
-### Step 3: The game client under Wine or Proton
-
-This is the part the project does not test. What Linux players report working:
-
-- A recent Wine (9 or newer) or GE-Proton, with DXVK. Lutris, Bottles, or Steam with
-  `WowClassic_ForCustomServers.exe` added as a non-Steam game all work; use whichever you
-  already know.
-- Give the client its own prefix. Run `WowClassic_ForCustomServers.exe` directly; there is no
-  Battle.net app involved.
-- If the game window stays black or the client crashes at start, force DirectX 11 in
-  `WTF/Config.wtf`:
-
-  ```
-  SET gxApi "D3D11"
-  ```
-
-- Keep the proxy current. Two Linux-specific client crashes (on flight-path landing and at
-  world entry) were caused by packet translation and fixed in the proxy, not in Wine.
+**Game client.** Runs under Wine or Proton. What Linux players report working: a recent Wine
+(9+) or GE-Proton with DXVK, through Lutris, Bottles, or Steam with
+`WowClassic_ForCustomServers.exe` added as a non-Steam game, in a prefix of its own, no
+Battle.net app involved. The proxy listens on `127.0.0.1`, which Wine shares with the host, so
+nothing on the network side needs setting up. If the window stays black or the client crashes at
+start, force DirectX 11 with `SET gxApi "D3D11"` in the client's `WTF/Config.wtf`. Keep the
+proxy current: two Linux-specific client crashes (flight-path landing, world entry) were fixed
+proxy-side.
 
 Stone Tavern's experimental [Better Client](https://stonetavern.app/betterclient) is a worked
 example of exactly this setup: their Linux package (about 8 GB, client included) bundles
 JimsProxy built natively for Linux, pre-configured for their realm, behind a one-click play
-script that starts the proxy, starts the game and stops the proxy again when you quit. It
-targets their own realm, so borrow the operating-system setup, not the server settings.
+script. It targets their own realm, so borrow the operating-system setup, not the server
+settings.
 
-### Step 4: Start
-
-Copy `scripts/play.sh` next to `JimsProxy` (or run it from the repository) and:
+**Play.** `scripts/play.sh` is the Linux/macOS version of `play.bat`:
 
 ```bash
-chmod +x play.sh
-./play.sh --proxy-dir ~/kronos/Hermes --game-exe "~/kronos/World of Warcraft/_classic_era_/WowClassic_ForCustomServers.exe"
+curl -L -o ~/kronos/Hermes/play.sh https://raw.githubusercontent.com/jameopotato/jimsproxy/master/scripts/play.sh
+chmod +x ~/kronos/Hermes/play.sh
+~/kronos/Hermes/play.sh --game-exe "$HOME/kronos/World of Warcraft/_classic_era_/WowClassic_ForCustomServers.exe"
 ```
 
-By default it starts the game with `wine "<game-exe>"`. If Lutris, Bottles or Steam starts
-your game, hand the script that command instead and it will wait for the `WowClassic` process
-to exit:
+By default it starts the game with `wine "<game-exe>"`. If Lutris, Bottles or Steam starts your
+game, hand it that command instead and it will wait for the WoW process to exit:
+`play.sh --game-cmd 'lutris lutris:rungameid/12'`. `--help` lists the other options. By hand:
+`./JimsProxy` in one terminal, wait for `Starting WorldSocket service`, start the client from
+your Wine setup, `Ctrl+C` the proxy after you quit.
 
-```bash
-./play.sh --proxy-dir ~/kronos/Hermes --game-cmd 'lutris lutris:rungameid/12'
-```
+### macOS (community-supported)
 
-Or by hand: start `./JimsProxy` in one terminal, wait for `Starting WorldSocket service`,
-start the client from your Wine setup, and `Ctrl+C` the proxy after you quit the game. `kill`
-(SIGTERM) and closing the terminal (SIGHUP) are handled gracefully too.
+**Proxy.** Builds and runs natively on Apple Silicon and Intel with the same `dotnet publish`
+command as on Linux, and `play.sh` works for the proxy side (pass the command that starts your
+game with `--game-cmd`). If it exits at startup with `AesGcm is not supported on your platform`,
+it prints the fix on the next lines (`brew install openssl@3`, then start it with
+`DYLD_LIBRARY_PATH=/opt/homebrew/opt/openssl@3/lib`).
 
----
-
-## macOS (community-supported)
-
-**Proxy:** builds and runs natively on Apple Silicon and Intel with the same
-`dotnet publish ... --use-current-runtime` command as on Linux. If it exits at startup with
-`AesGcm is not supported on your platform`, it prints the fix on the next lines
-(`brew install openssl@3`, then start it with `DYLD_LIBRARY_PATH=/opt/homebrew/opt/openssl@3/lib`).
-`scripts/play.sh` works on macOS for the proxy side; pass the command that starts your game
-with `--game-cmd`. (Stone Tavern's macOS and Linux packages, below, each contain a natively
-built JimsProxy as well, configured for their realm.)
-
-**Game client:** this project has not tested a macOS route, but one exists. Stone Tavern's
-experimental [Better Client](https://stonetavern.app/betterclient) ships a macOS package
-(about 8 GB) that runs the same Windows 1.14.2 client through Apple's free Game Porting
-Toolkit, with JimsProxy built natively for macOS behind it. Reproducing that for Kronos means
-the Game Porting Toolkit (or a Wine-based tool such as CrossOver or Whisky), your own client,
-and this proxy pointed at Kronos. The alternative is to play from a Windows machine with the
-launcher. If you get the Mac route working against Kronos, open an issue with your steps and
-this section will be updated.
+**Game client.** This project has not tested a macOS route, but one exists: Stone Tavern's
+experimental [Better Client](https://stonetavern.app/betterclient) ships a macOS package (about
+8 GB) that runs the same Windows 1.14.2 client through Apple's free Game Porting Toolkit, with
+JimsProxy built natively for macOS behind it. Reproducing that for Kronos means the Game Porting
+Toolkit (or a Wine-based tool such as CrossOver or Whisky), your own client, and this proxy
+pointed at Kronos. The alternative is to play from a Windows machine. If you get the Mac route
+working against Kronos, open an issue with your steps and this section will be updated.
 
 ---
 
-## The launch scripts
+## Reference
 
-`scripts/play.ps1` + `scripts/play.bat` (Windows) and `scripts/play.sh` (Linux, macOS) are
-the manual-install equivalent of the launcher's Play button. Copy them next to the proxy
-binary, or point them at it. Both do the same things in the same order:
-
-1. Find the proxy and the game executable (launcher layout auto-detected, or pass paths).
-2. Refuse to start if another process already listens on one of the proxy's four ports,
-   naming it, which catches the "a previous proxy is still running" case.
-3. Set `SET portal "127.0.0.1:<BNetPort>"` in `WTF/Config.wtf`, keeping a `Config.wtf.bak`
-   (skip with `-NoPortalFix` / `--no-portal-fix`).
-4. Start the proxy with its console output shown and saved to `play-console.log`, and
-   wait for `Starting WorldSocket service` (60 s by default).
-5. Start the game and wait for it to close. If what you pointed the script at is a launcher
-   (Arctium, or any wrapper that returns as soon as WoW is up), it waits for the WoW process
-   that launcher started instead.
-6. Ask the proxy to shut down cleanly (so `Logs/jimsproxy-*.jsonl` is flushed), and only
-   force-close it if it has not exited after 5 seconds. `-KeepProxy` / `--keep-proxy` leaves
-   it running instead.
-
-| | `play.ps1` (Windows) | `play.sh` (Linux, macOS) |
-|---|---|---|
-| Proxy folder | `-ProxyDir D:\Kronos\Hermes` | `--proxy-dir ~/kronos/Hermes` |
-| Game executable | `-GameExe <path>` | `--game-exe <path>` |
-| Game arguments (Arctium route) | `-GameArgs '--staticseed --version=ClassicEra'` | part of `--game-cmd` |
-| Custom game command | n/a | `--game-cmd 'lutris lutris:rungameid/12'` |
-| Ready timeout | `-TimeoutSeconds 90` | `--timeout 90` |
-| Leave the proxy running | `-KeepProxy` | `--keep-proxy` |
-| Do not touch Config.wtf | `-NoPortalFix` | `--no-portal-fix` |
-
-`play.bat` runs `play.ps1` with the execution policy bypassed for that one script, so a
-double-click works on a stock Windows install. To run `play.ps1` from a PowerShell prompt
-without the wrapper: `powershell -ExecutionPolicy Bypass -File .\play.ps1`.
-
-The scripts are new. `play.sh` has been exercised against a stand-in proxy on Linux;
-`play.ps1` follows the same design but has had less real-world use. If either misbehaves,
-the by-hand steps above always work; please open an issue with `play-console.log` attached.
-
----
-
-## Keeping it updated
-
-Manual installs do not update themselves. When a new release appears:
-
-1. Quit the game and stop the proxy.
-2. Download the new bundle from the [stable or beta link](#1-the-proxy) (or the GitHub
-   release, and verify its checksum) and replace `JimsProxy.exe`, the `CSV/` folder and
-   `Addons/`. Keep your edited `HermesProxy.config`; compare it against the repository's
-   current one for keys that were added (the [configuration reference](configuration.md)
-   lists every key and its default, so a missing key is never fatal).
-3. Keep `AccountData/`. It holds per-account state (quest tracking and similar); losing it
-   is what makes "my quest log looks wrong after updating" happen.
-4. Update the [JimsPlus addon](#the-jimsplus-addon) to the same version.
-
-Release notes are on the [releases page](https://github.com/jameopotato/jimsproxy/releases)
-and in [CHANGES.md](../CHANGES.md).
-
----
-
-## The JimsPlus addon
-
-JimsPlus is a small in-game addon that ships with the launcher and pairs with the proxy:
-client-side fixes (cast bars, mail and name display, taxi and pet quirks) plus an options
-panel for proxy features. It is optional but recommended, and it must match the proxy
-version: the proxy and the addon talk over a versioned in-game channel, and the proxy
-disables that channel if the addon does not answer correctly.
-
-The direct download bundle includes it as `Addons/JimsPlus/`: copy that folder into
-`World of Warcraft\_classic_era_\Interface\AddOns\` so you end up with
-`Interface\AddOns\JimsPlus\JimsPlus.toc`. From source, it is `Addons/JimsPlus` at the same tag
-as the proxy you run. In game, `/jp` opens its options.
-
----
-
-## Command line flags
+### Command line flags
 
 All flags override `HermesProxy.config` for that run only.
 
@@ -394,12 +473,12 @@ JimsProxy --metrics
 |---|---|
 | `--config <path>` | Use a different config file (default: `HermesProxy.config` beside the executable) |
 | `--set Key=Value` | Override a single config value; repeatable |
-| `--no-version-check` | Skip the update check at startup. Saves up to 15 s when offline; the launch scripts pass it |
+| `--no-version-check` | Skip the update check at startup. Saves up to 15 s when offline; the play scripts pass it |
 | `--metrics` | Print per-opcode latency metrics every 60 s (diagnostics only) |
 
-Running against more than one server? Keep a config per server and pick with `--config`.
+Playing on more than one server? Keep a config per server and pick with `--config`.
 
-## Chat commands
+### Chat commands
 
 Typed into any chat box while playing:
 
@@ -408,84 +487,34 @@ Typed into any chat box while playing:
 | `!qcomplete <questId>` | Mark a quest complete in the proxy's tracking |
 | `!quncomplete <questId>` | Undo the above |
 
----
+### Files and ports
 
-## Files and ports
-
-Everything the proxy writes goes beside its executable:
+Everything the proxy writes goes next to its executable:
 
 | Path | Contents |
 |---|---|
-| `Logs/jimsproxy-<date>-<time>.jsonl` | Structured diagnostic log, one per session (`StructuredLog`, on by default). Attach to bug reports. |
-| `AccountData/<account>/` | Per-account state the 1.14 client expects the server to remember. Keep it across updates. |
-| `PacketsLog/` | Full packet captures, only when `PacketsLog=true`. Large. |
-| `play-console.log` | Console output of the last run, written by the launch scripts. |
+| `Logs\jimsproxy-<date>-<time>.jsonl` | Structured diagnostic log, one per session (`StructuredLog`, on by default). Attach it to bug reports. |
+| `AccountData\<account>\` | Per-account state the 1.14 client expects the server to remember. Keep it across updates. |
+| `PacketsLog\` | Full packet captures, only when `PacketsLog=true`. Large. |
+| `play-console.log` | Console output of the last run, written by the play scripts. |
 
 All four listeners bind to `127.0.0.1` and all four ports must be free:
 
 | Key | Default | Used for |
 |---|---|---|
-| `BNetPort` | `1119` | Battle.net login. **What `SET portal` in `Config.wtf` points at.** |
+| `BNetPort` | `1119` | Login. **What `SET portal` in `Config.wtf` points at.** |
 | `RestPort` | `8081` | Login REST calls |
 | `RealmPort` | `8084` | Realm list and character select |
 | `InstancePort` | `8086` | The game world. Its `Starting WorldSocket service` line is the ready signal |
 
-Running two proxies at once (multiboxing)? Give the second one its own copy of the folder
-with a different set, for example `1120 / 8082 / 8085 / 8087` (what the launcher uses for
+Running two proxies at once (multiboxing)? Give the second one its own copy of the `Hermes`
+folder with a different set, for example `1120 / 8082 / 8085 / 8087` (what the launcher uses for
 its Alt client), and point that client's portal at the second `BNetPort`.
 
----
+### Every config key
 
-## Troubleshooting
-
-**"World Server is Down", or the client never reaches the realm list.**
-The portal and `BNetPort` disagree. `SET portal "127.0.0.1:1119"` in `WTF/Config.wtf` must
-match `BNetPort` in `HermesProxy.config`. Also confirm the proxy printed
-`Starting WorldSocket service` before you started the game.
-
-**The proxy exits immediately, or reports a bind or port error.**
-It needs four free ports on `127.0.0.1`: **1119, 8081, 8084, 8086**. Almost always this is a
-previous proxy still running: check Task Manager for `JimsProxy.exe` (or `HermesProxy.exe`
-from an old install) and end it, or `pgrep -fl JimsProxy` on Linux and macOS. The launch
-scripts name the process holding the port. A leftover proxy is worth taking seriously: it
-will keep serving your session quite happily, and you will think you are running a build you
-are not. A Windows `WSAEACCES (10013)` means something else owns the port: another program, a
-Windows port reservation, or a proxy running with higher privileges than you.
-
-**`Unsupported ClientBuild`, login fails, or the client complains about the version.**
-`ClientBuild` does not match your client. 1.14.2 is `42597`. Confirm the executable you are
-launching is really `WowClassic_ForCustomServers.exe` and really build 42597, or that you
-started `WowClassic.exe` through the Arctium Launcher with `--staticseed`; a plain
-`WowClassic.exe` never reaches the proxy at all.
-
-**`Config loading failed`.**
-`HermesProxy.config` is not beside the executable (the direct download bundle ships without
-one; see [What you need](#1-the-proxy)), or `--config` points at a file that does not exist. `The verification of the config failed` is printed right after the reason: a
-malformed `ClientSeed`, an unsupported build, or a port outside 1-65535.
-
-**A yellow "update available" banner at startup.**
-Harmless. The startup check compares against the archived upstream project and can be
-skipped with `--no-version-check`.
-
-**Quest progress or settings look wrong after updating.**
-You replaced the whole folder and lost `AccountData/`. Copy it over from the old folder.
-
-**Linux: the client crashes at world entry or when landing from a flight path.**
-Update the proxy; both crashes were fixed proxy-side (5.1.4 and 5.2.1-beta.4).
-
-**Linux: black window or crash at start under Wine or Proton.**
-Force DirectX 11 with `SET gxApi "D3D11"` in `WTF/Config.wtf`, and make sure DXVK is in
-the prefix (Proton and Lutris include it).
-
-**macOS: `AesGcm is not supported on your platform`.**
-Follow the two lines the proxy prints right after that message.
-
-**Antivirus flags the executable.**
-See [SmartScreen and antivirus](#step-3-start-the-proxy-then-the-game) above.
-
-> Unlike upstream HermesProxy, JimsProxy ignores the client's *Optimize Network for Speed*
-> setting on the local connection (it is a no-op over loopback), so you do not need to keep
-> it enabled to avoid disconnects.
+[configuration.md](configuration.md) documents all 40 keys the proxy reads, their defaults, and
+which ones you should leave alone.
 
 ---
 
@@ -494,13 +523,13 @@ See [SmartScreen and antivirus](#step-3-start-the-proxy-then-the-game) above.
 Open an issue on [github.com/jameopotato/jimsproxy](https://github.com/jameopotato/jimsproxy/issues)
 with:
 
-- The proxy version, printed on the second line at startup (`Version 2026-…`), and whether
-  you built it yourself.
-- The `Logs/jimsproxy-*.jsonl` file for the session. If a developer asks for more detail,
-  set `DebugOutput` to `true` and reproduce; if they ask for a packet capture, set
-  `PacketsLog` to `true` for that one session and turn it back off afterwards.
+- The proxy version: the `Version` line the proxy prints at startup (also in `play-console.log`),
+  or `manifest.json`; and whether you built it yourself.
+- The `Logs\jimsproxy-*.jsonl` file for the session. If a developer asks for more detail, set
+  `DebugOutput` to `true` in `HermesProxy.config` and reproduce; if they ask for a packet
+  capture, set `PacketsLog` to `true` for that one session and turn it back off afterwards.
 - Your operating system and, on Linux or macOS, how you run the client (Wine, Proton,
   CrossOver, and the version).
 
-Launcher users have a *Send Bug Report* button in the launcher's Help tab that attaches all
-of this automatically.
+Launcher users have a *Send Bug Report* button in the launcher's Help tab that attaches all of
+this automatically.

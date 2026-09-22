@@ -6,21 +6,13 @@ The upstream HermesProxy project was [archived in November 2024](https://github.
 
 **License:** GPL v3 (inherited from upstream — see `LICENSE`)
 
-## Getting Started
+## Quick Install (Windows)
 
-There are two ways to run JimsProxy. Both are supported.
+Download the **Classic WoW Launcher** from [jimothy.cc/install](https://jimothy.cc/install). It downloads or repairs the game client, installs and updates JimsProxy, and starts everything with one click. Nothing else on this page is needed.
 
-| | **Launcher** (Windows) | **Manual** |
-|---|---|---|
-| Setup | Guided wizard | Edit one config value and one `Config.wtf` line |
-| Proxy updates | Automatic, stable or beta channel | You re-download |
-| Game client | Downloaded, copied or repaired for you | **You supply it** |
-| Addons, keybind import, repair, multibox | Included | Not included (JimsPlus can be installed by hand) |
-| Linux / macOS | Not supported | Community-supported |
+## Manual Install (no launcher)
 
-**Most people want the launcher.** Download the **Classic WoW Launcher** from [jimothy.cc/install](https://jimothy.cc/install); the full install guide, covering both paths, is [classic-114-launcher/docs/INSTALL.md](https://github.com/jameopotato/classic-114-launcher/blob/master/docs/INSTALL.md).
-
-**Running the proxy yourself** (Linux, macOS, or a custom Windows setup): follow [docs/MANUAL-INSTALL.md](docs/MANUAL-INSTALL.md). On Windows the proxy bundle can be downloaded directly, [latest stable](https://jimothy.cc/proxy/stable/latest) or [latest beta](https://jimothy.cc/proxy/beta/latest); it ships without `HermesProxy.config` (take [this one](HermesProxy/HermesProxy.config) and set `ServerAddress`). The `scripts/` folder has launch scripts that do what the launcher's Play button does: `play.bat` / `play.ps1` on Windows and `play.sh` on Linux and macOS.
+[docs/MANUAL-INSTALL.md](docs/MANUAL-INSTALL.md) goes from the download link to the login screen step by step, with the exact commands: download the latest bundle ([stable](https://jimothy.cc/proxy/stable/latest) or [beta](https://jimothy.cc/proxy/beta/latest)), add the config, point it at Kronos, and play with `scripts/play.bat`. Windows first; Linux and macOS are in its appendix (community-supported, built from source). You supply the 1.14.2 (build 42597) game client.
 
 ## What This Fork Adds
 
@@ -91,7 +83,7 @@ dotnet test
 dotnet publish HermesProxy --configuration Release --use-current-runtime -p:UsePublishBuildSettings=true -o build/
 ```
 
-Output: `build/JimsProxy.exe` (or `build/JimsProxy` on Linux and macOS) + `build/CSV/` + `build/HermesProxy.config` — exactly the layout [docs/MANUAL-INSTALL.md](docs/MANUAL-INSTALL.md) expects. The build is self-contained; no .NET runtime is needed where it runs.
+Output: `build/JimsProxy.exe` (or `build/JimsProxy` on Linux and macOS) + `build/CSV/` + `build/HermesProxy.config` — the same layout as a manual install ([docs/MANUAL-INSTALL.md](docs/MANUAL-INSTALL.md)), config included. The build is self-contained; no .NET runtime is needed where it runs.
 
 To test a build with the launcher, either copy it over the bundled proxy in your game's `Hermes/` directory, or add `build/JimsProxy.exe` as a custom slot under **Settings → Proxy Binary** and switch to it:
 
