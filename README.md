@@ -8,11 +8,11 @@ The upstream HermesProxy project was [archived in November 2024](https://github.
 
 ## Quick Install (Windows)
 
-Download the **Classic WoW Launcher** from [jimothy.cc/install](https://jimothy.cc/install). It downloads or repairs the game client, installs and updates JimsProxy, and starts everything with one click. Nothing else on this page is needed.
+The **Classic WoW Launcher** ([jimothy.cc/install](https://jimothy.cc/install)) installs JimsProxy, updates it (stable or beta channel), manages addons, and starts the proxy and the game together. Windows only.
 
 ## Manual Install (no launcher)
 
-[docs/MANUAL-INSTALL.md](docs/MANUAL-INSTALL.md) goes from the download link to the login screen step by step, with the exact commands: download the latest bundle ([stable](https://jimothy.cc/proxy/stable/latest) or [beta](https://jimothy.cc/proxy/beta/latest)), add the config, point it at Kronos, and play with `scripts/play.bat`. Windows first; Linux and macOS are in its appendix (community-supported, built from source). You supply the 1.14.2 (build 42597) game client.
+[docs/MANUAL-INSTALL.md](docs/MANUAL-INSTALL.md) covers installing and running the proxy without the launcher: download the current archive ([stable](https://jimothy.cc/proxy/stable/latest) or [beta](https://jimothy.cc/proxy/beta/latest)), add the configuration file, set the server address, and run it with `scripts/play.bat` or manually. The main procedure targets Windows; Linux and macOS are in the appendix (community-supported, built from source). The 1.14.2 (build 42597) game client is not included.
 
 ## What This Fork Adds
 
