@@ -59,7 +59,7 @@ Keys fall into five groups, and the group matters more than the individual setti
 
 ## Connection
 
-The essential settings. `ServerAddress` is the only one most people change.
+The essential settings. For Kronos, `ServerAddress` is the only value that must be set.
 
 | Key | Default | In file | Description |
 |---|---|:---:|---|
