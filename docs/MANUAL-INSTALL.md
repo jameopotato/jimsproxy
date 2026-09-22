@@ -255,10 +255,11 @@ This is the part the project does not test. What Linux players report working:
 - Keep the proxy current. Two Linux-specific client crashes (on flight-path landing and at
   world entry) were caused by packet translation and fixed in the proxy, not in Wine.
 
-For a worked example of a 1.14 client packaged for Linux and macOS, look at Stone Tavern's
-"better client" (their ready-to-play 1.14.2 package with launch scripts) at
-[stonetavern.app/betterclient](https://stonetavern.app/betterclient). It is built for their
-own realm through HermesProxy, so borrow the operating-system setup, not the server settings.
+Stone Tavern's experimental [Better Client](https://stonetavern.app/betterclient) is a worked
+example of exactly this setup: their Linux package (about 8 GB, client included) bundles
+JimsProxy built natively for Linux, pre-configured for their realm, behind a one-click play
+script that starts the proxy, starts the game and stops the proxy again when you quit. It
+targets their own realm, so borrow the operating-system setup, not the server settings.
 
 ### Step 4: Start
 
