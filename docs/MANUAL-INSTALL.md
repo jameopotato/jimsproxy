@@ -256,8 +256,8 @@ This is the part the project does not test. What Linux players report working:
   world entry) were caused by packet translation and fixed in the proxy, not in Wine.
 
 For a worked example of a 1.14 client packaged for Linux and macOS, look at Stone Tavern's
-experimental 1.14 client and its launch scripts on
-[stonetavern.app/clients](https://stonetavern.app/clients). Their package is built for their
+"better client" (their ready-to-play 1.14.2 package with launch scripts) at
+[stonetavern.app/betterclient](https://stonetavern.app/betterclient). It is built for their
 own realm through HermesProxy, so borrow the operating-system setup, not the server settings.
 
 ### Step 4: Start
@@ -294,9 +294,9 @@ with `--game-cmd`.
 
 **Game client:** there is no confirmed way to run the custom-servers client on macOS at the
 time of writing. People either run the Windows client through CrossOver or Wine on the Mac,
-or play from a Windows machine with the launcher. Stone Tavern's macOS launcher on
-[stonetavern.app/clients](https://stonetavern.app/clients) is the closest reference for
-running a 1.14 client on a Mac. If you get it working against Kronos, open an issue with
+or play from a Windows machine with the launcher. Stone Tavern's "better client" page at
+[stonetavern.app/betterclient](https://stonetavern.app/betterclient), with its macOS launcher, is
+the closest reference for running a 1.14 client on a Mac. If you get it working against Kronos, open an issue with
 your steps and this section will be updated.
 
 ---
