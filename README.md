@@ -6,9 +6,21 @@ The upstream HermesProxy project was [archived in November 2024](https://github.
 
 **License:** GPL v3 (inherited from upstream — see `LICENSE`)
 
-## Quick Start (optional)
+## Getting Started
 
-Download the **JimsProxy Launcher** from [jimothy.cc/install](https://jimothy.cc/install). The launcher handles proxy updates, game launch, addon management, and configuration — no manual setup required.
+There are two ways to run JimsProxy. Both are supported.
+
+| | **Launcher** (Windows) | **Manual** |
+|---|---|---|
+| Setup | Guided wizard | Edit one config value and one `Config.wtf` line |
+| Proxy updates | Automatic, stable or beta channel | You re-download |
+| Game client | Downloaded, copied or repaired for you | **You supply it** |
+| Addons, keybind import, repair, multibox | Included | Not included (JimsPlus can be installed by hand) |
+| Linux / macOS | Not supported | Community-supported |
+
+**Most people want the launcher.** Download the **Classic WoW Launcher** from [jimothy.cc/install](https://jimothy.cc/install); the full install guide, covering both paths, is [classic-114-launcher/docs/INSTALL.md](https://github.com/jameopotato/classic-114-launcher/blob/master/docs/INSTALL.md).
+
+**Running the proxy yourself** (Linux, macOS, or a custom Windows setup): follow [docs/MANUAL-INSTALL.md](docs/MANUAL-INSTALL.md). The `scripts/` folder has launch scripts that do what the launcher's Play button does: `play.bat` / `play.ps1` on Windows and `play.sh` on Linux and macOS.
 
 ## What This Fork Adds
 
@@ -42,17 +54,21 @@ See [CHANGES.md](CHANGES.md) for the full changelog.
 | 1.12.2  | Vanilla   | 6005  | CMaNGOS, VMaNGOS, etc. |
 | 1.12.3  | Vanilla   | 6141  | CMaNGOS, VMaNGOS, etc. |
 
+Development and testing target **1.14.2 build 42597**. The other builds are inherited from upstream and are not regularly exercised.
+
 ## Configuration
 
-The proxy reads `HermesProxy.config` (XML format) from the working directory. The JimsProxy Launcher manages this automatically.
+The proxy reads `HermesProxy.config` (XML) from the folder containing its executable. The launcher manages this file for launcher installs; manual installs edit it by hand, and usually only `ServerAddress`. Every key the proxy reads, with its default and whether you should touch it, is documented in [docs/configuration.md](docs/configuration.md).
 
-For advanced use, CLI arguments override config values:
+CLI arguments override config values for one run:
 
 ```bash
 JimsProxy --config MyServer.config
 JimsProxy --set ServerAddress=logon.example.com --set ServerPort=3724
 JimsProxy --no-version-check
 ```
+
+The full flag list is in [docs/MANUAL-INSTALL.md](docs/MANUAL-INSTALL.md#command-line-flags).
 
 ## Building from Source
 
@@ -75,9 +91,9 @@ dotnet test
 dotnet publish HermesProxy --configuration Release --use-current-runtime -p:UsePublishBuildSettings=true -o build/
 ```
 
-Output: `build/JimsProxy.exe` + `build/CSV/` + `build/HermesProxy.config`
+Output: `build/JimsProxy.exe` (or `build/JimsProxy` on Linux and macOS) + `build/CSV/` + `build/HermesProxy.config` — exactly the layout [docs/MANUAL-INSTALL.md](docs/MANUAL-INSTALL.md) expects. The build is self-contained; no .NET runtime is needed where it runs.
 
-To test locally, copy the build output to your game's `Hermes/` directory:
+To test a build with the launcher, either copy it over the bundled proxy in your game's `Hermes/` directory, or add `build/JimsProxy.exe` as a custom slot under **Settings → Proxy Binary** and switch to it:
 
 ```bash
 cp build/JimsProxy.exe <game_dir>/Hermes/JimsProxy.exe

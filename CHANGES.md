@@ -13,6 +13,40 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-22 — Manual install guide, configuration reference, and launch scripts
+
+**Issue:** the README's only start path was "download the launcher", and the two docs that
+covered running the proxy by hand (#492, #495) were reverted for placement rather than content.
+Anyone landing on this repo wanting to run the proxy itself had build steps that stop at
+`dotnet publish` and nothing about connecting, and the Play button's start → wait-for-ready →
+launch → clean-shutdown sequence had no manual equivalent. `verify-checksums.*` still pointed at
+`Xian55/HermesProxy`.
+
+**Change:** docs only, plus scripts; no proxy code touched.
+- `docs/MANUAL-INSTALL.md` — the manual path for Windows, Linux and macOS (the latter two
+  community-supported): what you need (the game client is bring-your-own and is not linked),
+  the one config value, the portal line, the ready signal, updating, JimsPlus by hand, CLI flags,
+  chat commands, files and ports, troubleshooting, bug reports.
+- `docs/configuration.md` — the #495 reference restored (all 40 keys, verified 40/40 against
+  `Settings.cs` `config.Get*` calls; 19/19 in-file keys against `HermesProxy.config`), with the
+  launcher-ownership warning reworded to what the launcher actually does (regenerates on
+  setup/repair/update, rewrites managed keys on Save).
+- `scripts/play.sh` (Linux/macOS) and `scripts/play.ps1` + `play.bat` (Windows) — port check,
+  portal fix with backup, start proxy, wait for `Starting WorldSocket service`, start game, wait,
+  then the `__LAUNCHER_SHUTDOWN__` / `__PROXY_SHUTDOWN_ACK__` stdin handshake with SIGTERM/kill
+  fallback, so the JSONL log is flushed like a launcher stop.
+- `scripts/verify-checksums.sh` / `.ps1` — repo corrected to `jameopotato/jimsproxy`.
+- README "Getting Started" now presents both paths and links the guides; the canonical
+  install guide (both paths, launcher-first) lives in `classic-114-launcher/docs/INSTALL.md`.
+
+**Verification:** `play.sh` exercised on Linux against a stand-in proxy that mirrors the real
+startup lines and stdin handshake: normal run, port already in use, proxy failing before ready,
+`--keep-proxy`, a detached game command, SIGTERM and Ctrl+C. `play.ps1` is untested here (no
+PowerShell in the authoring environment) and is flagged as such in the guide. Doc links checked
+relative to the repo layout.
+
+---
+
 ## 2026-08-20 — Correct the shipped config defaults for standalone (non-launcher) use
 
 **Issue:** `HermesProxy/HermesProxy.config` is what anyone building from source or running the
