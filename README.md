@@ -6,13 +6,21 @@ The upstream HermesProxy project was [archived in November 2024](https://github.
 
 **License:** GPL v3 (inherited from upstream — see `LICENSE`)
 
-## Quick Install (Windows)
+## Installation
 
-The **Classic WoW Launcher** ([jimothy.cc/install](https://jimothy.cc/install)) installs JimsProxy, updates it (stable or beta channel), manages addons, and starts the proxy and the game together. Windows only.
+Three routes, all on Windows. Linux and macOS are covered in the manual guide's appendix (community-supported, built from source). The 1.14.2 (build 42597) game client is not included in any route.
 
-## Manual Install (no launcher)
+### Classic WoW Launcher
 
-[docs/MANUAL-INSTALL.md](docs/MANUAL-INSTALL.md) covers installing and running the proxy without the launcher: download the current archive ([stable](https://jimothy.cc/proxy/stable/latest) or [beta](https://jimothy.cc/proxy/beta/latest)), add the configuration file, set the server address, and run it with `scripts/play.bat` or manually. The main procedure targets Windows; Linux and macOS are in the appendix (community-supported, built from source). The 1.14.2 (build 42597) game client is not included.
+The **Classic WoW Launcher** ([jimothy.cc/install](https://jimothy.cc/install)) is a desktop application that installs JimsProxy, updates it (stable or beta channel), manages addons, and starts the proxy and the game together.
+
+### Quick-start bundle (no launcher)
+
+One zip, one double-click. The bundle's installer locates the 1.14.2 client, installs the current proxy next to it, configures the proxy and the client, and creates a Play command; running it again offers update, reconfigure, and uninstall. Guide: [docs/QUICK-INSTALL.md](docs/QUICK-INSTALL.md).
+
+### Manual install
+
+[docs/MANUAL-INSTALL.md](docs/MANUAL-INSTALL.md) covers every step by hand with the exact commands: download the current archive ([stable](https://jimothy.cc/proxy/stable/latest) or [beta](https://jimothy.cc/proxy/beta/latest)), add the configuration file, set the server address, and run the proxy with `scripts/play.bat` or manually.
 
 ## What This Fork Adds
 

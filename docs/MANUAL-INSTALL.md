@@ -4,10 +4,11 @@ This guide describes how to install, configure, and run JimsProxy without the Cl
 Launcher. The main procedure targets Windows. Linux and macOS are covered in the
 [appendix](#appendix-linux-and-macos-community-supported).
 
-An alternative on Windows is the Classic WoW Launcher, available at
-[jimothy.cc/install](https://jimothy.cc/install). It performs the installation described here
-automatically, updates the proxy (stable or beta channel), manages addons, and starts the proxy
-and the game together.
+Two alternatives on Windows perform the Installation section automatically: the
+[quick-start bundle](QUICK-INSTALL.md), a zip whose installer sets up the proxy next to an
+existing client, and the Classic WoW Launcher, available at
+[jimothy.cc/install](https://jimothy.cc/install), a desktop application that also updates the
+proxy (stable or beta channel), manages addons, and starts the proxy and the game together.
 
 Contents
 
