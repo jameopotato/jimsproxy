@@ -59,18 +59,29 @@ however you start it.
 
 Where to get it:
 
-- **Windows:** the latest [GitHub release](https://github.com/jameopotato/jimsproxy/releases/latest).
-  Download `JimsProxy-v<version>-win-x64.zip` and `checksums-sha256.txt`, then verify the
-  download with `scripts/verify-checksums.ps1` (or compare `Get-FileHash` output by hand).
+- **Windows, direct download.** The same bundle the launcher installs, straight from
+  jimothy.cc:
+
+  | Channel | Link |
+  |---|---|
+  | Latest stable | <https://jimothy.cc/proxy/stable/latest> |
+  | Latest beta | <https://jimothy.cc/proxy/beta/latest> |
+
+  The bundle contains `JimsProxy.exe`, `CSV/`, the JimsPlus addon under `Addons/JimsPlus/`,
+  and a `manifest.json` with the version. **It does not contain `HermesProxy.config`**: the
+  launcher writes its own, so the bundle ships without one and the proxy stops with
+  `Config loading failed` if it is missing. Download the config from the repository,
+  [`HermesProxy/HermesProxy.config`](https://raw.githubusercontent.com/jameopotato/jimsproxy/master/HermesProxy/HermesProxy.config)
+  (right-click, *Save as*), and put it beside `JimsProxy.exe`.
+- **Windows, GitHub release.** [The latest release](https://github.com/jameopotato/jimsproxy/releases/latest)
+  has `JimsProxy-v<version>-win-x64.zip` plus `checksums-sha256.txt`; verify the download with
+  `scripts/verify-checksums.ps1` or `Get-FileHash`. If the zip has no `HermesProxy.config`,
+  fetch it as above.
 - **Linux and macOS:** [build from source](../README.md#building-from-source). Releases do
   not ship Linux or macOS binaries yet. CI does build them on every push (the *Build Proxy*
   workflow produces `HermesProxy-ubuntu-*` and `HermesProxy-macos-universal-*` artifacts),
   but workflow artifacts need a GitHub login and expire, so treat them as a convenience,
   not a distribution channel.
-
-The bundle the launcher downloads (`hermes-bundle-<version>.zip` on jimothy.cc) is built for
-the launcher: it has no `HermesProxy.config` and expects the launcher to write one. Use the
-GitHub release for manual installs.
 
 ### 2. A game client, which you supply
 
@@ -80,12 +91,21 @@ JimsProxy does not distribute game files, and this guide does not link to any.
 |---|---|
 | Version | **WoW Classic Era 1.14.2** |
 | Build | **42597** |
-| Executable | **`WowClassic_ForCustomServers.exe`** |
+| Executable | **`WowClassic_ForCustomServers.exe`**, or the stock `WowClassic.exe` started through the Arctium Launcher |
 
-The custom-servers executable is required. The stock `WowClassic.exe` from Battle.net only
-ever talks to Blizzard's servers; it cannot be pointed anywhere else, and no proxy changes
-that. Your client's build must match `ClientBuild` in the proxy config exactly (`42597`), or
-login fails. Other 1.14 builds are listed in the config's comments but are not tested.
+On its own, the stock `WowClassic.exe` from Battle.net only talks to Blizzard's servers, and
+no proxy changes that. Two things make it accept a custom server:
+
+- **`WowClassic_ForCustomServers.exe`**, a patched build of the client. This is what the
+  launcher installs and what the rest of this guide assumes.
+- **The [Arctium WoW Launcher](https://github.com/Arctium/WoW-Launcher)** with the unpatched
+  `WowClassic.exe`. It patches the client in memory at start. Put it in the main game folder
+  (the one that contains `_classic_era_`) and start it with
+  `--staticseed --version=ClassicEra`. `--staticseed` makes the client use the fixed auth seed
+  that the proxy's shipped `ClientSeed` value matches, so leave that key alone.
+
+Either way the client's build must match `ClientBuild` in the proxy config exactly (`42597`),
+or login fails. Other 1.14 builds are listed in the config's comments but are not tested.
 
 The examples below use the launcher's folder layout, which the scripts auto-detect. Any
 layout works if you pass the paths explicitly.
@@ -167,7 +187,8 @@ starts the game, and shuts the proxy down cleanly when you close the game. Detai
 
    It is the last of the four listeners to come up, so once you see it everything is bound.
    Do not start the game before it appears.
-2. Start `WowClassic_ForCustomServers.exe`.
+2. Start `WowClassic_ForCustomServers.exe` (or the Arctium Launcher with
+   `--staticseed --version=ClassicEra`).
 3. Log in with your Kronos account name and password, pick your realm and character.
 4. When you are done playing, close the game first, then close the proxy's console window.
    The proxy handles the window close, `Ctrl+C` and a normal `taskkill` gracefully and
@@ -293,7 +314,9 @@ binary, or point them at it. Both do the same things in the same order:
    (skip with `-NoPortalFix` / `--no-portal-fix`).
 4. Start the proxy with its console output shown and saved to `play-console.log`, and
    wait for `Starting WorldSocket service` (60 s by default).
-5. Start the game and wait for it to close.
+5. Start the game and wait for it to close. If what you pointed the script at is a launcher
+   (Arctium, or any wrapper that returns as soon as WoW is up), it waits for the WoW process
+   that launcher started instead.
 6. Ask the proxy to shut down cleanly (so `Logs/jimsproxy-*.jsonl` is flushed), and only
    force-close it if it has not exited after 5 seconds. `-KeepProxy` / `--keep-proxy` leaves
    it running instead.
@@ -302,6 +325,7 @@ binary, or point them at it. Both do the same things in the same order:
 |---|---|---|
 | Proxy folder | `-ProxyDir D:\Kronos\Hermes` | `--proxy-dir ~/kronos/Hermes` |
 | Game executable | `-GameExe <path>` | `--game-exe <path>` |
+| Game arguments (Arctium route) | `-GameArgs '--staticseed --version=ClassicEra'` | part of `--game-cmd` |
 | Custom game command | n/a | `--game-cmd 'lutris lutris:rungameid/12'` |
 | Ready timeout | `-TimeoutSeconds 90` | `--timeout 90` |
 | Leave the proxy running | `-KeepProxy` | `--keep-proxy` |
@@ -322,10 +346,11 @@ the by-hand steps above always work; please open an issue with `play-console.log
 Manual installs do not update themselves. When a new release appears:
 
 1. Quit the game and stop the proxy.
-2. Download the new zip, verify the checksum, and replace `JimsProxy.exe` and the `CSV/`
-   folder. Keep your edited `HermesProxy.config`; compare it against the new one for keys
-   that were added (the [configuration reference](configuration.md) lists every key and its
-   default, so a missing key is never fatal).
+2. Download the new bundle from the [stable or beta link](#1-the-proxy) (or the GitHub
+   release, and verify its checksum) and replace `JimsProxy.exe`, the `CSV/` folder and
+   `Addons/`. Keep your edited `HermesProxy.config`; compare it against the repository's
+   current one for keys that were added (the [configuration reference](configuration.md)
+   lists every key and its default, so a missing key is never fatal).
 3. Keep `AccountData/`. It holds per-account state (quest tracking and similar); losing it
    is what makes "my quest log looks wrong after updating" happen.
 4. Update the [JimsPlus addon](#the-jimsplus-addon) to the same version.
@@ -343,10 +368,10 @@ panel for proxy features. It is optional but recommended, and it must match the 
 version: the proxy and the addon talk over a versioned in-game channel, and the proxy
 disables that channel if the addon does not answer correctly.
 
-To install it by hand, download the source of the same release from the
-[releases page](https://github.com/jameopotato/jimsproxy/releases) (or `git checkout` the tag)
-and copy `Addons/JimsPlus` into `World of Warcraft\_classic_era_\Interface\AddOns\JimsPlus`.
-In game, `/jp` opens its options.
+The direct download bundle includes it as `Addons/JimsPlus/`: copy that folder into
+`World of Warcraft\_classic_era_\Interface\AddOns\` so you end up with
+`Interface\AddOns\JimsPlus\JimsPlus.toc`. From source, it is `Addons/JimsPlus` at the same tag
+as the proxy you run. In game, `/jp` opens its options.
 
 ---
 
@@ -425,11 +450,13 @@ Windows port reservation, or a proxy running with higher privileges than you.
 
 **`Unsupported ClientBuild`, login fails, or the client complains about the version.**
 `ClientBuild` does not match your client. 1.14.2 is `42597`. Confirm the executable you are
-launching is really `WowClassic_ForCustomServers.exe` and really build 42597.
+launching is really `WowClassic_ForCustomServers.exe` and really build 42597, or that you
+started `WowClassic.exe` through the Arctium Launcher with `--staticseed`; a plain
+`WowClassic.exe` never reaches the proxy at all.
 
 **`Config loading failed`.**
-`HermesProxy.config` is not beside the executable, or `--config` points at a file that does
-not exist. `The verification of the config failed` is printed right after the reason: a
+`HermesProxy.config` is not beside the executable (the direct download bundle ships without
+one; see [What you need](#1-the-proxy)), or `--config` points at a file that does not exist. `The verification of the config failed` is printed right after the reason: a
 malformed `ClientSeed`, an unsupported build, or a port outside 1-65535.
 
 **A yellow "update available" banner at startup.**

@@ -18,7 +18,9 @@
 #   --game-exe PATH      WowClassic_ForCustomServers.exe
 #                        (default: <root>/World of Warcraft/_classic_era_/WowClassic_ForCustomServers.exe,
 #                         where <root> is the folder that contains Hermes/)
-#   --game-cmd CMD       command used to start the game (default: wine "<game-exe>")
+#   --game-cmd CMD       command used to start the game (default: wine "<game-exe>");
+#                        use this for Lutris/Bottles/Steam, or for the Arctium Launcher route
+#                        (e.g. wine "Arctium WoW Launcher.exe" --staticseed --version=ClassicEra)
 #   --timeout SECONDS    how long to wait for the proxy's ready line (default: 60)
 #   --keep-proxy         leave the proxy running after the game exits
 #   --no-portal-fix      never touch WTF/Config.wtf (by default the portal line is
@@ -40,7 +42,7 @@ TIMEOUT=60
 KEEP_PROXY=0
 PORTAL_FIX=1
 
-usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -76,7 +78,10 @@ PROXY_DIR="$(find_proxy_dir)" || die "JimsProxy binary not found. Pass --proxy-d
        (JimsProxy.exe is the Windows build; Linux/macOS need the native binary — see docs/MANUAL-INSTALL.md)"
 PROXY_BIN="$PROXY_DIR/JimsProxy"
 [ -x "$PROXY_BIN" ] || chmod +x "$PROXY_BIN" 2>/dev/null || die "cannot make $PROXY_BIN executable"
-[ -f "$PROXY_DIR/HermesProxy.config" ] || die "HermesProxy.config is missing next to $PROXY_BIN"
+[ -f "$PROXY_DIR/HermesProxy.config" ] || die "HermesProxy.config is missing next to $PROXY_BIN.
+       The direct download bundle does not include one. Get it from
+       https://raw.githubusercontent.com/jameopotato/jimsproxy/master/HermesProxy/HermesProxy.config
+       put it beside the proxy binary, and set ServerAddress (see docs/MANUAL-INSTALL.md)."
 [ -d "$PROXY_DIR/CSV" ] || die "CSV/ folder is missing next to $PROXY_BIN (the proxy cannot start without it)"
 
 root_dir="$(dirname "$PROXY_DIR")"
@@ -140,6 +145,8 @@ fi
 # ---------------------------------------------------------------- portal fix
 if [ -n "$GAME_EXE" ] && [ "$PORTAL_FIX" = 1 ]; then
   game_dir="$(dirname "$GAME_EXE")"
+  # The Arctium Launcher lives in the game root, one level above _classic_era_.
+  [ -d "$game_dir/_classic_era_" ] && game_dir="$game_dir/_classic_era_"
   wtf="$game_dir/WTF/Config.wtf"
   expected="SET portal \"127.0.0.1:${BNET_PORT}\""
   if [ -f "$wtf" ]; then

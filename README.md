@@ -20,7 +20,7 @@ There are two ways to run JimsProxy. Both are supported.
 
 **Most people want the launcher.** Download the **Classic WoW Launcher** from [jimothy.cc/install](https://jimothy.cc/install); the full install guide, covering both paths, is [classic-114-launcher/docs/INSTALL.md](https://github.com/jameopotato/classic-114-launcher/blob/master/docs/INSTALL.md).
 
-**Running the proxy yourself** (Linux, macOS, or a custom Windows setup): follow [docs/MANUAL-INSTALL.md](docs/MANUAL-INSTALL.md). The `scripts/` folder has launch scripts that do what the launcher's Play button does: `play.bat` / `play.ps1` on Windows and `play.sh` on Linux and macOS.
+**Running the proxy yourself** (Linux, macOS, or a custom Windows setup): follow [docs/MANUAL-INSTALL.md](docs/MANUAL-INSTALL.md). On Windows the proxy bundle can be downloaded directly, [latest stable](https://jimothy.cc/proxy/stable/latest) or [latest beta](https://jimothy.cc/proxy/beta/latest); it ships without `HermesProxy.config` (take [this one](HermesProxy/HermesProxy.config) and set `ServerAddress`). The `scripts/` folder has launch scripts that do what the launcher's Play button does: `play.bat` / `play.ps1` on Windows and `play.sh` on Linux and macOS.
 
 ## What This Fork Adds
 

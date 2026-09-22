@@ -25,7 +25,12 @@
 
 .PARAMETER GameExe
   Path to WowClassic_ForCustomServers.exe. Default: <root>\World of Warcraft\_classic_era_\WowClassic_ForCustomServers.exe
-  where <root> is the folder that contains Hermes\.
+  where <root> is the folder that contains Hermes\. Can also be the Arctium Launcher executable
+  (see -GameArgs); the script then waits for the WoW process it starts.
+
+.PARAMETER GameArgs
+  Arguments for the game executable. For the Arctium Launcher route with the stock WowClassic.exe:
+  -GameArgs '--staticseed --version=ClassicEra'
 
 .PARAMETER TimeoutSeconds
   How long to wait for the proxy's ready line. Default 60.
@@ -40,11 +45,14 @@
   .\play.ps1
 .EXAMPLE
   .\play.ps1 -ProxyDir D:\Kronos\Hermes -GameExe "D:\Kronos\World of Warcraft\_classic_era_\WowClassic_ForCustomServers.exe"
+.EXAMPLE
+  .\play.ps1 -GameExe "D:\Kronos\World of Warcraft\Arctium WoW Launcher.exe" -GameArgs '--staticseed --version=ClassicEra'
 #>
 [CmdletBinding()]
 param(
     [string]$ProxyDir,
     [string]$GameExe,
+    [string]$GameArgs,
     [int]$TimeoutSeconds = 60,
     [switch]$KeepProxy,
     [switch]$NoPortalFix
@@ -71,7 +79,9 @@ foreach ($c in $candidates) {
 if (-not $ProxyDir) { Fail "JimsProxy.exe not found. Pass -ProxyDir <folder containing JimsProxy.exe>." }
 $proxyExe = Join-Path $ProxyDir 'JimsProxy.exe'
 $configPath = Join-Path $ProxyDir 'HermesProxy.config'
-if (-not (Test-Path $configPath)) { Fail "HermesProxy.config is missing next to JimsProxy.exe ($ProxyDir)." }
+if (-not (Test-Path $configPath)) {
+    Fail "HermesProxy.config is missing next to JimsProxy.exe ($ProxyDir). The direct download bundle does not include one: get it from https://raw.githubusercontent.com/jameopotato/jimsproxy/master/HermesProxy/HermesProxy.config, put it beside JimsProxy.exe, and set ServerAddress (see docs\MANUAL-INSTALL.md)."
+}
 if (-not (Test-Path (Join-Path $ProxyDir 'CSV'))) { Fail "CSV\ folder is missing next to JimsProxy.exe. The proxy cannot start without it." }
 
 $rootDir = Split-Path -Parent $ProxyDir
@@ -87,7 +97,8 @@ if (-not $GameExe) { Fail "Game client not found. Pass -GameExe <path to WowClas
 if (-not (Test-Path $GameExe)) { Fail "Game executable does not exist: $GameExe" }
 $GameExe = (Resolve-Path $GameExe).Path
 if ((Split-Path -Leaf $GameExe) -ieq 'WowClassic.exe') {
-    Say "WARNING: WowClassic.exe is the Battle.net-only executable. Private servers need WowClassic_ForCustomServers.exe."
+    Say "WARNING: on its own, WowClassic.exe only talks to Blizzard's servers. Use WowClassic_ForCustomServers.exe,"
+    Say "         or point -GameExe at the Arctium Launcher with -GameArgs '--staticseed --version=ClassicEra'."
 }
 
 # ------------------------------------------------------------------ config values
@@ -127,6 +138,8 @@ if ($busy.Count -gt 0) {
 # ------------------------------------------------------------------ portal fix
 if (-not $NoPortalFix) {
     $gameDir  = Split-Path -Parent $GameExe
+    # The Arctium Launcher lives in the game root, one level above _classic_era_.
+    if (Test-Path (Join-Path $gameDir '_classic_era_')) { $gameDir = Join-Path $gameDir '_classic_era_' }
     $wtfDir   = Join-Path $gameDir 'WTF'
     $wtfPath  = Join-Path $wtfDir 'Config.wtf'
     $expected = "SET portal `"127.0.0.1:$bnetPort`""
@@ -235,14 +248,36 @@ try {
     Say "proxy is ready on 127.0.0.1:$bnetPort"
 
     # ---- start game
-    Say "starting the game: $GameExe"
-    $game = Start-Process -FilePath $GameExe -WorkingDirectory (Split-Path -Parent $GameExe) -PassThru
+    Say "starting the game: $GameExe $GameArgs"
+    $gameStarted = Get-Date
+    if ($GameArgs) {
+        $game = Start-Process -FilePath $GameExe -ArgumentList $GameArgs -WorkingDirectory (Split-Path -Parent $GameExe) -PassThru
+    } else {
+        $game = Start-Process -FilePath $GameExe -WorkingDirectory (Split-Path -Parent $GameExe) -PassThru
+    }
     while (-not $game.HasExited) {
         Pump-Proxy | Out-Null
         if ($proxy.HasExited) { Say "WARNING: the proxy exited while the game was running (log: $logPath)" ; break }
         Start-Sleep -Milliseconds 250
     }
-    if ($game.HasExited) { Say "game exited (code $($game.ExitCode))" }
+    if ($game.HasExited) { Say "game process exited (code $($game.ExitCode))" }
+
+    # A launcher (Arctium, or any wrapper) returns as soon as it has started WoW. If a WoW
+    # process is running, keep waiting for that one instead of stopping the proxy under it.
+    function Get-GameProcess { Get-Process -Name 'WowClassic', 'WowClassic_ForCustomServers' -ErrorAction SilentlyContinue }
+    if (((Get-Date) - $gameStarted).TotalSeconds -lt 5) {
+        $spawnDeadline = (Get-Date).AddSeconds(5)
+        while (-not (Get-GameProcess) -and (Get-Date) -lt $spawnDeadline) { Pump-Proxy | Out-Null; Start-Sleep -Milliseconds 500 }
+    }
+    if (Get-GameProcess) {
+        Say "WoW is running (started by a launcher); waiting for it to exit..."
+        while (Get-GameProcess) {
+            Pump-Proxy | Out-Null
+            if ($proxy.HasExited) { Say "WARNING: the proxy exited while the game was running (log: $logPath)" ; break }
+            Start-Sleep -Milliseconds 1000
+        }
+        Say "game exited"
+    }
 }
 catch {
     Write-Host "[play] ERROR: $($_.Exception.Message)" -ForegroundColor Red

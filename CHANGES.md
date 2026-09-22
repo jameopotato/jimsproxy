@@ -36,6 +36,13 @@ launch → clean-shutdown sequence had no manual equivalent. `verify-checksums.*
   then the `__LAUNCHER_SHUTDOWN__` / `__PROXY_SHUTDOWN_ACK__` stdin handshake with SIGTERM/kill
   fallback, so the JSONL log is flushed like a launcher stop.
 - `scripts/verify-checksums.sh` / `.ps1` — repo corrected to `jameopotato/jimsproxy`.
+- Follow-up the same day, from the Discord announcement: the manual guide now leads with the
+  direct bundle downloads (`jimothy.cc/proxy/stable/latest`, `/beta/latest`), states that the
+  bundle ships without `HermesProxy.config` (the proxy exits with `Config loading failed`
+  without one) and where to get it, and documents the Arctium Launcher route
+  (`--staticseed --version=ClassicEra` with the stock `WowClassic.exe`) beside
+  `WowClassic_ForCustomServers.exe`. The scripts accept a launcher as the game executable
+  (`-GameArgs` on Windows) and wait for the WoW process it spawns.
 - README "Getting Started" now presents both paths and links the guides; the canonical
   install guide (both paths, launcher-first) lives in `classic-114-launcher/docs/INSTALL.md`.
 
