@@ -28,11 +28,11 @@ Contents
 | Requirement | Details |
 |---|---|
 | Operating system | Windows 10 or Windows 11, 64-bit, with Windows PowerShell 5.1 (included). |
-| Game client | WoW Classic Era **1.14.2, build 42597**, already installed. The installer accepts this build only; any other build is listed as not supported. JimsProxy does not include or distribute the game client. |
+| Game client | WoW Classic Era **1.14.2, build 42597**, either installed (a `_classic_era_` folder) or present as a client archive (a zip that contains `.build.info` and the `_classic_era_` folder, such as `pkg_base.zip`), which the installer extracts. The installer accepts this build only; any other build is listed as not supported. JimsProxy does not include or distribute the game client. |
 | Custom-server capable executable | `WowClassic_ForCustomServers.exe` in the client's `_classic_era_` folder, or the unmodified `WowClassic.exe` together with the [Arctium WoW Launcher](https://github.com/Arctium/WoW-Launcher) placed in the folder above `_classic_era_`. See [Client executable options](MANUAL-INSTALL.md#client-executable-options). |
 | Server account | An account for the server. For Kronos, create one at [kronos-wow.com](https://www.kronos-wow.com). |
 | Network | Access to `jimothy.cc` (proxy archive) and `raw.githubusercontent.com` (configuration file and play scripts). |
-| Disk space | Approximately 500 MB on the drive that holds the client. |
+| Disk space | Approximately 500 MB on the drive that holds the client. Extracting a client archive additionally requires the archive's uncompressed size on the destination drive. |
 | Privileges | None. The installer does not request administrator rights. |
 
 ## Step 1: Download and extract the bundle
@@ -71,25 +71,37 @@ free disk space. A failed check is reported with its reason, and the installer e
 
 The installer scans the usual installation locations and the root of each fixed drive (three
 folder levels deep, at most 20 seconds) for a `_classic_era_` folder that contains a game
-executable, and lists what it found:
+executable, and the Downloads, Desktop, Documents, and drive-root folders for a client archive
+named `pkg_base.zip`. It lists what it found:
 
 ```
 [1] D:\Games\Kronos\World of Warcraft\_classic_era_    build 1.14.2.42597    WowClassic_ForCustomServers.exe
 [2] C:\Program Files (x86)\World of Warcraft\_classic_era_    not supported: build 1.15.7.60000
+[3] C:\Users\Name\Downloads\pkg_base.zip    client archive    build 1.14.2.42597    (will be extracted)
 [B] Browse for the _classic_era_ folder
+[A] Use a client archive (.zip)
 [T] Type the path
 [Q] Quit
 ```
 
-- The build is read from the client's `.build.info` file (or from the executable's version).
-  Only build 1.14.2.42597 can be selected.
+- The build is read from the client's `.build.info` file (inside the archive, for an archive)
+  or from the executable's version. Only build 1.14.2.42597 can be selected.
 - A client that has only `WowClassic.exe` is usable when the Arctium launcher is present in the
   folder above `_classic_era_`; the installer then configures the Play command to start Arctium
   with `--staticseed --version=ClassicEra`. Without Arctium, the entry states what is missing.
 
-Select the client by number, or use `B` or `T` to point the installer at a folder it did not
-find. If no usable client is selected, the installer exits with a message stating the
-requirement.
+Select the client by number, or use `B`, `A`, or `T` to point the installer at a folder or
+archive it did not find. If no usable client is selected, the installer exits with a message
+stating the requirement.
+
+**Client archives.** When an archive is selected, the installer asks for a destination folder
+(default `<drive>:\Games\Kronos`; the folder must be empty or absent, and the drive must have
+room for the archive's uncompressed contents plus 500 MB), then extracts the archive into
+`<destination>\World of Warcraft\`. Extraction of a full client takes several minutes; a
+progress line is printed as it proceeds. The archive is not modified or deleted. The
+installation then continues with `<destination>\World of Warcraft\_classic_era_` as the
+client. If the extraction is interrupted, the destination folder holds an incomplete client and
+must be deleted before the installer is run again.
 
 ### Step 3 of 6: Server and channel
 
@@ -197,6 +209,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ClientDir "D:
 | Parameter | Values |
 |---|---|
 | `-ClientDir <path>` | The `_classic_era_` folder |
+| `-ClientArchive <path>` | A client archive to extract; requires `-ExtractTo` |
+| `-ExtractTo <path>` | Destination folder for `-ClientArchive` (must be empty or absent) |
 | `-Server` | `kronos`, `kronos2`, `kronos3`, or a login address |
 | `-Channel` | `stable` or `beta` |
 | `-NoAddon`, `-NoShortcut` | Skip the addon or the shortcut |
@@ -211,6 +225,7 @@ selected; `4` a download failed; `5` a downloaded file failed verification; `6` 
 
 | Location | Change |
 |---|---|
+| `<root>\World of Warcraft\` | Created only when a client archive is extracted; holds the extracted client. |
 | `<root>\Hermes\` | Created. Holds the proxy, its configuration, the play scripts, `Play Kronos.cmd`, `quickstart.json` (installer state), and `install.log`. |
 | `_classic_era_\WTF\Config.wtf` | The `SET portal` line is set; the previous file is kept as `Config.wtf.bak`. |
 | `_classic_era_\Interface\AddOns\JimsPlus\` | Created or replaced, if the addon option is accepted. |
@@ -225,6 +240,15 @@ deleted.
 The installer accepts build 1.14.2.42597 only. Check the client's build as described in
 [Verifying the client build](MANUAL-INSTALL.md#verifying-the-client-build). A client in an
 unusual location can be selected with `B` (browse) or `T` (type the path).
+
+**An archive is listed as "not supported" or "not a client archive".**
+The archive's `.build.info` reports a build other than 1.14.2.42597, or the archive does not
+contain `.build.info` and a `_classic_era_` folder with a game executable. Only archives with
+that layout and build are extracted.
+
+**"Destination is not empty" or "not enough free space" when extracting an archive.**
+Choose an empty or non-existent folder on a drive with room for the extracted client; the
+required amount is shown in the message.
 
 **The entry says "needs WowClassic_ForCustomServers.exe or the Arctium launcher".**
 The folder contains only the unmodified `WowClassic.exe`. See
