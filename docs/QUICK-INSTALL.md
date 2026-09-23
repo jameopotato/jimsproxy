@@ -1,207 +1,138 @@
-# JimsProxy quick-start installation guide
+# JimsProxy quick-start installation
 
-This guide describes installing JimsProxy with the **quick-start bundle**: a zip archive whose
-installer locates an existing WoW Classic Era 1.14.2 client, installs the current proxy next to
-it, configures the proxy and the client, and creates a Play command. The bundle performs the
-Installation section of the [manual installation guide](MANUAL-INSTALL.md) automatically; the
-manual guide remains the reference for what each step does and for Linux and macOS.
-
-The quick-start bundle runs on Windows only and does not include or obtain the game client.
+The quick-start bundle is a zip whose installer locates an existing WoW Classic Era 1.14.2
+client, installs the current proxy next to it, configures the proxy and the client, and creates
+a Play command. It performs the Install section of the [manual guide](MANUAL-INSTALL.md); that
+guide remains the reference for what each step does. Windows only. The game client is not
+included.
 
 Contents
 
-- [Prerequisites](#prerequisites)
-- [Step 1: Download and extract the bundle](#step-1-download-and-extract-the-bundle)
-- [Step 2: Run the installer](#step-2-run-the-installer)
-- [Step 3: Play](#step-3-play)
-- [Updating](#updating)
-- [Reconfiguring](#reconfiguring)
-- [Uninstalling](#uninstalling)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Run](#run)
+- [Update, reconfigure, uninstall](#update-reconfigure-uninstall)
 - [Unattended installation](#unattended-installation)
 - [What the installer changes](#what-the-installer-changes)
 - [Troubleshooting](#troubleshooting)
 
 ---
 
-## Prerequisites
+## Requirements
 
-| Requirement | Details |
-|---|---|
-| Operating system | Windows 10 or Windows 11, 64-bit, with Windows PowerShell 5.1 (included). |
-| Game client | WoW Classic Era **1.14.2, build 42597**, either installed (a `_classic_era_` folder) or present as a client archive (a zip that contains `.build.info` and the `_classic_era_` folder, such as `pkg_base.zip`), which the installer extracts. The installer accepts this build only; any other build is listed as not supported. JimsProxy does not include or distribute the game client. |
-| Custom-server capable executable | `WowClassic_ForCustomServers.exe` in the client's `_classic_era_` folder, or the unmodified `WowClassic.exe` together with the [Arctium WoW Launcher](https://github.com/Arctium/WoW-Launcher) placed in the folder above `_classic_era_`. See [Client executable options](MANUAL-INSTALL.md#requirements). |
-| Server account | An account for the server. For Kronos, create one at [kronos-wow.com](https://www.kronos-wow.com). |
-| Network | Access to `jimothy.cc` (proxy archive) and `raw.githubusercontent.com` (configuration file and play scripts). |
-| Disk space | Approximately 500 MB on the drive that holds the client. Extracting a client archive additionally requires the archive's uncompressed size on the destination drive. |
-| Privileges | None. The installer does not request administrator rights. |
+- Windows 10 or 11, 64-bit, with Windows PowerShell 5.1 (included). No administrator rights.
+- WoW Classic Era **1.14.2, build 42597**, with `WowClassic_ForCustomServers.exe`: either
+  installed (a `_classic_era_` folder) or as a client archive (a zip containing `.build.info`
+  and the `_classic_era_` folder, such as `pkg_base.zip`), which the installer extracts. Any
+  other build is listed as not supported and cannot be selected. The game client is not
+  included.
+- An account on the server. For Kronos: [kronos-wow.com](https://www.kronos-wow.com).
+- Network access to `jimothy.cc` and `raw.githubusercontent.com`.
+- About 500 MB free next to the client, plus the archive's uncompressed size if one is extracted.
 
-## Step 1: Download and extract the bundle
+---
 
-1. Download `JimsProxy-QuickStart.zip`:
-   <https://github.com/jameopotato/jimsproxy/releases/latest/download/JimsProxy-QuickStart.zip>
-2. In File Explorer, right-click the downloaded file and select **Extract All…**, then
-   **Extract**. The default destination (a folder named `JimsProxy-QuickStart` next to the zip)
-   is suitable.
+## Install
 
-**Expected result:** the extracted folder contains `Install JimsProxy.cmd`, `install.ps1`,
-`README.txt`, and `VERSION.txt`.
+1. Download <https://github.com/jameopotato/jimsproxy/releases/latest/download/JimsProxy-QuickStart.zip>
+   and extract it (**Extract All**). The folder contains `Install JimsProxy.cmd`, `install.ps1`,
+   `README.txt`, and `VERSION.txt`. Run the installer from the extracted folder, not from
+   inside the zip.
+2. Double-click `Install JimsProxy.cmd`. A console window works through six steps; each menu
+   shows its default in brackets (Enter accepts it), and `Q` quits. Everything shown is also
+   written to `Hermes\install.log`.
 
-> **Note:** run the installer from the extracted folder. Started from inside the zip (the
-> Explorer preview of the archive), it stops with the message "Extract the zip first".
+`install.ps1` and `JimsProxy.exe` are not code-signed. If SmartScreen shows "Windows protected
+your PC", select **More info → Run anyway**. If antivirus software quarantines `JimsProxy.exe`,
+restore it and add the `Hermes` folder to the exclusion list.
 
-## Step 2: Run the installer
+**Step 1 of 6: Check this PC.** Operating system, PowerShell version, TLS 1.2, reachability of
+both hosts, free disk space. A failed check is reported and the installer exits (code 2).
 
-Double-click `Install JimsProxy.cmd`. A console window opens and works through six steps. Each
-step shows a numbered menu with a default in brackets; press Enter to accept the default, or
-type the number of another option. `Q` quits at any menu. Everything shown is also written to
-`Hermes\install.log`.
-
-> **Note:** `install.ps1` is not code-signed. Windows SmartScreen may display "Windows
-> protected your PC" the first time; select **More info**, then **Run anyway**. The same applies
-> to `JimsProxy.exe` when it first starts. If antivirus software quarantines `JimsProxy.exe`,
-> restore it and add the `Hermes` folder to the exclusion list.
-
-### Step 1 of 6: Check this PC
-
-The installer verifies the operating system and PowerShell version, enables TLS 1.2 for its
-downloads, checks that `jimothy.cc` and `raw.githubusercontent.com` are reachable, and checks
-free disk space. A failed check is reported with its reason, and the installer exits.
-
-### Step 2 of 6: Find the client
-
-The installer scans the usual installation locations and the root of each fixed drive (three
-folder levels deep, at most 20 seconds) for a `_classic_era_` folder that contains a game
-executable, and the Downloads, Desktop, Documents, and drive-root folders for a client archive
-named `pkg_base.zip`. It lists what it found:
+**Step 2 of 6: Find the client.** The installer scans the usual installation locations and the
+fixed drives (four folder levels, about a second) for `_classic_era_` folders, and the
+Downloads, Desktop, Documents and drive-root folders for `pkg_base.zip`:
 
 ```
 [1] D:\Games\Kronos\World of Warcraft\_classic_era_    build 1.14.2.42597    WowClassic_ForCustomServers.exe
-[2] C:\Program Files (x86)\World of Warcraft\_classic_era_    not supported: build 1.15.7.60000
-[3] C:\Users\Name\Downloads\pkg_base.zip    client archive    build 1.14.2.42597    (will be extracted)
+[-] C:\Program Files (x86)\World of Warcraft\_classic_era_    not supported: build 1.15.7.60000
+[2] C:\Users\Name\Downloads\pkg_base.zip    client archive    build 1.14.2.42597    (will be extracted)
 [B] Browse for the _classic_era_ folder
 [A] Use a client archive (.zip)
 [T] Type the path
 [Q] Quit
 ```
 
-- The build is read from the client's `.build.info` file (inside the archive, for an archive)
-  or from the executable's version. Only build 1.14.2.42597 can be selected.
-- A client that has only `WowClassic.exe` is usable when the Arctium launcher is present in the
-  folder above `_classic_era_`; the installer then configures the Play command to start Arctium
-  with `--staticseed --version=ClassicEra`. Without Arctium, the entry states what is missing.
+Entries marked `[-]` cannot be selected. For an archive, the installer asks for a destination
+(default `<drive>:\Games\Kronos`; must be empty or absent, with room for the extracted client),
+checks the build inside the archive first, and extracts into `<destination>\World of Warcraft\`.
+Extraction of a full client takes several minutes. The archive is not modified or deleted.
 
-Select the client by number, or use `B`, `A`, or `T` to point the installer at a folder or
-archive it did not find. If no usable client is selected, the installer exits with a message
-stating the requirement.
-
-**Client archives.** When an archive is selected, the installer asks for a destination folder
-(default `<drive>:\Games\Kronos`; the folder must be empty or absent, and the drive must have
-room for the archive's uncompressed contents plus 500 MB), then extracts the archive into
-`<destination>\World of Warcraft\`. Extraction of a full client takes several minutes; a
-progress line is printed as it proceeds. The archive is not modified or deleted. The
-installation then continues with `<destination>\World of Warcraft\_classic_era_` as the
-client. If the extraction is interrupted, the destination folder holds an incomplete client and
-must be deleted before the installer is run again.
-
-### Step 3 of 6: Server and channel
+**Step 3 of 6: Server and channel.**
 
 ```
 Server:   [1] Kronos (login.twinstar-wow.com)  [2] Kronos 2  [3] Kronos 3  [4] Other address    [1]
 Channel:  [1] Stable  [2] Beta (newer changes, less testing)                                    [1]
 ```
 
-### Step 4 of 6: Install the proxy
+**Step 4 of 6: Install the proxy.** No input. The installer reads the channel manifest,
+downloads the archive it names, verifies its SHA-256, extracts it into a new `Hermes` folder
+next to the `World of Warcraft` folder, downloads `HermesProxy.config` and the play scripts,
+sets `ServerAddress`, and writes `Play Kronos.cmd`. It refuses to install into a folder that
+already has a `Hermes` it did not create (a launcher or manual installation).
 
-No input is required. The installer creates a `Hermes` folder next to the `World of Warcraft`
-folder (or next to `_classic_era_` when there is no `World of Warcraft` level), reads the
-channel's manifest (`https://jimothy.cc/proxy/<channel>/latest.json`), downloads the archive it
-names, verifies the archive's SHA-256 against the manifest, extracts it, downloads
-`HermesProxy.config` and the play scripts from the repository, sets `ServerAddress`, and writes
-`Play Kronos.cmd`. Each action prints one line as it completes.
-
-### Step 5 of 6: Connect the game
-
-The installer sets `SET portal "127.0.0.1:1119"` in the client's `WTF\Config.wtf` (an existing
-file is backed up as `Config.wtf.bak`), then asks:
+**Step 5 of 6: Connect the game.** Sets `SET portal "127.0.0.1:1119"` in the client's
+`WTF\Config.wtf` (previous file kept as `Config.wtf.bak`), then asks:
 
 ```
-Install the JimsPlus addon?             [Y/n]
+Install the JimsPlus addon?              [Y/n]
 Create a desktop shortcut "Play Kronos"? [Y/n]
 ```
 
-JimsPlus is the in-game addon that pairs with the proxy (see
-[Installing the JimsPlus addon](MANUAL-INSTALL.md#jimsplus-addon-optional)).
+**Step 6 of 6: Done.** Prints a summary (folder, proxy version, client, server, channel, addon,
+shortcut, log path) and asks `Start the game now? [Y/n]`.
 
-### Step 6 of 6: Done
+---
 
-The installer prints a summary (installation folder, proxy version, client folder, executable
-route, server, channel, addon, shortcut, log path) and asks:
+## Run
+
+Double-click the **Play Kronos** desktop shortcut or `Hermes\Play Kronos.cmd`. The game starts
+after the console prints `[play] proxy is ready on 127.0.0.1:1119`; the console must stay open
+during the session. Exit the game to stop the proxy. `Play Kronos.cmd` runs the same `play.ps1`
+described in the [manual guide](MANUAL-INSTALL.md#run) with the paths resolved by the installer.
+
+---
+
+## Update, reconfigure, uninstall
+
+Run `Install JimsProxy.cmd` again and select the same client. Because an installation exists,
+the installer shows:
 
 ```
-Start the game now? [Y/n]
+[1] Update the proxy
+[2] Reconfigure (server, channel)
+[3] Uninstall
+[4] Quit
 ```
 
-**Expected result:** the `Hermes` folder contains `JimsProxy.exe`, `CSV`, `Addons`,
-`manifest.json`, `HermesProxy.config`, `play.bat`, `play.ps1`, `Play Kronos.cmd`,
-`quickstart.json`, and `install.log`.
+- **Update** downloads the current archive for the installed channel and replaces
+  `JimsProxy.exe`, `CSV`, `Addons` and `manifest.json`; re-copies JimsPlus if it was installed;
+  refreshes the play scripts. `HermesProxy.config` and `AccountData` are not modified.
+- **Reconfigure** shows the server and channel menus again. A channel change takes effect at the
+  next update. The network check is skipped.
+- **Uninstall** asks for confirmation, offers to move `AccountData` to
+  `<root>\JimsProxy-AccountData-backup`, deletes `Hermes`, deletes `Interface\AddOns\JimsPlus`
+  if the installer created it, removes the `SET portal` line only if it points at `127.0.0.1`,
+  and deletes the shortcut.
 
-## Step 3: Play
+Update and Uninstall refuse to run while `JimsProxy.exe` is running (exit code 2).
 
-1. Double-click the **Play Kronos** shortcut on the desktop, or `Hermes\Play Kronos.cmd`.
-2. A console window opens. Wait for the line `[play] proxy is ready on 127.0.0.1:1119`; the
-   game starts immediately after it. The console window must stay open during the session.
-3. At the login screen, enter the account name and password, then select a realm and a
-   character.
-4. To end the session, exit the game. The console prints `[play] stopping the proxy...` and
-   closes.
-
-`Play Kronos.cmd` runs the same `play.ps1` described in
-[Running the proxy and the game](MANUAL-INSTALL.md#run) with the
-paths resolved by the installer.
-
-## Updating
-
-1. Exit the game and confirm that no `JimsProxy.exe` process is running.
-2. Run `Install JimsProxy.cmd` again and select the same client. Because an installation exists,
-   the installer shows:
-
-   ```
-   [1] Update the proxy
-   [2] Reconfigure (server, channel)
-   [3] Uninstall
-   [4] Quit
-   ```
-
-3. Select `1`. The installer downloads the current archive for the installed channel, replaces
-   `JimsProxy.exe`, `CSV`, `Addons`, and `manifest.json`, re-copies the JimsPlus addon if it was
-   installed, and refreshes the play scripts. `HermesProxy.config` and `AccountData` are not
-   modified.
-
-The installer refuses to update while the proxy is running.
-
-## Reconfiguring
-
-Run `Install JimsProxy.cmd`, select the client, and choose `2`. The server and channel menus
-from Step 3 are shown again; `ServerAddress` in `HermesProxy.config` and the stored channel are
-updated. A channel change takes effect at the next update.
-
-## Uninstalling
-
-Run `Install JimsProxy.cmd`, select the client, and choose `3`. The installer:
-
-1. Refuses to continue while the proxy is running.
-2. Offers to move `AccountData` (per-account state) to `<root>\JimsProxy-AccountData-backup`
-   before deleting the `Hermes` folder.
-3. Deletes the `Hermes` folder.
-4. Deletes `_classic_era_\Interface\AddOns\JimsPlus` if the installer installed it.
-5. Removes the `SET portal` line from `WTF\Config.wtf` and the desktop shortcut.
-
-The game client itself is not modified beyond items 4 and 5.
+---
 
 ## Unattended installation
 
-`install.ps1` accepts parameters that replace the corresponding prompts. Any prompt whose value
-is supplied is skipped; `-Yes` accepts every remaining default.
+`install.ps1` accepts parameters in place of the prompts. A supplied value skips its prompt;
+`-Yes` accepts every remaining default and does not start the game.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ClientDir "D:\Games\Kronos\World of Warcraft\_classic_era_" -Server kronos -Channel stable -Yes
@@ -211,7 +142,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ClientDir "D:
 |---|---|
 | `-ClientDir <path>` | The `_classic_era_` folder |
 | `-ClientArchive <path>` | A client archive to extract; requires `-ExtractTo` |
-| `-ExtractTo <path>` | Destination folder for `-ClientArchive` (must be empty or absent) |
+| `-ExtractTo <path>` | Destination for `-ClientArchive` (empty or absent) |
 | `-Server` | `kronos`, `kronos2`, `kronos3`, or a login address |
 | `-Channel` | `stable` or `beta` |
 | `-NoAddon`, `-NoShortcut` | Skip the addon or the shortcut |
@@ -219,56 +150,52 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ClientDir "D:
 | `-Update`, `-Reconfigure`, `-Uninstall` | Run that action on an existing installation |
 | `-Root <path>` | The folder containing `Hermes`, for `-Update` and `-Uninstall` |
 
-Exit codes: `0` success; `1` unexpected error; `2` a Step 1 check failed; `3` no usable client
-selected; `4` a download failed; `5` a downloaded file failed verification; `6` cancelled.
+Exit codes: `0` success; `1` unexpected error; `2` a Step 1 check failed, or the proxy is
+running; `3` no usable client selected; `4` a download failed or the channel is paused; `5` a
+downloaded file failed verification; `6` cancelled (`Q` or `Ctrl+C`).
+
+---
 
 ## What the installer changes
 
 | Location | Change |
 |---|---|
-| `<root>\World of Warcraft\` | Created only when a client archive is extracted; holds the extracted client. |
-| `<root>\Hermes\` | Created. Holds the proxy, its configuration, the play scripts, `Play Kronos.cmd`, `quickstart.json` (installer state), and `install.log`. |
-| `_classic_era_\WTF\Config.wtf` | The `SET portal` line is set; the previous file is kept as `Config.wtf.bak`. |
-| `_classic_era_\Interface\AddOns\JimsPlus\` | Created or replaced, if the addon option is accepted. |
-| Desktop | `Play Kronos.lnk`, if the shortcut option is accepted. |
+| `<root>\Hermes\` | Created: the proxy, `HermesProxy.config`, play scripts, `Play Kronos.cmd`, `quickstart.json` (installer state), `install.log` |
+| `<root>\World of Warcraft\` | Created only when a client archive is extracted |
+| `_classic_era_\WTF\Config.wtf` | `SET portal` line set; previous file kept as `Config.wtf.bak` |
+| `_classic_era_\Interface\AddOns\JimsPlus\` | Created or replaced, if accepted |
+| Desktop | `Play Kronos.lnk`, if accepted |
 
-No other file in the game client is read for any purpose other than detection, and none is
-deleted.
+Nothing else in the client is modified, and nothing is deleted.
+
+---
 
 ## Troubleshooting
 
-**"No usable client found" or the only entries are "not supported".**
-The installer accepts build 1.14.2.42597 only. Check the client's build as described in
-[Verifying the client build](MANUAL-INSTALL.md#verifying-the-client-build). A client in an
-unusual location can be selected with `B` (browse) or `T` (type the path).
+**Every client is listed `[-]`, or none is found.** Only build 1.14.2.42597 is accepted; see
+[Verifying the client build](MANUAL-INSTALL.md#verifying-the-client-build). `B`, `A` or `T`
+selects a client the scan did not find.
 
-**An archive is listed as "not supported" or "not a client archive".**
-The archive's `.build.info` reports a build other than 1.14.2.42597, or the archive does not
-contain `.build.info` and a `_classic_era_` folder with a game executable. Only archives with
-that layout and build are extracted.
+**An archive is "not supported" or "not a client archive".** Its `.build.info` reports another
+build, or it lacks `.build.info` and a `_classic_era_` folder with the game executable.
 
-**"Destination is not empty" or "not enough free space" when extracting an archive.**
-Choose an empty or non-existent folder on a drive with room for the extracted client; the
-required amount is shown in the message.
+**"Destination is not empty" or "not enough free space".** Choose an empty or non-existent
+folder on a drive with room for the extracted client. An interrupted extraction leaves an
+incomplete folder that must be deleted before running again.
 
-**The entry says "needs WowClassic_ForCustomServers.exe or the Arctium launcher".**
-The folder contains only the unmodified `WowClassic.exe`. See
-[Client executable options](MANUAL-INSTALL.md#requirements).
+**"A Hermes folder already exists here."** The folder holds a launcher or manual installation.
+Update it with that route, or choose a different client folder.
 
-**"Download failed" (exit code 4) or "verification failed" (exit code 5).**
-The proxy archive or a repository file could not be fetched, or the downloaded archive did not
-match the SHA-256 in the channel manifest. Check the network, then run the installer again; a
-partial installation is completed on the next run. A message that the channel is paused means a
-release is being published; retry later.
+**Download failed (exit code 4).** A host was unreachable, or the channel is paused while a
+release is published; retry later.
 
-**Step 1 fails on connectivity.**
-`jimothy.cc` or `raw.githubusercontent.com` is not reachable from this PC (firewall, proxy,
-or DNS). Both are required.
+**Verification failed (exit code 5), or the warning "SHA-256 not verified".** The download did
+not match the channel manifest, or the manifest could not be read and the archive was fetched
+without a checksum (its contents are still checked). Run the installer again.
 
-**"Update" or "Uninstall" refuses to run.**
-`JimsProxy.exe` is still running. End the session with the Play window, or end the process in
-Task Manager (`Ctrl+Shift+Esc`), and retry.
+**Update or Uninstall refuses to run.** `JimsProxy.exe` is still running. Exit the game or end
+the process in Task Manager.
 
-**Problems after installation** (connection, ports, login, "World Server is Down") are covered
-in the manual guide's [Troubleshooting](MANUAL-INSTALL.md#troubleshooting) section; the
-installed files are identical to a manual installation.
+Problems after installation (connection, ports, login) are covered in the manual guide's
+[Troubleshooting](MANUAL-INSTALL.md#troubleshooting); the installed files are identical to a
+manual installation.
