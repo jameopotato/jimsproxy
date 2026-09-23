@@ -6,19 +6,32 @@ The upstream HermesProxy project was [archived in November 2024](https://github.
 
 **License:** GPL v3 (inherited from upstream — see `LICENSE`)
 
-## Quick Start (optional)
+## Installation
 
-Download the **JimsProxy Launcher** from [jimothy.cc/install](https://jimothy.cc/install). The launcher handles proxy updates, game launch, addon management, and configuration — no manual setup required.
+Three routes, all on Windows. Linux and macOS are covered in the manual guide's appendix (community-supported, built from source). The 1.14.2 (build 42597) game client is not included in any route.
+
+### Classic WoW Launcher
+
+The **Classic WoW Launcher** ([jimothy.cc/install](https://jimothy.cc/install)) is a Windows desktop application: proxy installation and updates (stable or beta), realm selection, addon management and profiles, keybinding and macro import, optional auto-login, multibox support, and proxy feature control (Cast Pipeline, 41-yard nameplates, Threat Engine, iMorph compatibility).
+
+### Quick-start bundle (no launcher)
+
+One zip, one double-click. The bundle's installer locates the 1.14.2 client, installs the current proxy next to it, configures the proxy and the client, and creates a Play command; running it again offers update, reconfigure, and uninstall. Guide: [docs/QUICK-INSTALL.md](docs/QUICK-INSTALL.md).
+
+### Manual install
+
+[docs/MANUAL-INSTALL.md](docs/MANUAL-INSTALL.md) covers every step by hand with the exact commands: download the current archive ([stable](https://jimothy.cc/proxy/stable/latest) or [beta](https://jimothy.cc/proxy/beta/latest)), add the configuration file, set the server address, and run the proxy with `scripts/play.bat` or manually.
 
 ## What This Fork Adds
 
-- **Kronos translation fixes** — spell casting, realm switching, disconnects, combat log, auction house, and dozens of packet translation bugs fixed for Twinstar's MaNGOS fork
-- **Structured JSONL logging** — every packet, translation, and lifecycle event emitted to machine-readable logs for diagnosing issues
-- **Spell system overhaul** — cast-time spell queue, GCD sweep sync, RTT-adaptive fire offset, off-GCD macro support
-- **Auto-reconnect** — recovers from unplanned server disconnects without manual relogin
-- **NPC and pet scale parity** — creature sizes match vanilla 1.12 proportions
-- **Bundled with JimsProxy Launcher** — one-click setup, automatic updates, addon management
-- **Active development** — more fixes and features coming
+- **Kronos protocol compatibility** — login, realm switching, character handling, auction house, chat links, GM tickets, transports and flight paths translated for Twinstar's MaNGOS fork (`ServerType`)
+- **Cast pipeline** — spell queue with an adjustable window, latency-adaptive GCD release, off-GCD handling, optional low-latency mode
+- **Stuck-state and disconnect fixes** — looping cast animations, lit action buttons, auto-attack and Auto Shot recovery, movement lockups after teleports and battleground exits, auto-reconnect after unplanned disconnects
+- **Aura and timer accuracy** — vanilla duration data, combo-point scaling, other units' remaining buff time, swing-timer correctness
+- **Threat engine** — synthesized threat for threat-meter addons (opt-in)
+- **1.12 visual parity** — NPC, pet and player scale from vanilla data, animations, emotes, tooltips and Kronos item-data corrections
+- **Addon interoperability** — the bundled JimsPlus addon; PallyPower and HealComm bridges between 1.12 and 1.14 players; intact compressed addon communication
+- **Diagnostics** — structured JSONL session logs, bug reports from the launcher, per-opcode latency metrics, a kill switch for every shipped fix
 
 See [CHANGES.md](CHANGES.md) for the full changelog.
 
@@ -40,17 +53,21 @@ See [CHANGES.md](CHANGES.md) for the full changelog.
 | 1.12.2  | Vanilla   | 6005  | CMaNGOS, VMaNGOS, etc. |
 | 1.12.3  | Vanilla   | 6141  | CMaNGOS, VMaNGOS, etc. |
 
+Development and testing target **1.14.2 build 42597**. The other builds are inherited from upstream and are not regularly exercised.
+
 ## Configuration
 
-The proxy reads `HermesProxy.config` (XML format) from the folder containing the executable — it switches its working directory there at startup, so it does not matter where you launch it from. The JimsProxy Launcher manages this automatically.
+The proxy reads `HermesProxy.config` (XML) from the folder containing its executable. The launcher manages this file for launcher installs; manual installs edit it by hand, and usually only `ServerAddress`. Every key the proxy reads, with its default and whether you should touch it, is documented in [docs/configuration.md](docs/configuration.md).
 
-For advanced use, CLI arguments override config values:
+CLI arguments override config values for one run:
 
 ```bash
 JimsProxy --config MyServer.config
 JimsProxy --set ServerAddress=logon.example.com --set ServerPort=3724
 JimsProxy --no-version-check
 ```
+
+The full flag list is in [docs/MANUAL-INSTALL.md](docs/MANUAL-INSTALL.md#command-line-flags).
 
 ## Building from Source
 
@@ -73,9 +90,9 @@ dotnet test
 dotnet publish HermesProxy --configuration Release --use-current-runtime -p:UsePublishBuildSettings=true -o build/
 ```
 
-Output: `build/JimsProxy.exe` + `build/CSV/` + `build/HermesProxy.config`
+Output: `build/JimsProxy.exe` (or `build/JimsProxy` on Linux and macOS) + `build/CSV/` + `build/HermesProxy.config` — the same layout as a manual install ([docs/MANUAL-INSTALL.md](docs/MANUAL-INSTALL.md)), config included. The build is self-contained; no .NET runtime is needed where it runs.
 
-To test locally, copy the build output to your game's `Hermes/` directory:
+To test a build with the launcher, either copy it over the bundled proxy in your game's `Hermes/` directory, or add `build/JimsProxy.exe` as a custom slot under **Settings → Proxy Binary** and switch to it:
 
 ```
 copy build\JimsProxy.exe <game_dir>\Hermes\JimsProxy.exe
