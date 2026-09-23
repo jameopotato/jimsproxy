@@ -1,33 +1,6 @@
 #!/usr/bin/env bash
-# play.sh — start JimsProxy, wait until it is ready, launch the game, and shut the
-# proxy down cleanly when the game exits. Linux and macOS.
-#
-# This is the manual-install equivalent of the launcher's Play button. Running the
-# 1.14 game client on Linux/macOS is community-supported: the proxy runs natively,
-# the game runs under Wine/Proton (Linux) or has no confirmed path yet (macOS).
-# See docs/MANUAL-INSTALL.md.
-#
-# Usage:
-#   ./play.sh                                   # proxy next to this script (or ./Hermes), game auto-detected
-#   ./play.sh --proxy-dir ~/kronos/Hermes --game-exe "~/kronos/World of Warcraft/_classic_era_/WowClassic_ForCustomServers.exe"
-#   ./play.sh --game-cmd 'lutris lutris:rungameid/12'   # let another launcher start the game
-#
-# Options:
-#   --proxy-dir DIR      folder containing the JimsProxy binary
-#                        (default: this script's folder, then ./Hermes, then ../Hermes)
-#   --game-exe PATH      WowClassic_ForCustomServers.exe
-#                        (default: <root>/World of Warcraft/_classic_era_/WowClassic_ForCustomServers.exe,
-#                         where <root> is the folder that contains Hermes/)
-#   --game-cmd CMD       command used to start the game (default: wine "<game-exe>");
-#                        use this for Lutris/Bottles/Steam, or for the Arctium Launcher route
-#                        (e.g. wine "Arctium WoW Launcher.exe" --staticseed --version=ClassicEra)
-#   --timeout SECONDS    how long to wait for the proxy's ready line (default: 60)
-#   --keep-proxy         leave the proxy running after the game exits
-#   --no-portal-fix      never touch WTF/Config.wtf (by default the portal line is
-#                        corrected to the proxy's BNetPort, with a .bak backup)
-#   -h, --help           this text
-#
-# Environment variables PROXY_DIR, GAME_EXE and GAME_CMD are honoured as defaults.
+# play.sh: start JimsProxy, wait until it is ready, start the game, and stop the proxy when
+# the game exits. Linux and macOS. See docs/MANUAL-INSTALL.md.
 
 set -u
 
@@ -35,24 +8,32 @@ READY_LINE="Starting WorldSocket service"
 SHUTDOWN_SENTINEL="__LAUNCHER_SHUTDOWN__"
 SHUTDOWN_ACK="__PROXY_SHUTDOWN_ACK__"
 
-PROXY_DIR="${PROXY_DIR:-}"
-GAME_EXE="${GAME_EXE:-}"
-GAME_CMD="${GAME_CMD:-}"
-TIMEOUT=60
-KEEP_PROXY=0
-PORTAL_FIX=1
+TIMEOUT=60   # seconds to wait for the ready line
 
-usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; }
+PROXY_DIR=""
+GAME_EXE=""
+GAME_CMD=""
+
+usage() {
+  cat <<'USAGE'
+Usage: play.sh [--proxy-dir DIR] [--game-exe PATH] [--game-cmd CMD]
+
+  --proxy-dir DIR   folder containing JimsProxy
+                    (default: this script's folder, then ./Hermes, then ../Hermes)
+  --game-exe PATH   WowClassic_ForCustomServers.exe
+                    (default: <root>/World of Warcraft/_classic_era_/, where <root> contains Hermes)
+  --game-cmd CMD    command that starts the game (default: wine "<game-exe>"),
+                    for example a Lutris, Bottles or Steam command
+  -h, --help        show this text
+USAGE
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --proxy-dir)     PROXY_DIR="$2"; shift 2 ;;
-    --game-exe)      GAME_EXE="$2"; shift 2 ;;
-    --game-cmd)      GAME_CMD="$2"; shift 2 ;;
-    --timeout)       TIMEOUT="$2"; shift 2 ;;
-    --keep-proxy)    KEEP_PROXY=1; shift ;;
-    --no-portal-fix) PORTAL_FIX=0; shift ;;
-    -h|--help)       usage; exit 0 ;;
+    --proxy-dir) PROXY_DIR="$2"; shift 2 ;;
+    --game-exe)  GAME_EXE="$2"; shift 2 ;;
+    --game-cmd)  GAME_CMD="$2"; shift 2 ;;
+    -h|--help)   usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
@@ -75,14 +56,14 @@ find_proxy_dir() {
 }
 
 PROXY_DIR="$(find_proxy_dir)" || die "JimsProxy binary not found. Pass --proxy-dir <folder containing JimsProxy>.
-       (JimsProxy.exe is the Windows build; Linux/macOS need the native binary — see docs/MANUAL-INSTALL.md)"
+       JimsProxy.exe is the Windows build; Linux and macOS need the native binary built from source."
 PROXY_BIN="$PROXY_DIR/JimsProxy"
 [ -x "$PROXY_BIN" ] || chmod +x "$PROXY_BIN" 2>/dev/null || die "cannot make $PROXY_BIN executable"
 [ -f "$PROXY_DIR/HermesProxy.config" ] || die "HermesProxy.config is missing next to $PROXY_BIN.
        The direct download bundle does not include one. Get it from
        https://raw.githubusercontent.com/jameopotato/jimsproxy/master/HermesProxy/HermesProxy.config
        put it beside the proxy binary, and set ServerAddress (see docs/MANUAL-INSTALL.md)."
-[ -d "$PROXY_DIR/CSV" ] || die "CSV/ folder is missing next to $PROXY_BIN (the proxy cannot start without it)"
+[ -d "$PROXY_DIR/CSV" ] || die "CSV/ folder is missing next to $PROXY_BIN; the proxy cannot start without it."
 
 root_dir="$(dirname "$PROXY_DIR")"
 if [ -z "$GAME_EXE" ]; then
@@ -100,7 +81,7 @@ if [ -n "$GAME_EXE" ] && [ ! -f "$GAME_EXE" ]; then
   die "game executable does not exist: $GAME_EXE"
 fi
 if [ -z "$GAME_CMD" ]; then
-  command -v wine >/dev/null 2>&1 || die "wine is not installed (or not on PATH). Install Wine, or pass --game-cmd with the command your Proton/Lutris/Bottles setup uses."
+  command -v wine >/dev/null 2>&1 || die "wine is not on PATH. Install Wine, or pass --game-cmd with the command that starts the game."
   GAME_CMD="wine \"$GAME_EXE\""
 fi
 
@@ -116,7 +97,7 @@ SERVER_ADDRESS="$(config_value ServerAddress)"
 
 if [ "${SERVER_ADDRESS:-127.0.0.1}" = "127.0.0.1" ]; then
   say "WARNING: ServerAddress in HermesProxy.config is still 127.0.0.1 (localhost)."
-  say "         For Kronos set it to login.twinstar-wow.com — see docs/MANUAL-INSTALL.md."
+  say "         For Kronos, set it to login.twinstar-wow.com. See docs/MANUAL-INSTALL.md."
 fi
 
 # ---------------------------------------------------------------- port check
@@ -138,15 +119,13 @@ for p in "$BNET_PORT" "$REALM_PORT" "$INSTANCE_PORT" "$REST_PORT"; do
   port_listening "$p" && busy="$busy $p"
 done
 if [ -n "$busy" ]; then
-  die "port(s)$busy already in use. A previous JimsProxy is probably still running — stop it first
-       (pgrep -fl JimsProxy), or change the ports in HermesProxy.config."
+  die "port(s)$busy already in use. A previous JimsProxy is probably still running; stop it
+       (pgrep -fl JimsProxy) or change the ports in HermesProxy.config."
 fi
 
 # ---------------------------------------------------------------- portal fix
-if [ -n "$GAME_EXE" ] && [ "$PORTAL_FIX" = 1 ]; then
+if [ -n "$GAME_EXE" ]; then
   game_dir="$(dirname "$GAME_EXE")"
-  # The Arctium Launcher lives in the game root, one level above _classic_era_.
-  [ -d "$game_dir/_classic_era_" ] && game_dir="$game_dir/_classic_era_"
   wtf="$game_dir/WTF/Config.wtf"
   expected="SET portal \"127.0.0.1:${BNET_PORT}\""
   if [ -f "$wtf" ]; then
@@ -181,11 +160,7 @@ cleanup() {
   local rc=$?
   trap - EXIT INT TERM
   if [ -n "$PROXY_PID" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
-    if [ "$KEEP_PROXY" = 1 ] && [ "$rc" = 0 ]; then
-      say "leaving the proxy running (pid $PROXY_PID). Stop it later with: kill $PROXY_PID"
-    else
-      stop_proxy
-    fi
+    stop_proxy
   fi
   [ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null
   exec 3>&- 2>/dev/null
@@ -223,11 +198,11 @@ deadline=$(( SECONDS + TIMEOUT ))
 while ! grep -q "$READY_LINE" "$LOG" 2>/dev/null; do
   if ! kill -0 "$PROXY_PID" 2>/dev/null; then
     sleep 0.5
-    die "the proxy exited before it was ready — read the lines above (full log: $LOG)"
+    die "the proxy exited before it was ready. Read the lines above (full log: $LOG)."
   fi
   if grep -Eq "Config loading failed|verification of the config failed|Failed to start|AesGcm is not supported" "$LOG" 2>/dev/null; then
     sleep 0.5
-    die "the proxy reported a startup error — read the lines above (full log: $LOG)"
+    die "the proxy reported a startup error. Read the lines above (full log: $LOG)."
   fi
   [ "$SECONDS" -lt "$deadline" ] || die "timed out after ${TIMEOUT}s waiting for the proxy to become ready (log: $LOG)"
   sleep 0.5
