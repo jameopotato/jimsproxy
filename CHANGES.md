@@ -13,6 +13,49 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-22 — Quick-start bundle: installer script and build script
+
+**Issue:** `docs/QUICK-INSTALL.md` described a one-click installer that did not exist yet, so
+the only route without the launcher was the five manual steps of `docs/MANUAL-INSTALL.md`.
+
+**Change:** scripts and docs only; no proxy code touched.
+- `scripts/quickstart/`: the bundle sources. `Install JimsProxy.cmd` is the entry point and
+  stops with "Extract the zip first" when opened from inside the zip; `install.ps1` is the
+  six-step installer plus update, reconfigure, and uninstall; `README.txt`.
+- `install.ps1` checks the client build (1.14.2.42597 only, from `.build.info` or the
+  executable's version, also inside a client archive before any extraction), downloads the
+  proxy archive named by `jimothy.cc/proxy/<channel>/latest.json` and verifies its published
+  SHA-256, checks the archive's contents before creating `Hermes`, keeps `HermesProxy.config`
+  and `AccountData` on update, and refuses a root folder whose `Hermes` it did not create
+  (a launcher or manual installation). Client archives are identified by their contents, never
+  by file name: the scan opens each zip larger than 1 GB and accepts it if it holds
+  `.build.info` and `_classic_era_/WowClassic_ForCustomServers.exe` (entry names compared with
+  forward slashes). Windows PowerShell 5.1, ASCII only, no administrator rights.
+- `scripts/build-quickstart.ps1`: packs the bundle into `build/JimsProxy-QuickStart.zip`
+  (files at the zip root) with a generated `VERSION.txt`, refuses non-ASCII `.ps1`/`.cmd`
+  files, and prints the zip's SHA-256.
+- `scripts/play.ps1`: parameters reduced to `-ProxyDir` and `-GameExe`; the portal line is
+  always set, the proxy always stopped, and the ready wait fixed at 60 seconds. The wait for a
+  WoW process started by a wrapper is removed (it also waited on any other running client).
+- `docs/QUICK-INSTALL.md`: menus, prompts, parameters and exit codes corrected against
+  `install.ps1`.
+
+**Verification:** on Windows 11 with PowerShell 5.1, against a local server serving the
+published 5.2.0 and 5.2.1-beta.4 archives (SHA-256 identical to `latest.json`) and a copy of a
+1.14.2.42597 client. `play.ps1`: `play.bat -GameExe` reset a changed portal line, reached the
+Kronos realm list, and on game exit stopped the proxy through the stdin handshake; a killed
+game and Ctrl+C in the Play window also stopped it through the handshake. Installer:
+unattended install; update 5.2.0 to 5.2.1-beta.4 left `HermesProxy.config` and `AccountData`
+byte-identical and was refused while the proxy ran; reconfigure; interactive and unattended
+uninstall. Archives: the scan listed an 8.1 GB client archive and a wrong-build one (not
+selectable) by contents and skipped a 1.1 GB non-client zip; the client archive was extracted,
+installed and played to the realm list; wrong-build, non-client and unreadable archives were
+rejected before extraction; an archive with backslash entry names inside a prefix folder
+installed unattended; non-empty and too-small destinations refused; Ctrl+C during extraction
+(exit 6, incomplete-folder message, re-run refused). Also: no network (exit 2); an error page
+in place of the proxy archive (exit 5, no `Hermes` left); a failed run resumed on the next run.
+Not yet run against the live jimothy.cc.
+
 ## 2026-09-22 — Installation guides, configuration reference, and play scripts
 
 **Issue:** the README offered only the launcher. Running the proxy by hand had no documentation

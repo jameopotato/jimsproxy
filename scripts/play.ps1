@@ -1,64 +1,27 @@
 <#
 .SYNOPSIS
-  Start JimsProxy, wait until it is ready, launch WoW, and stop the proxy when WoW exits.
-
-.DESCRIPTION
-  The manual-install equivalent of the launcher's Play button (Windows).
-  See docs/MANUAL-INSTALL.md. Double-click play.bat to run this without touching
-  the PowerShell execution policy.
-
-  What it does, in order:
-    1. Finds JimsProxy.exe and the game executable.
-    2. Refuses to start if a previous proxy still holds one of the proxy's ports.
-    3. Points WTF\Config.wtf at the proxy (SET portal "127.0.0.1:<BNetPort>"), keeping a .bak.
-    4. Starts the proxy and waits for its ready line ("Starting WorldSocket service").
-    5. Starts WowClassic_ForCustomServers.exe and waits for it to close.
-    6. Asks the proxy to shut down cleanly (so its diagnostic log is flushed),
-       force-closing it only if it does not answer within 5 seconds.
-
-  Proxy console output is shown here and saved to play-console.log next to JimsProxy.exe.
-  Closing this window with the X while the game runs skips the clean shutdown and leaves the
-  proxy running; the port check on the next run will tell you. Use Ctrl+C instead.
+  Start JimsProxy, wait until it is ready, start the game, and stop the proxy when the game
+  exits. Sets SET portal in WTF\Config.wtf (previous file kept as Config.wtf.bak). See
+  docs/MANUAL-INSTALL.md; play.bat runs this script without changing the execution policy.
 
 .PARAMETER ProxyDir
   Folder containing JimsProxy.exe. Default: this script's folder, then .\Hermes, then ..\Hermes.
 
 .PARAMETER GameExe
   Path to WowClassic_ForCustomServers.exe. Default: <root>\World of Warcraft\_classic_era_\WowClassic_ForCustomServers.exe
-  where <root> is the folder that contains Hermes\. Can also be the Arctium Launcher executable
-  (see -GameArgs); the script then waits for the WoW process it starts.
-
-.PARAMETER GameArgs
-  Arguments for the game executable. For the Arctium Launcher route with the stock WowClassic.exe:
-  -GameArgs '--staticseed --version=ClassicEra'
-
-.PARAMETER TimeoutSeconds
-  How long to wait for the proxy's ready line. Default 60.
-
-.PARAMETER KeepProxy
-  Leave the proxy running after the game exits.
-
-.PARAMETER NoPortalFix
-  Never touch WTF\Config.wtf.
+  where <root> is the folder that contains Hermes\.
 
 .EXAMPLE
-  .\play.ps1
-.EXAMPLE
-  .\play.ps1 -ProxyDir D:\Kronos\Hermes -GameExe "D:\Kronos\World of Warcraft\_classic_era_\WowClassic_ForCustomServers.exe"
-.EXAMPLE
-  .\play.ps1 -GameExe "D:\Kronos\World of Warcraft\Arctium WoW Launcher.exe" -GameArgs '--staticseed --version=ClassicEra'
+  .\play.ps1 -GameExe "D:\Kronos\World of Warcraft\_classic_era_\WowClassic_ForCustomServers.exe"
 #>
 [CmdletBinding()]
 param(
     [string]$ProxyDir,
-    [string]$GameExe,
-    [string]$GameArgs,
-    [int]$TimeoutSeconds = 60,
-    [switch]$KeepProxy,
-    [switch]$NoPortalFix
+    [string]$GameExe
 )
 
 $ErrorActionPreference = 'Stop'
+$TimeoutSeconds   = 60
 $ReadyLine        = 'Starting WorldSocket service'
 $ShutdownSentinel = '__LAUNCHER_SHUTDOWN__'
 $ShutdownAck      = '__PROXY_SHUTDOWN_ACK__'
@@ -97,8 +60,7 @@ if (-not $GameExe) { Fail "Game client not found. Pass -GameExe <path to WowClas
 if (-not (Test-Path $GameExe)) { Fail "Game executable does not exist: $GameExe" }
 $GameExe = (Resolve-Path $GameExe).Path
 if ((Split-Path -Leaf $GameExe) -ieq 'WowClassic.exe') {
-    Say "WARNING: on its own, WowClassic.exe only talks to Blizzard's servers. Use WowClassic_ForCustomServers.exe,"
-    Say "         or point -GameExe at the Arctium Launcher with -GameArgs '--staticseed --version=ClassicEra'."
+    Say "WARNING: WowClassic.exe connects only to Blizzard's servers. Use WowClassic_ForCustomServers.exe."
 }
 
 # ------------------------------------------------------------------ config values
@@ -136,32 +98,27 @@ if ($busy.Count -gt 0) {
 }
 
 # ------------------------------------------------------------------ portal fix
-if (-not $NoPortalFix) {
-    $gameDir  = Split-Path -Parent $GameExe
-    # The Arctium Launcher lives in the game root, one level above _classic_era_.
-    if (Test-Path (Join-Path $gameDir '_classic_era_')) { $gameDir = Join-Path $gameDir '_classic_era_' }
-    $wtfDir   = Join-Path $gameDir 'WTF'
-    $wtfPath  = Join-Path $wtfDir 'Config.wtf'
-    $expected = "SET portal `"127.0.0.1:$bnetPort`""
-    if (Test-Path $wtfPath) {
-        $lines = @(Get-Content $wtfPath)
-        $current = $lines | Where-Object { $_ -match '^SET portal ' } | Select-Object -First 1
-        if ($current -ne $expected) {
-            Copy-Item $wtfPath "$wtfPath.bak" -Force
-            if ($current) {
-                $done = $false
-                $lines = $lines | ForEach-Object { if (-not $done -and $_ -match '^SET portal ') { $done = $true; $expected } else { $_ } }
-            } else {
-                $lines += $expected
-            }
-            Set-Content -Path $wtfPath -Value $lines
-            Say "Config.wtf: set portal to 127.0.0.1:$bnetPort (backup in Config.wtf.bak)"
+$wtfDir   = Join-Path (Split-Path -Parent $GameExe) 'WTF'
+$wtfPath  = Join-Path $wtfDir 'Config.wtf'
+$expected = "SET portal `"127.0.0.1:$bnetPort`""
+if (Test-Path $wtfPath) {
+    $lines = @(Get-Content $wtfPath)
+    $current = $lines | Where-Object { $_ -match '^SET portal ' } | Select-Object -First 1
+    if ($current -ne $expected) {
+        Copy-Item $wtfPath "$wtfPath.bak" -Force
+        if ($current) {
+            $done = $false
+            $lines = $lines | ForEach-Object { if (-not $done -and $_ -match '^SET portal ') { $done = $true; $expected } else { $_ } }
+        } else {
+            $lines += $expected
         }
-    } else {
-        New-Item -ItemType Directory -Force -Path $wtfDir | Out-Null
-        Set-Content -Path $wtfPath -Value @($expected, 'SET textLocale "enUS"', 'SET audioLocale "enUS"')
-        Say "Config.wtf: created with portal 127.0.0.1:$bnetPort"
+        Set-Content -Path $wtfPath -Value $lines
+        Say "Config.wtf: set portal to 127.0.0.1:$bnetPort (backup in Config.wtf.bak)"
     }
+} else {
+    New-Item -ItemType Directory -Force -Path $wtfDir | Out-Null
+    Set-Content -Path $wtfPath -Value @($expected, 'SET textLocale "enUS"', 'SET audioLocale "enUS"')
+    Say "Config.wtf: created with portal 127.0.0.1:$bnetPort"
 }
 
 # ------------------------------------------------------------------ start proxy
@@ -248,47 +205,21 @@ try {
     Say "proxy is ready on 127.0.0.1:$bnetPort"
 
     # ---- start game
-    Say "starting the game: $GameExe $GameArgs"
-    $gameStarted = Get-Date
-    if ($GameArgs) {
-        $game = Start-Process -FilePath $GameExe -ArgumentList $GameArgs -WorkingDirectory (Split-Path -Parent $GameExe) -PassThru
-    } else {
-        $game = Start-Process -FilePath $GameExe -WorkingDirectory (Split-Path -Parent $GameExe) -PassThru
-    }
+    Say "starting the game: $GameExe"
+    $game = Start-Process -FilePath $GameExe -WorkingDirectory (Split-Path -Parent $GameExe) -PassThru
     while (-not $game.HasExited) {
         Pump-Proxy | Out-Null
         if ($proxy.HasExited) { Say "WARNING: the proxy exited while the game was running (log: $logPath)" ; break }
         Start-Sleep -Milliseconds 250
     }
     if ($game.HasExited) { Say "game process exited (code $($game.ExitCode))" }
-
-    # A launcher (Arctium, or any wrapper) returns as soon as it has started WoW. If a WoW
-    # process is running, keep waiting for that one instead of stopping the proxy under it.
-    function Get-GameProcess { Get-Process -Name 'WowClassic', 'WowClassic_ForCustomServers' -ErrorAction SilentlyContinue }
-    if (((Get-Date) - $gameStarted).TotalSeconds -lt 5) {
-        $spawnDeadline = (Get-Date).AddSeconds(5)
-        while (-not (Get-GameProcess) -and (Get-Date) -lt $spawnDeadline) { Pump-Proxy | Out-Null; Start-Sleep -Milliseconds 500 }
-    }
-    if (Get-GameProcess) {
-        Say "WoW is running (started by a launcher); waiting for it to exit..."
-        while (Get-GameProcess) {
-            Pump-Proxy | Out-Null
-            if ($proxy.HasExited) { Say "WARNING: the proxy exited while the game was running (log: $logPath)" ; break }
-            Start-Sleep -Milliseconds 1000
-        }
-        Say "game exited"
-    }
 }
 catch {
     Write-Host "[play] ERROR: $($_.Exception.Message)" -ForegroundColor Red
     $exitCode = 1
 }
 finally {
-    if ($KeepProxy -and $exitCode -eq 0 -and $proxy -and -not $proxy.HasExited) {
-        Say "leaving the proxy running (PID $($proxy.Id)). Stop it later from Task Manager."
-    } else {
-        Stop-Proxy
-    }
+    Stop-Proxy
     if ($log) { $log.Dispose() }
 }
 exit $exitCode
