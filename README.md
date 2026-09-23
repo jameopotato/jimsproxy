@@ -12,7 +12,7 @@ Three routes, all on Windows. Linux and macOS are covered in the manual guide's 
 
 ### Classic WoW Launcher
 
-The **Classic WoW Launcher** ([jimothy.cc/install](https://jimothy.cc/install)) is a desktop application that installs JimsProxy, updates it (stable or beta channel), manages addons, and starts the proxy and the game together.
+The **Classic WoW Launcher** ([jimothy.cc/install](https://jimothy.cc/install)) is a Windows desktop application: proxy installation and updates (stable or beta), realm selection, addon management and profiles, keybinding and macro import, optional auto-login, multibox support, and proxy feature control (Cast Pipeline, 41-yard nameplates, Threat Engine, iMorph compatibility).
 
 ### Quick-start bundle (no launcher)
 
@@ -24,13 +24,14 @@ One zip, one double-click. The bundle's installer locates the 1.14.2 client, ins
 
 ## What This Fork Adds
 
-- **Kronos translation fixes** — spell casting, realm switching, disconnects, combat log, auction house, and dozens of packet translation bugs fixed for Twinstar's MaNGOS fork
-- **Structured JSONL logging** — every packet, translation, and lifecycle event emitted to machine-readable logs for diagnosing issues
-- **Spell system overhaul** — cast-time spell queue, GCD sweep sync, RTT-adaptive fire offset, off-GCD macro support
-- **Auto-reconnect** — recovers from unplanned server disconnects without manual relogin
-- **NPC and pet scale parity** — creature sizes match vanilla 1.12 proportions
-- **Bundled with JimsProxy Launcher** — one-click setup, automatic updates, addon management
-- **Active development** — more fixes and features coming
+- **Kronos protocol compatibility** — login, realm switching, character handling, auction house, chat links, GM tickets, transports and flight paths translated for Twinstar's MaNGOS fork (`ServerType`)
+- **Cast pipeline** — spell queue with an adjustable window, latency-adaptive GCD release, off-GCD handling, optional low-latency mode
+- **Stuck-state and disconnect fixes** — looping cast animations, lit action buttons, auto-attack and Auto Shot recovery, movement lockups after teleports and battleground exits, auto-reconnect after unplanned disconnects
+- **Aura and timer accuracy** — vanilla duration data, combo-point scaling, other units' remaining buff time, swing-timer correctness
+- **Threat engine** — synthesized threat for threat-meter addons (opt-in)
+- **1.12 visual parity** — NPC, pet and player scale from vanilla data, animations, emotes, tooltips and Kronos item-data corrections
+- **Addon interoperability** — the bundled JimsPlus addon; PallyPower and HealComm bridges between 1.12 and 1.14 players; intact compressed addon communication
+- **Diagnostics** — structured JSONL session logs, bug reports from the launcher, per-opcode latency metrics, a kill switch for every shipped fix
 
 See [CHANGES.md](CHANGES.md) for the full changelog.
 
