@@ -29,7 +29,7 @@ Contents
 |---|---|
 | Operating system | Windows 10 or Windows 11, 64-bit, with Windows PowerShell 5.1 (included). |
 | Game client | WoW Classic Era **1.14.2, build 42597**, either installed (a `_classic_era_` folder) or present as a client archive (a zip that contains `.build.info` and the `_classic_era_` folder, such as `pkg_base.zip`), which the installer extracts. The installer accepts this build only; any other build is listed as not supported. JimsProxy does not include or distribute the game client. |
-| Custom-server capable executable | `WowClassic_ForCustomServers.exe` in the client's `_classic_era_` folder, or the unmodified `WowClassic.exe` together with the [Arctium WoW Launcher](https://github.com/Arctium/WoW-Launcher) placed in the folder above `_classic_era_`. See [Client executable options](MANUAL-INSTALL.md#client-executable-options). |
+| Custom-server capable executable | `WowClassic_ForCustomServers.exe` in the client's `_classic_era_` folder, or the unmodified `WowClassic.exe` together with the [Arctium WoW Launcher](https://github.com/Arctium/WoW-Launcher) placed in the folder above `_classic_era_`. See [Client executable options](MANUAL-INSTALL.md#requirements). |
 | Server account | An account for the server. For Kronos, create one at [kronos-wow.com](https://www.kronos-wow.com). |
 | Network | Access to `jimothy.cc` (proxy archive) and `raw.githubusercontent.com` (configuration file and play scripts). |
 | Disk space | Approximately 500 MB on the drive that holds the client. Extracting a client archive additionally requires the archive's uncompressed size on the destination drive. |
@@ -130,7 +130,7 @@ Create a desktop shortcut "Play Kronos"? [Y/n]
 ```
 
 JimsPlus is the in-game addon that pairs with the proxy (see
-[Installing the JimsPlus addon](MANUAL-INSTALL.md#installing-the-jimsplus-addon-optional)).
+[Installing the JimsPlus addon](MANUAL-INSTALL.md#jimsplus-addon-optional)).
 
 ### Step 6 of 6: Done
 
@@ -156,7 +156,7 @@ Start the game now? [Y/n]
    closes.
 
 `Play Kronos.cmd` runs the same `play.ps1` described in
-[Running the proxy and the game](MANUAL-INSTALL.md#running-the-proxy-and-the-game) with the
+[Running the proxy and the game](MANUAL-INSTALL.md#run) with the
 paths resolved by the installer.
 
 ## Updating
@@ -253,7 +253,7 @@ required amount is shown in the message.
 
 **The entry says "needs WowClassic_ForCustomServers.exe or the Arctium launcher".**
 The folder contains only the unmodified `WowClassic.exe`. See
-[Client executable options](MANUAL-INSTALL.md#client-executable-options).
+[Client executable options](MANUAL-INSTALL.md#requirements).
 
 **"Download failed" (exit code 4) or "verification failed" (exit code 5).**
 The proxy archive or a repository file could not be fetched, or the downloaded archive did not
