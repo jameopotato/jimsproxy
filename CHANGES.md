@@ -13,46 +13,33 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
-## 2026-09-22 — Manual install guide, configuration reference, and launch scripts
+## 2026-09-22 — Installation guides, configuration reference, and play scripts
 
-**Issue:** the README's only start path was "download the launcher", and the two docs that
-covered running the proxy by hand (#492, #495) were reverted for placement rather than content.
-Anyone landing on this repo wanting to run the proxy itself had build steps that stop at
-`dotnet publish` and nothing about connecting, and the Play button's start → wait-for-ready →
-launch → clean-shutdown sequence had no manual equivalent. `verify-checksums.*` still pointed at
+**Issue:** the README offered only the launcher. Running the proxy by hand had no documentation
+beyond `dotnet publish` (#492 and #495 were reverted for placement, not content), there was no
+manual equivalent of the launcher's Play sequence, and `verify-checksums.*` pointed at
 `Xian55/HermesProxy`.
 
-**Change:** docs only, plus scripts; no proxy code touched.
-- `docs/MANUAL-INSTALL.md` — the manual path for Windows, Linux and macOS (the latter two
-  community-supported): what you need (the game client is bring-your-own and is not linked),
-  the one config value, the portal line, the ready signal, updating, JimsPlus by hand, CLI flags,
-  chat commands, files and ports, troubleshooting, bug reports.
-- `docs/configuration.md` — the #495 reference restored (all 40 keys, verified 40/40 against
-  `Settings.cs` `config.Get*` calls; 19/19 in-file keys against `HermesProxy.config`), with the
-  launcher-ownership warning reworded to what the launcher actually does (regenerates on
-  setup/repair/update, rewrites managed keys on Save).
-- `scripts/play.sh` (Linux/macOS) and `scripts/play.ps1` + `play.bat` (Windows) — port check,
-  portal fix with backup, start proxy, wait for `Starting WorldSocket service`, start game, wait,
-  then the `__LAUNCHER_SHUTDOWN__` / `__PROXY_SHUTDOWN_ACK__` stdin handshake with SIGTERM/kill
-  fallback, so the JSONL log is flushed like a launcher stop.
-- `scripts/verify-checksums.sh` / `.ps1` — repo corrected to `jameopotato/jimsproxy`.
-- Rewritten the same day after review into a novice step-by-step (numbered steps, exact
-  PowerShell commands, a check after every step). The guide leads with the
-  direct bundle downloads (`jimothy.cc/proxy/stable/latest`, `/beta/latest`), states that the
-  bundle ships without `HermesProxy.config` (the proxy exits with `Config loading failed`
-  without one) and where to get it, and documents the Arctium Launcher route
-  (`--staticseed --version=ClassicEra` with the stock `WowClassic.exe`) beside
-  `WowClassic_ForCustomServers.exe`. The scripts accept a launcher as the game executable
-  (`-GameArgs` on Windows) and wait for the WoW process it spawns.
-- README: "Quick Install" (the launcher) and "Manual Install" (this guide). This guide is the
-  canonical install document; the launcher repo is private and keeps only the Discord post set
-  and the website handoff.
+**Change:** docs and scripts only; no proxy code.
+- `README.md`: an Installation section with three routes (the launcher at jimothy.cc/install,
+  the quick-start bundle, manual install) and a current feature list.
+- `docs/MANUAL-INSTALL.md`: install and run without the launcher on Windows, with the exact
+  PowerShell commands; Linux and macOS appendix (community-supported, built from source);
+  troubleshooting; reference.
+- `docs/QUICK-INSTALL.md`: the quick-start bundle's installer, prompts, parameters and exit codes.
+- `docs/configuration.md`: all 40 keys the proxy reads (restores #495).
+- `scripts/play.ps1` + `play.bat` (Windows) and `scripts/play.sh` (Linux, macOS): port check,
+  portal line, start the proxy, wait for `Starting WorldSocket service`, start the game, then stop
+  the proxy through the stdin shutdown handshake so the JSONL log is flushed.
+- `scripts/verify-checksums.*`: repository corrected to `jameopotato/jimsproxy`.
 
-**Verification:** `play.sh` exercised on Linux against a stand-in proxy that mirrors the real
-startup lines and stdin handshake: normal run, port already in use, proxy failing before ready,
-`--keep-proxy`, a detached game command, SIGTERM and Ctrl+C. `play.ps1` is untested here (no
-PowerShell in the authoring environment) and is flagged as such in the guide. Doc links checked
-relative to the repo layout.
+**Verification:** configuration keys checked against `Settings.cs` (40/40) and the shipped
+`HermesProxy.config` (19/19). Download facts (file name, archive layout, `latest.json` hash,
+TLS 1.2, progress-bar cost) confirmed against jimothy.cc from Windows PowerShell 5.1. `play.sh`
+run on Linux against a stand-in proxy that mirrors the real startup lines and shutdown
+handshake: normal session, port in use, startup failure, detached game command, missing config,
+SIGTERM, Ctrl+C. `play.ps1` is verified on Windows in the quick-start bundle entry. Relative
+links and anchors checked.
 
 ---
 
