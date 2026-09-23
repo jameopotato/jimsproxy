@@ -148,8 +148,8 @@ Step 3 adds one.
 
 **File Explorer**
 
-1. Open the URL for the chosen channel. The browser saves a file named like
-   `hermes-bundle-5.2.0.zip` to the Downloads folder.
+1. Open the URL for the chosen channel. The browser saves a file named `JimsProxy-<version>.zip`
+   (for example `JimsProxy-5.2.0.zip`) to the Downloads folder.
 2. Right-click the downloaded file and select **Extract All…**.
 3. In the destination field, replace the suggested path with `C:\Games\Kronos\Hermes` and
    select **Extract**.
@@ -157,14 +157,31 @@ Step 3 adds one.
 **PowerShell**
 
 ```powershell
+$ProgressPreference = 'SilentlyContinue'
 Invoke-WebRequest -Uri "https://jimothy.cc/proxy/stable/latest" -OutFile "$env:TEMP\jimsproxy-bundle.zip"
 Expand-Archive -Path "$env:TEMP\jimsproxy-bundle.zip" -DestinationPath "C:\Games\Kronos\Hermes" -Force
 ```
 
+The first line disables the download progress bar, which slows Windows PowerShell 5.1 downloads
+considerably (measured: 25 s with the bar, 1.4 s without, for the same file).
+
 **Expected result:** `C:\Games\Kronos\Hermes` contains `JimsProxy.exe`, `CSV`, `Addons`, and
 `manifest.json` directly. If the contents are inside a sub-folder (for example
-`Hermes\hermes-bundle-5.2.0\JimsProxy.exe`), move them up into `Hermes` and delete the empty
-sub-folder.
+`Hermes\JimsProxy-5.2.0\JimsProxy.exe`), *Extract All* kept its suggested destination; move the
+contents up into `Hermes` and delete the empty sub-folder.
+
+**Optional verification.** Each channel publishes a manifest,
+`https://jimothy.cc/proxy/<channel>/latest.json`, whose `sha256` field is the archive's SHA-256.
+To compare the downloaded file against it:
+
+```powershell
+(Get-FileHash "$env:TEMP\jimsproxy-bundle.zip" -Algorithm SHA256).Hash -eq (Invoke-RestMethod "https://jimothy.cc/proxy/stable/latest.json").sha256
+```
+
+Expected output: `True`. The manifest is cached for up to five minutes, so a release published
+between the download and the check produces a false `False`; repeat the check after a few minutes
+before treating it as a corrupted download. The archive is about 38 MB; a downloaded file of a few
+KB is an error page, not the archive.
 
 > **Note:** `JimsProxy.exe` is not code-signed and opens listening ports on the local machine.
 > Antivirus software may quarantine it, and Windows SmartScreen may display "Windows protected
@@ -367,11 +384,15 @@ A manual installation is not updated automatically. Releases are listed on the
    `HermesProxy.config` or `AccountData`, so both are left unchanged.
 
    ```powershell
+   $ProgressPreference = 'SilentlyContinue'
    Invoke-WebRequest -Uri "https://jimothy.cc/proxy/stable/latest" -OutFile "$env:TEMP\jimsproxy-bundle.zip"
    Expand-Archive -Path "$env:TEMP\jimsproxy-bundle.zip" -DestinationPath "C:\Games\Kronos\Hermes" -Force
    ```
 
-   For the beta channel, use `https://jimothy.cc/proxy/beta/latest`.
+   For the beta channel, use `https://jimothy.cc/proxy/beta/latest`. The four most recent
+   releases of each channel remain downloadable by version, for example
+   `https://jimothy.cc/proxy/stable/JimsProxy-5.2.0.zip`, which allows returning to an earlier
+   version with the same commands.
 3. If JimsPlus is installed, copy the updated addon again as described in
    [Installing the JimsPlus addon](#installing-the-jimsplus-addon-optional).
 
@@ -417,6 +438,22 @@ value (a malformed `ClientSeed`, an unsupported build, or a port outside 1–655
 The client build is not 42597, or the unmodified `WowClassic.exe` was started without the
 Arctium launcher. See [Verifying the client build](#verifying-the-client-build) and
 [Client executable options](#client-executable-options).
+
+**`Invoke-WebRequest` fails with an SSL or TLS error.**
+The server requires TLS 1.2 or newer. Current Windows 10 and 11 installations negotiate it by
+default; on a system whose .NET defaults to an older protocol, run the following in the same
+PowerShell window before the download:
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+```
+
+**The download link returns error 503.**
+The channel is paused while a release is being published. Retry later.
+
+**The downloaded file is only a few KB, or `Expand-Archive` reports an invalid archive.**
+The download returned an error page instead of the archive. Download again in a browser, or
+verify the file as described in [Step 2](#step-2-download-and-extract-the-proxy).
 
 **A yellow "update available" message appears at proxy startup.**
 The message comes from a version check against the archived upstream project and can be
@@ -566,6 +603,23 @@ Listeners, all bound to `127.0.0.1`:
 To run two proxy instances at once (multiboxing), use a second copy of the `Hermes` folder with
 a different port set (the launcher's second instance uses `1120 / 8082 / 8085 / 8087`) and set
 that client's portal to the second `BNetPort`.
+
+### Download manifest
+
+`https://jimothy.cc/proxy/stable/latest.json` and `https://jimothy.cc/proxy/beta/latest.json`
+describe the current release of each channel. `https://jimothy.cc/proxy/<channel>/latest`
+redirects to the archive named in `url`.
+
+| Field | Contents |
+|---|---|
+| `version` | Release version, for example `5.2.0` |
+| `url` | Download URL of the archive |
+| `sha256` | SHA-256 of the archive |
+| `pub_date` | Publication time (UTC) |
+| `notes` | Release notes, when provided |
+| `build.built_at`, `build.commit`, `build.runtime`, `build.framework` | Build metadata copied from the archive's `manifest.json` |
+
+While a channel is paused for publishing, `latest` returns `503` and `latest.json` returns `204`.
 
 ### Configuration keys
 

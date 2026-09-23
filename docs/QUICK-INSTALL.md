@@ -113,8 +113,9 @@ Channel:  [1] Stable  [2] Beta (newer changes, less testing)                    
 ### Step 4 of 6: Install the proxy
 
 No input is required. The installer creates a `Hermes` folder next to the `World of Warcraft`
-folder (or next to `_classic_era_` when there is no `World of Warcraft` level), downloads the
-proxy archive for the chosen channel from `jimothy.cc`, extracts it, downloads
+folder (or next to `_classic_era_` when there is no `World of Warcraft` level), reads the
+channel's manifest (`https://jimothy.cc/proxy/<channel>/latest.json`), downloads the archive it
+names, verifies the archive's SHA-256 against the manifest, extracts it, downloads
 `HermesProxy.config` and the play scripts from the repository, sets `ServerAddress`, and writes
 `Play Kronos.cmd`. Each action prints one line as it completes.
 
@@ -255,9 +256,10 @@ The folder contains only the unmodified `WowClassic.exe`. See
 [Client executable options](MANUAL-INSTALL.md#client-executable-options).
 
 **"Download failed" (exit code 4) or "verification failed" (exit code 5).**
-The proxy archive or a repository file could not be fetched, or the download was not a valid
-archive. Check the network, then run the installer again; a partial installation is completed
-on the next run.
+The proxy archive or a repository file could not be fetched, or the downloaded archive did not
+match the SHA-256 in the channel manifest. Check the network, then run the installer again; a
+partial installation is completed on the next run. A message that the channel is paused means a
+release is being published; retry later.
 
 **Step 1 fails on connectivity.**
 `jimothy.cc` or `raw.githubusercontent.com` is not reachable from this PC (firewall, proxy,
