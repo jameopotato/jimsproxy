@@ -50,7 +50,7 @@ restore it and add the `Hermes` folder to the exclusion list.
 both hosts, free disk space. A failed check is reported and the installer exits (code 2).
 
 **Step 2 of 6: Find the client.** The installer scans the usual installation locations and the
-fixed drives (four folder levels, about a second) for `_classic_era_` folders, and the
+fixed drives (four folder levels deep) for `_classic_era_` folders, and the
 Downloads, Desktop, Documents and drive-root folders for `pkg_base.zip`:
 
 ```
@@ -119,13 +119,14 @@ the installer shows:
   `JimsProxy.exe`, `CSV`, `Addons` and `manifest.json`; re-copies JimsPlus if it was installed;
   refreshes the play scripts. `HermesProxy.config` and `AccountData` are not modified.
 - **Reconfigure** shows the server and channel menus again. A channel change takes effect at the
-  next update. The network check is skipped.
+  next update.
 - **Uninstall** asks for confirmation, offers to move `AccountData` to
   `<root>\JimsProxy-AccountData-backup`, deletes `Hermes`, deletes `Interface\AddOns\JimsPlus`
   if the installer created it, removes the `SET portal` line only if it points at `127.0.0.1`,
   and deletes the shortcut.
 
-Update and Uninstall refuse to run while `JimsProxy.exe` is running (exit code 2).
+Update and Uninstall refuse to run while `JimsProxy.exe` is running (exit code 2). Reconfigure
+and Uninstall skip the Step 1 network check.
 
 ---
 
@@ -176,15 +177,15 @@ Nothing else in the client is modified, and nothing is deleted.
 [Verifying the client build](MANUAL-INSTALL.md#verifying-the-client-build). `B`, `A` or `T`
 selects a client the scan did not find.
 
-**An archive is "not supported" or "not a client archive".** Its `.build.info` reports another
-build, or it lacks `.build.info` and a `_classic_era_` folder with the game executable.
+**An archive is rejected.** Its `.build.info` reports another build, or it lacks `.build.info`
+and a `_classic_era_` folder with the game executable.
 
-**"Destination is not empty" or "not enough free space".** Choose an empty or non-existent
-folder on a drive with room for the extracted client. An interrupted extraction leaves an
-incomplete folder that must be deleted before running again.
+**The archive destination is refused.** It must be an empty or non-existent folder on a drive
+with room for the extracted client. An interrupted extraction leaves an incomplete folder that
+must be deleted before running again.
 
-**"A Hermes folder already exists here."** The folder holds a launcher or manual installation.
-Update it with that route, or choose a different client folder.
+**The installer refuses a folder that already has `Hermes`.** It holds a launcher or manual
+installation. Update it with that route, or choose a different client folder.
 
 **Download failed (exit code 4).** A host was unreachable, or the channel is paused while a
 release is published; retry later.
