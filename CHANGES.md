@@ -13,6 +13,22 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-23 — Release workflow: attach JimsProxy-QuickStart.zip to every release
+
+**Issue:** the quick-start guide and jimothy.cc link to
+`releases/latest/download/JimsProxy-QuickStart.zip`, which resolves only against the newest full
+release. A release without the asset breaks that link.
+
+**Change:** `.github/workflows/Release.yml`: the Windows build job runs
+`scripts/build-quickstart.ps1` under Windows PowerShell 5.1 and uploads
+`build/JimsProxy-QuickStart.zip` as an artifact; the release job already attaches every artifact
+zip and lists it in `checksums-sha256.txt`. The verify job fails the release if the zip is missing
+or lacks `Install JimsProxy.cmd`, `install.ps1`, `README.txt`, or `VERSION.txt` at its root. The
+build step fails if `scripts/build-quickstart.ps1` is absent (it arrives with PR #532).
+
+**Verification:** workflow YAML parsed with js-yaml; the verify check run locally against a zip
+built by `scripts/build-quickstart.ps1`. First real run is the next release.
+
 ## 2026-09-22 — Quick-start bundle: installer script and build script
 
 **Issue:** `docs/QUICK-INSTALL.md` described a one-click installer that did not exist yet, so
