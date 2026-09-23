@@ -23,7 +23,7 @@ Contents
 - Windows 10 or 11, 64-bit, with Windows PowerShell 5.1 (included). No administrator rights.
 - WoW Classic Era **1.14.2, build 42597**, with `WowClassic_ForCustomServers.exe`: either
   installed (a `_classic_era_` folder) or as a client archive (a zip containing `.build.info`
-  and the `_classic_era_` folder, such as `pkg_base.zip`), which the installer extracts. Any
+  and the `_classic_era_` folder), which the installer extracts. Any
   other build is listed as not supported and cannot be selected. The game client is not
   included.
 - An account on the server. For Kronos: [kronos-wow.com](https://www.kronos-wow.com).
@@ -51,12 +51,12 @@ both hosts, free disk space. A failed check is reported and the installer exits 
 
 **Step 2 of 6: Find the client.** The installer scans the usual installation locations and the
 fixed drives (four folder levels deep) for `_classic_era_` folders, and the
-Downloads, Desktop, Documents and drive-root folders for `pkg_base.zip`:
+Downloads, Desktop, Documents and drive-root folders for client archives:
 
 ```
 [1] D:\Games\Kronos\World of Warcraft\_classic_era_    build 1.14.2.42597    WowClassic_ForCustomServers.exe
 [-] C:\Program Files (x86)\World of Warcraft\_classic_era_    not supported: build 1.15.7.60000
-[2] C:\Users\Name\Downloads\pkg_base.zip    client archive    build 1.14.2.42597    (will be extracted)
+[2] C:\Users\Name\Downloads\client.zip    client archive    build 1.14.2.42597    (will be extracted)
 [B] Browse for the _classic_era_ folder
 [A] Use a client archive (.zip)
 [T] Type the path
