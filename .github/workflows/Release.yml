@@ -156,6 +156,26 @@ jobs:
           compression-level: 0
           retention-days: 1
 
+      # Every release carries JimsProxy-QuickStart.zip: the quick-start guide and
+      # jimothy.cc link to releases/latest/download/JimsProxy-QuickStart.zip, which
+      # resolves against the newest full release only. Windows PowerShell 5.1 is the
+      # shell the installer targets, so the bundle is built with it.
+      - name: Build quick-start bundle
+        shell: powershell
+        run: |
+          if (-not (Test-Path scripts\build-quickstart.ps1)) { throw 'scripts/build-quickstart.ps1 is missing; the release needs JimsProxy-QuickStart.zip' }
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-quickstart.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload quick-start bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: JimsProxy-QuickStart
+          path: build/JimsProxy-QuickStart.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
   verify:
     needs: [version, test, build]
     runs-on: ubuntu-latest
@@ -213,6 +233,20 @@ jobs:
           fi
 
           echo "OK: archive contains the binary, config and $csv_count CSV entries"
+
+          qs=$(find artifacts -name "JimsProxy-QuickStart.zip" -type f | head -1)
+          if [ -z "$qs" ]; then
+            echo "FAIL: JimsProxy-QuickStart.zip missing"
+            exit 1
+          fi
+          for entry in "Install JimsProxy.cmd" install.ps1 README.txt VERSION.txt; do
+            if ! unzip -Z1 "$qs" | grep -qx "$entry"; then
+              echo "FAIL: $entry missing from JimsProxy-QuickStart.zip"
+              unzip -Z1 "$qs"
+              exit 1
+            fi
+          done
+          echo "OK: JimsProxy-QuickStart.zip contains the installer at its root"
 
   release:
     needs: [version, test, build, verify]
