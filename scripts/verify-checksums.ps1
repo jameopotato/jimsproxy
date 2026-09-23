@@ -1,18 +1,18 @@
-# Verify HermesProxy release checksums
+# Verify JimsProxy release checksums
 # Usage: .\verify-checksums.ps1 [-Directory <path>]
 #
 # Downloads checksums-sha256.txt from the latest release and verifies
-# all HermesProxy archives in the specified directory (default: current dir).
+# all JimsProxy release archives in the specified directory (default: current dir).
 
 param(
     [string]$Directory = "."
 )
 
-$Repo = "Xian55/HermesProxy"
+$Repo = "jameopotato/jimsproxy"
 $ChecksumsFile = "checksums-sha256.txt"
 $ChecksumsPath = Join-Path $Directory $ChecksumsFile
 
-Write-Host "=== HermesProxy Release Checksum Verifier ===" -ForegroundColor Cyan
+Write-Host "=== JimsProxy Release Checksum Verifier ===" -ForegroundColor Cyan
 Write-Host ""
 
 # Download checksums file if not present

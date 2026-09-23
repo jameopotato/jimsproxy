@@ -1,17 +1,17 @@
 #!/bin/bash
-# Verify HermesProxy release checksums
+# Verify JimsProxy release checksums
 # Usage: ./verify-checksums.sh [download-directory]
 #
 # Downloads checksums-sha256.txt from the latest release and verifies
-# all HermesProxy archives in the specified directory (default: current dir).
+# all JimsProxy release archives in the specified directory (default: current dir).
 
 set -e
 
 DIR="${1:-.}"
-REPO="Xian55/HermesProxy"
+REPO="jameopotato/jimsproxy"
 CHECKSUMS="checksums-sha256.txt"
 
-echo "=== HermesProxy Release Checksum Verifier ==="
+echo "=== JimsProxy Release Checksum Verifier ==="
 echo ""
 
 # Download checksums file if not present
