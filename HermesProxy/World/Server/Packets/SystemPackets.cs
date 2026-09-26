@@ -233,7 +233,12 @@ public class FeatureSystemStatus : ServerPacket
     public bool ChatDisabledByPlayer;
     public bool LFGListCustomRequiresAuthenticator;
     public bool BattlegroundsEnabled;
-    public List<byte> RaceClassExpansionLevels = new();
+    // JimsProxy: this list sits behind a has-bit (WriteBit(RaceClassExpansionLevels != null)) and the
+    // proxy never fills it, so it must stay null: the nullable sweep's `= new()` set the bit and wrote
+    // a zero count, which the 1.14.2 client under Linux faulted on at world entry (6 of 6 runs; 0 of 4
+    // with the bit clear). Upstream shipped it null for years. Any field that feeds a
+    // WriteBit(x != null) is a protocol signal: keep it T? with a null default, never `= new()`.
+    public List<byte>? RaceClassExpansionLevels;
 
     public SocialQueueConfig QuickJoinConfig;
     public SquelchInfo Squelch;

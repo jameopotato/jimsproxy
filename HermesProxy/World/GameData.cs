@@ -45,6 +45,9 @@ public static partial class GameData
     //MIRASU   Frostbolt visual), not the SpellXSpellVisual wrapper IDs we look up via
     //MIRASU   GetSpellVisual. Used to dismiss target-frame cast bars on mob interrupts.
     public static FrozenDictionary<uint, uint> SpellXSpellVisualToSpellVisual = FrozenDictionary<uint, uint>.Empty;
+    // JimsProxy (CancelWindupKitOnGo): SpellVisualID -> kits used ONLY as caster-side wind-ups
+    // (SpellVisualEvent start event 1 -> end event 2, TargetType 1) in the current client build.
+    public static FrozenDictionary<uint, uint[]> SpellVisualWindupKits = FrozenDictionary<uint, uint[]>.Empty;
     public static FrozenDictionary<uint, uint> LearnSpells = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, uint> TotemSpells = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, uint> Gems = FrozenDictionary<uint, uint>.Empty;
@@ -63,6 +66,11 @@ public static partial class GameData
     // by the IsInWorld() gate. Without this, players get autobanned for casting a
     // predecessor rank whose silent server-side removal the proxy never saw.
     public static FrozenDictionary<uint, uint> SpellRankPredecessor = FrozenDictionary<uint, uint>.Empty;
+    // JimsProxy (respec cast lock): talent-rank spell id -> Talent.dbc ClassMask, from the same
+    // TalentSpellRanks.csv as TalentRankPredecessors. Lets the respec lock pick out the local
+    // player's OWN talent spells (a spell can be a talent for one class and a trainer spell for
+    // another) without a per-class table.
+    public static FrozenDictionary<uint, uint> TalentSpellClassMask = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, uint> TransportPeriods = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, string> AreaNames = FrozenDictionary<uint, string>.Empty;
     public static FrozenDictionary<string, uint> AreaIdsByName = FrozenDictionary<string, uint>.Empty;
@@ -416,6 +424,16 @@ public static partial class GameData
         return 0;
     }
 
+    // JimsProxy (CancelWindupKitOnGo): the wind-up kits to cancel for a GO's SpellXSpellVisualID.
+    // Empty when either table is missing or the visual has no exclusive wind-up kit.
+    public static ReadOnlySpan<uint> GetWindupKitsForXSpellVisual(uint spellXSpellVisualId)
+    {
+        uint visual = GetSpellVisualIdFromXSpellVisual(spellXSpellVisualId);
+        if (visual != 0 && SpellVisualWindupKits.TryGetValue(visual, out var kits))
+            return kits;
+        return ReadOnlySpan<uint>.Empty;
+    }
+
     /// <summary>
     /// Returns true if the given spell does not trigger the global cooldown on
     /// vanilla 1.12 servers. JimsProxy issue #43 — these spells bypass the
@@ -684,6 +702,23 @@ public static partial class GameData
         2645,   // Ghost Wolf
         15473,  // Shadowform
     }.ToFrozenSet();
+
+    // JimsProxy (fishing recast wedge): the Fishing channel spells. Scopes the held
+    // channel zero-update guard to fishing only — see GameSessionData.OnLocalChannelStart.
+    // 33095 included because TBC 2.4.3 backends are accepted by the version checker.
+    public static readonly FrozenSet<uint> FishingChannelSpells = new uint[]
+    {
+        7620,   // Fishing (Apprentice)
+        7731,   // Fishing (Journeyman)
+        7732,   // Fishing (Expert)
+        18248,  // Fishing (Artisan)
+        33095,  // Fishing (Master, TBC)
+    }.ToFrozenSet();
+
+    public static bool IsFishingChannelSpell(uint spellId) => FishingChannelSpells.Contains(spellId);
+
+    // GAMEOBJECT_TYPE_FISHINGNODE — the bobber a fishing channel spawns for its caster.
+    public const sbyte FishingNodeGameObjectType = 17;
 
     /// <summary>
     /// JimsProxy: true if the spell is a CP-scaling enemy-debuff finisher we compute
@@ -967,6 +1002,7 @@ public static partial class GameData
             LoadItemEnchantVisuals,
             LoadSpellVisuals,
             LoadSpellVisualResolved,
+            LoadSpellVisualWindupKits,
             LoadLearnSpells,
             LoadTotemSpells,
             LoadGems,
@@ -1442,6 +1478,34 @@ public static partial class GameData
         SpellXSpellVisualToSpellVisual = dict.ToFrozenDictionary();
     }
 
+    // JimsProxy (CancelWindupKitOnGo): SpellVisualID -> exclusive caster-side wind-up kits.
+    // Missing-tolerant like LoadSpellVisualResolved (no file => empty table => the cancel path
+    // sends nothing). Regenerate with scripts/gen-windup-kits.py from the wago.tools
+    // SpellVisualEvent CSV for the client build (1.14.2.42597 today): keep rows with
+    // StartEvent=1, EndEvent=2, TargetType=1 (the caster kit that carries the held wind-up sound; the 2026-09-07 PTR run showed the sound-owning effect reports it, e.g. 99, never the 3->13 precast kit) and drop any kit that also appears under a
+    // different (StartEvent, EndEvent, TargetType), so a cancel by kit can never hit a
+    // non-wind-up effect.
+    public static void LoadSpellVisualWindupKits()
+    {
+        var path = Path.Combine("CSV", $"SpellVisualWindupKits{ModernVersion.ExpansionVersion}.csv");
+        if (!File.Exists(path))
+            return;
+
+        using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+        var dict = new Dictionary<uint, List<uint>>(EstimateRowCount(path, 12));
+
+        foreach (var row in reader)
+        {
+            uint spellVisualId = uint.Parse(row[0].Span);
+            uint kitId = uint.Parse(row[1].Span);
+            if (!dict.TryGetValue(spellVisualId, out var kits))
+                dict[spellVisualId] = kits = new List<uint>(1);
+            if (!kits.Contains(kitId))
+                kits.Add(kitId);
+        }
+        SpellVisualWindupKits = dict.ToFrozenDictionary(kv => kv.Key, kv => kv.Value.ToArray());
+    }
+
     public static void LoadLearnSpells()
     {
         var path = Path.Combine("CSV", "LearnSpells.csv");
@@ -1593,8 +1657,10 @@ public static partial class GameData
         using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
         var predecessors = new Dictionary<uint, uint[]>(2048);
         var siblings = new Dictionary<uint, uint[]>(2048);
+        var classMasks = new Dictionary<uint, uint>(2048);
         foreach (var row in reader)
         {
+            uint.TryParse(row[1].Span, out uint classMask);
             var ranks = new System.Collections.Generic.List<uint>(5);
             for (int col = 3; col <= 7; col++)
             {
@@ -1607,6 +1673,7 @@ public static partial class GameData
                 uint thisRank = ranks[i];
                 uint[] preds = i == 0 ? Array.Empty<uint>() : ranks.GetRange(0, i).ToArray();
                 predecessors[thisRank] = preds;
+                classMasks[thisRank] = classMask;
                 var sib = new System.Collections.Generic.List<uint>(ranks.Count - 1);
                 for (int j = 0; j < ranks.Count; j++)
                     if (j != i) sib.Add(ranks[j]);
@@ -1615,6 +1682,7 @@ public static partial class GameData
         }
         TalentRankPredecessors = predecessors.ToFrozenDictionary();
         TalentRankSiblings = siblings.ToFrozenDictionary();
+        TalentSpellClassMask = classMasks.ToFrozenDictionary();
     }
 
     public static void LoadSpellRankChain()

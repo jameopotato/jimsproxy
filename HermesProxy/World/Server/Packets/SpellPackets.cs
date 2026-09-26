@@ -824,7 +824,16 @@ class CancelChannelling : ClientPacket
 
 class SpellPrepare : ServerPacket, ISpanWritable
 {
-    public SpellPrepare() : base(Opcode.SMSG_SPELL_PREPARE) { }
+    // JimsProxy (#394 looping cast kit): SMSG_SPELL_PREPARE must ride the SAME connection as
+    // SMSG_SPELL_START / SMSG_SPELL_GO / SMSG_CAST_FAILED. Without the explicit ConnectionType the
+    // one-argument ServerPacket ctor defaults to ConnectionType.Realm (Packet.cs:70), which is meant
+    // for character-select traffic, so PREPARE went out on the realm socket while the rest of the
+    // cast lifecycle went out on the instance socket. TCP orders bytes within a connection and
+    // guarantees nothing between two, so the client could handle the START before the PREPARE's
+    // re-key and mint a duplicate cast object that strands holding the wind-up kit. TrinityCore puts
+    // all four opcodes on CONNECTION_TYPE_INSTANCE, which is why native realms never produce this.
+    // Inherited from upstream's original "Add spell casting by client" commit; every fork has it.
+    public SpellPrepare() : base(Opcode.SMSG_SPELL_PREPARE, ConnectionType.Instance) { }
 
     public override void Write()
     {
@@ -1010,6 +1019,40 @@ public class CancelSpellVisual : ServerPacket, ISpanWritable
     public int SpellVisualID;
 }
 
+// JimsProxy (CancelWindupKitOnGo): SMSG_CANCEL_SPELL_VISUAL_KIT releases every effect of ONE
+// SpellVisualKit on ONE unit through the client's normal safe-release path (visual and sound).
+// Narrower than CancelSpellVisual, which cancels every kit of a SpellVisual and would blank the
+// GO/impact kit playing at that instant. Layout mirrors the retail packet (packed source GUID,
+// kit id, one bit for the mounted-visual flag).
+public class CancelSpellVisualKit : ServerPacket, ISpanWritable
+{
+    public CancelSpellVisualKit() : base(Opcode.SMSG_CANCEL_SPELL_VISUAL_KIT, ConnectionType.Instance) { }
+
+    public override void Write()
+    {
+        _worldPacket.WritePackedGuid128(Source);
+        _worldPacket.WriteInt32(SpellVisualKitID);
+        _worldPacket.WriteBit(MountedVisual);
+        _worldPacket.FlushBits();
+    }
+
+    public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size + 4 + 1;
+
+    public int WriteToSpan(Span<byte> buffer)
+    {
+        var writer = new SpanPacketWriter(buffer);
+        writer.WritePackedGuid128(Source.Low, Source.High);
+        writer.WriteInt32(SpellVisualKitID);
+        writer.WriteBits(MountedVisual ? 1u : 0u, 1);
+        writer.FlushBits();
+        return writer.Position;
+    }
+
+    public WowGuid128 Source;
+    public int SpellVisualKitID;
+    public bool MountedVisual;
+}
+
 //MIRASU - SMSG_SPELL_INTERRUPT_LOG is the dedicated interrupt-broadcast opcode in modern
 //MIRASU   WoW (1.14+). The target-frame cast bar's dismiss-on-kick is wired to this packet,
 //MIRASU   not to SMSG_SPELL_FAILED_OTHER. Vanilla 1.12 didn't have this opcode, so the proxy
@@ -1160,6 +1203,18 @@ public class SpellCastData
     public List<TargetLocation> TargetPoints = new();
     public CreatureImmunities Immunities;
     public SpellHealPrediction Predict = new();
+}
+
+// JimsProxy: the server rolled a creature through Feign Death; the client shows "Feign Death resisted" on it.
+public class FeignDeathResisted : ServerPacket, ISpanWritable
+{
+    public FeignDeathResisted() : base(Opcode.SMSG_FEIGN_DEATH_RESISTED) { }
+
+    public override void Write() { }
+
+    public int MaxSize => 0;
+
+    public int WriteToSpan(Span<byte> buffer) => 0;
 }
 
 public struct SpellMissStatus

@@ -36,8 +36,6 @@ One zip, one double-click. The bundle's installer locates the 1.14.2 client, ins
 See [CHANGES.md](CHANGES.md) for the full changelog.
 
 ## Supported Versions
-### Recommended Client Version and Build
-1.14.2 build 42597
 
 ### Modern Client (what you play with)
 
@@ -96,9 +94,9 @@ Output: `build/JimsProxy.exe` (or `build/JimsProxy` on Linux and macOS) + `build
 
 To test a build with the launcher, either copy it over the bundled proxy in your game's `Hermes/` directory, or add `build/JimsProxy.exe` as a custom slot under **Settings → Proxy Binary** and switch to it:
 
-```bash
-cp build/JimsProxy.exe <game_dir>/Hermes/JimsProxy.exe
-cp -r build/CSV/* <game_dir>/Hermes/CSV/
+```
+copy build\JimsProxy.exe <game_dir>\Hermes\JimsProxy.exe
+xcopy /E /Y build\CSV <game_dir>\Hermes\CSV\
 ```
 
 .NET 6 will not work — the target framework is `net10.0` (set centrally in `Directory.Packages.props`).

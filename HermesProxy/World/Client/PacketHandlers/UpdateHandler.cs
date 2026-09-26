@@ -239,6 +239,12 @@ public partial class WorldClient
         }
         GetSession().GameState.LastAuraCasterOnTarget.Remove(guid);
 
+        // JimsProxy (fishing recast wedge): the previous bobber's destroy is the anchor
+        // that lets a held channel zero-update be dropped as its teardown, and the new
+        // bobber's destroy is where the kept-alive client channel ends.
+        DropHeldChannelZeroUpdateIfAnchored(guid, "destroy_object");
+        EndOrphanedClientChannelIfBobber(guid);
+
         // JimsProxy (PR #161 follow-up — destroy-hook fast path): if any pending
         // cast was aimed at this GUID, evict it now and emit synthetic
         // CastFailed(BadTargets). Faster than waiting up to 2.5s for the
@@ -651,6 +657,33 @@ public partial class WorldClient
 
         foreach (var auraUpdate in auraUpdates)
             SendPacketToClient(auraUpdate);
+
+        // (temp-enchant-0s-after-relogin): deliver enchant timers whose server push
+        // beat the item's create — the client dropped (or would have dropped) the
+        // original, so re-emit now that the create is out. Seconds on the wire,
+        // matching SendItemEnchantTimeUpdate in every mangos-lineage core.
+        var enchantReemits = GetSession().GameState.TakeEnchantTimeReemits();
+        if (enchantReemits != null)
+        {
+            foreach (var (itemGuid, modernSlot, durationSeconds) in enchantReemits)
+            {
+                ItemEnchantTimeUpdate enchant = new ItemEnchantTimeUpdate();
+                enchant.ItemGuid = itemGuid;
+                enchant.DurationLeft = durationSeconds;
+                enchant.Slot = modernSlot;
+                enchant.OwnerGuid = GetSession().GameState.CurrentPlayerGuid;
+                SendPacketToClient(enchant);
+                if (Settings.DebugOutput)
+                {
+                    Log.Event("enchant.duration.reemitted_post_create", new
+                    {
+                        item_guid = itemGuid.ToString(),
+                        modern_slot = modernSlot,
+                        duration_seconds = durationSeconds,
+                    });
+                }
+            }
+        }
 
         // JimsProxy (camp stun lock, step 2): this update carried the login's first
         // self create block (marked in DetectStuckLogoutStunAtSelfCreate) — release
@@ -1989,6 +2022,27 @@ public partial class WorldClient
         return flags;
     }
 
+    // JimsProxy (map exploration reset 2026-09-01): compose modern 64-bit explored-zone
+    // elements from the legacy 32-bit field pair. The modern builder always writes the WHOLE
+    // ulong element, and a mid-session discovery dirties exactly ONE legacy field — so the
+    // paired half must come from the cumulative `updates` dict (the values path merges into
+    // the session's cached fields in place), never from the outgoing update being staged.
+    // Composing against the outgoing update zeroed the paired 32 zones on every new
+    // discovery, wiping chunks of the explored map until relog (the WowLegacyCore/HermesProxy#331
+    // revert, still reachable through partial updates; not this repo's #331).
+    internal static void TranslateExploredZones(int legacyBaseField, int legacyFieldCount, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, ulong?[] modernExploredZones)
+    {
+        for (int i = 0; i < legacyFieldCount; i += 2)
+        {
+            if (updateMaskArray[legacyBaseField + i] || updateMaskArray[legacyBaseField + i + 1])
+            {
+                uint low = updates.TryGetValue(legacyBaseField + i, out var lowField) ? lowField.UInt32Value : 0;
+                uint high = updates.TryGetValue(legacyBaseField + i + 1, out var highField) ? highField.UInt32Value : 0;
+                modernExploredZones[i / 2] = ((ulong)high << 32) | low;
+            }
+        }
+    }
+
     public void StoreObjectUpdate(WowGuid128 guid, ObjectType objectType, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, AuraUpdate auraUpdate, PowerUpdate? powerUpdate, bool isCreate, ObjectUpdate updateData, BitArray actuallyChangedValuesMaskArray)
     {
         StoreObjectUpdateInternal(guid, objectType, updateMaskArray, updates, auraUpdate, powerUpdate, isCreate, updateData);
@@ -2064,6 +2118,13 @@ public partial class WorldClient
     {
         DetectStuckLogoutStunAtSelfCreate(guid, updates, isCreate, updateData);
         SynthStandOnFearCcOnset(guid, updates);
+
+        // JimsProxy (fishing recast wedge): remember our newest bobber so a recast's
+        // CHANNEL_START can tell whether the previous one is still alive.
+        if (isCreate && objectType == ObjectType.GameObject &&
+            updateData.GameObjectData.TypeID == GameData.FishingNodeGameObjectType &&
+            updateData.GameObjectData.CreatedBy == GetSession().GameState.CurrentPlayerGuid)
+            GetSession().GameState.LocalFishingBobberGuid = guid;
 
         // JimsProxy: comprehensive pet diagnostics for the Hunter-Pet-Stealth-Stuck
         // investigation. Fires on every UPDATE_OBJECT block targeting a pet GUID
@@ -2627,37 +2688,23 @@ public partial class WorldClient
                     updateData.ItemData.Enchantment[Enums.Classic.EnchantmentSlot.Prop4] = ReadEnchantData(Enums.WotLK.EnchantmentSlot.Prop4);
                 }
 
-                // (temp-enchant-0s-after-relogin): consume stashed pre-create
-                // SMSG_ITEM_ENCHANT_TIME_UPDATE pushes into this create. At login the
-                // push beats the item's create block and the modern client discards it
-                // for an unbuilt guid — the enchant then renders with the create's zero
-                // duration field as a permanently flashing "0s" buff. The handler
-                // stashed the push (decay-tracked); write it into the create's duration
-                // field so the countdown starts at the real remaining time.
+                // (temp-enchant-0s-after-relogin): a stashed pre-create
+                // SMSG_ITEM_ENCHANT_TIME_UPDATE means this item's enchant timer never
+                // reached the client — it discards the push for an unbuilt guid, and
+                // that push is the ONLY carrier the weapon-buff countdown reads (the
+                // create's duration field is a stale save-time snapshot no client
+                // generation uses for the timer; .pkt-proven 2026-08-28: a create
+                // carrying 24min in the field still rendered flashing "0s"). Arm a
+                // re-emit here; HandleUpdateObject flushes it AFTER this create's
+                // packet is sent — the same "must be after add to map" ordering every
+                // mangos-lineage core enforces server-side.
                 if (isCreate)
                 {
                     var pendingEnchants = GetSession().GameState.ConsumePendingItemEnchantDurations(guid, Environment.TickCount);
                     if (pendingEnchants != null)
                     {
                         foreach (var (legacySlot, durationMs) in pendingEnchants)
-                        {
-                            int modernSlot = (int)TranslateEnchantmentSlotToModern(legacySlot);
-                            if (modernSlot >= updateData.ItemData.Enchantment.Length)
-                                continue;
-                            var enchantment = updateData.ItemData.Enchantment[modernSlot];
-                            if (enchantment == null || !GameSessionData.ShouldInjectEnchantDuration(enchantment))
-                                continue;
-                            enchantment.Duration = durationMs;
-                            if (Framework.Settings.DebugOutput)
-                            {
-                                Log.Event("enchant.duration.injected_at_create", new
-                                {
-                                    item_guid = guid.ToString(),
-                                    legacy_slot = legacySlot,
-                                    duration_ms = durationMs,
-                                });
-                            }
-                        }
+                            GetSession().GameState.ArmEnchantTimeReemit(guid, TranslateEnchantmentSlotToModern(legacySlot), durationMs);
                     }
                 }
 
@@ -4362,24 +4409,9 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
             int PLAYER_EXPLORED_ZONES_1 = LegacyVersion.GetUpdateField(PlayerField.PLAYER_EXPLORED_ZONES_1);
             if (PLAYER_EXPLORED_ZONES_1 >= 0)
             {
+                // JimsProxy (map exploration reset 2026-09-01): see TranslateExploredZones.
                 int maxZones = LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180) ? 128 : 64;
-                for (int i = 0; i < maxZones; i++)
-                {
-                    if (updateMaskArray[PLAYER_EXPLORED_ZONES_1 + i])
-                    {
-                        // Two legacy uint32 zone fields pack into one modern ulong: even i → low 32,
-                        // odd i → high 32. On a partial UPDATE_FIELDS we must replace only the
-                        // targeted half and PRESERVE the other half — otherwise the paired field's
-                        // explored bits get clobbered, causing previously-explored areas to revert
-                        // to unexplored on the world map (WowLegacyCore/HermesProxy#331).
-                        ulong existing = updateData.ActivePlayerData.ExploredZones[i / 2] ?? 0UL;
-                        uint newValue = updates[PLAYER_EXPLORED_ZONES_1 + i].UInt32Value;
-                        if ((i & 1) != 0)
-                            updateData.ActivePlayerData.ExploredZones[i / 2] = (existing & 0xFFFFFFFFUL) | ((ulong)newValue << 32);
-                        else
-                            updateData.ActivePlayerData.ExploredZones[i / 2] = (existing & 0xFFFFFFFF00000000UL) | (ulong)newValue;
-                    }
-                }
+                TranslateExploredZones(PLAYER_EXPLORED_ZONES_1, maxZones, updateMaskArray, updates, updateData.ActivePlayerData.ExploredZones);
             }
             int PLAYER_FIELD_COINAGE = LegacyVersion.GetUpdateField(PlayerField.PLAYER_FIELD_COINAGE);
             if (PLAYER_FIELD_COINAGE >= 0 && updateMaskArray[PLAYER_FIELD_COINAGE])

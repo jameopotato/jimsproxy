@@ -59,6 +59,51 @@ public partial class WorldSocket
         // Stamped before the CHANGE_TRANSPORT drop below so boarding via that opcode counts.
         GetSession().GameState.DiagLastObservedPlayerTransportGuid = movement.MoveInfo.TransportGuid;
 
+        // JimsProxy (charge strafe-latch cure 2026-08-28, re-anchored 2026-08-29):
+        // fire the cure the moment the orphan is observed — the armed pend's real
+        // strafe bit set with the pend bit gone in the client's own reported flags
+        // (lands at SPLINE_DONE's same-ms MOVE_STOP or the FALL_LAND up to ~250ms
+        // later; both shapes wire-observed). v1 anchored on the player's
+        // post-charge SPLINE_UNROOT, which does not exist — Kronos spline-roots
+        // the charge TARGET, never the charging player. The synth ROOT wipes the
+        // client's movement flags and makes it emit the matching stop opcodes
+        // (correcting Kronos's view too); the synth UNROOT rebuilds from physical
+        // key state, so a genuinely-held strafe resumes same-frame. Both acks are
+        // swallowed by counter in HandleMoveForceAck2.
+        long pendLatchArmedAt = GetSession().GameState.ChargePendLatchArmedAtMs;
+        if (pendLatchArmedAt != 0)
+        {
+            long nowMs = Environment.TickCount64;
+            if (!World.Client.ChargePendLatchCure.IsArmed(pendLatchArmedAt, nowMs))
+            {
+                GetSession().GameState.ChargePendLatchArmedAtMs = 0;
+            }
+            else if (Framework.Settings.ChargePendLatchCure &&
+                     World.Client.ChargePendLatchCure.ShouldFire(
+                         GetSession().GameState.ChargePendLatchArmedFlags, movement.MoveInfo.Flags))
+            {
+                GetSession().GameState.ChargePendLatchArmedAtMs = 0;
+                MoveSetFlag cureRoot = new MoveSetFlag(Opcode.SMSG_MOVE_ROOT);
+                cureRoot.MoverGUID = GetSession().GameState.CurrentPlayerGuid;
+                cureRoot.MoveCounter = World.Client.ChargePendLatchCure.SynthCounterRoot;
+                SendPacket(cureRoot);
+                MoveSetFlag cureUnroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
+                cureUnroot.MoverGUID = GetSession().GameState.CurrentPlayerGuid;
+                cureUnroot.MoveCounter = World.Client.ChargePendLatchCure.SynthCounterUnroot;
+                SendPacket(cureUnroot);
+                // DebugOutput-gated per the diagnostics rubric: this is the fix working,
+                // not an unexpected-edge signature (review 2026-09-05).
+                if (Framework.Settings.DebugOutput)
+                    Framework.Logging.Log.Event("charge.pend_latch.cure_sent", new
+                    {
+                        armed_flags = GetSession().GameState.ChargePendLatchArmedFlags,
+                        observed_flags = movement.MoveInfo.Flags,
+                        trigger_opcode = movement.GetUniversalOpcode().ToString(),
+                        armed_age_ms = nowMs - pendLatchArmedAt,
+                    });
+            }
+        }
+
         bool isMoveStart = IsMovementStartOpcode(movement.GetUniversalOpcode());
 
         // JimsProxy (PR #161 follow-up — movement preemption): mark any in-flight
@@ -165,10 +210,26 @@ public partial class WorldSocket
         // transport state rides in every ordinary movement packet; 1.12 has no such opcode.
         if (movement.GetUniversalOpcode() == Opcode.CMSG_MOVE_CHANGE_TRANSPORT)
         {
+            // JimsProxy (charge strafe-latch cure 2026-08-28): the client emits this
+            // packet at every charge GO (spline≈pseudo-transport). A pending strafe
+            // start in its flags is the wire-proven orphan signature — the mid-air
+            // press whose release the spline will swallow and whose pend the spline
+            // exit will apply as a keyless real strafe flag (stuck-strafing-after-
+            // Charge, 3/3 field latches + 2/2 deliberate repros). Arm the one-shot
+            // cure; it fires at the top of this handler on the first packet showing
+            // the pend applied, and is harmless if the key is actually still held
+            // (force-unroot rebuilds from physical key state).
+            bool pendStrafeArmed = World.Client.ChargePendLatchCure.ShouldArm(movement.MoveInfo.Flags);
+            if (pendStrafeArmed)
+            {
+                GetSession().GameState.ChargePendLatchArmedAtMs = Environment.TickCount64;
+                GetSession().GameState.ChargePendLatchArmedFlags = movement.MoveInfo.Flags;
+            }
             Framework.Logging.Log.Event("movement.change_transport.dropped", new
             {
                 server_build = Framework.Settings.ServerBuild.ToString(),
                 on_transport = !movement.MoveInfo.TransportGuid.IsEmpty(),
+                pend_latch_armed = pendStrafeArmed,
             });
             return;
         }
@@ -394,6 +455,24 @@ public partial class WorldSocket
     void HandleMoveForceAck2(MovementAckMessage movementAck)
     {
         var universalOpcode = movementAck.GetUniversalOpcode();
+
+        // JimsProxy (charge strafe-latch cure 2026-08-28): the ack legs of the synth
+        // ROOT+UNROOT pulse. Swallowed for the same reason as the carried-root cure
+        // ack below (the legacy server never sent these ops); the flags the client
+        // reports in each ack are the field proof of the cure working — the root ack
+        // should show the orphaned strafe already wiped. DebugOutput-gated per the
+        // diagnostics rubric (fix-working breadcrumb; review 2026-09-05).
+        if (World.Client.ChargePendLatchCure.IsCureCounter(movementAck.Ack.MoveCounter))
+        {
+            if (Framework.Settings.DebugOutput)
+                Log.Event("charge.pend_latch.cure_acked", new
+                {
+                    opcode = universalOpcode.ToString(),
+                    move_counter = movementAck.Ack.MoveCounter,
+                    client_flags = movementAck.Ack.MoveInfo.Flags,
+                });
+            return;
+        }
 
         // JimsProxy (carried-root cure): the ack for the proxy-synthesized cure
         // unroot carries a sentinel counter. The legacy server never sent that op,

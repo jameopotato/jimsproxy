@@ -73,7 +73,7 @@ public class SpellFailedOtherDedupTests
         var session = NewSession();
         var member = Caster(73772);
         session.RecentlyForwardedSpellFailedOther[(member, Skinning)] = 1000;
-        session.OtherCasterActiveCastIds[(member, Skinning)] = SomeCastId(5);
+        session.EnqueueObservedStartCastId(member, Skinning, SomeCastId(5));
 
         Assert.False(session.ShouldDedupSpellFailedOther(member, Skinning, 1411, Window, out var msSince));
         Assert.Equal(411, msSince); // within the window: callers log the bypass
@@ -99,7 +99,7 @@ public class SpellFailedOtherDedupTests
         var session = NewSession();
         var member = Caster(73772);
         session.RecentlyForwardedSpellFailedOther[(member, Firebolt)] = 1000;
-        session.OtherCasterActiveCastIds[(member, Skinning)] = SomeCastId(7);
+        session.EnqueueObservedStartCastId(member, Skinning, SomeCastId(7));
 
         Assert.True(session.ShouldDedupSpellFailedOther(member, Firebolt, 1400, Window, out _));
     }
@@ -115,12 +115,12 @@ public class SpellFailedOtherDedupTests
         var session = NewSession();
         var member = Caster(73772);
 
-        session.OtherCasterActiveCastIds[(member, Skinning)] = SomeCastId(4);
+        session.EnqueueObservedStartCastId(member, Skinning, SomeCastId(4));
         Assert.False(session.ShouldDedupSpellFailedOther(member, Skinning, 1000, Window, out _));
-        session.OtherCasterActiveCastIds.TryRemove((member, Skinning), out _);
+        Assert.True(session.TryPairObservedTerminatorCastId(member, Skinning, out _, out _));
         session.RecentlyForwardedSpellFailedOther[(member, Skinning)] = 1000;
 
-        session.OtherCasterActiveCastIds[(member, Skinning)] = SomeCastId(5);
+        session.EnqueueObservedStartCastId(member, Skinning, SomeCastId(5));
 
         Assert.False(session.ShouldDedupSpellFailedOther(member, Skinning, 1411, Window, out var msSince));
         Assert.Equal(411, msSince);

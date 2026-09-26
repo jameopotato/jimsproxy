@@ -170,6 +170,14 @@ public sealed class GameSessionData
     // permanently.
     public uint LocalChannelSpellId; // 0 means not channeling
     public long LocalChannelEndTickMs;
+    // JimsProxy (fishing recast wedge 2026-09-01): packet-anchored guard state for the
+    // previous bobber's channel zero-update — see OnLocalChannelStart below.
+    public WowGuid128 LocalFishingBobberGuid;     // newest bobber the server created for us
+    public WowGuid128 StaleZeroUpdateBobberGuid;  // armed while set: the bobber whose teardown is still owed
+    public bool LocalChannelBreakActionSeen;
+    public bool StaleBobberTeardownSeenThisPass;
+    public SpellChannelUpdate? HeldLocalChannelZeroUpdate;
+    public WowGuid128 OrphanedClientChannelBobberGuid; // set after a drop: the client's channel outlives the server's; the proxy ends it when this bobber goes
 
     /// <summary>True while the local player's channel window (tracked from
     /// MSG_CHANNEL_START/UPDATE) is open, with a small grace margin. Used to
@@ -180,6 +188,145 @@ public sealed class GameSessionData
         return LocalChannelSpellId != 0 &&
                Environment.TickCount64 < LocalChannelEndTickMs + 2000;
     }
+
+    /// <summary>
+    /// JimsProxy (fishing recast wedge 2026-09-01): MSG_CHANNEL_START bookkeeping for the
+    /// local player. A fishing bobber outlives its channel by a couple of seconds, and on
+    /// mangos-family cores the bobber's timeout finishes whatever channel the player has
+    /// at that moment (Unit::FinishSpell sends a channel update with no time remaining
+    /// for CURRENT_CHANNELED_SPELL without checking that the bobber belongs to it). So a
+    /// recast inside that window has its NEW channel ended by the server ~100ms after it
+    /// opened, while the new bobber lives on and stays lootable. Vanilla's channel update
+    /// carries no spell id, so the modern client faithfully ends the channel it just
+    /// opened: the char stands idle, the bobber floats out its full life, and every recast
+    /// from then on repeats the race. The guard keeps the client's channel open so the
+    /// bobber can be waited out. It arms only when the previous bobber is still in the
+    /// object cache at the new CHANNEL_START, and it acts only on the zero-update that
+    /// shares a read pass with that bobber's SMSG_DESTROY_OBJECT / SMSG_FISH_NOT_HOOKED.
+    /// Scoped to fishing because eating a genuine early interrupt of a combat channel
+    /// would wedge the cast bar the other way.
+    /// </summary>
+    public void OnLocalChannelStart(uint spellId, uint durationMs)
+    {
+        LocalChannelSpellId = durationMs > 0 ? spellId : 0;
+        LocalChannelEndTickMs = Environment.TickCount64 + durationMs;
+        LocalChannelBreakActionSeen = false;
+        StaleBobberTeardownSeenThisPass = false;
+        HeldLocalChannelZeroUpdate = null; // a new START supersedes anything still held
+        StaleZeroUpdateBobberGuid = default;
+        OrphanedClientChannelBobberGuid = default;
+        if (!GameData.IsFishingChannelSpell(LocalChannelSpellId) || LocalFishingBobberGuid == default)
+            return;
+        // The new bobber's create block trails this START in the same batch, so the newest
+        // bobber we know of is still the previous cast's — armed iff it is not destroyed yet.
+        bool previousBobberAlive;
+        lock (ObjectCacheLock)
+            previousBobberAlive = ObjectCacheLegacy.ContainsKey(LocalFishingBobberGuid);
+        if (previousBobberAlive)
+            StaleZeroUpdateBobberGuid = LocalFishingBobberGuid;
+    }
+
+    public enum LocalChannelZeroUpdateDisposition { Forward, Held, Dropped }
+
+    /// <summary>
+    /// JimsProxy (fishing recast wedge 2026-09-01): decision for a MSG_CHANNEL_UPDATE with
+    /// no time remaining for the local player. Forward = genuine end (the #244 emote-guard
+    /// window is closed here). Held = the previous bobber's teardown may follow in this
+    /// read pass: the caller parks the packet until that bobber's destroy drops it or the
+    /// socket drains and releases it. Dropped = the teardown already passed this pass.
+    /// </summary>
+    public LocalChannelZeroUpdateDisposition ClassifyLocalChannelZeroUpdate(SpellChannelUpdate update)
+    {
+        if (StaleZeroUpdateBobberGuid == default || LocalChannelBreakActionSeen)
+        {
+            // JimsProxy (#244 emote channel guard): the server ends a channel by sending an
+            // update with no time remaining — close our window early.
+            LocalChannelSpellId = 0;
+            StaleZeroUpdateBobberGuid = default;
+            OrphanedClientChannelBobberGuid = default;
+            return LocalChannelZeroUpdateDisposition.Forward;
+        }
+        if (StaleBobberTeardownSeenThisPass)
+        {
+            StaleBobberTeardownSeenThisPass = false;
+            StaleZeroUpdateBobberGuid = default;
+            OrphanedClientChannelBobberGuid = LocalFishingBobberGuid;
+            return LocalChannelZeroUpdateDisposition.Dropped;
+        }
+        HeldLocalChannelZeroUpdate = update;
+        return LocalChannelZeroUpdateDisposition.Held;
+    }
+
+    /// <summary>
+    /// JimsProxy (fishing recast wedge 2026-09-01): SMSG_DESTROY_OBJECT for the armed
+    /// bobber, or SMSG_FISH_NOT_HOOKED (guid-less; only a bobber's teardown or a bobber
+    /// click sends it, and a click is a break action). True = a held zero-update was
+    /// dropped. With nothing held, the anchor is remembered for the rest of this read pass.
+    /// </summary>
+    public bool OnFishingBobberTeardownAnchor(WowGuid128 destroyedGuid = default)
+    {
+        if (destroyedGuid != default && destroyedGuid == LocalFishingBobberGuid)
+            LocalFishingBobberGuid = default;
+        if (StaleZeroUpdateBobberGuid == default)
+            return false;
+        if (destroyedGuid != default && destroyedGuid != StaleZeroUpdateBobberGuid)
+            return false;
+        if (HeldLocalChannelZeroUpdate == null)
+        {
+            StaleBobberTeardownSeenThisPass = true;
+            return false;
+        }
+        HeldLocalChannelZeroUpdate = null;
+        StaleZeroUpdateBobberGuid = default;
+        OrphanedClientChannelBobberGuid = LocalFishingBobberGuid;
+        return true;
+    }
+
+    /// <summary>
+    /// JimsProxy (fishing recast wedge 2026-09-01): after a drop the server has no channel
+    /// but the client still does, so nothing on the wire will ever end it. The new bobber's
+    /// SMSG_DESTROY_OBJECT (catch looted, fish escaped, or timed out) is where the server
+    /// would have ended a channel of its own — true = the caller ends the client's now.
+    /// </summary>
+    public bool TakeOrphanedClientChannelEnd(WowGuid128 destroyedGuid)
+    {
+        if (OrphanedClientChannelBobberGuid == default || destroyedGuid != OrphanedClientChannelBobberGuid)
+            return false;
+        OrphanedClientChannelBobberGuid = default;
+        LocalChannelSpellId = 0;
+        return true;
+    }
+
+    /// <summary>
+    /// JimsProxy (fishing recast wedge 2026-09-01): the legacy socket has no more buffered
+    /// packets, so the read pass is over. Returns a held zero-update for forwarding (no
+    /// anchor came with it, so it was genuine) and closes the channel window; an anchor
+    /// seen without a zero-update disarms the guard — nothing is owed any more.
+    /// </summary>
+    public SpellChannelUpdate? TakeHeldLocalChannelZeroUpdateAtDrain()
+    {
+        if (StaleBobberTeardownSeenThisPass)
+        {
+            StaleBobberTeardownSeenThisPass = false;
+            StaleZeroUpdateBobberGuid = default;
+        }
+        var held = HeldLocalChannelZeroUpdate;
+        if (held == null)
+            return null;
+        HeldLocalChannelZeroUpdate = null;
+        StaleZeroUpdateBobberGuid = default;
+        OrphanedClientChannelBobberGuid = default;
+        LocalChannelSpellId = 0;
+        return held;
+    }
+
+    /// <summary>
+    /// JimsProxy (fishing recast wedge 2026-09-01): the client did something that can
+    /// legitimately end its channel early (cancel cast/channel, GO use, another cast) —
+    /// any zero-update after this is genuine, so the guard stands down until the next
+    /// channel start.
+    /// </summary>
+    public void RecordLocalChannelBreakAction() => LocalChannelBreakActionSeen = true;
     public string? TaxiAttemptId;
     public bool IsWaitingForNewWorld;
     public bool IsWaitingForWorldPortAck;
@@ -212,6 +359,18 @@ public sealed class GameSessionData
     public bool WorldEntryPendingCarriedRootCheck;   // set at NEW_WORLD; consumed at the player's first destination update
     public bool WorldEntryCarriedRootCureArmed;      // dispatcher → end-of-UPDATE_OBJECT synth handoff (stuck-stun pattern)
     public bool WorldEntryCureAfterTeleportAck;      // same-map teleport variant: armed at the self MoveTeleport, fired at its CMSG_MOVE_TELEPORT_ACK
+    // JimsProxy (charge strafe-latch cure 2026-08-28, re-anchored 2026-08-29):
+    // one-shot armed when the charge-GO CHANGE_TRANSPORT carries a pending strafe
+    // start (the wire-proven orphan signature — see ChargePendLatchCure), fired as
+    // a synthetic force ROOT+UNROOT pulse on the first client movement packet
+    // showing the pend APPLIED (real strafe bit set, pend bit gone) — both sites
+    // live in HandlePlayerMove, same thread. 0 = disarmed; TTL-guarded so an arm
+    // whose pend never applies (client resolved it) expires silently. Disarmed by
+    // any real self force-root: the root itself wipes the client's movement flags
+    // (the natural cure), and pulsing an unroot under a live server root would
+    // free the player early.
+    public long ChargePendLatchArmedAtMs;
+    public uint ChargePendLatchArmedFlags;           // the arming packet's modern movement flags, for the cure breadcrumb
     // JimsProxy (zep-stuck-no-move 2026-05-14): set to a sentinel MoveCounter when
     // HandleNewWorld emits a synthesized SMSG_MOVE_TELEPORT to clear the modern
     // client's stale MOVEMENTFLAG_ONTRANSPORT after a cross-continent transport
@@ -751,6 +910,40 @@ public sealed class GameSessionData
         }
     }
 
+    // JimsProxy (cast-id breadcrumbs): find the pending press a client cast id belongs to, by client or server id.
+    public ClientCastRequest? FindPendingCastByCastId(WowGuid128 castId)
+    {
+        if (castId.IsEmpty())
+            return null;
+        static bool Matches(ClientCastRequest? cast, WowGuid128 id) =>
+            cast != null && (cast.ClientGUID == id || cast.ServerGUID == id);
+        lock (_gcdLock)
+        {
+            if (Matches(_heldGcdCast, castId))
+                return _heldGcdCast;
+            if (Matches(_heldCastTimeCast, castId))
+                return _heldCastTimeCast;
+        }
+        if (Matches(CurrentClientNextMeleeCast, castId))
+            return CurrentClientNextMeleeCast;
+        if (Matches(CurrentClientAutoRepeatCast, castId))
+            return CurrentClientAutoRepeatCast;
+        // Walk the queues under PendingCastsLock like every other read walk here: the preferred-state
+        // dequeue and the rebuild paths empty and re-fill the queue under it, and an unlocked snapshot
+        // taken mid-rebuild would report a live press as absent, the exact null signature this lookup
+        // exists to surface for a stale client object.
+        lock (PendingCastsLock)
+        {
+            foreach (var cast in PendingNormalCasts)
+                if (Matches(cast, castId))
+                    return cast;
+            foreach (var cast in PendingPetCasts)
+                if (Matches(cast, castId))
+                    return cast;
+        }
+        return null;
+    }
+
     public bool HasNonStartedPendingCastForSpell(uint spellId)
     {
         lock (PendingCastsLock)
@@ -765,6 +958,117 @@ public sealed class GameSessionData
         }
     }
 
+    // JimsProxy (fifo-terminator-symmetry + dup-failure frame hold): per-spell STARTED twin
+    // of the check above — "is a same-spell cast currently between its forwarded SPELL_START
+    // and its terminal event?" For the frame hold that in-flight window is the hold predicate:
+    // a dup press's CAST_FAILED delivered during it can share a client frame with the cast's
+    // SPELL_GO, and the client's kit-cancel sweep runs by (unit, visualID) — not CastID — so
+    // the correctly-CastID'd dup failure can still tear the live cast's visual kit in the same
+    // frame its GO is closing it (the #394 looping-sound collision, 2026-08-14 Stonetavern JSONL).
+    public bool HasStartedPendingCastForSpell(uint spellId)
+    {
+        lock (PendingCastsLock)
+        {
+            foreach (var item in PendingNormalCasts)
+            {
+                if (item.HasStarted &&
+                    (item.SpellId == spellId || (item.LegacySpellId != 0 && item.LegacySpellId == spellId)))
+                    return true;
+            }
+            return false;
+        }
+    }
+
+    // JimsProxy (dup-failure frame hold): a dup press's failure delivery, held while its
+    // same-spell started cast is still in flight. Either a list of fully-built client packets
+    // (SpellPrepare + CastFailed, the unsuppressed path) or the pending request to ack via
+    // SendCastRequestFailed(DontReport) (the SuppressSpellCastErrors path). Released after the
+    // started cast's terminal event forwards — SugarProxy's AddFailedPacket/GetFailedPacket
+    // shape (hold by data dependency, never a clock), with a strictly wider release set: the
+    // stale sweep ties held entries to the pending-cast lifecycle, so a silently-evicted cast
+    // can't strand its dup's button-release past the next cast event.
+    public sealed class HeldDupFailure
+    {
+        public uint SpellId;
+        public List<ServerPacket> Packets = new();
+        public ClientCastRequest? SuppressAck;
+        public uint ReasonId;
+        public long HeldAtMs;
+    }
+
+    // Lock order: _heldDupFailuresLock may be taken BEFORE PendingCastsLock (the stale sweep
+    // checks anchors under it) — never call the held-dup methods while holding PendingCastsLock.
+    private readonly Dictionary<uint, List<HeldDupFailure>> _heldDupFailures = new();
+    private readonly object _heldDupFailuresLock = new();
+
+    public void HoldDupFailure(HeldDupFailure held)
+    {
+        lock (_heldDupFailuresLock)
+        {
+            if (!_heldDupFailures.TryGetValue(held.SpellId, out var list))
+            {
+                list = new List<HeldDupFailure>();
+                _heldDupFailures[held.SpellId] = list;
+            }
+            list.Add(held);
+        }
+    }
+
+    public int HeldDupFailureCount
+    {
+        get { lock (_heldDupFailuresLock) { int n = 0; foreach (var l in _heldDupFailures.Values) n += l.Count; return n; } }
+    }
+
+    /// <summary>
+    /// Remove and return every held dup failure for this spell, in hold (FIFO) order —
+    /// null when none (keeps the per-GO hot path allocation-free). Called right after the
+    /// started cast's terminal event (SPELL_GO or its real CAST_FAILED) forwards, so the
+    /// release lands in the flush AFTER the terminal — Sugar's replay position, empirically
+    /// safe in its field record.
+    /// </summary>
+    public List<HeldDupFailure>? TakeHeldDupFailures(uint spellId)
+    {
+        lock (_heldDupFailuresLock)
+        {
+            if (_heldDupFailures.Count != 0 && _heldDupFailures.Remove(spellId, out var list))
+                return list;
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Remove and return held dup failures whose anchor died: no started same-spell cast
+    /// remains pending (evicted by the watchdog, parse-failure drain, destroy eviction, or a
+    /// world transfer clear). The caller must still DELIVER these — a never-released dup
+    /// failure strands the client's action button lit (the press is never answered).
+    /// Self-healing: run on every local cast event, like RunWatchdogEviction.
+    /// </summary>
+    public List<HeldDupFailure>? TakeStaleHeldDupFailures()
+    {
+        List<HeldDupFailure>? stale = null;
+        lock (_heldDupFailuresLock)
+        {
+            if (_heldDupFailures.Count == 0)
+                return null;
+            List<uint>? deadKeys = null;
+            foreach (var key in _heldDupFailures.Keys)
+            {
+                if (!HasStartedPendingCastForSpell(key))
+                    (deadKeys ??= new List<uint>()).Add(key);
+            }
+            if (deadKeys != null)
+            {
+                foreach (var key in deadKeys)
+                {
+                    if (_heldDupFailures.Remove(key, out var list))
+                        (stale ??= new List<HeldDupFailure>()).AddRange(list);
+                }
+            }
+        }
+        return stale;
+    }
+
+
     // JimsProxy: proxy→server RTT measurement for adaptive GCD fire offset.
     private readonly object _rttLock = new();
     private long _lastPingSendTickMs;
@@ -777,7 +1081,149 @@ public sealed class GameSessionData
     //MIRASU   Without this, mob casts reuse a deterministic CastID (spellId+casterCounter) on
     //MIRASU   every cycle and the modern client treats consecutive casts as the same in-flight
     //MIRASU   cast -- visuals/sounds drift and target-frame cast bars don't dismiss on kick.
-    public ConcurrentDictionary<(WowGuid128 caster, uint spellId), WowGuid128> OtherCasterActiveCastIds = new();
+    // JimsProxy (#484 observed-castid-pairing): was a single slot per (caster, spell) — a
+    // rapid same-spell recast overwrote the predecessor's CastID, so the predecessor's late
+    // cancel broadcast (Kronos delivers it 0-554ms AFTER the successor's SPELL_START) popped
+    // the SUCCESSOR's ID: the terminator built for the old cast was stamped with the new
+    // cast's identity and killed the new bar at 0ms (field: 9 instances, heal-snipe /
+    // chain-cast spam). Now a short FIFO per key, mirroring _playerForwardedStartCastIds.
+    // The server runs at most ONE live cast per unit, so the list is [superseded
+    // predecessor?, live cast]: a terminator pairs with the OLDEST (a predecessor's echo
+    // always precedes any event of the successor's outcome), a GO pairs with the NEWEST
+    // (only the live cast can complete). The predecessor's echo window provably closes at
+    // the successor's GO (the echo lags the superseding START by less than one cast time),
+    // so GO purges everything older — an entry cannot outlive one cast cycle and a stale
+    // zombie can never eat a later cast's terminator.
+    private readonly Dictionary<(WowGuid128 caster, uint spellId), List<WowGuid128>> _observedLiveCastIds = new();
+    // JimsProxy (#485 killed-then-fired recovery): last CastID consumed by a terminator per
+    // key, kept until the next same-key START or GO. Kronos broadcasts SPELL_FAILED_OTHER
+    // for casts it then COMPLETES (non-terminal failures: 536/16.7k observed-player casts in
+    // the 12-day corpus) — the terminator pops the tracked entry, so the following GO would
+    // mint a fresh CastID the client never saw start. Recovering the terminated ID instead
+    // lets START/terminator/GO tell one coherent story and makes the killed-then-fired
+    // signature sweepable from always-on events (terminator castIdCounter == GO
+    // castIdCounter).
+    private readonly Dictionary<(WowGuid128 caster, uint spellId), WowGuid128> _observedTerminatedCastIds = new();
+    private readonly object _observedCastIdsLock = new();
+
+    /// <summary>
+    /// Record the CastID minted at an observed (non-local, non-pet) caster's SPELL_START.
+    /// Keeps at most the direct predecessor alongside the new live cast: anything older has
+    /// had a full cast cycle for its echo to arrive and is dropped (see field notes above).
+    /// A new START also invalidates any stashed terminated-ID recovery for the key.
+    /// </summary>
+    public void EnqueueObservedStartCastId(WowGuid128 caster, uint spellId, WowGuid128 castId)
+    {
+        var key = (caster, spellId);
+        lock (_observedCastIdsLock)
+        {
+            _observedTerminatedCastIds.Remove(key);
+            if (!_observedLiveCastIds.TryGetValue(key, out var list))
+            {
+                list = new List<WowGuid128>(2);
+                _observedLiveCastIds[key] = list;
+            }
+            // Keep only the cast that was live until now (the direct predecessor).
+            while (list.Count > 1)
+                list.RemoveAt(0);
+            list.Add(castId);
+        }
+    }
+
+    /// <summary>
+    /// Pair an observed caster's SPELL_GO with the NEWEST tracked CastID — the server runs
+    /// one live cast per unit, so only the newest can complete; anything older is a
+    /// superseded predecessor whose echo window this GO closes (purged here). Also clears
+    /// the terminated-ID stash: a completed successor means any stashed predecessor ID is
+    /// stale.
+    /// </summary>
+    public bool TryPairObservedGoCastId(WowGuid128 caster, uint spellId, out WowGuid128 castId)
+    {
+        var key = (caster, spellId);
+        lock (_observedCastIdsLock)
+        {
+            if (_observedLiveCastIds.TryGetValue(key, out var list) && list.Count > 0)
+            {
+                castId = list[^1];
+                _observedLiveCastIds.Remove(key);
+                _observedTerminatedCastIds.Remove(key);
+                return true;
+            }
+        }
+        castId = default;
+        return false;
+    }
+
+    /// <summary>
+    /// Pair an observed caster's terminator (SPELL_FAILED_OTHER / SPELL_FAILURE) with the
+    /// OLDEST tracked CastID: when a superseded predecessor is still tracked, its late echo
+    /// is the first terminator to arrive, so the echo consumes the predecessor and the live
+    /// cast keeps its identity. pairedLiveCast reports whether the consumed entry WAS the
+    /// live (newest) cast — callers gate the client-visible interrupt synthesis on it so a
+    /// predecessor's echo can no longer dismiss the on-screen bar (#484). The consumed ID is
+    /// stashed for killed-then-fired GO recovery (#485).
+    /// </summary>
+    public bool TryPairObservedTerminatorCastId(WowGuid128 caster, uint spellId, out WowGuid128 castId, out bool pairedLiveCast)
+    {
+        var key = (caster, spellId);
+        lock (_observedCastIdsLock)
+        {
+            if (_observedLiveCastIds.TryGetValue(key, out var list) && list.Count > 0)
+            {
+                castId = list[0];
+                pairedLiveCast = list.Count == 1;
+                list.RemoveAt(0);
+                if (list.Count == 0)
+                    _observedLiveCastIds.Remove(key);
+                _observedTerminatedCastIds[key] = castId;
+                return true;
+            }
+        }
+        castId = default;
+        pairedLiveCast = false;
+        return false;
+    }
+
+    /// <summary>
+    /// Recover the CastID a terminator consumed when the cast then completes anyway
+    /// (killed-then-fired, #485): SPELL_GO with no live tracked entry re-uses the terminated
+    /// cast's ID instead of minting one the client never saw start. Single-shot; invalidated
+    /// by any same-key START or GO.
+    /// </summary>
+    public bool TryRecoverTerminatedObservedCastId(WowGuid128 caster, uint spellId, out WowGuid128 castId)
+    {
+        var key = (caster, spellId);
+        lock (_observedCastIdsLock)
+        {
+            if (_observedTerminatedCastIds.TryGetValue(key, out castId))
+            {
+                _observedTerminatedCastIds.Remove(key);
+                return true;
+            }
+        }
+        castId = default;
+        return false;
+    }
+
+    /// <summary>Whether an observed cast instance is tracked live for (caster, spell) — the dedup's live-terminator bypass (#471).</summary>
+    public bool HasLiveObservedCast(WowGuid128 caster, uint spellId)
+    {
+        lock (_observedCastIdsLock)
+        {
+            return _observedLiveCastIds.ContainsKey((caster, spellId));
+        }
+    }
+
+    private int ClearObservedCastIds()
+    {
+        lock (_observedCastIdsLock)
+        {
+            int count = _observedLiveCastIds.Count;
+            _observedLiveCastIds.Clear();
+            _observedTerminatedCastIds.Clear();
+            return count;
+        }
+    }
     //MIRASU - monotonic sequence used to make non-player CastIDs unique per cast.
     public int OtherCastSequenceCounter;
     public int PlayerChildCastSequence;
@@ -795,9 +1241,8 @@ public sealed class GameSessionData
 
     // JimsProxy (observed-pose strand, 2026-08-14): decide whether an incoming
     // SMSG_SPELL_FAILED_OTHER may be dropped by the retry-storm dedup. A failure whose
-    // (caster, spell) has a live tracked cast instance (OtherCasterActiveCastIds /
-    // PetAutoCastActiveCastIds) is that instance's ONLY terminator — the next
-    // SPELL_START overwrites the tracked entry, so a skipped cancel permanently
+    // (caster, spell) has a live tracked cast instance (_observedLiveCastIds /
+    // PetAutoCastActiveCastIds) is that instance's terminator — a skipped cancel
     // strands the cast-hold kit on the 1.14.2 client (observed player frozen in the
     // skinning "crafting hands" pose until despawn; same for mob casting poses).
     // The storm the dedup was built for (repeat failures with NO intervening
@@ -814,7 +1259,7 @@ public sealed class GameSessionData
         if (!RecentlyForwardedSpellFailedOther.TryGetValue(key, out var lastMs) || nowMs - lastMs >= dedupWindowMs)
             return false;
         msSinceLastForwarded = nowMs - lastMs;
-        if (OtherCasterActiveCastIds.ContainsKey(key) || PetAutoCastActiveCastIds.ContainsKey(key))
+        if (HasLiveObservedCast(caster, spellId) || PetAutoCastActiveCastIds.ContainsKey(key))
             return false; // live cast instance: this failure is its terminator, never a duplicate
         return true;
     }
@@ -888,12 +1333,20 @@ public sealed class GameSessionData
     public Dictionary<WowGuid128, Dictionary<byte, int>> UnitAuraDurationPushTime = [];
     // JimsProxy (temp-enchant-0s-after-relogin): remaining-time pushes from
     // SMSG_ITEM_ENCHANT_TIME_UPDATE, keyed item guid → (legacy enchantment slot →
-    // seconds + receipt tick). At login vanilla cores send the push BEFORE the item's
-    // create block (the only carrier of remaining time — the create's duration field is
-    // zero), and the modern client discards updates for guids it has not constructed.
-    // The push is stashed here and consumed into the item's create block when it is
-    // translated. Not carried across sessions: each login gets fresh pushes.
+    // seconds + receipt tick). Kronos can send the push BEFORE the item's create
+    // block (the only carrier the client's weapon-buff timer reads — the create's
+    // duration field is a stale save-time snapshot no client uses for the countdown),
+    // and the client discards it for guids it has not constructed ("must be after
+    // add to map" in every mangos-lineage core). The push is stashed here when it
+    // arrives pre-create and re-emitted (PendingEnchantTimeReemits) once the item's
+    // create has been forwarded. Not carried across sessions: each login gets fresh
+    // pushes.
     public Dictionary<WowGuid128, Dictionary<uint, (uint Seconds, int Tick)>> PendingItemEnchantDurations = [];
+    // Re-emits armed while an item create block is being translated (stash consumed),
+    // flushed by HandleUpdateObject AFTER the update packet carrying the create has
+    // been sent to the client — the proxy-layer equivalent of the servers' own
+    // SendEnchantmentDurations-after-add-to-map ordering.
+    public List<(WowGuid128 ItemGuid, uint ModernSlot, uint DurationSeconds)>? PendingEnchantTimeReemits;
     public Dictionary<WowGuid128, Dictionary<byte, WowGuid128>> UnitAuraCaster = [];
     // Wall-clock aura expiry per (unit, spell). Unlike the per-slot caches above this
     // survives unit destroys AND relogs (carried over in CreateNewGameSessionData), so a
@@ -933,6 +1386,12 @@ public sealed class GameSessionData
     public Dictionary<uint, uint> RealSpellToLearnSpell = [];
     public Dictionary<uint, ArenaTeamData> ArenaTeams = [];
     public World.Server.Packets.MailListResult? PendingMailListPacket;
+    // JimsProxy (#508): MailID -> attachment slot of the in-flight CMSG_MAIL_TAKE_ITEM, echoed back on the
+    // error result because the legacy server omits it there and the 1.14 client keys its pending take on it.
+    // Written on the client-socket thread (the take), read and removed on the world-client thread (the
+    // result); concurrent like the other cross-thread session maps, even though the client's own
+    // pending-command gate serializes a take and its result in practice.
+    public ConcurrentDictionary<uint, uint> PendingMailTakeAttachId = new();
     public HashSet<uint> RequestedItemTextIds = [];
     public Dictionary<uint, string> ItemTexts = [];
     public Dictionary<uint, uint> BattleFieldQueueTypes = [];
@@ -1642,11 +2101,23 @@ public sealed class GameSessionData
         }
         return result.Count > 0 ? result : null;
     }
-    // Inject only where the create shows a live enchant whose duration field the
-    // server left empty (vanilla's login shape); a server-provided duration wins.
-    public static bool ShouldInjectEnchantDuration(HermesProxy.World.Objects.ItemEnchantment? enchantment)
+    // Sub-second remainders are dropped: they truncate to 0, which is both the
+    // broken display value and the client's removal signal — and the server's own
+    // expiry is due within the second anyway.
+    public void ArmEnchantTimeReemit(WowGuid128 itemGuid, uint modernSlot, uint durationMs)
     {
-        return enchantment is { ID: > 0 } && (enchantment.Duration == null || enchantment.Duration == 0);
+        uint durationSeconds = durationMs / 1000;
+        if (durationSeconds == 0)
+            return;
+
+        PendingEnchantTimeReemits ??= [];
+        PendingEnchantTimeReemits.Add((itemGuid, modernSlot, durationSeconds));
+    }
+    public List<(WowGuid128 ItemGuid, uint ModernSlot, uint DurationSeconds)>? TakeEnchantTimeReemits()
+    {
+        var reemits = PendingEnchantTimeReemits;
+        PendingEnchantTimeReemits = null;
+        return reemits;
     }
     public void StoreAuraCaster(WowGuid128 target, byte slot, WowGuid128 caster)
     {
@@ -2247,6 +2718,70 @@ public sealed class GameSessionData
         return victim;
     }
 
+    // JimsProxy (post-kill upstream stop): victims for which the kill-time preempt also sent the
+    // legacy server a synthetic CMSG_ATTACK_STOP. Kronos echoes that with SMSG_ATTACKSTOP naming
+    // the corpse (wire-verified 2026-08-18: retarget stops echo with the victim guid). That echo
+    // is ours, not an organic server stop — it must neither reach the modern client (which already
+    // got the preempt stop) nor run the handshake bookkeeping, which could tear down a swing the
+    // player re-started within the echo RTT (#464 wedge family). Bounded FIFO: an echo that never
+    // comes (server had already dropped its swing state) must not accumulate. A stale entry is NOT
+    // inert on its own — mangos-family cores reuse a static spawn's low guid across respawns (the
+    // respawn is the same object) and a player victim's guid never changes — so a genuine later
+    // stop naming that guid (stun, fear, Gouge) could be swallowed and the client left swinging
+    // while the server had stopped. InvalidateSyntheticUpstreamStopEcho closes that at the
+    // server's own SMSG_ATTACK_START for the same victim: a fresh confirmed engage means any
+    // older pending stop for that guid is dead. Lazily created — the test mock
+    // (RuntimeHelpers.GetUninitializedObject) skips field initializers.
+    private List<WowGuid64>? _pendingSyntheticUpstreamStopEchoes;
+    private const int MaxPendingSyntheticUpstreamStopEchoes = 8;
+
+    /// <summary>
+    /// JimsProxy (post-kill upstream stop): remember that we sent the legacy server a synthetic
+    /// CMSG_ATTACK_STOP for this dead victim, so its echo can be consumed on arrival.
+    /// Pure data operation — no socket dependency, easy to unit-test.
+    /// </summary>
+    public void RecordSyntheticUpstreamAttackStop(WowGuid64 victim)
+    {
+        if (victim == WowGuid64.Empty)
+            return;
+        var pending = _pendingSyntheticUpstreamStopEchoes ??= new List<WowGuid64>();
+        pending.Add(victim);
+        if (pending.Count > MaxPendingSyntheticUpstreamStopEchoes)
+            pending.RemoveAt(0);
+    }
+
+    /// <summary>
+    /// JimsProxy (post-kill upstream stop): pairing trigger for the synthetic upstream stop's
+    /// echo. Consumes by EXACT victim match only — an empty-victim SMSG_ATTACKSTOP can be a real
+    /// server-initiated stop (CC, death, engage refusal) and must always take the normal #464
+    /// path. Pure data operation — no socket dependency, easy to unit-test.
+    /// </summary>
+    public bool TryConsumeSyntheticUpstreamStopEcho(WowGuid64 victim)
+    {
+        if (victim == WowGuid64.Empty)
+            return false;
+        return _pendingSyntheticUpstreamStopEchoes?.Remove(victim) ?? false;
+    }
+
+    /// <summary>
+    /// JimsProxy (post-kill upstream stop): the legacy server confirmed a NEW swing on this victim
+    /// (SMSG_ATTACK_START naming the local player). Any pending synthetic-stop echo for the same
+    /// guid is stale — a respawned static spawn or a resurrected player carries the same guid —
+    /// and must not be left to swallow a genuine later stop on the re-engaged unit. Same thread
+    /// as the echo consume. Pure data operation — no socket dependency, easy to unit-test.
+    /// </summary>
+    public void InvalidateSyntheticUpstreamStopEcho(WowGuid64 victim)
+    {
+        if (victim == WowGuid64.Empty)
+            return;
+        var pending = _pendingSyntheticUpstreamStopEchoes;
+        if (pending == null)
+            return;
+        for (int i = pending.Count - 1; i >= 0; i--)
+            if (pending[i] == victim)
+                pending.RemoveAt(i);
+    }
+
     /// <summary>
     /// JimsProxy (PR #161 follow-up): walks PendingNormalCasts and PendingPetCasts,
     /// dequeues any entry whose WatchdogDeadlineMs has expired, and returns the
@@ -2767,7 +3302,7 @@ public sealed class GameSessionData
     /// time gets silently rejected by HasNonStartedPendingCastForSpell —
     /// user-visible symptom is "spell stuck, spamming key does nothing, no
     /// error message" (e.g. rogue's R-key Sinister Strike not firing). Same
-    /// story for OtherCasterActiveCastIds (mob/other-player CastIDs minted
+    /// story for _observedLiveCastIds (mob/other-player CastIDs minted
     /// pre-DC won't match anything the new server-side state knows about).
     /// Returns the count of entries cleared so the reconnect log can show
     /// whether the gap was actually significant.
@@ -2783,10 +3318,17 @@ public sealed class GameSessionData
             petCount = PendingPetCasts.Count;
             while (PendingPetCasts.TryDequeue(out _)) { }
         }
-        int otherCount = OtherCasterActiveCastIds.Count;
-        OtherCasterActiveCastIds.Clear();
+        int otherCount = ClearObservedCastIds();
         PetAutoCastActiveCastIds.Clear();
         ClearForwardedStartCastIds();
+        // JimsProxy (dup-failure frame hold): drop held dup failures with the session state —
+        // their anchors were just cleared, and the client resets its own cast/button state
+        // across a reconnect or load screen. Delivering them into the new session would ship
+        // stale-CastID packets and pollute the held_ms field-gate metric.
+        lock (_heldDupFailuresLock)
+        {
+            _heldDupFailures.Clear();
+        }
         // Single-slot trackers for melee + auto-repeat (Auto Shot, Shoot Wand)
         // — same lifecycle as PendingNormalCasts; if a tracker was set when
         // the DC fired, it never gets cleared by the SPELL_GO/CAST_FAILED
@@ -3384,6 +3926,146 @@ public sealed class GameSessionData
         PendingTrainerBuyRemovedPredecessor = 0u;
         return restored;
     }
+    // JimsProxy (respec cast lock): the cast-block-unknown-spells guard is reactive — it learns a
+    // spell is gone only when the server's SMSG_REMOVED_SPELL reaches the proxy. A talent respec
+    // wipes every talent spell server-side the instant MSG_TALENT_WIPE_CONFIRM is processed, so
+    // between the client's confirm and the removal burst arriving (a full RTT — seconds under a
+    // lag spike) a lingering action-bar press is forwarded for a spell the server no longer has →
+    // Kronos "Spell not in player book" autoban (2026-09-06, Shadowform). Arm at the confirm:
+    // every known spell that is, or descends by rank chain from, one of this class's talent
+    // spells is locked and the guard rejects its casts locally. Each real removal releases its
+    // spell. MSG_QUERY_NEXT_MAIL_TIME queued right behind the confirm is processed in order on
+    // the server, so its reply fences the wipe — success or silent rejection — and clears
+    // whatever the server kept. The timeout is a backstop for a lost fence only.
+    private HashSet<uint>? _respecLockedSpells;
+    private object? _respecLockSync;
+    public long RespecLockArmedTickMs;
+    public const long RespecLockTimeoutMs = 120_000;
+    // The fence is matched by ordinal: the modern client sends its own mail-time queries, and a
+    // reply to one of those landing inside the window must not read as "wipe processed".
+    private long _mailTimeQueriesSent;
+    private long _mailTimeRepliesSeen;
+    private long _respecFenceOrdinal; // 0 = no fence outstanding (ordinals start at 1)
+
+    private object RespecLockSync => System.Threading.LazyInitializer.EnsureInitialized(ref _respecLockSync);
+
+    public bool IsRespecCastLockArmed
+    {
+        get { lock (RespecLockSync) return _respecLockedSpells is { Count: > 0 }; }
+    }
+
+    /// <summary>Locks every known spell rooted in a talent of the local player's class (class 0 =
+    /// not yet seen: every talent-rooted spell). Returns the locked count. Re-arming while armed
+    /// unions the sets and restarts the timeout.</summary>
+    public int ArmRespecCastLock(long nowTickMs)
+    {
+        lock (RespecLockSync)
+        {
+            _respecLockedSpells ??= new HashSet<uint>();
+            CollectRespecLockSpells(CurrentPlayerKnownSpells, CurrentPlayerClass, _respecLockedSpells);
+            RespecLockArmedTickMs = nowTickMs;
+            return _respecLockedSpells.Count;
+        }
+    }
+
+    /// <summary>Walks each known spell's rank chain down to its first rank: a talent of this class
+    /// anywhere on the chain marks the known spell. Catches the talent itself (Shadowform) and the
+    /// trainer-bought higher ranks the server unlearns with it (Mortal Strike R3 whose R1 talent
+    /// was superseded out of the known set long ago).</summary>
+    public static void CollectRespecLockSpells(IEnumerable<uint> knownSpells, byte playerClass, HashSet<uint> into)
+    {
+        uint classMask = playerClass == 0 ? 0u : 1u << (playerClass - 1);
+        foreach (uint known in knownSpells)
+        {
+            uint cur = known;
+            for (int depth = 0; depth < 16; depth++)
+            {
+                if (GameData.TalentSpellClassMask.TryGetValue(cur, out uint talentClasses)
+                    && (classMask == 0 || (talentClasses & classMask) != 0))
+                {
+                    into.Add(known);
+                    break;
+                }
+                if (!GameData.SpellRankPredecessor.TryGetValue(cur, out cur))
+                    break;
+            }
+        }
+    }
+
+    /// <summary>Every MSG_QUERY_NEXT_MAIL_TIME the proxy sends to the server — the client's own and
+    /// the fence — so the fence's reply can be told apart from a stale one by ordinal.</summary>
+    public void NoteMailTimeQuerySent(bool isRespecFence)
+    {
+        lock (RespecLockSync)
+        {
+            _mailTimeQueriesSent++;
+            if (isRespecFence)
+                _respecFenceOrdinal = _mailTimeQueriesSent;
+        }
+    }
+
+    /// <summary>Counts a MSG_QUERY_NEXT_MAIL_TIME reply; true when it is the fence's own reply (or a
+    /// later one) and the lock is still armed — the wipe has been processed either way.</summary>
+    public bool NoteMailTimeReplyReachesRespecFence()
+    {
+        lock (RespecLockSync)
+        {
+            _mailTimeRepliesSeen++;
+            return _respecFenceOrdinal != 0 && _respecLockedSpells is { Count: > 0 } && _mailTimeRepliesSeen >= _respecFenceOrdinal;
+        }
+    }
+
+    /// <summary>Whether a cast must be rejected because the wipe is still pending for this spell.
+    /// Lazily expires the whole lock past RespecLockTimeoutMs; <paramref name="expiredCount"/> is
+    /// how many spells that released (0 when nothing expired).</summary>
+    public bool IsRespecCastLocked(uint spellId, long nowTickMs, out int expiredCount)
+    {
+        expiredCount = 0;
+        lock (RespecLockSync)
+        {
+            if (_respecLockedSpells is not { Count: > 0 })
+                return false;
+            if (nowTickMs - RespecLockArmedTickMs > RespecLockTimeoutMs)
+            {
+                expiredCount = _respecLockedSpells.Count;
+                _respecLockedSpells.Clear();
+                return false;
+            }
+            return _respecLockedSpells.Contains(spellId);
+        }
+    }
+
+    /// <summary>A real removal (SMSG_REMOVED_SPELL) confirms this spell is gone — the known-set
+    /// check covers it from here, so release it. Returns whether it was locked; <paramref
+    /// name="remaining"/> is how many locked spells still await the server.</summary>
+    public bool ReleaseRespecLockedSpell(uint spellId, out int remaining)
+    {
+        lock (RespecLockSync)
+        {
+            remaining = 0;
+            if (_respecLockedSpells == null)
+                return false;
+            bool wasLocked = _respecLockedSpells.Remove(spellId);
+            remaining = _respecLockedSpells.Count;
+            return wasLocked;
+        }
+    }
+
+    /// <summary>The server is done with the wipe (fence reply, explicit rejection, fresh spellbook):
+    /// anything still locked was kept server-side and is safe to cast. Returns the released count.</summary>
+    public int ClearRespecCastLock()
+    {
+        lock (RespecLockSync)
+        {
+            if (_respecLockedSpells == null)
+                return 0;
+            int released = _respecLockedSpells.Count;
+            _respecLockedSpells.Clear();
+            _respecFenceOrdinal = 0;
+            return released;
+        }
+    }
+
     public void StoreCreatureClass(uint entry, Class classId)
     {
         CreatureClasses[entry] = classId;
@@ -3581,6 +4263,27 @@ public class ClientCastRequest
     public long HeldAtTickMs;
 
     public bool HasSentPrepare;
+
+    // JimsProxy (stuck action button, RE round 15, 2026-09-08): true once a SpellPrepare
+    // (client cast id -> server cast id) has gone to the client for this press, which is the
+    // moment the 1.14 client re-keys its cast object from the client id to the server id. That
+    // happens at SPELL_START for on-GCD casts and at forward time for off-GCD casts.
+    public bool PrepareSentToClient => HasStarted || HasSentPrepare;
+
+    // The CastID a CAST_FAILED answering this press must carry: the id the client's cast object
+    // is keyed by right now. A press that was never re-keyed stays on its client id. Re-keying it
+    // with a PREPARE only to fail it on the server id is what left the client's press object
+    // pinned in its casting state with the action button lit until relog (three live PTR
+    // specimens under the in-process harness, about one in ten rejected heal-spam frames).
+    public WowGuid128 FailureCastId => PrepareSentToClient ? ServerGUID : ClientGUID;
+
+    // Whether a failure emitted for this press must be preceded by a (repeat) SpellPrepare: only
+    // an off-GCD press that was re-keyed at forward time and never started keeps that shape. A
+    // never-re-keyed press gets no PREPARE at all (the failure goes out on its client id above),
+    // and a started cast was re-keyed by the START-time PREPARE already. Every proxy emitter that
+    // fails a pending press (the request-failed helper, the CAST_FAILED handler, the destroy and
+    // watchdog evictions) reads this and FailureCastId so all four agree on the wire shape.
+    public bool NeedsPrepareBeforeFailure => !HasStarted && HasSentPrepare;
 
     // JimsProxy (held-aware GCD anchoring): true once this press was released from the GCD
     // hold slot by the release timer (ForwardHeldGcdCast) — i.e. the proxy RE-TIMED it.
@@ -3792,7 +4495,12 @@ public class GlobalSessionData
                 target_low = cast.TargetGuid.GetCounter(),
                 had_started = cast.HasStarted,
             });
-            if (!cast.HasStarted)
+            // JimsProxy (stuck action button, review of the client-id failure rule): a never-started
+            // press the client was never told to re-key is failed on its CLIENT id with no PREPARE.
+            // Re-keying it here only to fail it on the server id was the shape that pins the 1.14
+            // client's press object with the action button lit until relog. An off-GCD press that
+            // was re-keyed at forward time keeps the repeat-PREPARE shape (NeedsPrepareBeforeFailure).
+            if (cast.NeedsPrepareBeforeFailure)
             {
                 SpellPrepare prepare = new();
                 prepare.ClientCastID = cast.ClientGUID;
@@ -3803,7 +4511,7 @@ public class GlobalSessionData
             failed.SpellID = cast.SpellId;
             failed.SpellXSpellVisualID = cast.SpellXSpellVisualId;
             failed.Reason = (byte)SpellCastResultClassic.BadTargets;
-            failed.CastID = cast.ServerGUID;
+            failed.CastID = cast.FailureCastId;
             InstanceSocket.SendPacket(failed);
         }
 
@@ -3860,7 +4568,13 @@ public class GlobalSessionData
             // head). The synthetic CastFailed below already carries cast.ServerGUID == that CastID.
             if (cast.HasStarted)
                 GameState.RemoveForwardedStartCastId(cast.SpellId, cast.ServerGUID);
-            if (!cast.HasStarted)
+            // JimsProxy (stuck action button, review of the client-id failure rule): a never-started
+            // press (a SPELL_FAILURE armed the watchdog and Kronos dropped the trailing CAST_FAILED)
+            // is failed on its CLIENT id with no PREPARE, the same rule as the CAST_FAILED handler;
+            // re-keying it here only to fail it on the server id pinned the press object with the
+            // button lit. Started casts keep the server id (FailureCastId) so the FIFO release above
+            // and the failure agree; off-GCD presses keep the repeat-PREPARE shape.
+            if (cast.NeedsPrepareBeforeFailure)
             {
                 SpellPrepare prepare = new();
                 prepare.ClientCastID = cast.ClientGUID;
@@ -3871,7 +4585,7 @@ public class GlobalSessionData
             failed.SpellID = cast.SpellId;
             failed.SpellXSpellVisualID = cast.SpellXSpellVisualId;
             failed.Reason = (byte)SpellCastResultClassic.DontReport;
-            failed.CastID = cast.ServerGUID;
+            failed.CastID = cast.FailureCastId;
             InstanceSocket.SendPacket(failed);
 
             // JimsProxy (transient-no-dismiss-started): under LowLatencyMode, HandleSpellFailure

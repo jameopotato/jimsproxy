@@ -13,6 +13,22 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-23 — Release workflow: attach JimsProxy-QuickStart.zip to every release
+
+**Issue:** the quick-start guide and jimothy.cc link to
+`releases/latest/download/JimsProxy-QuickStart.zip`, which resolves only against the newest full
+release. A release without the asset breaks that link.
+
+**Change:** `.github/workflows/Release.yml`: the Windows build job runs
+`scripts/build-quickstart.ps1` under Windows PowerShell 5.1 and uploads
+`build/JimsProxy-QuickStart.zip` as an artifact; the release job already attaches every artifact
+zip and lists it in `checksums-sha256.txt`. The verify job fails the release if the zip is missing
+or lacks `Install JimsProxy.cmd`, `install.ps1`, `README.txt`, or `VERSION.txt` at its root. The
+build step fails if `scripts/build-quickstart.ps1` is absent (it arrives with PR #532).
+
+**Verification:** workflow YAML parsed with js-yaml; the verify check run locally against a zip
+built by `scripts/build-quickstart.ps1`. First real run is the next release.
+
 ## 2026-09-22 — Quick-start bundle: installer script and build script
 
 **Issue:** `docs/QUICK-INSTALL.md` described a one-click installer that did not exist yet, so
@@ -83,6 +99,511 @@ run on Linux against a stand-in proxy that mirrors the real startup lines and sh
 handshake: normal session, port in use, startup failure, detached game command, missing config,
 SIGTERM, Ctrl+C. `play.ps1` is verified on Windows in the quick-start bundle entry. Relative
 links and anchors checked.
+
+---
+
+## 2026-09-18 — SMSG_FEATURE_SYSTEM_STATUS: leave the RaceClassExpansionLevels list absent instead of sending an empty one (Linux client crash at world entry)
+
+**Issue:** a player on Linux reported the 1.14.2 client crashing at world entry on the proxy, 6 of 6
+runs, and 0 of 4 runs with one bit cleared. `SMSG_FEATURE_SYSTEM_STATUS` carries an optional
+`RaceClassExpansionLevels` list behind a has-bit (`WriteBit(RaceClassExpansionLevels != null)`). The
+proxy never fills the list, and upstream shipped the field null for years, so the bit was clear.
+Xian55's nullable sweep (97e431a1, 2026-04-02, inherited in the 04-18 rebase) defaulted the field to
+`new()`, so every v5 build has sent the bit set with a count of 0. The Windows client tolerates that
+(the reporter's theory, not measured: the parse reads its own stack and usually corrupts silently);
+the Linux client faults on it.
+
+**Change:** `World/Server/Packets/SystemPackets.cs` — `RaceClassExpansionLevels` is `List<byte>?` with
+a null default, the pre-sweep shape. A per-class audit of every `WriteBit(x != null)` in the server
+packets found no other has-bit field left with a non-null default; `PartyMemberPartialState.Auras`
+and `PartyMemberPetStats.Auras`, which the same sweep also changed, were restored to null by #435
+(the `= new()` on `PartyMemberFullState.Auras` is correct: that writer has no has-bit). Rule for the
+codebase: a field that feeds a `WriteBit(x != null)` is a protocol signal and stays `T?` with a null
+default, never `= new()`.
+
+**Verification:** `HermesProxy.Tests/World/FeatureSystemStatusTests.cs` (the default field is null;
+the default packet is 4 bytes shorter than one with an empty list and 7 shorter than one with three
+entries, so no count is written). Reporter, on v5.2.0 plus this line, Linux: the fixed build enters
+the world and plays normally with everything else unchanged. Windows: the bit-clear shape is what
+upstream HermesProxy sent to the same client from 2022 until the sweep.
+
+---
+
+## 2026-09-17 — Send SMSG_SPELL_PREPARE on the instance connection, like the rest of the cast lifecycle (#528)
+
+**Issue:** the looping cast sound, held casting pose and stuck action button (#394) were a stranded
+duplicate cast object on the client. `SMSG_SPELL_PREPARE` declared no connection type, so the
+one-argument `ServerPacket` constructor gave it `ConnectionType.Realm` and the client-bound send path
+routed every on-GCD cast's prepare down the realm socket while its `SMSG_SPELL_START`, `SMSG_SPELL_GO`
+and `SMSG_CAST_FAILED` went down the instance socket. Two TCP connections carry no ordering between
+them, and the client decodes both into one shared event queue, so a START could be handled before the
+prepare's re-key had written the server id onto the press object; the START's lookup then missed it,
+minted a second object under the same id and hung the wind-up kit on it; the GO later resolved and
+freed the press object and the duplicate stranded with its kit. TrinityCore declares all of these on
+`CONNECTION_TYPE_INSTANCE`, which is why a native realm never produces it. Off-GCD and special-slot
+presses already sent their prepare on the receiving (instance) socket and have never stranded; every
+specimen on record came from the on-GCD population routed by the declaration. Inherited from upstream's
+original client-casting commit.
+
+**Change:** `World/Server/Packets/SpellPackets.cs` — `SpellPrepare` passes `ConnectionType.Instance`.
+The spell-visual cancels stay on instance (native puts them on realm) because the #525 kit cancel is
+emitted immediately before the GO and depends on arriving first; `SMSG_CANCEL_AUTO_REPEAT` stays on
+realm, as native. A prepare now shares its START's path through the login-eviction hold, the
+pending-uninstanced queue and the instance-socket wait. Follow-up audit, not this change: three of the
+four threat packets still default to realm where native uses instance (the fourth, ThreatClear, is
+realm natively too).
+
+**Verification:** `HermesProxy.Tests/World/CastLifecycleConnectionTests.cs` (3: prepare on instance;
+every cast-lifecycle packet on one connection; the kit cancel on the GO's connection); suite
+1128/1128. Seen live with the in-process harness on both builds, solo: on the stock build every
+PREPARE coincided with a 34-byte arrival on the realm socket and a 105-byte arrival on the instance
+socket, 7/7 casts; on this branch every PREPARE coincided with a 139-byte arrival on the instance
+socket and the realm socket carried no prepare-sized arrival all session, 5/5. In-game on the branch:
+68 casts across a session with world transitions and 40 across a regression pass, zero prepares queued
+or delayed, zero stranded objects. No reproduction exists; verification in the field is the absence of
+recurring stuck action buttons across group play, judged against #525, which releases the sound and
+pose and leaves the button.
+
+---
+
+## 2026-09-14 — Echo the requested attachment id on a rejected mail take so the 1.14 client releases the slot (#527)
+
+**Issue:** #508. Bags full, open a mail with an item attachment, take it: rejected with "Inventory is
+full", correctly. Free a bag slot and take again: nothing happens, no message, no packet, and the
+attachment stays greyed out for the rest of the world session. The 1.12 server writes the error path of
+`SMSG_SEND_MAIL_RESULT` as `[mailId][MAIL_ITEM_TAKEN][MAIL_ERR_EQUIP_ERROR][equipError]` with no item
+guid or count, so the proxy forwarded the modern `SMSG_MAIL_COMMAND_RESULT` with `AttachID = 0`. The
+1.14 client keys the attachment's pending take on that id; a result for slot 0 never releases slot 1,
+so every later click is a silent client-side no-op until the world session ends. Stock capture
+2026-09-14 09:09: one `CMSG_MAIL_TAKE_ITEM`, the InvFull result with attach id 0, a
+`CMSG_DESTROY_ITEM`, then no further take until logout.
+
+**Change:** `World/Server/PacketHandlers/MailHandler.cs` — when `CMSG_MAIL_TAKE_ITEM` is forwarded,
+remember the slot the client asked for (always 1 pre-TBC) per mail id. `World/Client/PacketHandlers/
+MailHandler.cs` — on any item-taken result that arrives without an attachment id, put the remembered
+slot back, falling back to slot 1 on vanilla; the record is consumed by its result, and one whose
+result never arrives lives only until the session data is rebuilt (bounded by distinct mail ids); the
+success path is unchanged. The result parse is split into
+`WorldClient.ParseMailCommandResult` so the legacy byte layouts can be driven through it in tests.
+`GlobalSessionData.cs` — `PendingMailTakeAttachId`, a `ConcurrentDictionary` like the other
+cross-thread session maps (written on the client-socket thread, consumed on the world-client thread).
+On a 1.12 server the recorded slot is always 1 and the vanilla fallback yields the same value, so on
+Kronos the fallback is the fix; the map changes the result only on a TBC-or-later legacy server.
+The idea is from Novivy's fork (fe9adaca, 2026-05-17); it was never in this lineage.
+
+**Verification:** `HermesProxy.Tests/World/MailTakeItemAttachIdTests.cs` (6: bag-full echo, vanilla
+fallback with no record, untouched success path, record consumption on both outcomes, money-take
+scope guard; four red on the unfixed code); suite 1113/1113. Fix build, same recipe, 2026-09-14 09:08:
+the InvFull result carries attach id 1, the client retries twice, an item is mailed away, the take
+succeeds. Both session logs re-read at review: one take in the stock log, four in the fix log.
+
+---
+
+## 2026-09-13 — Cast-id breadcrumbs: name the object an Esc press cancels (#394 looping cast, Mirasu)
+
+**Issue:** a looping cast leaves a stale cast object on the client, and the only trace of it in a
+JSONL is the `CMSG_CANCEL_CAST` the player sends when they press Escape on it. The cancel handler
+logged nothing, so a reporter's log only gave the packet size, which narrows the id to a family
+(press id, server id, sequenced GO id) but never names the spell or the object. Warlock session
+`jimsproxy-20260911-183649.jsonl` (Kronos, refire on): ten Escape presses that hit no live cast,
+spread over four loop moments, none attributable to a spell.
+
+**Change:** `World/Server/PacketHandlers/SpellHandler.cs` — `HandleCancelCast` emits
+`spell.cancel_cast` with the spell id, the full cast id, and whether a pending press still owns
+that id (`pending_match` = `client_id` / `server_id` / null, via the new
+`GameSessionData.FindPendingCastByCastId`). Ungated, one line per Escape, like its siblings
+`spell.cancel_channelling` and `spell.cancel_aura`. `World/Server/WorldSocket.cs` — at the send
+choke point, DebugOutput on, every local-player `SMSG_SPELL_PREPARE` (client id to server id),
+`SMSG_SPELL_START`, `SMSG_SPELL_GO`, `SMSG_CAST_FAILED` and `SMSG_SPELL_FAILURE` emits `cast.wire`
+with the cast id exactly as written to the wire (`World/CastIdBreadcrumbs.cs`). Together an Escape
+press in a log points at the exact cast and says whether its id ever matched anything we sent.
+No behaviour change. Review notes: the shipped config has DebugOutput off, so a reporter's log
+carries the Escape line only; the wire trail needs DebugOutput on. Ids are written in the record
+form every other cast event uses (`cast_id`) with a fixed-width hex twin (`cast_id_hex`), and the
+pending lookup walks the cast queues under `PendingCastsLock` like every other read walk, so a
+rebuild in flight on the other thread cannot make a live press read as absent.
+
+**Verification:** `HermesProxy.Tests/World/CastIdBreadcrumbsTests.cs` (6 tests: hex format,
+per-packet payloads, local-caster gating, pending lookup across all six slots); suite 1081/1081.
+
+---
+
+## 2026-09-11 — Cancel a local cast's wind-up kit right before its SPELL_GO (#525)
+
+**Issue:** the looping cast sound and held casting pose (#394). Every loop cast on record is a
+clean START and GO pair on the wire; the client's GO handler fails to resolve the cast object
+that holds the wind-up (an exact key probe landing on a key-matching hash node with the wrong or
+missing object, client RE rounds 9 to 22), so the held precast sound and pose are never released.
+A second GO on the same id (the `RefireSpellGo` opt-in) probes the same key and finds the same
+wrong occupant: in the reporter's 92-minute warlock session of 2026-09-11 the refire fired on all
+730 local GOs and Life Tap and Shadow Bolt still looped, the second refire-on loop on record.
+
+**Change:** `HermesProxy/Configuration/Settings.cs` — `CancelWindupKitOnGo`, default on, `false`
+restores the stock GO. `HermesProxy/World/Client/PacketHandlers/SpellHandler.cs` — in
+`HandleSpellGo`, on the two branches that complete a cast the client was started on (the pending
+dequeue, and the orphan-recovery branch that stamps a GO from the forwarded-START FIFO, keyed on
+the parser-resolved visual) and only for non-channeled spells, send `SMSG_CANCEL_SPELL_VISUAL_KIT`
+for the caster and each wind-up kit of the spell's visual immediately before the GO
+(`SendWindupKitCancels`; the deferred form-exit path included).
+The client's handler for that packet walks the caster's own display effects by kit id and runs its
+normal release on each, sound stop included, without needing the cast object. `HermesProxy/
+GameData.cs` and `HermesProxy/CSV/SpellVisualWindupKits1.csv` — the table (791 visuals, 176 kits),
+generated by `scripts/gen-windup-kits.py` from SpellVisualEvent (the caster kit from start event 1
+to end event 2, target type 1, kits reused under any other event pair excluded). Holy heals,
+Shield, Renew, Inner Fire, Holy Light and Flash of Light resolve to kit 99; Shadow Bolt,
+Corruption and Mind Blast to 114; Life Tap, Shadow Word: Pain, Fear and the curses to 217;
+Immolate and Holy Fire to 60; Fireball to 30. Sunder Armor, Battle Shout and the potions have no
+wind-up kit and get no cancel. Known collateral: the kit's pose and model end one frame early; a
+co-active effect from another visual that shares the kit id can be released early (cosmetic,
+self-recovering). The stranded cast object is untouched, so a loop that would have happened can
+still leave the action button lit until relog (the button is #517's fix). Every send is logged
+under DebugOutput as `cast.windup_kit_cancel`.
+
+**Verification:** `WindupKitCancelTests` (26: the decision seam, the table, the orphan-branch key and
+the packet writer). Suite 1095/1095 at the PR, 1101/1101 with the review commit.
+Under the in-process cast-object harness on the PTR: 40 of 40 and then 46 of 46 pressed holy GOs
+cancelled in the same tick, every sound-owning held effect on the caster's display carried kit 99,
+released and collected at the GO, nothing cut short; live realm, 86 minutes: 272 of 272 table-kit
+GOs covered (kits 99, 60, 114, 217), 0 strays. The RE's round-22 ship check rated the cancel
+memory-safe (display-confined, the client's own retire path, no cast-side state, safe between a
+same-flush START and GO, mounted-visual bit inert). No loop occurred under the lever in those
+runs; the refire-on warlock reporter is the first field test.
+
+---
+
+## 2026-09-11 — Forward SMSG_FEIGN_DEATH_RESISTED so a resisted Feign Death is reported (#522, Mirasu)
+
+**Issue:** a creature in combat with the player can resist Feign Death. The server then keeps the
+aura, so the button greys for the cooldown, but never sets the dead flags, and the only word the
+client gets is `SMSG_FEIGN_DEATH_RESISTED`. The proxy had no handler for that opcode (it logged as
+`packet.untranslated`), so on a resist the player saw a greyed button and nothing else: no pose, no
+message, no way to tell a resist from a failed cast. Kronos, hunter at a target dummy
+(`jimsproxy-20260911-102024.jsonl`): two normal feigns with the dead dynamic flag forwarded, then
+a third press after idling in combat that arrived as the resist packet with no flag change.
+
+**Change:** `World/Client/PacketHandlers/SpellHandler.cs` — `HandleFeignDeathResisted`, a
+passthrough that sends the new `FeignDeathResisted` server packet (`World/Server/Packets/
+SpellPackets.cs`); both the legacy and the modern packet are empty (legacy opcode 0x2B4, modern
+0x273C in the 42597 table). One `spell.feign_death_resisted` event marks it in the log.
+
+**Verification:** field-tested on Kronos: the resist now shows the client's "Feign Death resisted"
+text and normal feigns are unchanged. Review: opcode present in every legacy table and in the modern
+table for 42597, empty-packet shape matches the existing empty packets, clean merge. 1075/1075.
+
+---
+
+## 2026-09-11 — JimsPlus: the ApiCompat shims are opt-in (off by default)
+
+**Issue:** the shims shipped in v5.2.1-beta.2 on by default (#507) and one of them tainted the
+action-bar paging for every stance and form user in combat (#520). Most players run no addon that
+needs the modern APIs, so a default-on compatibility layer exposes everyone to that class of risk
+for the benefit of a few.
+
+**Change:** `Addons/JimsPlus/Core.lua` — `apiCompat` defaults to `false`, with a one-time reset:
+1.2.3 wrote `apiCompat = true` into every SavedVariables on first load without the player choosing
+it, so the defaults are re-applied once (`apiCompatDefaultsVersion = 2`) and the player's own
+choice sticks from then on. `ApiCompat.lua` installs only when the option is explicitly on;
+`Options.lua` reflects the same and the tooltip says the option is off by default. Owner's call
+(2026-09-11). Players who need the shims (WeakAuras packs or addons written for newer clients)
+turn on "Modern addon API shims" in the JimsPlus options and /reload.
+
+**Verification:** Lua 5.1 parse of the three changed files against the beta baseline; the option
+round-trip is part of the beta.3 in-game pass.
+
+---
+
+## 2026-09-10 — ApiCompat: nil-guard the shim assignments so existing bar functions are never re-written (#520, Mirasu)
+
+**Issue:** on v5.2.1-beta.2 a warrior changing stance in combat no longer got the main bar paged; the
+buttons stayed on the previous stance's page (reported by Drek, default action bars). Any class with
+a bonus bar was affected (stances, druid forms, Shadowform). `ApiCompat.lua`'s vehicle block wrote
+every name with `X = X or stub`; the `or` protects the value, not the write, so the assignment ran
+whether or not `X` existed, and a global written by addon code is tainted regardless of the value
+stored. Two of those names exist on 1.14.2 and are read by secure Blizzard code on every bonus-bar
+update (`ActionBarController_UpdateAll` calls `HasTempShapeshiftActionBar` and
+`GetTempShapeshiftBarIndex`); after the re-assignment that path ran tainted and its protected
+`actionpage` attribute write was refused in combat (`ADDON_ACTION_BLOCKED` naming JimsPlus at
+`ActionBarController.lua:93`). Out of combat the tainted path still paged, which is why it was
+missed. Workaround on beta.2 was unticking "Modern addon API shims".
+
+**Change:** `Addons/JimsPlus/ApiCompat.lua` — the eighteen vehicle-API names are now assigned only
+when the global is nil (`if X == nil then X = stub end`), so a function the client provides is never
+written. The other three shim blocks were already guarded that way. No behaviour change for any name
+that is actually missing. JimsPlus 1.2.4.
+
+**Verification:** reproduced on a warrior with default bars, shims enabled, before and after on the
+same character in one session: stance change in combat pages the bar and no `ADDON_ACTION_BLOCKED`
+from JimsPlus. Both file versions parse as Lua 5.1. HermesCompat upstream uses the same idiom and
+has the same bug, so running it alongside still taints.
+
+---
+
+## 2026-09-08 — Answer a never-re-keyed rejected press on its client cast id, no SpellPrepare (#517)
+
+**Issue:** a press the server rejects before it STARTs was answered with `SMSG_SPELL_PREPARE`
+(client cast id to server cast id) followed by `SMSG_CAST_FAILED` on the server id. On the 1.14.2
+client that re-key leaves the press's cast object pinned in its casting state with the action
+button lit until relog: the client's CAST_FAILED lookup on the server id misses the re-keyed object
+and tears down a transient stub instead (client RE, round 15). Caught live three times on the
+Kronos PTR under the in-process cast-object harness (Heal rank 4, Flash Heal), about one rejected
+heal-spam frame in ten; the same rejected-press shape is routine on a warrior (Sunder Armor
+`UnitNotInfront` / `NotReady`), so it may cover some of the Sunder and Battle Shout button sticks
+(#498 stays open: its sticks self-clear, which is not the pinned shape seen here; #497's mount stick
+is a started cast after dismount and is unaffected). The stuck button is a distinct outcome from
+the looping cast sound (#394): the object never started, so it carries no wind-up effects.
+
+**Change:** `GlobalSessionData.cs` — `ClientCastRequest.PrepareSentToClient` (`HasStarted ||
+HasSentPrepare`), `FailureCastId` (the server id once a PREPARE went out, else the client id) and
+`NeedsPrepareBeforeFailure` (only an off-GCD press re-keyed at forward time and never started
+repeats its PREPARE). Every emitter that fails a pending press reads them: `WorldSocket.
+SendCastRequestFailed` (`Server/PacketHandlers/SpellHandler.cs`; a never-re-keyed non-pet request
+goes to `SendCastFailedWithoutPrepare` with the caller's reason), the `SMSG_CAST_FAILED` handler
+(`Client/PacketHandlers/SpellHandler.cs`; the dup PREPARE is built only for the off-GCD shape, the
+#491 held item then carries just the CastFailed), and, added at review, the destroy eviction and
+the watchdog eviction (`GlobalSessionData.EvictPendingCastsForDestroyedTarget` /
+`RunWatchdogEviction`), which used the same PREPARE-then-server-id shape for never-started presses.
+The special-slot accept (Shoot / next-melee) now records its forward-time PREPARE in
+`HasSentPrepare` so the rule is complete for those requests too. Unchanged: started casts (re-keyed
+at START, failures keep the server id and the FIFO-pinned id), off-GCD presses, pets, the
+special-slot failure handler. Side change: a movement-cancelled never-started press, previously
+answered on the server id with no PREPARE, now carries the client id the client actually holds.
+
+**Verification:** `RejectedPressFailureShapeTests` (8 cases) pins the rule for every state the
+emitters see. Field A/B on the Kronos PTR, same character, same play, same harness: 3 stuck
+buttons in 28 rejected never-started presses (9 min) before; 0 in 197 (6 min, priest heal spam plus
+warrior Sunder, Bloodthirst, Heroic Strike spam) with the fix, every rejection on the client id
+with no PREPARE. The eviction emitters are covered by the same rule but were not exercised in that
+run; field gate on the next beta.
+
+---
+
+## 2026-09-07 — Lock talent spells at the respec confirm so a lagged press can't reach the server after the wipe (#515, Mirasu)
+
+**Issue:** a player respecced during a lag spike, pressed Shadowform while the spellbook was still
+draining, and got the Kronos "Spell not in player book" kick and ban (since lifted). The
+cast-block-unknown-spells guard (#185) is reactive: it drops a spell from `CurrentPlayerKnownSpells`
+only when the server's removal packet reaches the proxy, while the server wipes every talent spell the
+instant it processes `MSG_TALENT_WIPE_CONFIRM`. Between the confirm leaving and the removal burst
+arriving there is a full round trip in which a lingering action-bar press is forwarded for a spell the
+server no longer has. A native 1.12 client has the same race.
+
+**Change:** `GlobalSessionData.cs` — a speculative lock armed at `CMSG_CONFIRM_RESPEC_WIPE`
+(`ArmRespecCastLock` / `CollectRespecLockSpells`): every known spell that is, or descends by rank
+chain from, a talent spell of the player's class is locked, using a new
+`GameData.TalentSpellClassMask` (Talent.dbc ClassMask, from the same `TalentSpellRanks.csv`). That
+catches the talent itself and the trainer-bought higher ranks the server unlearns with it.
+`World/Server/PacketHandlers/SpellHandler.cs` — `HandleCastSpell` rejects a locked press locally with
+the guard's own `NotKnown` CastFailed (client cast id, no PREPARE), and `ForwardHeldGcdCast` re-runs
+both the known-set check and the lock at release, since a press parked for the GCD or a cast time can
+outlive a respec. Release: each real removal (`SMSG_UNLEARNED_SPELLS` / `SMSG_SEND_UNLEARN_SPELLS`)
+releases its spell; a `MSG_QUERY_NEXT_MAIL_TIME` queued right behind the confirm is processed in
+order on the server, so its reply fences the wipe (success or silent rejection) and stands down
+whatever the server kept, matched by ordinal so a reply to the client's own query cannot stand the
+lock down early; the "no talents" wipe-confirm reply and `SMSG_BUY_FAILED` clear it; a fresh spellbook
+clears it; a 120 s timeout is a backstop for a lost fence only. The known-set mirror is never
+speculatively mutated. Diags: `spell.cast.blocked_respec_pending`, `spell.cast.blocked_at_held_release`
+and `spell.respec_lock.expired` unconditional; `spell.respec_lock.armed` / `drained` / `cleared`
+DebugOutput-gated (review housekeeping).
+
+**Verification:** real respec on a paladin on Kronos (`jimsproxy-20260907-141942`): 28 locked, exactly
+28 `SMSG_UNLEARNED_SPELLS`, drained, the untalent visual, then the fence reply, all within one 172 ms
+round trip; the locked set equalled the server's wipe set. `RespecCastLockTests` (17 cases); suite
+978/978 on the branch.
+
+---
+
+## 2026-09-06 — Fishing: keep the new channel open when the previous bobber's timeout ends it (#510, Mirasu)
+
+**Issue:** recasting fishing while the previous bobber still exists makes mangos-family servers run
+the old bobber's timeout against whatever channel is current: the server ends the NEW channel about
+100 ms after it opened (a trailing `MSG_CHANNEL_UPDATE(0)` behind the new `MSG_CHANNEL_START`) while
+the new bobber floats out its full lifetime. The same server tick clears `UNIT_CHANNEL_SPELL` and
+`UNIT_FIELD_CHANNEL_OBJECT`, so the 1.14 client drops the fishing pose, refuses the bobber and refuses
+a recast until it expires; every recast from then on repeats the race.
+
+**Change:** `World/Client/PacketHandlers/SpellHandler.cs`, `World/Client/WorldClient.cs`,
+`GlobalSessionData.cs`, `World/GameData.cs`, client/server `GameObjectHandler.cs`,
+`World/Client/PacketHandlers/UpdateHandler.cs`, `World/Server/PacketHandlers/SpellHandler.cs` —
+a packet-anchored guard, fishing spells only. Armed iff the player's previous bobber is still in the
+object cache at the new `MSG_CHANNEL_START` (own bobber tracked on its create block); the zero-update
+is held and dropped only when that bobber's `SMSG_DESTROY_OBJECT` or `SMSG_FISH_NOT_HOOKED` lands in
+the same read pass, and a socket drain releases it as genuine (same drain rule as the #450 preempt
+attack stop). After a drop the player's channel spell/object fields are re-asserted to the new
+bobber, and the new bobber's `SMSG_DESTROY_OBJECT` (catch looted, fish escaped, timed out) ends the
+client's channel with a synthesized zero-update. `CMSG_CAST_SPELL` now records a channel-break
+action. Diags: `spell.channel.stale_zero_update_dropped` (DebugOutput-gated);
+`spell.channel.zero_update_released_at_drain` logs unconditionally.
+
+**Verification:** author's in-game passes on the packet-anchored guard plus the field re-assert
+(recast with the old bobber up: pose kept, bite and loot on the new bobber); suite 986/986 on the
+branch (`ChannelStaleZeroUpdateTests`).
+
+---
+
+## 2026-09-01 — Map exploration no longer wipes on every new discovery (#511, Mirasu)
+
+**Issue:** each newly discovered subzone darkened a chunk of previously explored world map
+until relog. Two legacy 32-bit `PLAYER_EXPLORED_ZONES` fields pack into one modern 64-bit
+element and the modern update builder always writes the whole element; a mid-session discovery
+dirties exactly ONE legacy field, and `StoreObjectUpdateInternal` composed the untouched half
+from the outgoing `ObjectUpdate` being staged (a fresh object per values block, so always empty
+there), writing 32 zone bits as zero. The 2026-05-01 fix (`cfe445b0`) only corrected the
+parity asymmetry and left that null source in place, so the wipe survived for both parities.
+
+**Change:** `World/Client/PacketHandlers/UpdateHandler.cs`: new `TranslateExploredZones`
+composes each 64-bit element from BOTH 32-bit halves out of the cumulative legacy field dict.
+On the values path `ReadValuesUpdateBlock` merges every update into the session's cached fields
+in place (`ObjectCacheLegacy`, seeded at create), so that dict always holds the latest value of
+both halves. A field the server never sent is genuinely unexplored (zero at create is omitted
+from the mask); untouched pairs stay null so the builder does not resend full exploration
+state on every update. No diagnostics added.
+
+**Verification:** 6 tests (`ExploredZonesTranslationTests`): partial even/odd updates preserve
+the cached half, full-pair composition, unmasked pairs stay null, a missing partner composes as
+unexplored, multiple pairs in one update. Author-verified in-game on Kronos V (three mid-session
+discoveries with the map intact, held across a relog). Review 2026-09-05: values-path dict
+identity traced end to end; suite 967/967 on the PR head.
+
+---
+
+## 2026-08-29 — Cure the post-Charge stuck-strafe latch (orphaned pending-strafe flag)
+
+**Issue:** after a Charge the character sometimes came out of the spline stuck strafing —
+transmitted in every movement packet, so server-visible — until a strafe key was pressed;
+forward, backward and turn keys could not clear it. Wire-proven mechanism (.pkt movement-flag
+decode over 4 sessions / 83 charges): the 1.14.2 client queues a strafe key pressed mid-air
+during a forward-held jump as `PendingStrafeLeft/Right` instead of applying it; when the Charge
+spline hijacks the fall, the key release mid-spline is swallowed without clearing the pend, and
+the spline-exit landing applies the stale pend as a real strafe flag with no key behind it. A
+pending strafe start in the `CMSG_MOVE_CHANGE_TRANSPORT` the client emits at charge GO appeared
+on exactly the latching charges (3/3 field latches + 2/2 deliberate reproductions).
+
+**Change:** `World/Client/ChargePendLatchCure.cs` (new, pure decision logic): arm predicate
+(pending strafe starts only), fire predicate (armed pend's real bit set with the pend bit gone,
+i.e. the orphan observed), 3 s arm TTL, synth counters 0xFFFFFF03/04 inside the established
+`IsSynthCounter` swallow range. `Server/PacketHandlers/MovementHandler.cs`: arm inside the
+existing CHANGE_TRANSPORT drop (`pend_latch_armed` added to that always-on event for wild
+frequency); fire at the top of `HandlePlayerMove` on the first client packet showing the pend
+applied — a synthetic SMSG_MOVE_ROOT + SMSG_MOVE_UNROOT pulse to the client (corpus-proven: a
+force-root wipes all client movement flags and makes the client emit the matching stop opcodes,
+which forward and correct the server's view too; a force-unroot rebuilds flags from physical
+key state, so a genuinely held key resumes same-frame — safe in both worlds); dedicated ack
+branch in `HandleMoveForceAck2` swallows both acks. `Client/PacketHandlers/MovementHandler.cs`:
+a real self force-root between arm and fire disarms. Kronos's charge-bracketing spline
+root/unroot addresses the charge TARGET, never the charging player, so no server anchor exists
+and the cure fires on the orphan's own appearance. Config kill switch `ChargePendLatchCure`
+(default true) gates the pulse only. Diagnostics `charge.pend_latch.cure_sent` /
+`charge.pend_latch.cure_acked` are DebugOutput-gated (review 2026-09-05).
+
+**Verification:** 24 unit tests (`ChargePendLatchCureTests`) pin the arm/fire predicates
+against the verbatim wire shapes of every specimen plus the counter-range invariants (cure acks
+can never reach the legacy server); suite 985/985. Field-verified 2026-08-29, 5 recipe attempts:
+2 armed → 2 cures → 0 latches, both ROOT acks returned `client_flags=Root` only (the orphaned
+strafe wiped), same-frame ROOT→UNROOT applied in order, cure within ~100 ms of touchdown, no
+false-positive fires anywhere in the session.
+
+---
+
+## 2026-08-28 — Re-emit pre-create enchant time pushes after the item create (temp-enchant 0s, round 2)
+
+**Issue:** the sharpening-stone "flashing 0s" buff recurred on 5.2.1-beta.1
+(`jimsproxy-20260828-104459.jsonl`) despite the 2026-08-14 stash-and-inject fix (#473). Decoding
+the modern .pkt (`modern_42597_1787939107.pkt`) disproved #473's mechanism: the client's
+weapon-buff countdown is driven **only** by `SMSG_ITEM_ENCHANT_TIME_UPDATE` — the create block's
+enchantment duration field is a stale save-time snapshot that no client generation reads for the
+timer (the bad login's create carried 1,440,292 ms ≈ 24 min in the field and the client still
+rendered flashing 0s). #473's inject never fired in any field log; every "working" login worked
+because Kronos happens to send the push 1–5× per login and one usually lands after the creates.
+The 10:45 login got exactly one push, pre-create — the stash swallowed it and the client never
+received any enchant timer. This matches server canon: cmangos-classic, vmangos, and TrinityCore
+master all send enchant durations from `SendInitialPacketsAfterAddToMap` with the comment
+"must be after add to map" — the post-create requirement is client-imposed and predates 1.14.
+
+**Change:** `World/Client/PacketHandlers/UpdateHandler.cs` — the item-create consume site no
+longer writes the create's duration field; it arms a re-emit
+(`GameSessionData.ArmEnchantTimeReemit`), and `HandleUpdateObject` flushes armed re-emits as
+modern `ItemEnchantTimeUpdate` packets (whole seconds, matching canon `leftduration / 1000`)
+right after the update packet carrying the create — replicating the servers' own ordering at the
+proxy layer. `GlobalSessionData.cs` — `PendingEnchantTimeReemits` + arm/take (grab-and-clear;
+sub-second remainders dropped: 0 is both the broken display value and the client's removal
+signal). Removed the now-dead `ShouldInjectEnchantDuration` gate. The pre-create stash, decay
+tracking, and the forward path for post-create pushes are unchanged. Diags (DebugOutput-gated):
+`enchant.duration.reemitted_post_create` joins `enchant.duration.stashed_precreate`.
+
+**Verification:** red-first — 6 new arm/take tests failed on throwing stubs, green after
+implementation; suite 962/962. Field gate: relogin with an active stone on a login where Kronos's
+only push lands pre-create → expect `stashed_precreate` + `reemitted_post_create` and a real
+countdown (per-login coin flip on Kronos's send pattern, may need several relogs; any login
+showing stash events without a wrong display is a pass for that login).
+
+---
+
+## 2026-08-22 — Repair the Release workflow (Windows-only) so releases carry assets
+
+**Issue:** `.github/workflows/Release.yml` already builds and attaches packaged binaries plus
+checksums — but it had **failed every one of its 10 runs** and had not run at all since
+2026-05-20. That is why every release, including v5.1.9, all four v5.2.0 betas and v5.2.0 itself,
+shipped with **zero assets** and had to be cut by hand. Two causes, both from inheriting the
+workflow unchanged across the fork:
+
+1. **Binary name.** `HermesProxy.csproj` sets `<AssemblyName>JimsProxy</AssemblyName>`, so publish
+   emits `JimsProxy.exe`. The workflow still referenced `publish/HermesProxy` when marking the
+   binary executable, in the MacOS `lipo` step, and in the verify step's smoke run. `chmod` on a
+   non-existent file exits non-zero, killing the Ubuntu leg first and letting fail-fast cancel
+   Windows and MacOS — exactly the job pattern in the final run.
+2. **RuntimeIdentifier conflict.** `HermesProxy.csproj` pins
+   `<RuntimeIdentifier>win-x64</RuntimeIdentifier>` whenever `UsePublishBuildSettings` is set,
+   which all three matrix legs passed. The Ubuntu leg (`--use-current-runtime`) and the MacOS leg
+   (`--runtime osx-arm64`) were each fighting a csproj hardcoded to Windows.
+
+Run logs are past GitHub's retention (HTTP 410), so the diagnosis is from source rather than logs.
+
+**Change:** `.github/workflows/Release.yml` — dropped the Ubuntu and MacOS matrix legs and made
+`build` a single `windows-latest` job. JimsProxy is a Windows-only fork (csproj pins `win-x64`,
+the launcher is Windows-only, and `WowClassic_ForCustomServers.exe` exists only on Windows), so
+those legs could never have produced a usable artifact. Publish now writes straight to `-o publish`
+instead of globbing `bin/Release/*/publish`. Added an explicit publish-output assertion for
+`JimsProxy.exe` + `HermesProxy.config` + `CSV/` so a rename breaks the build loudly instead of
+silently producing an empty archive. The verify job asserts on **archive contents** (binary,
+config, and a full CSV set) rather than executing the binary, which an Ubuntu runner
+cannot do. Assets are renamed `JimsProxy-<tag>-win-x64.zip`. The release step now uploads into an
+existing release instead of failing on create, since tags are frequently cut by hand.
+
+An in-archive `README.txt` with setup notes was drafted for this change but split out
+(2026-08-23): packaged prose belongs to the parked standalone-docs effort and ships only after
+its own review. The archive is the three pieces the manual setup needs: `JimsProxy.exe`,
+`HermesProxy.config`, `CSV/`.
+
+**Verification:** YAML structure checked (5 jobs, single `windows-latest` build job, no tabs); no
+stale binary references remain. The packaged layout matches the
+`JimsProxy-v5.2.0-beta.4-win-x64.zip` asset built by hand and attached to the v5.2.0-beta.4
+release on 2026-08-22, whose contents were field-tested against Kronos on 2026-08-20. **Field gate
+pending:** the workflow itself has not been run since the fix — the first `workflow_dispatch` will
+prove it end to end. Note that `workflow_dispatch` only becomes available once this file is on the
+**default branch**, so attaching assets to an already-published tag requires it to reach `master`.
+
+---
+
+## 2026-08-22 — Retire the tracked `build-single/` distribution
+
+**Issue:** `build-single/` was a prebuilt copy of the proxy committed into the repo — 100 files,
+~115 MB, of which the exe alone was 80,146,765 bytes. It was stale (`5.0.6-latency-fixes.1`,
+April 30), referenced nowhere in this repo or the launcher repo, and undownloadable: GitHub cannot
+serve a directory, so using it meant cloning the whole repository. Every clone and every launcher
+`git submodule update` paid for it.
+
+**Change:** removed `build-single/` and added it to `.gitignore`, so a local publish into that path
+is never re-committed. The prebuilt proxy ships as a release asset instead —
+`JimsProxy-<tag>-win-x64.zip`, currently on v5.2.0 and v5.2.0-beta.4. Supersedes #458, which
+proposed refreshing the directory rather than retiring it. Existing clones do not shrink: the blob
+stays reachable in history, and rewriting the history of a public repo with forks is not worth it.
+This stops the growth rather than reversing it.
+
+**Verification:** `git grep build-single` returns no hits outside the directory itself, in this repo
+or the launcher repo. Nothing unique is removed — all 98 CSVs under `build-single/CSV/` exist in
+`HermesProxy/CSV/`, and the only other files were the stale exe and a stale `HermesProxy.config`
+(pre-#490 `ClientBuild=40618`, `PacketsLog=true`). `git check-ignore -v` matches both
+`build-single/JimsProxy.exe` and `build-single/CSV/*`.
 
 ---
 
@@ -386,3 +907,26 @@ Config kill switch `LoginEvictionMerge` (default true). Events: `login.eviction_
 **Change:** The trainer-buy predecessor bookkeeping is extracted into four pure operations on `GameSessionData` (the attack-stop pattern): `ApplyTrainerBuyPredecessorRemoval` (buy, from Server/NPCHandler), `ApplyLearnedSpellKnownState` (learn, from Client/SpellHandler — the behavioral change: a confirmed learn for the pending buy now restores the removed predecessor, new always-on event `spell.trainer_buy.predecessor_restored_on_learn`), `ApplySupercededSpellKnownState` (supersede, unchanged semantics: remove + confirm-without-restore), `ApplyTrainerBuyFailedKnownState` (explicit failure, unchanged semantics incl. the non-matching-failure clear-without-restore fail-safe). All supersede orderings stay ban-safe: SUPERCEDED-first clears the pending state so the learn never restores; LEARNED-first restores transiently and the following SUPERCEDED's unconditional remove wins; the Twizzy no-response race (the autoban the defense exists for) confirms nothing, so the removal stands and the cast guard keeps blocking.
 
 **Verification:** 11 truth-table tests (`TrainerBuyPredecessorRestoreTests`) covering every ordering: downrank restore, both supersede arrival orders, the no-response ban case, both FAILED id forms (real + learn-wrapper), non-matching FAILED fail-safe, unrelated learn/supersede mid-window, unknown-predecessor buy, single-slot pending re-buy. Double red-proof: neutering the restore fails exactly the 3 restore tests; neutering the supersede pending-confirm fails exactly the ban-critical SUPERCEDED-then-LEARN test. Suite 865/865. Live-verified 2026-08-14 both directions on Kronos: pre-fix build repro'd the lockout (`spell.cast.blocked_unknown_spell`), post-fix build restored (`spell.trainer_buy.predecessor_restored_on_learn`, lower rank casts). Remaining field check: train a genuine supersede tier (First Aid book/Stealth-style) and confirm the old tier stays gone.
+
+## 2026-08-18 - Post-kill upstream CMSG_ATTACK_STOP: end the server/client attack-state split at every kill
+
+**Issue:** The ghost-swing preempt (#450/#452) tells the modern client its melee ended the instant its victim dies (SMSG_PARTY_KILL_LOG -> synthetic SMSG_ATTACK_STOP NowDead) - but nothing tells the legacy server. The modern client treats auto-attack as server-authoritative and, told it stopped, never sends CMSG_ATTACK_STOP; Kronos does not stop the killer's swing on victim death either, so the server keeps swinging at the corpse until its next swing tick refuses it: legacy SMSG_ATTACKSWING_DEADTARGET, forwarded as AttackSwingError(DeadTarget), 1.4-3.5s after essentially every kill (26 swing errors across ~26 kills in modern_42597_1787075164.pkt, 2026-08-18). For those seconds server and client disagree about whether the player is attacking - the exact window where the post-kill stuck-highlight family clusters. In the capture's fatal window (11:09:16-11:09:20): Execute kill -> rage zeroed -> target auto-clear -> live add selected -> zero c2s casts AND zero c2s attack commands despite /targetenemy+/startattack+/cast macro presses (rage explains the silent casts; nothing wire-side explains a silent /startattack) -> DeadTarget error lands mid-window -> dead 3.9s later. The session's earlier replica death window WITHOUT a straggler produced no stick report, and the 08-03 permanent sticks (eat-context) sit 20-28s from any kill or swing error - this change targets the kill-window desync class only.
+
+**Change:** `World/Client/PacketHandlers/CombatHandler.cs` (`HandlePartyKillLog`): when the settled-attack preempt fires, also send the legacy server the CMSG_ATTACK_STOP a real 1.12 client would have produced, so both sides agree the melee ended (gated on new `PreemptAttackStopUpstream`, default on, `Configuration/Settings.cs` - kill switch restores the client-only preempt). `GameSessionData` gains a bounded pending set (`RecordSyntheticUpstreamAttackStop` / `TryConsumeSyntheticUpstreamStopEcho`, pure operations): Kronos echoes the stop naming the corpse (wire-verified via the retarget stops at +443.6/+444.0 in the same capture), and `HandleAttackStop` consumes that echo by EXACT victim match BEFORE the armed-preempt consume and the `ApplyLocalPlayerAttackStop` bookkeeping - forwarding it would hand the client a duplicate stop, and running the bookkeeping could tear down a swing handshake the player re-started within the echo RTT (the 2026-08-13 empty-victim wedge family). Empty-victim stops always fall through unchanged (they can be real CC/death/refusal stops). A pending echo is retired by the server's own SMSG_ATTACK_START naming the same victim (`InvalidateSyntheticUpstreamStopEcho`, `HandleAttackStart`): mangos-family cores reuse a static spawn's low guid across respawns and a player victim's guid never changes, so an echo that never came must not be left to swallow a genuine later stop on the re-engaged unit (review hardening, 2026-09-05). Diagnostics `combat.attack_stop_upstream_synth` / `combat.attack_stop_upstream_echo_swallowed` are DebugOutput-gated per the diagnostics policy.
+
+**Verification:** 11 tests (`AttackStopUpstreamEchoTests`): exact-once consume; wrong-victim, empty-victim and nothing-pending negatives; record-empty ignored; FIFO bound eviction; the full kill -> re-engage -> echo sequence leaving the new swing handshake untouched; the no-pending disjointness case (PreserveTargetSwitch unchanged); and the ATTACK_START retirement (same victim retired, other victim untouched, no-op cases). Red-first: the suite fails to compile without the primitives, stubbing the consume to always-false fails 5/8, and a no-op invalidate fails the retirement test. Suite 972/972 (2026-09-05, on the v5.2.1-beta.1 tip). Field gate (DebugOutput on): grind kills - expect `combat.attack_stop_upstream_synth` on each settled kill, `combat.attack_stop_upstream_echo_swallowed` ~200ms later, and the per-kill ATTACKSWING_DEADTARGET stragglers to disappear from PacketsLog; `PreemptAttackStopUpstream=false` restores today's wire behavior.
+
+## 2026-08-19 — Observed-caster CastID pairing: predecessor's echo can no longer kill the successor's bar; killed-then-fired GOes recover their CastID (#484, #485)
+
+**Issue:** Two defects in the observed (non-local, non-pet) caster cast tracker, both surfaced by a one-line field report ("certain player castbars are cancelling/interrupting as soon as they start") and quantified against the 15-session / 1.31 GB Mirasu corpus (2026-08-04→16). (1) #484: `OtherCasterActiveCastIds` was a single slot per (caster, spell); a rapid same-spell recast overwrote the predecessor's CastID, so the predecessor's late cancel broadcast — Kronos delivers it 0–554 ms AFTER the superseding SPELL_START (heal-snipe / chain-cast spam) — popped the SUCCESSOR's ID: the terminator was stamped with the new cast's identity and the synthesized SMSG_SPELL_INTERRUPT_LOG + SMSG_CANCEL_SPELL_VISUAL dismissed the new bar 0–1 ms after it appeared (9 corpus instances: Healing Touch 10181, Shadow Bolt 11660, Greater Heal 9875). The local-player path already fixed this exact shape with a per-spell FIFO (`_playerForwardedStartCastIds`); the observed path never got it. #471's live-cast dedup bypass makes the mis-forward MORE likely in exactly this window, so the FIFO is its missing prerequisite. (2) #485: Kronos broadcasts SMSG_SPELL_FAILED_OTHER for casts it then COMPLETES (killed-then-fired: 536 of 16,704 observed-player cast-time casts, 18 casters — one Frostbolt-spamming mage alone 439); the terminator popped the tracked entry, so the following SPELL_GO minted a fresh CastID the client never saw start.
+
+**Change:** `GlobalSessionData.cs`: the single-slot map becomes a short per-(caster, spell) FIFO (`_observedLiveCastIds`) with packet-paired rules derived from the server running at most ONE live cast per unit — a terminator pairs with the OLDEST tracked entry (`TryPairObservedTerminatorCastId`, reporting `pairedLiveCast=false` when it consumed a superseded predecessor), a GO pairs with the NEWEST (`TryPairObservedGoCastId`) and purges anything older (the predecessor's echo window provably closes at the successor's GO, so no zombie can outlive one cast cycle); a START keeps only the direct predecessor alongside the new cast. The ID a terminator consumed is stashed (`_observedTerminatedCastIds`, invalidated by any same-key START or GO) and `TryRecoverTerminatedObservedCastId` lets a killed-then-fired GO re-use it, so START/terminator/GO reference one cast. `World/Client/PacketHandlers/SpellHandler.cs`: both terminator handlers (`HandleSpellFailedOther`, `HandleSpellFailure`) gate the interrupt-kit synthesis on `pairedLiveCast` — those packets are caster-addressed (no cast identity on the wire), so when the terminator consumed a predecessor's entry they would have dismissed the successor's on-screen bar; the FAILED_OTHER itself still forwards with the predecessor's CastID for the combat log. New always-on field `pairedLiveCast` on `spell.failed_other.routed` / `spell.failure.routed` (corpus sweepability, #477 precedent); new DebugOutput-gated `cast.observed_go_after_terminator` marks each killed-then-fired recovery. `ResetInFlightCastState` clears both structures. Single-live-cast killed-then-fired (the mage's 439) is NOT fixable proxy-side without holding packets — the bar still flickers; #485 stays open for the Kronos-side question. Blast radius: observed casters only; local player, local pet, and the fallback deterministic-seed path are bit-for-bit unchanged; with no recast-overlap the FIFO degenerates to the old single-slot behavior exactly.
+
+**Verification:** 11 new tests (`ObservedCastIdPairingTests`) driving the pairing methods directly: the #484 defect shape (echo consumes predecessor, not live cast; GO still pairs the live cast), legit single-cast interrupt unchanged, double-echo residual pins today's outcome, GO purge, killed-then-fired recovery + stash invalidation by START and by GO, zombie hygiene on third START, key independence, reset. Existing dedup suite adapted to the new API with intent unchanged (8/8). Double red-proof: reverting the terminator to newest-pop single-slot semantics fails exactly the 3 pairing tests; neutering the stash recovery fails exactly the killed-then-fired test. Suite 946/946. Field gate: in the next corpus, `spell.failed_other.routed pairedLiveCast=false` should appear on heal-snipe clusters with the successor's bar surviving, and killed-then-fired becomes directly sweepable as terminator castIdCounter == following GO castIdCounter.
+## 2026-08-19 — Log schema: local-player CAST_FAILED terminator breadcrumb (#485 self-side measurement)
+
+**Issue:** The forwarded `SMSG_CAST_FAILED` in `HandleCastFailed`'s dequeue path is the packet that dismisses the LOCAL player's own cast bar, and it was the one client-bound terminator with no log event — observed casters log `spell.failed_other.routed` / `spell.failure.routed`, the local path logged nothing. Consequence: the #485 killed-then-fired analysis (bar dismissed, cast fires anyway; 536 observed-player instances in the 12-day corpus) could not be run for our own casts — Kronos's non-terminal failure broadcasts reach the local caster too (vanilla `SendMessageToSet(true)` includes self), and whether they ever flicker the local bar is unmeasurable from every field log we have.
+
+**Change:** `World/Client/PacketHandlers/SpellHandler.cs` (`HandleCastFailed`, dequeue-forward path): DebugOutput-gated `cast.failed.routed` emitted alongside the forwarded CastFailed — spell_id, raw + effective reason (captures DontReport rewrites), stamped cast_id_low (after identity-pinning), was_started, movement_suppressed. Gated per the diagnostics rubric (fires on every real local cast failure — normal flow, not an unexpected-edge signature). No behavior change; log-only.
+
+**Verification:** Build clean, suite 935/935 (log-only change, no new tests per #463/#477 schema precedent). Field use: with DebugOutput on, a local killed-then-fired would appear as `cast.failed.routed was_started=true` followed by a same-spell `spell.cast phase=go` for the local player — the exact sweep already run for observed casters in #485. *(2026-08-23 rebase over the #491 frame hold: emitted on the immediate-delivery path only — a held dup's later delivery is logged by `cast.fail.dup_flushed`, and a `was_started=true` failure is never held, so the killed-then-fired sweep population keeps delivery-accurate timestamps.)*

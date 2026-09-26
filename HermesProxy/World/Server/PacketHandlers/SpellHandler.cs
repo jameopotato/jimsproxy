@@ -83,6 +83,23 @@ public partial class WorldSocket
     }
     public void SendCastRequestFailed(ClientCastRequest castRequest, bool isPet, SpellCastResultClassic reason = SpellCastResultClassic.SpellInProgress)
     {
+        // JimsProxy (stuck action button, RE round 15, 2026-09-08): a player press the client has
+        // never been told to re-key (no SpellPrepare yet: not started, not an off-GCD forward) is
+        // answered on the CLIENT cast id with no SpellPrepare. Re-keying it to a server id only to
+        // fail it is what left the 1.14 client's press object pinned in its casting state with the
+        // action button lit until relog (three live specimens on the PTR under the in-process
+        // harness, about one in ten rejected heal-spam frames: the object survives CAST_FAILED on
+        // the server id because that lookup misses it and tears down a transient stub instead).
+        // The client-id shape is the one the duplicate drop has always used and it has never
+        // stuck, and a rejected press never gets a START or GO, so the client has no use for the
+        // server id. Presses already re-keyed (started, or off-GCD prepared at forward time) and
+        // pets keep the shape below unchanged.
+        if (!castRequest.PrepareSentToClient && !isPet)
+        {
+            SendCastFailedWithoutPrepare(castRequest, reason);
+            return;
+        }
+
         if (!castRequest.HasStarted)
         {
             SpellPrepare prepare2 = new SpellPrepare();
@@ -141,6 +158,10 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CAST_SPELL)]
     void HandleCastSpell(CastSpell cast)
     {
+        // JimsProxy (fishing recast wedge): casting anything ends a running channel on the
+        // server, so a zero-update that follows is genuine — stand the guard down.
+        GetSession().GameState.RecordLocalChannelBreakAction();
+
         // JimsProxy (cast-block-unknown-spells): vanilla 1.12 server autobans clients that
         // emit CMSG_CAST_SPELL for spells they don't know. Native 1.12 clients block this
         // locally and never send the packet; modern Classic 1.14 clients send it through to
@@ -187,6 +208,27 @@ public partial class WorldSocket
             SendPacket(failed);
             return;
         }
+
+        // JimsProxy (respec cast lock): the talent wipe is in flight — the server may already have
+        // removed this spell without the removal having reached us. Reject locally exactly like an
+        // unknown spell; the lock releases per real removal / fence reply (GameSessionData).
+        if (GetSession().GameState.IsRespecCastLocked(guardSpellId, Environment.TickCount64, out int respecLockExpired))
+        {
+            Log.Event("spell.cast.blocked_respec_pending", new
+            {
+                spell_id = guardSpellId,
+                client_cast_id = cast.Cast.CastID.ToString(),
+            });
+            CastFailed failed = new();
+            failed.SpellID = guardSpellId;
+            failed.SpellXSpellVisualID = cast.Cast.SpellXSpellVisualID;
+            failed.Reason = (uint)SpellCastResultClassic.NotKnown;
+            failed.CastID = cast.Cast.CastID;
+            SendPacket(failed);
+            return;
+        }
+        if (respecLockExpired > 0)
+            Log.Event("spell.respec_lock.expired", new { released_count = respecLockExpired });
 
         // JimsProxy (PR #161 follow-up): self-heal any leaked peek-without-CAST_FAILED
         // before HasStartedNormalCast / HasNonStartedPendingCastForSpell run their
@@ -293,6 +335,11 @@ public partial class WorldSocket
                 prepare.ClientCastID = cast.Cast.CastID;
                 prepare.ServerCastID = castRequest.ServerGUID;
                 SendPacket(prepare);
+                // JimsProxy (stuck action button, client-id failure rule): this PREPARE re-keys the
+                // client's press object to the server id at forward time, exactly like the off-GCD
+                // path. Record it so any failure emitted for this request later keeps the server id
+                // (FailureCastId) instead of a client id the client no longer holds.
+                castRequest.HasSentPrepare = true;
 
                 currentCast = castRequest;
             }
@@ -867,6 +914,23 @@ public partial class WorldSocket
             return;
         }
 
+        // JimsProxy (respec cast lock): a press parked for the GCD / a cast time passed the
+        // spellbook guard when it arrived; a respec or a removal can land while it waits, and
+        // forwarding it now is the same autoban path. Re-run both checks at release.
+        var heldKnown = gameState.CurrentPlayerKnownSpells;
+        bool heldUnknown = heldKnown.Count > 0 && !heldKnown.Contains(cast.SpellId);
+        if (heldUnknown || gameState.IsRespecCastLocked(cast.SpellId, Environment.TickCount64, out _))
+        {
+            Log.Event("spell.cast.blocked_at_held_release", new
+            {
+                spell_id = cast.SpellId,
+                client_cast_id = cast.ClientGUID.ToString(),
+                reason = heldUnknown ? "unknown_spell" : "respec_pending",
+            });
+            SendCastFailedWithoutPrepare(cast, SpellCastResultClassic.NotKnown);
+            return;
+        }
+
         // DIAGNOSTIC (stuck-spell investigation): remove when closed
         if (Framework.Settings.DebugOutput)
             Log.Event("cast.forwarded", new
@@ -1051,6 +1115,20 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CANCEL_CAST)]
     void HandleCancelCast(CancelCast cast)
     {
+        // JimsProxy (cast-id breadcrumbs): name the object an Esc press cancels and whether we still hold its press.
+        var cancelled = GetSession().GameState.FindPendingCastByCastId(cast.CastID);
+        Log.Event("spell.cancel_cast", new
+        {
+            spell_id = cast.SpellID,
+            cast_id = cast.CastID.ToString(),
+            cast_id_hex = CastIdBreadcrumbs.Hex(cast.CastID),
+            cast_id_counter = cast.CastID.GetCounter(),
+            cast_id_empty = cast.CastID.IsEmpty(),
+            pending_match = cancelled == null ? null : (cancelled.ClientGUID == cast.CastID ? "client_id" : "server_id"),
+            pending_spell_id = cancelled?.SpellId,
+            pending_started = cancelled?.HasStarted,
+        });
+
         // JimsProxy (issue #43): if the client cancels while we have a held cast waiting for
         // GCD expiry, drop the held cast so it doesn't fire after the cancel. Resolve the
         // client's button state with DontReport.
@@ -1084,6 +1162,10 @@ public partial class WorldSocket
             SendCastFailedWithoutPrepare(heldCastTimeDrop);
         }
 
+        // JimsProxy (fishing recast wedge): a client-initiated cancel makes any
+        // following zero channel-update genuine — don't let the guard hold it.
+        GetSession().GameState.RecordLocalChannelBreakAction();
+
         WorldPacket packet = new WorldPacket(Opcode.CMSG_CANCEL_CAST);
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
             packet.WriteUInt8(0);
@@ -1097,6 +1179,8 @@ public partial class WorldSocket
         {
             spell_id = cast.SpellID,
         });
+        // JimsProxy (fishing recast wedge): see HandleCancelCast.
+        GetSession().GameState.RecordLocalChannelBreakAction();
         WorldPacket packet = new WorldPacket(Opcode.CMSG_CANCEL_CHANNELLING);
         packet.WriteInt32(cast.SpellID);
         SendPacketToServer(packet);

@@ -97,6 +97,14 @@ public static class Settings
     // active regardless (instrument, not cure). See World/Client/WorldEntryCeremony.cs.
     // Default-init true so paths that bypass LoadAndVerifyFrom (tests) get the fix.
     public static bool WorldEntryCarriedRootCure = true;
+    // JimsProxy (charge strafe-latch cure 2026-08-28): synthesize a force ROOT+UNROOT pulse to
+    // the client when a Charge spline exit applies an orphaned pending-strafe flag (the player
+    // comes out of the charge stuck strafing until a strafe key is touched). Key = kill switch
+    // for the cure pulse only; the arm signature still stamps `pend_latch_armed` on the
+    // change_transport.dropped event so wild frequency stays measurable with the cure off.
+    // See World/Client/ChargePendLatchCure.cs. Default-init true so paths that bypass
+    // LoadAndVerifyFrom (tests) get the fix.
+    public static bool ChargePendLatchCure = true;
     // JimsProxy (#382 MC-cap BG FPS drop): strip UNIT_FLAG_PET_IN_COMBAT (0x800) from a
     // PLAYER for exactly the duration of a player-on-player charm (Gnomish MC Cap 13181,
     // priest MC 605). Vanilla cores set that flag on the charmed unit itself; modern
@@ -176,9 +184,44 @@ public static class Settings
     // frame; the 1.14 client can drop the coalesced SPELL_GO, so the cast never closes — a stuck
     // cast pose + looping cast sound + lit action button that persists until logout (survives
     // /reload). When set, on a local instant's first SPELL_GO re-fire a stripped duplicate SPELL_GO
-    // (~8ms later, in a clean frame, visual suppressed, no targets/log) so the client processes it
+    // (RefireSpellGoDeferMs later, in a clean frame, visual suppressed, no targets/log) so the client processes it
     // and closes the cast. No-op on clean casts. Independent of LowLatencyMode. Default OFF — opt-in.
+    // Also covers OBSERVED casters (other players / NPCs, incl. cast-time spells like Flash of Light) on any
+    // SPELL_GO that paired with a seen SPELL_START — most stuck precast sounds are observed, not local.
     public static bool RefireSpellGo;
+    // JimsProxy (post-kill upstream stop): the ghost-swing preempt pushes the modern client an
+    // early SMSG_ATTACK_STOP when its melee victim dies, but that is CLIENT-only — the client,
+    // told it stopped, never sends CMSG_ATTACK_STOP, and Kronos keeps the player's swing running
+    // against the corpse until the next swing tick refuses it (ATTACKSWING_DEADTARGET 1.4-3.5s
+    // after essentially every kill; 26/~26 kills in the 2026-08-18 capture). For those seconds
+    // server and client disagree about whether the player is attacking — the window where
+    // post-kill stuck-highlight / silent-startattack reports cluster. When set, the preempt also
+    // sends the legacy server the CMSG_ATTACK_STOP a real 1.12 client would have produced, and
+    // the server's echo is consumed instead of forwarded. Kill switch: set false to restore the
+    // client-only preempt. Default on.
+    public static bool PreemptAttackStopUpstream = true;
+    // JimsProxy (RefireSpellGo defer): ms the stripped duplicate GO lands after the original. Must exceed ONE
+    // client frame so it processes in a clean frame, separate from the coalesced START+GO — else it's useless.
+    // 50ms clears down to ~20fps (crowds, where the bug is worst); the duplicate is inert so a late land is
+    // UX-free. Frame-clearing via a conservative fixed margin, not per-frame FPS estimation. Tune to your FPS floor.
+    public static int RefireSpellGoDeferMs;
+    // JimsProxy (CancelWindupKitOnGo): the 1.14 client closes a cast's held wind-up kit at SPELL_GO
+    // through a cancel keyed on the caster's own display; when that resolve is skipped in the GO
+    // frame, or when the client's own cast-end parks the effect on its deferred list, the wind-up
+    // (kit + looping sound) stays live until a world load — the #394 looping cast sound. The
+    // client's handler for SMSG_CANCEL_SPELL_VISUAL_KIT runs the normal safe release on every effect
+    // of that kit on that unit, sound stop included, and needs no cast-side id. When set, immediately
+    // BEFORE forwarding the GO that completes a local pressed cast, send that cancel for the caster
+    // and each wind-up kit of the spell's visual (CSV/SpellVisualWindupKits<exp>.csv). Local player
+    // only, channels excluded. A cancel sent after an orphan park cannot reach the parked effect,
+    // which is why it precedes the GO. Default ON: the client RE (rounds 13, 14 and 22) rated the
+    // injected cancel memory-safe (the client's own kitted retire path, display-scoped, no cast-side
+    // state touched) and it is the one mechanism that reaches a wind-up whose cast object the GO
+    // cannot find; the refire (RefireSpellGo) cannot. Known collateral: the kit's pose and model
+    // effects end one frame early, and a co-active effect that merely shares the kit id can be
+    // released early (cosmetic, self-recovering). Kill switch: set false to restore the stock GO.
+    // Every send is logged under DebugOutput (cast.windup_kit_cancel).
+    public static bool CancelWindupKitOnGo;
     // JimsProxy (#379 form-exit): the 1.14 client auto-shifts out of a form to cast
     // (CMSG_CANCEL_AURA + CMSG_CAST_SPELL ~1ms apart), but the 1.12 server emits the cast's
     // SMSG_SPELL_START ~20ms BEFORE the form-removal SMSG_UPDATE_OBJECT. The cast's visual kit
@@ -270,6 +313,7 @@ public static class Settings
         LoginEvictionMerge = config.GetBoolean("LoginEvictionMerge", true);
         LoginPreCreateOpHold = config.GetBoolean("LoginPreCreateOpHold", true);
         WorldEntryCarriedRootCure = config.GetBoolean("WorldEntryCarriedRootCure", true);
+        ChargePendLatchCure = config.GetBoolean("ChargePendLatchCure", true);
         Charm382StripPetInCombat = config.GetBoolean("Charm382StripPetInCombat", true);
         SynthStandOnFear = config.GetBoolean("SynthStandOnFear", true);
         AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);
@@ -279,6 +323,9 @@ public static class Settings
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);
         IdentityPinnedCastIds = config.GetBoolean("IdentityPinnedCastIds", false);
         RefireSpellGo = config.GetBoolean("RefireSpellGo", false);
+        PreemptAttackStopUpstream = config.GetBoolean("PreemptAttackStopUpstream", true);
+        RefireSpellGoDeferMs = config.GetInt("RefireSpellGoDeferMs", 50);
+        CancelWindupKitOnGo = config.GetBoolean("CancelWindupKitOnGo", true);
         var rttPrefireStr = config.GetString("RttPrefire", "off");
         RttPrefire = rttPrefireStr.Equals("timer", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Timer
             : rttPrefireStr.Equals("knocker", StringComparison.OrdinalIgnoreCase) ? RttPrefireMode.Knocker
