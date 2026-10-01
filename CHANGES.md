@@ -13,6 +13,38 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-09-27 — Quick-start installer 1.1.0: client list, existing installations, welcome screen
+
+**Issue:** first hands-on test of the installer. Clients that already had a launcher or manual
+`Hermes` were listed as choices and then refused, so a valid client could not be used at all;
+long paths wrapped and the list mixed usable clients with unusable ones; the typed-path option
+added nothing over Browse; the installer started without saying what it would do.
+
+**Change:** `scripts/quickstart/install.ps1`, `scripts/quickstart/README.txt`, `docs/QUICK-INSTALL.md`.
+- Welcome screen before Step 1: what the installer does, the guide link, Enter to continue
+  (skipped with `-Yes`). The welcome screen and `README.txt` link the jimothy.cc quick-start
+  guide.
+- Every menu uses arrow keys and Enter (numbered choices when input is redirected). The client
+  list shows a green `√` per usable client with its folder name and a shortened path, notes
+  clients that already have a `Hermes`, counts unusable clients on one dim line, and puts
+  Browse, Extract a client archive, Keep searching and Quit after a blank line. The typed-path
+  options are removed. Temporary folders are not scanned.
+- Keep searching walks every folder on every fixed drive, with a folder counter; Esc stops it.
+- Only 1.15 clients found: the installer recommends the Classic WoW Launcher, which can copy and
+  patch a 1.15 client.
+- A client with an existing `Hermes`: copy the client (showing the extra disk space) into a new
+  folder and install there, or install in place after a warning, renaming the old `Hermes` to
+  `Hermes-backup-<date>` at Step 4 and carrying its `AccountData` over. `-CopyTo` does the copy
+  unattended.
+
+**Verification:** Windows 11, PowerShell 5.1, local copies of the published archives. The
+arrow-key list driven by keypresses in Windows Terminal (screenshot checked) through a full
+install; the numbered fallback; copy route unattended (8.1 GB, original byte-identical, `Data`
+junction copied as real files) and in-place route interactive (No returns to the list, Yes
+renames at Step 4, `AccountData` carried over); Keep searching (246,373 folders in 85 s, found a
+client six levels deep); only-1.15 recommendation; unattended install, reconfigure, update and
+uninstall unchanged.
+
 ## 2026-09-23 — Release workflow: attach JimsProxy-QuickStart.zip to every release
 
 **Issue:** the quick-start guide and jimothy.cc link to
