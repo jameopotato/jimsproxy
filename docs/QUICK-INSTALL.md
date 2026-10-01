@@ -41,7 +41,8 @@ Contents
 2. Double-click `Install JimsProxy.cmd`. A console window describes what the installer does,
    links this guide, and waits for Enter. It then works through six steps. In each menu, the
    arrow keys move the highlight and Enter selects; `Q` quits. Everything shown is also written
-   to `Hermes\install.log`.
+   to a log: `%TEMP%\jimsproxy-quickstart.log` until the `Hermes` folder exists, then
+   `Hermes\install.log`. A failure message names it.
 
 `install.ps1` and `JimsProxy.exe` are not code-signed. If SmartScreen shows "Windows protected
 your PC", select **More info → Run anyway**. If antivirus software quarantines `JimsProxy.exe`,
@@ -96,8 +97,8 @@ and the original client are not modified. A full client takes a few minutes.
 ```
 Server:
  > Kronos (login.twinstar-wow.com)
-   Kronos 2 (login2.twinstar-wow.com)
-   Kronos 3 (login3.twinstar-wow.com)
+   Kronos mirror 2 (login2.twinstar-wow.com)
+   Kronos mirror 3 (login3.twinstar-wow.com)
    Other address
 
 Channel:
@@ -149,8 +150,8 @@ Select:
 - **Update** downloads the current archive for the installed channel and replaces
   `JimsProxy.exe`, `CSV`, `Addons` and `manifest.json`; re-copies JimsPlus if it was installed;
   refreshes the play scripts. `HermesProxy.config` and `AccountData` are not modified.
-- **Reconfigure** shows the server and channel menus again. A channel change takes effect at the
-  next update.
+- **Reconfigure** shows the server and channel menus again. A server change takes effect when the
+  proxy restarts; a channel change at the next update.
 - **Uninstall** asks for confirmation (from this menu), offers to move `AccountData` to
   `<root>\JimsProxy-AccountData-backup`, deletes `Hermes`, deletes `Interface\AddOns\JimsPlus`
   if the installer created it, removes the `SET portal` line only if it points at `127.0.0.1`,
@@ -176,7 +177,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ClientDir "D:
 | `-ClientArchive <path>` | A client archive to extract |
 | `-ExtractTo <path>` | Destination for `-ClientArchive` (empty or absent); without it the destination is asked, or the default is used with `-Yes` |
 | `-CopyTo <path>` | When the client already has a `Hermes` the installer did not create: copy the client to this empty or new folder and install there |
-| `-Server` | `kronos`, `kronos2`, `kronos3`, or a login address |
+| `-Server` | `kronos`, `kronos2` or `kronos3` (mirrors), or a login address |
 | `-Channel` | `stable` or `beta` |
 | `-NoAddon`, `-NoShortcut` | Skip the addon or the shortcut |
 | `-Yes` | Accept all defaults; no prompts (the welcome screen is skipped) |

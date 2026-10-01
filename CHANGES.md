@@ -13,6 +13,26 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-10-01 — Quick-start installer 1.1.1: Kronos login mirrors; guide corrections
+
+**Issue:** `login2.twinstar-wow.com` and `login3.twinstar-wow.com` are mirrors of
+`login.twinstar-wow.com` that reach the same realms, but the installer and the guides labelled them
+"Kronos 2" and "Kronos 3", which reads as separate realms. The quick-start guide also named only
+`Hermes\install.log` as the log, although the installer logs to `%TEMP%` until `Hermes` exists, and
+said nothing about when a server change takes effect.
+
+**Change:** `scripts/quickstart/install.ps1` (1.1.1): server menu names `Kronos mirror 2` and
+`Kronos mirror 3`, as in the launcher; the `-Server` keys `kronos2` and `kronos3` are unchanged, so
+existing `quickstart.json` files keep working; the `-Server` error and the header describe the
+mirrors and when the installer copies or extracts a client. `docs/QUICK-INSTALL.md`: mirror labels
+in the server menu and the `-Server` row, both log locations, when a server change takes effect.
+`docs/MANUAL-INSTALL.md`: mirror labels and when to use one. `docs/configuration.md`: `ServerAddress`
+lists the mirrors as mirrors.
+
+**Verification:** server menu shows the mirror labels; `-Server kronos2` selects
+`login2.twinstar-wow.com`; installations made with installers 1.0.0 and 1.1.0 on `kronos2` update
+and reconfigure under 1.1.1 with the server kept.
+
 ## 2026-09-27 — Quick-start installer 1.1.0: client list, existing installations, welcome screen
 
 **Issue:** first hands-on test of the installer. Clients that already had a launcher or manual

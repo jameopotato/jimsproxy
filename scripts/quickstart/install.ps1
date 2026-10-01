@@ -11,7 +11,8 @@
   The installer changes nothing outside the chosen root folder (the folder that holds
   "World of Warcraft", or the folder that holds "_classic_era_"), the client's WTF and
   Interface\AddOns\JimsPlus folders, the optional desktop shortcut, and its own temporary
-  files in %TEMP%. It never downloads, copies, patches, or deletes game files.
+  files in %TEMP%. It never downloads, patches, or deletes game files; it copies or extracts a
+  client only when that is selected.
 
   Exit codes: 0 success, 1 unexpected error, 2 preflight failed, 3 no usable client selected,
   4 download failed, 5 verification failed, 6 cancelled.
@@ -38,7 +39,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest is many times slower with the progress bar on 5.1
 
 # ================================================================== constants
-$InstallerVersion = '1.1.0'
+$InstallerVersion = '1.1.1'
 $GuideUrl         = 'https://jimothy.cc/install/guide/quick-start'
 $LauncherUrl      = 'https://jimothy.cc/install'
 $RequiredBuild    = '1.14.2.42597'
@@ -47,8 +48,8 @@ $ProxyHost        = 'https://jimothy.cc'
 $RawBase          = 'https://raw.githubusercontent.com/jameopotato/jimsproxy/master'
 $Servers = @(
     [pscustomobject]@{ Key = 'kronos';  Name = 'Kronos';   Address = 'login.twinstar-wow.com' },
-    [pscustomobject]@{ Key = 'kronos2'; Name = 'Kronos 2'; Address = 'login2.twinstar-wow.com' },
-    [pscustomobject]@{ Key = 'kronos3'; Name = 'Kronos 3'; Address = 'login3.twinstar-wow.com' }
+    [pscustomobject]@{ Key = 'kronos2'; Name = 'Kronos mirror 2'; Address = 'login2.twinstar-wow.com' },
+    [pscustomobject]@{ Key = 'kronos3'; Name = 'Kronos mirror 3'; Address = 'login3.twinstar-wow.com' }
 )
 $MinFreeBytes     = 500MB
 $ScanSeconds      = 20
@@ -1042,7 +1043,7 @@ function Select-ServerAndChannel {
         $match = @($Servers | Where-Object { $_.Key -ieq $Server })
         if ($match.Count -gt 0) { $key = $match[0].Key; $address = $match[0].Address }
         elseif (Test-ServerAddress $Server) { $key = 'other'; $address = $Server }
-        else { Stop-Install 1 "-Server must be kronos, kronos2, kronos3, or a hostname or IP address (got '$Server')." 'Correct the parameter and run the installer again.' }
+        else { Stop-Install 1 "-Server must be kronos, kronos2 or kronos3 (mirrors), or a hostname or IP address (got '$Server')." 'Correct the parameter and run the installer again.' }
         Out-Log "Server: $address"
     } else {
         $items = @($Servers | ForEach-Object { New-MenuItem -Key $_.Key -Text "$($_.Name) ($($_.Address))" }) + @(New-MenuItem -Key 'other' -Text 'Other address')

@@ -32,7 +32,7 @@ default unless added. **Default** is the effective out-of-the-box value.
 
 | Key | Default | In file | Description |
 |---|---|:---:|---|
-| `ServerAddress` | `127.0.0.1` | ✅ | Server login address. Kronos: `login.twinstar-wow.com`, `login2.twinstar-wow.com`, `login3.twinstar-wow.com`. |
+| `ServerAddress` | `127.0.0.1` | ✅ | Server login address. Kronos: `login.twinstar-wow.com`; mirrors: `login2.twinstar-wow.com`, `login3.twinstar-wow.com`. |
 | `ServerPort` | `3724` | ✅ | Login port. |
 | `ServerBuild` | `auto` | ✅ | Legacy server build. `auto` selects `5875` (1.12.1) for a 1.14 client. Explicit values: `5875`, `6005`, `6141` (1.12.x), `8606` (2.4.3). |
 | `ClientBuild` | `42597` | ✅ | Must match the client build exactly. `42597` (1.14.2) is the tested build. If the key is absent the built-in default is `40892` (2.5.2), so keep it. |
