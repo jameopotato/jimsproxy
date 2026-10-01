@@ -125,8 +125,10 @@ login address.
 | Server | `ServerAddress` |
 |---|---|
 | Kronos | `login.twinstar-wow.com` |
-| Kronos 2 | `login2.twinstar-wow.com` |
-| Kronos 3 | `login3.twinstar-wow.com` |
+| Kronos mirror 2 | `login2.twinstar-wow.com` |
+| Kronos mirror 3 | `login3.twinstar-wow.com` |
+
+The mirrors reach the same realms; use one when `login.twinstar-wow.com` is down.
 
 No other key needs changing for Kronos. All keys: [configuration reference](configuration.md).
 
