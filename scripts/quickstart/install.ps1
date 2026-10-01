@@ -21,6 +21,7 @@ param(
     [string]$ClientDir,
     [string]$ClientArchive,
     [string]$ExtractTo,
+    [string]$CopyTo,
     [string]$Server,
     [string]$Channel,
     [switch]$NoAddon,
@@ -37,7 +38,9 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest is many times slower with the progress bar on 5.1
 
 # ================================================================== constants
-$InstallerVersion = '1.0.0'
+$InstallerVersion = '1.1.0'
+$GuideUrl         = 'https://jimothy.cc/install/guide/quick-start'
+$LauncherUrl      = 'https://jimothy.cc/install'
 $RequiredBuild    = '1.14.2.42597'
 $ReadyLine        = 'Starting WorldSocket service'
 $ProxyHost        = 'https://jimothy.cc'
@@ -77,7 +80,8 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $script:LogPath   = Join-Path $env:TEMP 'jimsproxy-quickstart.log'
 $script:TempPaths = New-Object System.Collections.Generic.List[string]
 $script:Step      = 'Start'
-$script:Extracting = $null      # root folder while a client archive is being extracted
+$script:Extracting = $null      # destination folder while a client is being extracted or copied
+$script:ExtractVerb = 'extraction'
 $script:Finished  = $false      # false in the final block only when Ctrl+C stopped the script
 
 # ================================================================== output and input
@@ -158,6 +162,124 @@ function Read-YesNo {
         if ($a -eq 'Q') { Stop-Install 6 'Cancelled.' 'Run the installer again to continue.' }
         Out-Log 'Enter Y or N.'
     }
+}
+
+# ================================================================== menus
+$CheckMark = [string][char]0x221A   # renders in every console font and code page
+
+function Test-InteractiveConsole {
+    try { return (-not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected -and $Host.Name -eq 'ConsoleHost') }
+    catch { return $false }
+}
+
+function New-MenuItem {
+    # A selectable row has a Key; a row without one is information (Dim) or a blank spacer.
+    param([string]$Key, [string]$Text, [string]$Mark = '', [switch]$Dim)
+    return [pscustomobject]@{ Key = $Key; Text = $Text; Mark = $Mark; Dim = [bool]$Dim; Selectable = [bool]$Key }
+}
+
+function Format-ShortPath {
+    # Shortens a path from the middle, keeping the drive and the last folders.
+    param([string]$Path, [int]$Max)
+    if ($Path.Length -le $Max -or $Max -lt 12) { return $Path }
+    $root = [System.IO.Path]::GetPathRoot($Path)
+    $parts = $Path.Substring($root.Length).Split('\')
+    $tail = ''
+    for ($i = $parts.Count - 1; $i -ge 0; $i--) {
+        $candidate = if ($tail) { $parts[$i] + '\' + $tail } else { $parts[$i] }
+        if (($root + '...\' + $candidate).Length -gt $Max) { break }
+        $tail = $candidate
+    }
+    if (-not $tail) { return $Path.Substring(0, $Max - 3) + '...' }
+    return $root + '...\' + $tail
+}
+
+function Show-Menu {
+    # Arrow keys and Enter in a console; numbered choices when input or output is redirected.
+    # Returns the chosen item's Key. Q or Esc cancels the installer.
+    param([string]$Title, [object[]]$Items, [string]$DefaultKey)
+    $selectable = @(for ($i = 0; $i -lt $Items.Count; $i++) { if ($Items[$i].Selectable) { $i } })
+    $idx = $selectable[0]
+    foreach ($i in $selectable) { if ($Items[$i].Key -eq $DefaultKey) { $idx = $i } }
+    $logText = @($Title) + @($Items | ForEach-Object { if ($_.Selectable) { "  $($_.Mark) $($_.Text)" } else { "    $($_.Text)" } })
+    try { [System.IO.File]::AppendAllText($script:LogPath, ($logText -join "`r`n") + "`r`n", $Utf8NoBom) } catch { }
+
+    if ($Yes) { Write-Host $Title; Out-Log "  -> $($Items[$idx].Text) (accepted by -Yes)"; return $Items[$idx].Key }
+
+    if (-not (Test-InteractiveConsole)) {
+        Write-Host $Title
+        $map = @{}; $n = 0; $defaultNumber = '1'
+        for ($i = 0; $i -lt $Items.Count; $i++) {
+            $it = $Items[$i]
+            if ($it.Selectable) {
+                $n++; $map["$n"] = $it.Key
+                if ($i -eq $idx) { $defaultNumber = "$n" }
+                Write-Host ("[{0}] {1}{2}" -f $n, $(if ($it.Mark) { "$($it.Mark) " } else { '' }), $it.Text)
+            } else { Write-Host ("    " + $it.Text) }
+        }
+        $keys = @(1..$n | ForEach-Object { "$_" })
+        $k = Read-Choice 'Select' $keys $defaultNumber
+        try { [System.IO.File]::AppendAllText($script:LogPath, "  -> $($Items[[array]::IndexOf(@($Items.Key), $map[$k])].Text)`r`n", $Utf8NoBom) } catch { }
+        return $map[$k]
+    }
+
+    Write-Host $Title
+    $width = [Math]::Max(40, [Console]::WindowWidth - 1)
+    foreach ($it in $Items) { Write-Host '' }
+    $top = [Console]::CursorTop - $Items.Count
+    Write-Host '  Up/Down to move, Enter to select, Q to quit' -ForegroundColor DarkGray
+    $bottom = [Console]::CursorTop
+    $drawRow = {
+        param([int]$i, [bool]$on)
+        $it = $Items[$i]
+        [Console]::SetCursorPosition(0, $top + $i)
+        if (-not $it.Selectable) {
+            $line = ('    ' + $it.Text)
+            if ($line.Length -gt $width) { $line = $line.Substring(0, $width - 3) + '...' }
+            Write-Host $line.PadRight($width) -NoNewline -ForegroundColor $(if ($it.Dim) { 'DarkGray' } else { 'Gray' })
+            return
+        }
+        $body = $it.Text
+        if ($body.Length -gt $width - 6) { $body = $body.Substring(0, $width - 9) + '...' }
+        $fg = if ($on) { 'Black' } else { 'Gray' }
+        $bg = if ($on) { 'Gray' } else { [Console]::BackgroundColor }
+        Write-Host $(if ($on) { ' > ' } else { '   ' }) -NoNewline -ForegroundColor Cyan
+        Write-Host $(if ($it.Mark) { $it.Mark } else { ' ' }) -NoNewline -ForegroundColor Green
+        Write-Host ' ' -NoNewline
+        Write-Host $body -NoNewline -ForegroundColor $fg -BackgroundColor $bg
+        Write-Host ''.PadRight([Math]::Max(0, $width - 5 - $body.Length)) -NoNewline
+    }
+    $cursorWas = $true
+    try { $cursorWas = [Console]::CursorVisible; [Console]::CursorVisible = $false } catch { }
+    try {
+        for ($i = 0; $i -lt $Items.Count; $i++) { & $drawRow $i ($i -eq $idx) }
+        while ($true) {
+            $key = [Console]::ReadKey($true)
+            $pos = [array]::IndexOf($selectable, $idx)
+            $next = $idx
+            switch ($key.Key) {
+                'UpArrow'   { if ($pos -gt 0) { $next = $selectable[$pos - 1] } else { $next = $selectable[$selectable.Count - 1] } }
+                'DownArrow' { if ($pos -lt $selectable.Count - 1) { $next = $selectable[$pos + 1] } else { $next = $selectable[0] } }
+                'Home'      { $next = $selectable[0] }
+                'End'       { $next = $selectable[$selectable.Count - 1] }
+                'Enter'     { $next = -1 }
+                'Escape'    { $next = -2 }
+                'Q'         { $next = -2 }
+            }
+            if ($next -eq -1) { break }
+            if ($next -eq -2) {
+                [Console]::SetCursorPosition(0, $bottom)
+                Stop-Install 6 'Cancelled.' 'Run the installer again to continue.'
+            }
+            if ($next -ne $idx) { & $drawRow $idx $false; & $drawRow $next $true; $idx = $next }
+        }
+    } finally {
+        try { [Console]::CursorVisible = $cursorWas } catch { }
+        [Console]::SetCursorPosition(0, $bottom)
+    }
+    try { [System.IO.File]::AppendAllText($script:LogPath, "  -> $($Items[$idx].Text)`r`n", $Utf8NoBom) } catch { }
+    Write-Host "  -> $($Items[$idx].Text)"
+    return $Items[$idx].Key
 }
 
 # ================================================================== file helpers
@@ -348,10 +470,16 @@ function Get-ScanPlan {
     # Roots in priority order with how deep to look for a _classic_era_ folder (FolderDepth)
     # and for client archives (ZipDepth); -1 means not at all. Drive roots come last because
     # they are the slowest; the 20-second cap then cuts off the least likely places first.
+    # -Deep ("Keep searching") walks every fixed drive with no practical depth limit.
+    param([switch]$Deep)
     $homeDir = $env:USERPROFILE
     $desktop = [Environment]::GetFolderPath('Desktop')
     $plan = New-Object System.Collections.Generic.List[object]
     $add = { param($p, $f, $z) if ($p -and [System.IO.Directory]::Exists($p)) { $plan.Add([pscustomobject]@{ Path = $p.TrimEnd('\') + '\'; FolderDepth = $f; ZipDepth = $z }) } }
+    if ($Deep) {
+        foreach ($d in @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady })) { & $add $d.RootDirectory.FullName 64 4 }
+        return , $plan
+    }
     & $add ${env:ProgramFiles(x86)} $ClientDepth -1
     & $add $env:ProgramFiles $ClientDepth -1
     & $add $env:APPDATA $ClientDepth -1
@@ -371,19 +499,34 @@ function Get-ScanPlan {
 function Find-Candidates {
     # One breadth-first walk per root. A folder already walked from an earlier root is
     # skipped with its subtree (an earlier root always covers it at least as deep). Does
-    # not descend into junctions or symbolic links.
+    # not descend into junctions or symbolic links. -Deep has no time cap; it shows a folder
+    # counter and stops early on Esc.
+    param([switch]$Deep)
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $eraDirs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $zips    = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $visited = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $completed = $true
-    foreach ($root in (Get-ScanPlan)) {
+    $interactive = Test-InteractiveConsole
+    # Temporary folders never hold a real installation; other programs' test copies there only
+    # add noise to the list.
+    foreach ($t in @($env:TEMP, $env:TMP, (Join-Path $env:LOCALAPPDATA 'Temp'))) {
+        if ($t) { try { [void]$visited.Add([System.IO.Path]::GetFullPath($t).TrimEnd('\') + '\') } catch { } }
+    }
+    if ($Deep) { Out-Log "Searching every folder on every fixed drive.$(if ($interactive) { ' Press Esc to stop.' })" }
+    foreach ($root in (Get-ScanPlan -Deep:$Deep)) {
         if ($visited.Contains($root.Path)) { continue }
         $maxDepth = [Math]::Max($root.FolderDepth, $root.ZipDepth)
         $queue = New-Object System.Collections.Generic.Queue[object]
         $queue.Enqueue(@($root.Path, 0))
         while ($queue.Count -gt 0) {
-            if ($clock.Elapsed.TotalSeconds -ge $ScanSeconds) { $completed = $false; break }
+            if (-not $Deep -and $clock.Elapsed.TotalSeconds -ge $ScanSeconds) { $completed = $false; break }
+            if ($Deep -and ($visited.Count % 500) -eq 0) {
+                if ($interactive) {
+                    Write-Host -NoNewline ("`r  searched {0:N0} folders, found {1} client(s)   " -f $visited.Count, ($eraDirs.Count + $zips.Count))
+                    if ([Console]::KeyAvailable -and [Console]::ReadKey($true).Key -eq 'Escape') { $completed = $false; break }
+                }
+            }
             $item = $queue.Dequeue()
             $dir = $item[0]; $level = $item[1]
             if (-not $visited.Add($dir)) { continue }
@@ -410,8 +553,10 @@ function Find-Candidates {
         }
         if (-not $completed) { break }
     }
-    if (-not $completed) {
-        Out-Log "The scan stopped after $ScanSeconds seconds; folders not reached are not listed. Use B, A, or T to select a client."
+    if ($Deep -and $interactive) { Write-Host '' }
+    if ($Deep) { Out-Log ("Searched {0:N0} folders in {1:mm\:ss}{2}." -f $visited.Count, $clock.Elapsed, $(if ($completed) { '' } else { ' (stopped with Esc)' })) }
+    elseif (-not $completed) {
+        Out-Log "The scan stopped after $ScanSeconds seconds; folders not reached are not listed. Use Keep searching or Browse."
     }
     $result = New-Object System.Collections.Generic.List[object]
     foreach ($d in ($eraDirs | Sort-Object)) { $result.Add((Get-FolderCandidate $d)) }
@@ -450,47 +595,169 @@ function Show-ZipPicker {
 }
 
 # ================================================================== client archive extraction
-function Test-ExtractDestination {
+function Test-Destination {
     # Returns $null when the destination is acceptable, otherwise the reason.
-    param([string]$Dest, [pscustomobject]$Archive)
-    if (-not [System.IO.Path]::IsPathRooted($Dest) -or $Dest -notmatch '^[A-Za-z]:\\') { return "Enter a full path that starts with a drive letter, such as D:\Games\Kronos." }
+    param([string]$Dest, [long]$RequiredBytes)
+    if (-not [System.IO.Path]::IsPathRooted($Dest) -or $Dest -notmatch '^[A-Za-z]:\\') { return "Use a full path that starts with a drive letter, such as D:\Games\Kronos." }
     if ([System.IO.File]::Exists($Dest)) { return "Destination is a file: $Dest" }
     if ([System.IO.Directory]::Exists($Dest) -and @([System.IO.Directory]::EnumerateFileSystemEntries($Dest)).Count -gt 0) {
         return "Destination is not empty: $Dest. Choose an empty or new folder."
     }
-    $need = $Archive.UncompressedBytes + $MinFreeBytes
+    $need = $RequiredBytes + $MinFreeBytes
     try { $free = Get-FreeBytes $Dest } catch { return "Drive not available for: $Dest" }
     if ($free -lt $need) { return "Not enough free space on $([System.IO.Path]::GetPathRoot($Dest)): $(Format-Size $need) required, $(Format-Size $free) free." }
     return $null
 }
 
-function Select-ExtractDestination {
-    param([pscustomobject]$Archive)
-    $default = Join-Path ([System.IO.Path]::GetPathRoot($Archive.Path)) 'Games\Kronos'
-    if ($ExtractTo) {
-        $dest = [System.IO.Path]::GetFullPath($ExtractTo.Trim().Trim('"'))
-        $why = Test-ExtractDestination $dest $Archive
+function Select-Destination {
+    # Picks an empty or new folder for an extracted or copied client. $Given is the value of
+    # -ExtractTo or -CopyTo, which skips the menu.
+    param([string]$Purpose, [long]$RequiredBytes, [string]$NearPath, [string]$Given)
+    if ($Given) {
+        $dest = [System.IO.Path]::GetFullPath($Given.Trim().Trim('"'))
+        $why = Test-Destination $dest $RequiredBytes
         if ($why) { Stop-Install 3 $why 'Choose an empty or new folder on a drive with enough free space, and run the installer again.' }
         return $dest
     }
+    $base = Join-Path ([System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($NearPath))) 'Games\Kronos'
+    $default = $base; $n = 2
+    while ([System.IO.Directory]::Exists($default) -and @([System.IO.Directory]::EnumerateFileSystemEntries($default)).Count -gt 0) { $default = "$base $n"; $n++ }
     while ($true) {
         Out-Log ''
-        Out-Log "The client will be extracted to <destination>\World of Warcraft. Extracted size: $(Format-Size $Archive.UncompressedBytes)."
-        Out-Log "[1] $default"
-        Out-Log '[B] Browse for a folder'
-        Out-Log '[T] Type the path'
-        Out-Log '[Q] Quit'
-        $k = Read-Choice 'Destination' @('1', 'B', 'T') '1'
-        $dest = $null
-        if ($k -eq '1') { $dest = $default }
-        elseif ($k -eq 'B') { $dest = Show-FolderPicker 'Select an empty folder for the extracted client' }
-        else { $dest = Read-Line 'Destination folder:' }
+        Out-Log "The client will be $Purpose to <folder>\World of Warcraft ($(Format-Size $RequiredBytes)). The folder must be empty or new."
+        $items = @(
+            (New-MenuItem -Key 'default' -Text $default),
+            (New-MenuItem -Key 'browse' -Text 'Browse for another folder')
+        )
+        $k = Show-Menu 'Destination folder:' $items 'default'
+        $dest = if ($k -eq 'default') { $default } else { Show-FolderPicker 'Select an empty folder, or create a new one' }
         if (-not $dest) { continue }
-        try { $dest = [System.IO.Path]::GetFullPath($dest.Trim().Trim('"')) } catch { Out-Log "Not a valid path: $dest"; continue }
-        $why = Test-ExtractDestination $dest $Archive
+        try { $dest = [System.IO.Path]::GetFullPath($dest) } catch { Out-Log "Not a valid path: $dest"; continue }
+        $why = Test-Destination $dest $RequiredBytes
         if (-not $why) { return $dest }
         Out-Log $why
         if ($Yes) { Stop-Install 3 $why 'Choose an empty or new folder on a drive with enough free space, and run the installer again.' }
+    }
+}
+
+function Select-ExtractDestination {
+    param([pscustomobject]$Archive)
+    return Select-Destination 'extracted' $Archive.UncompressedBytes $Archive.Path $ExtractTo
+}
+
+# ================================================================== copying a client
+$CopySkipAtRoot = @('Hermes', 'JimsProxy-AccountData-backup')   # proxy folders, not client files
+$CopySkipInEra  = @('Cache', 'Logs', 'Errors')                  # regenerated by the client
+
+function Get-CopyPlan {
+    # Lists the files to copy from a client's game folder (the folder above _classic_era_),
+    # following junctions so the copy is independent of the original. Returns
+    # @{ Files = list of relative paths; Bytes = total size }.
+    param([string]$GameDir)
+    $files = New-Object System.Collections.Generic.List[string]
+    $bytes = [long]0
+    $stack = New-Object System.Collections.Generic.Stack[object]
+    $stack.Push(@('', 0))
+    while ($stack.Count -gt 0) {
+        $item = $stack.Pop(); $rel = $item[0]; $depth = $item[1]
+        if ($depth -gt 32) { continue }
+        $full = if ($rel) { Join-Path $GameDir $rel } else { $GameDir }
+        try {
+            foreach ($f in ([System.IO.DirectoryInfo]$full).GetFiles()) { $files.Add($(if ($rel) { "$rel\$($f.Name)" } else { $f.Name })); $bytes += $f.Length }
+            foreach ($d in ([System.IO.DirectoryInfo]$full).GetDirectories()) {
+                if ($depth -eq 0 -and ($CopySkipAtRoot -contains $d.Name -or $d.Name -like 'Hermes-backup-*')) { continue }
+                if ($rel -ieq '_classic_era_' -and $CopySkipInEra -contains $d.Name) { continue }
+                $stack.Push(@($(if ($rel) { "$rel\$($d.Name)" } else { $d.Name }), ($depth + 1)))
+            }
+        } catch { Stop-Install 1 "Cannot read $full ($($_.Exception.Message))." 'Close programs that use the client and run the installer again.' }
+    }
+    return @{ Files = $files; Bytes = $bytes }
+}
+
+function Copy-Client {
+    # Copies the client into <Dest>\World of Warcraft and returns the copy as a candidate.
+    param([pscustomobject]$Client, [string]$Dest, [hashtable]$Plan)
+    $game = Split-Path -Parent $Client.Path
+    $target = Join-Path $Dest 'World of Warcraft'
+    Out-Log "Copying $game"
+    Out-Log "     to $target"
+    Out-Log "$($Plan.Files.Count) files, $(Format-Size $Plan.Bytes). The original is not changed."
+    [void][System.IO.Directory]::CreateDirectory($target)
+    $script:Extracting = $Dest; $script:ExtractVerb = 'copy'
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $count = 0; $bytes = [long]0; $lastCount = 0; $lastBytes = [long]0
+    foreach ($rel in $Plan.Files) {
+        $src = Join-Path $game $rel
+        $dst = Join-Path $target $rel
+        [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($dst))
+        [System.IO.File]::Copy($src, $dst, $false)
+        $count++; $bytes += (New-Object System.IO.FileInfo($dst)).Length
+        if ($count - $lastCount -ge 1000 -or $bytes - $lastBytes -ge 1GB) {
+            Out-Log ('  {0} files, {1} of {2}, {3:mm\:ss} elapsed' -f $count, (Format-Size $bytes), (Format-Size $Plan.Bytes), $clock.Elapsed)
+            $lastCount = $count; $lastBytes = $bytes
+        }
+    }
+    Out-Log ('  {0} files, {1}, finished in {2:mm\:ss}' -f $count, (Format-Size $bytes), $clock.Elapsed)
+    $script:Extracting = $null
+    $era = Join-Path $target '_classic_era_'
+    $c = Get-FolderCandidate $era
+    if (-not $c.Usable) { Stop-Install 5 "The copied client does not pass the client check: $($c.Status)." "Delete $Dest and run the installer again." }
+    return $c
+}
+
+function Select-ExistingHermesAction {
+    # The chosen client's root already has a Hermes the installer did not create. Offers a
+    # copy of the client into a new folder, or an in-place install that keeps the old Hermes
+    # as a backup. Returns @{ Action = 'copy' | 'inplace' | 'back'; Client }.
+    param([pscustomobject]$Client)
+    $root = Get-InstallRoot $Client.Path
+    $hermes = Join-Path $root 'Hermes'
+    $game = Split-Path -Parent $Client.Path
+    Out-Log ''
+    Out-Log "$hermes already exists: this client has a Classic WoW Launcher or manual JimsProxy/HermesProxy installation."
+    Out-Log 'Measuring the client...'
+    $plan = Get-CopyPlan $game
+    $items = @(
+        (New-MenuItem -Key 'copy' -Text 'Copy the client to a new folder and install there (recommended)'),
+        (New-MenuItem -Dim -Text "Clean install. The current client and its Hermes are not touched. Needs $(Format-Size $plan.Bytes) of additional disk space."),
+        (New-MenuItem -Key 'inplace' -Text 'Install here, keeping the current Hermes as a backup'),
+        (New-MenuItem -Dim -Text 'Renames Hermes to Hermes-backup-<date>. A launcher or other installation that uses this folder stops working until the backup is renamed back.'),
+        (New-MenuItem -Text ''),
+        (New-MenuItem -Key 'back' -Text 'Choose a different client')
+    )
+    $k = Show-Menu 'How should the installer proceed?' $items 'copy'
+    if ($k -eq 'back') { return @{ Action = 'back'; Client = $null } }
+    if ($k -eq 'inplace') {
+        Out-Log ''
+        Out-Log "WARNING: $hermes will be renamed to Hermes-backup-<date> and a new Hermes installed."
+        Out-Log '         If the Classic WoW Launcher or another installation uses this folder, it stops working'
+        Out-Log '         until you delete the new Hermes and rename the backup to Hermes. If you are not sure'
+        Out-Log '         whether anything else uses this folder, choose the copy instead.'
+        if (-not (Read-YesNo 'Install here anyway?' $false)) { return @{ Action = 'back'; Client = $null } }
+        return @{ Action = 'inplace'; Client = $Client }
+    }
+    $dest = Select-Destination 'copied' $plan.Bytes $root $null
+    return @{ Action = 'copy'; Client = (Copy-Client $Client $dest $plan) }
+}
+
+function Backup-ExistingHermes {
+    # In-place route, run at Step 4 once the proxy archive has passed its checks: renames the
+    # existing Hermes and carries its AccountData into the new one.
+    param([string]$HermesDir)
+    $running = @(Get-Process -Name 'JimsProxy', 'HermesProxy' -ErrorAction SilentlyContinue | Where-Object {
+        $p = $null; try { $p = $_.Path } catch { }
+        (-not $p) -or $p.StartsWith($HermesDir + '\', [System.StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($running.Count -gt 0) { Stop-Install 2 "A proxy is running from $HermesDir (PID $(($running | ForEach-Object { $_.Id }) -join ', '))." 'Close the game and the launcher (or end the proxy in Task Manager), then run the installer again.' }
+    $backup = "$HermesDir-backup-$((Get-Date).ToString('yyyyMMdd-HHmmss'))"
+    try { Move-Item -LiteralPath $HermesDir -Destination $backup }
+    catch { Stop-Install 2 "Could not rename $HermesDir ($($_.Exception.Message))." 'Close programs that use that folder and run the installer again.' }
+    Out-Log "  renamed the existing Hermes to $backup"
+    $accountData = Join-Path $backup 'AccountData'
+    if ([System.IO.Directory]::Exists($accountData)) {
+        [void][System.IO.Directory]::CreateDirectory($HermesDir)
+        Copy-Item -LiteralPath $accountData -Destination (Join-Path $HermesDir 'AccountData') -Recurse -Force
+        Out-Log '  copied AccountData from the backup'
     }
 }
 
@@ -639,18 +906,59 @@ function Invoke-Preflight {
     Out-Log "Free space on $([System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($probe))): $(Format-Size $free): OK"
 }
 
-function Write-CandidateMenu {
+function Get-ClientMenuItems {
+    # One row per usable client (checkmark, name, shortened path, install note), one dim line
+    # summarising the unusable ones, then the manual choices after a blank line.
     param($Candidates)
-    $n = 0
-    foreach ($c in $Candidates) {
-        if ($c.Usable) { $n++; Out-Log "[$n] $($c.Path)    $($c.Status)" }
-        else { Out-Log "[-] $($c.Path)    $($c.Status)" }
+    $usable = @($Candidates | Where-Object { $_.Usable })
+    $unusable = @($Candidates | Where-Object { -not $_.Usable })
+    $width = 100
+    if (Test-InteractiveConsole) { $width = [Math]::Max(60, [Console]::WindowWidth - 7) }
+    $rows = @()
+    foreach ($c in $usable) {
+        if ($c.Kind -eq 'archive') {
+            $name = [System.IO.Path]::GetFileName($c.Path)
+            $where = Split-Path -Parent $c.Path
+            $note = 'client archive, extracted to a new folder'
+        } else {
+            $root = Get-InstallRoot $c.Path
+            $name = Split-Path -Leaf $root
+            if (-not $name) { $name = $root }
+            $where = $root
+            $hermes = Join-Path $root 'Hermes'
+            $state = Get-State $root
+            $note = if ($state -and $state.status -eq 'installed') { 'JimsProxy quick-start installed' }
+                    elseif ([System.IO.Directory]::Exists($hermes)) { 'has a launcher or manual Hermes' }
+                    else { '' }
+        }
+        $rows += [pscustomobject]@{ Name = $name; Where = $where; Note = $note; Candidate = $c }
     }
-    if ($Candidates.Count -eq 0) { Out-Log 'No client was found in the scanned locations.' }
-    Out-Log '[B] Browse for the _classic_era_ folder'
-    Out-Log '[A] Use a client archive (.zip)'
-    Out-Log '[T] Type the path (folder or .zip)'
-    Out-Log '[Q] Quit'
+    $nameWidth = [Math]::Min(26, [Math]::Max(8, (@($rows | ForEach-Object { $_.Name.Length }) + 0 | Measure-Object -Maximum).Maximum))
+    $items = @()
+    $i = 0
+    foreach ($r in $rows) {
+        $i++
+        $name = if ($r.Name.Length -gt $nameWidth) { $r.Name.Substring(0, $nameWidth - 3) + '...' } else { $r.Name.PadRight($nameWidth) }
+        $note = if ($r.Note) { "  ($($r.Note))" } else { '' }
+        $pathRoom = $width - $nameWidth - 2 - $note.Length
+        $items += New-MenuItem -Key "client:$i" -Mark $CheckMark -Text ("{0}  {1}{2}" -f $name, (Format-ShortPath $r.Where $pathRoom), $note)
+    }
+    if ($unusable.Count -gt 0) {
+        $reasons = @($unusable | Group-Object Status | Sort-Object Count -Descending | ForEach-Object {
+            $s = $_.Name -replace '^not supported: ', '' -replace '^not usable: ', ''
+            if ($_.Count -gt 1) { "$s (x$($_.Count))" } else { $s }
+        })
+        $other = if ($usable.Count -gt 0) { 'other ' } else { '' }
+        $noun = if ($unusable.Count -eq 1) { "${other}client found, not usable" } else { "${other}clients found, not usable" }
+        $items += New-MenuItem -Dim -Text "$($unusable.Count) $noun`: $($reasons -join '; ')"
+    }
+    if ($usable.Count -eq 0 -and $unusable.Count -eq 0) { $items += New-MenuItem -Dim -Text 'No client found in the usual locations.' }
+    $items += New-MenuItem -Text ''
+    $items += New-MenuItem -Key 'browse' -Text 'Browse for a client folder'
+    $items += New-MenuItem -Key 'archive' -Text 'Extract a client archive (.zip)'
+    $items += New-MenuItem -Key 'deep' -Text 'Keep searching (every folder on every drive)'
+    $items += New-MenuItem -Key 'quit' -Text 'Quit'
+    return @{ Items = $items; Rows = $rows }
 }
 
 $RequirementText = "A WoW Classic Era 1.14.2 client, build 42597, with WowClassic_ForCustomServers.exe, as a folder or as a client archive, is required."
@@ -690,23 +998,34 @@ function Select-Client {
     }
 
     Out-Log "Scanning for clients (at most $ScanSeconds seconds)..."
-    $candidates = Find-Candidates
+    $candidates = New-Object System.Collections.Generic.List[object]
+    foreach ($c in (Find-Candidates)) { $candidates.Add($c) }
     while ($true) {
         Out-Log ''
-        Write-CandidateMenu $candidates
         $usable = @($candidates | Where-Object { $_.Usable })
-        $keys = @()
-        for ($i = 1; $i -le $usable.Count; $i++) { $keys += "$i" }
-        $keys += 'B', 'A', 'T'
-        $default = if ($usable.Count -gt 0) { '1' } else { 'B' }
         if ($Yes -and $usable.Count -eq 0) { Stop-Install 3 'No usable client was found.' $RequirementText }
-        $k = Read-Choice 'Select' $keys $default
+        $only115 = ($usable.Count -eq 0 -and @($candidates | Where-Object { $_.Build -like '1.15.*' }).Count -gt 0)
+        if ($only115) {
+            Out-Log 'Only WoW Classic 1.15 clients were found; this installer needs 1.14.2 (build 42597).'
+            Out-Log "The Classic WoW Launcher can copy a 1.15 client and patch the copy into 1.14.2: $LauncherUrl"
+            Out-Log ''
+        }
+        $menu = Get-ClientMenuItems $candidates
+        $default = if ($usable.Count -gt 0) { 'client:1' } elseif ($only115) { 'quit' } else { 'browse' }
+        $k = Show-Menu 'Select a client:' $menu.Items $default
         $picked = $null
-        switch ($k) {
-            'B' { $picked = Resolve-UserChoice (Show-FolderPicker 'Select the _classic_era_ folder (or the folder that contains it)') }
-            'A' { $picked = Resolve-UserChoice (Show-ZipPicker) }
-            'T' { $picked = Resolve-UserChoice (Read-Line 'Path to the _classic_era_ folder or the client archive:') }
-            default { $picked = $usable[[int]$k - 1] }
+        switch -Regex ($k) {
+            '^client:(\d+)$' { $picked = $menu.Rows[[int]$Matches[1] - 1].Candidate }
+            '^browse$'  { $picked = Resolve-UserChoice (Show-FolderPicker 'Select the _classic_era_ folder, or the folder that contains it') }
+            '^archive$' { $picked = Resolve-UserChoice (Show-ZipPicker) }
+            '^deep$' {
+                $known = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($c in $candidates) { [void]$known.Add($c.Path) }
+                $added = 0
+                foreach ($c in (Find-Candidates -Deep)) { if ($known.Add($c.Path)) { $candidates.Add($c); $added++ } }
+                Out-Log "Keep searching found $added more client(s)."
+            }
+            '^quit$' { Stop-Install 6 'Cancelled.' 'Run the installer again to continue.' }
         }
         if ($null -eq $picked) { continue }
         if (-not $picked.Usable) { Out-Log "Cannot use $($picked.Path): $($picked.Status). $RequirementText"; continue }
@@ -726,17 +1045,14 @@ function Select-ServerAndChannel {
         else { Stop-Install 1 "-Server must be kronos, kronos2, kronos3, or a hostname or IP address (got '$Server')." 'Correct the parameter and run the installer again.' }
         Out-Log "Server: $address"
     } else {
-        $i = 0
-        foreach ($s in $Servers) { $i++; Out-Log "[$i] $($s.Name) ($($s.Address))" }
-        Out-Log '[4] Other address'
-        Out-Log '[Q] Quit'
-        $default = '1'
+        $items = @($Servers | ForEach-Object { New-MenuItem -Key $_.Key -Text "$($_.Name) ($($_.Address))" }) + @(New-MenuItem -Key 'other' -Text 'Other address')
+        $default = 'kronos'
         if ($CurrentServer) {
-            $idx = [array]::IndexOf(@($Servers | ForEach-Object { $_.Address }), $CurrentServer)
-            $default = if ($idx -ge 0) { "$($idx + 1)" } else { '4' }
+            $match = @($Servers | Where-Object { $_.Address -eq $CurrentServer })
+            $default = if ($match.Count -gt 0) { $match[0].Key } else { 'other' }
         }
-        $k = Read-Choice 'Server' @('1', '2', '3', '4') $default
-        if ($k -eq '4') {
+        $k = Show-Menu 'Server:' $items $default
+        if ($k -eq 'other') {
             if ($Yes -and $CurrentServer) { $address = $CurrentServer }
             else {
                 while ($true) {
@@ -747,7 +1063,7 @@ function Select-ServerAndChannel {
             }
             $key = 'other'
         } else {
-            $s = $Servers[[int]$k - 1]; $key = $s.Key; $address = $s.Address
+            $s = @($Servers | Where-Object { $_.Key -eq $k })[0]; $key = $s.Key; $address = $s.Address
         }
     }
 
@@ -758,11 +1074,11 @@ function Select-ServerAndChannel {
         Out-Log "Channel: $ch"
     } else {
         Out-Log ''
-        Out-Log '[1] Stable: the current release'
-        Out-Log '[2] Beta: newer changes, less testing'
-        Out-Log '[Q] Quit'
-        $default = if ($CurrentChannel -eq 'beta') { '2' } else { '1' }
-        $ch = if ((Read-Choice 'Channel' @('1', '2') $default) -eq '2') { 'beta' } else { 'stable' }
+        $items = @(
+            (New-MenuItem -Key 'stable' -Text 'Stable: the current release'),
+            (New-MenuItem -Key 'beta' -Text 'Beta: newer changes, less testing')
+        )
+        $ch = Show-Menu 'Channel:' $items $(if ($CurrentChannel -eq 'beta') { 'beta' } else { 'stable' })
     }
     return @{ Server = $key; Address = $address; Channel = $ch }
 }
@@ -1030,6 +1346,7 @@ function Invoke-Install {
     if ($free -lt $MinFreeBytes) { Stop-Install 2 "Only $(Format-Size $free) free on $([System.IO.Path]::GetPathRoot($rootDir)); $(Format-Size $MinFreeBytes) is required." 'Free disk space and run the installer again.' }
     $source = Get-ProxyArchive $settings.Channel
 
+    if ($Selection.ContainsKey('InPlace') -and $Selection.InPlace) { Backup-ExistingHermes $hermes }
     $state = Get-State $rootDir
     if ($null -eq $state) { $state = New-State $rootDir $client $(if ($archive) { $archive.Path } else { $null }) }
     $state.clientDir = $client.Path; $state.gameExe = $client.GameExe
@@ -1146,6 +1463,30 @@ try {
     if ($ClientDir -and $ClientArchive) { Stop-Install 1 'Use either -ClientDir or -ClientArchive, not both.' 'Correct the parameters and run the installer again.' }
     if ($Channel -and $Channel -notin @('stable', 'beta')) { Stop-Install 1 "-Channel must be stable or beta (got '$Channel')." 'Correct the parameters and run the installer again.' }
 
+    if (-not $Yes) {
+        Out-Log ''
+        Out-Log 'This installer sets up JimsProxy for WoW Classic Era 1.14.2 (build 42597) on Kronos:'
+        Out-Log '  1. Checks this PC and finds your 1.14.2 client (or extracts or copies one for you).'
+        Out-Log '  2. Downloads the current JimsProxy into a Hermes folder next to the client.'
+        Out-Log '  3. Points the client at the proxy and, if you want, installs the JimsPlus addon.'
+        Out-Log '  4. Creates a "Play Kronos" command that starts the proxy and the game together.'
+        Out-Log 'It never downloads game files and needs no administrator rights. Run it again later'
+        Out-Log 'to update, reconfigure, or uninstall.'
+        Out-Log ''
+        Out-Log "Guide: $GuideUrl"
+        Out-Log ''
+        if (Test-InteractiveConsole) {
+            Write-Host 'Press Enter to continue, or Q to quit.' -ForegroundColor Cyan
+            while ($true) {
+                $key = [Console]::ReadKey($true).Key
+                if ($key -eq 'Enter') { break }
+                if ($key -eq 'Q' -or $key -eq 'Escape') { Stop-Install 6 'Cancelled before any change.' $null }
+            }
+        } else {
+            if ((Read-Line 'Press Enter to continue, or Q to quit:') -ieq 'Q') { Stop-Install 6 'Cancelled before any change.' $null }
+        }
+    }
+
     $state = $null
     if ($Root) {
         $state = Get-State ([System.IO.Path]::GetFullPath($Root.Trim().Trim('"')))
@@ -1166,11 +1507,21 @@ try {
         if ($existing -and $existing.status -eq 'installed') { $state = $existing; break }
         if ($existing) { Out-Log "Resuming the unfinished installation in $hermes."; break }
         if ([System.IO.Directory]::Exists($hermes)) {
-            $why = "$hermes already exists and was not created by this installer (a launcher or manual installation). The installer does not modify it."
-            if ($ClientDir -or $Yes) { Stop-Install 3 $why 'Select a client whose root folder has no Hermes folder, or remove that installation first.' }
-            Out-Log $why
-            Out-Log 'Select another client.'
-            continue
+            if ($CopyTo) {
+                Out-Log "$hermes already exists; copying the client to $CopyTo (-CopyTo)."
+                $plan = Get-CopyPlan (Split-Path -Parent $selection.Client.Path)
+                $dest = Select-Destination 'copied' $plan.Bytes $rootDir $CopyTo
+                $selection.Client = Copy-Client $selection.Client $dest $plan
+                break
+            }
+            if ($ClientDir -or $Yes) {
+                Stop-Install 3 "$hermes already exists and was not created by this installer (a launcher or manual installation)." 'Add -CopyTo <empty folder> to copy the client and install there, or run the installer without -Yes to choose.'
+            }
+            $choice = Select-ExistingHermesAction $selection.Client
+            if ($choice.Action -eq 'back') { continue }
+            if ($choice.Action -eq 'inplace') { $selection.InPlace = $true; break }
+            $selection.Client = $choice.Client
+            break
         }
         if ($Update -or $Reconfigure -or $Uninstall) { Stop-Install 3 "No quick-start installation found for $($selection.Client.Path)." 'Run the installer without -Update, -Reconfigure, or -Uninstall to install.' }
         break
@@ -1186,16 +1537,17 @@ try {
         else {
             Write-Heading "Existing installation in $($state.root)\Hermes"
             Out-Log "Proxy $(Get-ProxyVersion (Join-Path $state.root 'Hermes')), $($state.channel) channel, server $($state.serverAddress)"
-            Out-Log '[1] Update the proxy'
-            Out-Log '[2] Reconfigure (server, channel)'
-            Out-Log '[3] Uninstall'
-            Out-Log '[4] Quit'
-            $k = Read-Choice 'Select' @('1', '2', '3', '4') '1'
-            switch ($k) {
-                '1' { Invoke-Update $state }
-                '2' { Invoke-Reconfigure $state }
-                '3' { Invoke-Uninstall $state $true }
-                '4' { Stop-Install 6 'Cancelled; nothing was changed.' $null }
+            $items = @(
+                (New-MenuItem -Key 'update' -Text 'Update the proxy'),
+                (New-MenuItem -Key 'reconfigure' -Text 'Reconfigure (server, channel)'),
+                (New-MenuItem -Key 'uninstall' -Text 'Uninstall'),
+                (New-MenuItem -Key 'quit' -Text 'Quit')
+            )
+            switch (Show-Menu 'Select:' $items 'update') {
+                'update'      { Invoke-Update $state }
+                'reconfigure' { Invoke-Reconfigure $state }
+                'uninstall'   { Invoke-Uninstall $state $true }
+                'quit'        { Stop-Install 6 'Cancelled; nothing was changed.' $null }
             }
         }
     } else {
@@ -1216,7 +1568,7 @@ catch {
 finally {
     if ($script:Extracting) {
         Out-Log ''
-        Out-Log "The extraction did not finish. $($script:Extracting) holds an incomplete client and must be deleted before the installer is run again."
+        Out-Log "The $($script:ExtractVerb) did not finish. $($script:Extracting) holds an incomplete client and must be deleted before the installer is run again."
     }
     foreach ($p in $script:TempPaths) {
         try {

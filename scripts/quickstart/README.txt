@@ -7,5 +7,5 @@ The bundle does not include or obtain the game client.
 To install: double-click "Install JimsProxy.cmd" and follow the prompts.
 Run it again later to update, reconfigure, or uninstall.
 
-Guide: https://github.com/jameopotato/jimsproxy/blob/master/docs/QUICK-INSTALL.md
+Guide: https://jimothy.cc/install/guide/quick-start
 Installer version: see VERSION.txt

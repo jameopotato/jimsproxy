@@ -38,9 +38,10 @@ Contents
    and extract it (**Extract All**). The folder contains `Install JimsProxy.cmd`, `install.ps1`,
    `README.txt`, and `VERSION.txt`. Run the installer from the extracted folder, not from
    inside the zip.
-2. Double-click `Install JimsProxy.cmd`. A console window works through six steps; each menu
-   shows its default in brackets (Enter accepts it), and `Q` quits. Everything shown is also
-   written to `Hermes\install.log`.
+2. Double-click `Install JimsProxy.cmd`. A console window describes what the installer does,
+   links this guide, and waits for Enter. It then works through six steps. In each menu, the
+   arrow keys move the highlight and Enter selects; `Q` quits. Everything shown is also written
+   to `Hermes\install.log`.
 
 `install.ps1` and `JimsProxy.exe` are not code-signed. If SmartScreen shows "Windows protected
 your PC", select **More info → Run anyway**. If antivirus software quarantines `JimsProxy.exe`,
@@ -55,35 +56,53 @@ Documents, drive-root and drive `Games` folders for client archives: each zip la
 is opened and listed if its contents are a client archive, whatever its file name.
 
 ```
-[1] D:\Games\Kronos\World of Warcraft\_classic_era_    build 1.14.2.42597    WowClassic_ForCustomServers.exe
-[-] C:\Program Files (x86)\World of Warcraft\_classic_era_    not supported: build 1.15.7.60000
-[2] C:\Users\Name\Downloads\client.zip    client archive    build 1.14.2.42597    (will be extracted)
-[B] Browse for the _classic_era_ folder
-[A] Use a client archive (.zip)
-[T] Type the path (folder or .zip)
-[Q] Quit
+Select a client:
+ > √ Kronos                 D:\Games\Kronos
+   √ kronoswow              C:\...\AppData\Roaming\kronoswow  (has a launcher or manual Hermes)
+   √ client.zip             C:\Users\Name\Downloads  (client archive, extracted to a new folder)
+     2 other clients found, not usable: build 1.15.8.67156 (x2)
+
+   Browse for a client folder
+   Extract a client archive (.zip)
+   Keep searching (every folder on every drive)
+   Quit
 ```
 
-Entries marked `[-]` cannot be selected. The installer refuses a client whose root folder
-already has a `Hermes` it did not create (a launcher or manual installation). For an archive, the installer asks for a destination
-(default `<drive>:\Games\Kronos`; must be empty or absent, with room for the extracted client),
-checks the build inside the archive first, and extracts into `<destination>\World of Warcraft\`.
-Extraction of a full client takes several minutes. The archive is not modified or deleted.
+`√` marks a usable client: build 1.14.2.42597 with `WowClassic_ForCustomServers.exe`. Clients
+that cannot be used are counted on one line with the reason. If only WoW Classic 1.15 clients
+are found, the installer recommends the Classic WoW Launcher
+([jimothy.cc/install](https://jimothy.cc/install)), which can copy a 1.15 client and patch the
+copy into 1.14.2. **Keep searching** walks every folder on every fixed drive (it can take a few
+minutes; Esc stops it) and adds what it finds to the list.
+
+**A client that already has a `Hermes` folder** (from the launcher or a manual installation)
+offers two routes:
+
+- **Copy the client to a new folder and install there** (recommended): a clean install that
+  leaves the current client and its `Hermes` untouched. It needs the client's size in
+  additional disk space; the installer shows the amount.
+- **Install here, keeping the current `Hermes` as a backup**: after a warning and a confirmation,
+  the existing `Hermes` is renamed to `Hermes-backup-<date>` at Step 4 and its `AccountData` is
+  carried into the new one. A launcher or other installation that uses that folder stops working
+  until the backup is renamed back.
+
+For an archive or a copy, the installer asks for a destination (default `<drive>:\Games\Kronos`,
+or **Browse**; it must be empty or absent, with room for the client) and writes the client to
+`<destination>\World of Warcraft\`. An archive's build is checked before extraction; the archive
+and the original client are not modified. A full client takes a few minutes.
 
 **Step 3 of 6: Server and channel.**
 
 ```
-[1] Kronos (login.twinstar-wow.com)
-[2] Kronos 2 (login2.twinstar-wow.com)
-[3] Kronos 3 (login3.twinstar-wow.com)
-[4] Other address
-[Q] Quit
-Server [1]
+Server:
+ > Kronos (login.twinstar-wow.com)
+   Kronos 2 (login2.twinstar-wow.com)
+   Kronos 3 (login3.twinstar-wow.com)
+   Other address
 
-[1] Stable: the current release
-[2] Beta: newer changes, less testing
-[Q] Quit
-Channel [1]
+Channel:
+ > Stable: the current release
+   Beta: newer changes, less testing
 ```
 
 **Step 4 of 6: Install the proxy.** No input. The installer reads the channel manifest,
@@ -120,10 +139,11 @@ Run `Install JimsProxy.cmd` again and select the same client. Because an install
 the installer shows:
 
 ```
-[1] Update the proxy
-[2] Reconfigure (server, channel)
-[3] Uninstall
-[4] Quit
+Select:
+ > Update the proxy
+   Reconfigure (server, channel)
+   Uninstall
+   Quit
 ```
 
 - **Update** downloads the current archive for the installed channel and replaces
@@ -155,16 +175,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ClientDir "D:
 | `-ClientDir <path>` | The `_classic_era_` folder |
 | `-ClientArchive <path>` | A client archive to extract |
 | `-ExtractTo <path>` | Destination for `-ClientArchive` (empty or absent); without it the destination is asked, or the default is used with `-Yes` |
+| `-CopyTo <path>` | When the client already has a `Hermes` the installer did not create: copy the client to this empty or new folder and install there |
 | `-Server` | `kronos`, `kronos2`, `kronos3`, or a login address |
 | `-Channel` | `stable` or `beta` |
 | `-NoAddon`, `-NoShortcut` | Skip the addon or the shortcut |
-| `-Yes` | Accept all defaults; no prompts |
+| `-Yes` | Accept all defaults; no prompts (the welcome screen is skipped) |
 | `-Update`, `-Reconfigure`, `-Uninstall` | Run that action on an existing installation, without confirmation |
 | `-Root <path>` | The folder containing `Hermes`, for `-Update`, `-Reconfigure` and `-Uninstall` |
 
 Exit codes: `0` success; `1` unexpected error or invalid parameter; `2` a Step 1 check failed,
 or the proxy is running; `3` no usable client selected (including a refused destination, an
-existing `Hermes` the installer did not create, or no installation at `-Root`); `4` a download
+existing `Hermes` the installer did not create without `-CopyTo`, or no installation at
+`-Root`); `4` a download
 failed or the channel is paused; `5` a downloaded or extracted file failed verification; `6`
 cancelled (`Q` or `Ctrl+C`).
 
@@ -175,7 +197,8 @@ cancelled (`Q` or `Ctrl+C`).
 | Location | Change |
 |---|---|
 | `<root>\Hermes\` | Created: the proxy, `HermesProxy.config`, play scripts, `Play Kronos.cmd`, `quickstart.json` (installer state), `install.log` |
-| `<root>\World of Warcraft\` | Created only when a client archive is extracted |
+| `<root>\World of Warcraft\` | Created only when a client archive is extracted or a client is copied |
+| `<root>\Hermes-backup-<date>\` | The previous `Hermes`, renamed, only when installing in place over a launcher or manual installation |
 | `_classic_era_\WTF\Config.wtf` | `SET portal` line set; previous file kept as `Config.wtf.bak`; created if absent |
 | `_classic_era_\Interface\AddOns\JimsPlus\` | Created or updated, if accepted |
 | Desktop | `Play Kronos.lnk`, if accepted |
@@ -186,20 +209,21 @@ Nothing else in the client is modified, and nothing is deleted.
 
 ## Troubleshooting
 
-**Every client is listed `[-]`, or none is found.** Only build 1.14.2.42597 is accepted; see
-[Verifying the client build](MANUAL-INSTALL.md#verifying-the-client-build). `B`, `A` or `T`
-selects a client the scan did not find.
+**No client has a `√`, or none is found.** Only build 1.14.2.42597 is accepted; see
+[Verifying the client build](MANUAL-INSTALL.md#verifying-the-client-build). **Keep searching**
+looks everywhere, and **Browse** selects a client folder directly. For a 1.15 client, use the
+[Classic WoW Launcher](https://jimothy.cc/install).
 
 **An archive is rejected or not listed.** Its `.build.info` reports another build, or it lacks
 `.build.info` and `_classic_era_\WowClassic_ForCustomServers.exe`. The scan lists only zips
-larger than 1 GB; `A` or `T` selects a smaller one.
+larger than 1 GB; **Extract a client archive** selects a smaller one.
 
-**The archive destination is refused.** It must be an empty or non-existent folder on a drive
-with room for the extracted client. An interrupted extraction leaves an incomplete folder that
-must be deleted before running again.
+**The destination is refused.** It must be an empty or non-existent folder on a drive with room
+for the client. An interrupted extraction or copy leaves an incomplete folder that must be
+deleted before running again.
 
-**The installer refuses a folder that already has `Hermes`.** It holds a launcher or manual
-installation. Update it with that route, or choose a different client folder.
+**An in-place install broke the launcher.** Delete the new `Hermes` and rename
+`Hermes-backup-<date>` back to `Hermes`.
 
 **Download failed (exit code 4).** A host was unreachable, or the channel is paused while a
 release is published; retry later.
