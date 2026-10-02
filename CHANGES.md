@@ -13,6 +13,81 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-10-02 — Quick-start installer 1.1.2: review fixes, yes/no menus, console look
+
+**Issue:** a code review of the installer found, among others: Update, Reconfigure and Uninstall
+acted on the folder recorded in `quickstart.json`, so uninstalling a copied installation (a
+common way to multibox) removed the original's `Hermes`, addon and portal line; `-Uninstall` on
+an unfinished installation installed instead; OneDrive marks every synced folder as a reparse
+point, so Update and Uninstall failed there and the scan skipped OneDrive folders; the window
+closed at once after a successful Update, Reconfigure or Uninstall; a menu taller than the window
+(or a window shrunk during a menu) crashed in Windows Terminal; an empty `latest.json` crashed
+instead of falling back; keys pressed while busy answered the next menu; an in-place install
+interrupted after the rename made a second backup on the next run; Uninstall and Reconfigure
+needed the internet; `-CopyTo` and `-ExtractTo` could not be resumed; a client under Program
+Files failed late with an unexpected error. Separately, the yes/no questions were still typed
+`[Y/n]` prompts and the console output was plain text.
+
+**Change (review fixes):** `scripts/quickstart/install.ps1`, `Install JimsProxy.cmd`:
+- `Get-State` re-bases a copied or moved `quickstart.json` onto the folder it was read from
+  (and drops the original's shortcut), so maintenance acts only on the selected copy.
+- `-Update` and `-Reconfigure` act only on a finished installation (exit 3 otherwise);
+  `-Uninstall` also removes an unfinished one; no action switch falls through to installing;
+  action switches cannot be combined with `-ClientArchive`, `-ExtractTo` or `-CopyTo`.
+- Links are recognised by link type (junction or symbolic link), not by the reparse-point
+  attribute; `Remove-Tree` deletes bottom-up; the scan descends into OneDrive folders.
+- The installer waits for a key at the end of every interactive run started from the `.cmd`
+  (success, failure, `Q` or Ctrl+C); the `.cmd` pauses itself only if PowerShell cannot run.
+- Menus that do not fit the window, or whose window shrinks, use numbered choices.
+- An empty, `null` or `{}` `latest.json` is treated as unreadable (warning, fallback).
+- Keys typed while the installer is busy are discarded before each menu and the welcome prompt.
+- In-place: the state (with the backup's path) is saved before `AccountData` is copied; the copy
+  is repeated on resume.
+- Step 1 only warns about an unreachable host; the hard check runs before the first download.
+- A folder that `-CopyTo` or `-ExtractTo` (or the menu) already filled is continued on the next
+  run instead of refused.
+- A root that cannot be written offers the copy route (or `-CopyTo`); destinations are checked
+  for write access.
+- The copy route waits until the game is closed (Retry / Quit; `-Yes` stops with exit 2), and a
+  file that still cannot be copied stops with one instruction naming it, instead of the generic
+  "run again" advice contradicting "delete the incomplete folder".
+- A copy destination inside the client being copied is refused.
+- The desktop shortcut is `Play Kronos.lnk` unless that name already belongs to another
+  installation; then it is `Play Kronos (<installation folder>).lnk`. Uninstall deletes the
+  shortcut only if it still starts that installation.
+
+**Change (look and menus):** `scripts/quickstart/install.ps1` (1.1.2):
+- `Read-YesNo` shows a Yes / No menu with the default highlighted when it runs in a console;
+  redirected input keeps the typed `[Y/n]` answer and `-Yes` still accepts the defaults.
+- Menus at the bottom of the window no longer draw one line low (which left a blank line under
+  the question and overwrote the key hint): the menu position is measured after the hint line,
+  which scrolls the window.
+- Console look: title and subtitle, step headings as a dim counter and a cyan name over a thin
+  rule, a green checkmark on each passed check, warnings in yellow, the failure block in red
+  with its Next line in white, a `►` menu cursor, a progress bar that updates in place while a
+  client is copied or extracted, and the final summary in a green frame (long paths shortened
+  to fit). The log file stays plain text and keeps the progress milestones; redirected output
+  stays plain lines.
+
+`docs/QUICK-INSTALL.md`: Step 5 and Step 6 show the menus; menu examples use the `►` cursor; the
+review fixes (window stays open, offline Uninstall and Reconfigure, copies, resumable
+destinations, action-switch rules, exit codes).
+
+**Verification:** a scripted suite of 36 checks, all passing: a copied installation updated and
+uninstalled while the original's `Hermes`, addon and portal line stayed intact; action switches
+refused or uninstalling (never installing); junctions vs. OneDrive folders; `Remove-Tree` on a
+tree with a read-only file and a junction; an empty manifest; in-place resume (one backup,
+`AccountData` re-copied); offline Uninstall and offline install; `-CopyTo` and `-ExtractTo`
+resumed by the same command; a read-only root refused, then installed via `-CopyTo`; a running
+game blocks the copy (exit 2 unattended; Retry continues once it is closed); a copy destination
+inside the source refused; a second installation's shortcut gets its own name, and uninstalling
+leaves a shortcut that now starts another installation. In Windows
+Terminal, driven by keypresses (screenshots checked): the window waiting after a successful
+Update; Ctrl+C during an extraction keeping its messages on screen; Esc pressed twice during
+Keep searching; a full install with the new look, the progress bar, the framed summary, a failure
+block, the yes/no menus. In the classic console: a menu taller than the window and a window
+shrunk during a menu both fall back to numbered choices. Redirected and `-Yes` runs unchanged.
+
 ## 2026-10-01 — Quick-start installer 1.1.1: Kronos login mirrors; guide corrections
 
 **Issue:** `login2.twinstar-wow.com` and `login3.twinstar-wow.com` are mirrors of

@@ -42,14 +42,18 @@ Contents
    links this guide, and waits for Enter. It then works through six steps. In each menu, the
    arrow keys move the highlight and Enter selects; `Q` quits. Everything shown is also written
    to a log: `%TEMP%\jimsproxy-quickstart.log` until the `Hermes` folder exists, then
-   `Hermes\install.log`. A failure message names it.
+   `Hermes\install.log`. A failure message names it. When the installer ends, for any reason,
+   the window stays open until a key is pressed.
 
 `install.ps1` and `JimsProxy.exe` are not code-signed. If SmartScreen shows "Windows protected
 your PC", select **More info → Run anyway**. If antivirus software quarantines `JimsProxy.exe`,
 restore it and add the `Hermes` folder to the exclusion list.
 
-**Step 1 of 6: Check this PC.** Operating system, PowerShell version, TLS 1.2, reachability of
-both hosts, free disk space. A failed check is reported and the installer exits (code 2).
+**Step 1 of 6: Check this PC.** Operating system, PowerShell version, TLS 1.2, free disk space,
+and whether both hosts can be reached. A failed check is reported and the installer exits
+(code 2); an unreachable host is only a warning here, because Uninstall and Reconfigure work
+offline. Installing and updating stop with code 2 if a host is still unreachable when the
+download starts.
 
 **Step 2 of 6: Find the client.** The installer scans the usual installation locations and the
 fixed drives (four folder levels deep) for `_classic_era_` folders, and the Downloads, Desktop,
@@ -58,7 +62,7 @@ is opened and listed if its contents are a client archive, whatever its file nam
 
 ```
 Select a client:
- > √ Kronos                 D:\Games\Kronos
+ ► √ Kronos                 D:\Games\Kronos
    √ kronoswow              C:\...\AppData\Roaming\kronoswow  (has a launcher or manual Hermes)
    √ client.zip             C:\Users\Name\Downloads  (client archive, extracted to a new folder)
      2 other clients found, not usable: build 1.15.8.67156 (x2)
@@ -77,7 +81,8 @@ copy into 1.14.2. **Keep searching** walks every folder on every fixed drive (it
 minutes; Esc stops it) and adds what it finds to the list.
 
 **A client that already has a `Hermes` folder** (from the launcher or a manual installation)
-offers two routes:
+offers two routes. A client in a folder that cannot be written without administrator rights
+(for example under Program Files) offers the first one:
 
 - **Copy the client to a new folder and install there** (recommended): a clean install that
   leaves the current client and its `Hermes` untouched. It needs the client's size in
@@ -89,20 +94,22 @@ offers two routes:
 
 For an archive or a copy, the installer asks for a destination (default `<drive>:\Games\Kronos`,
 or **Browse**; it must be empty or absent, with room for the client) and writes the client to
-`<destination>\World of Warcraft\`. An archive's build is checked before extraction; the archive
-and the original client are not modified. A full client takes a few minutes.
+`<destination>\World of Warcraft\`. A copy's destination must be outside the client being
+copied, and the game must be closed while it is copied (the installer waits, with Retry). An
+archive's build is checked before extraction; the archive and the original client are not
+modified. A full client takes a few minutes.
 
 **Step 3 of 6: Server and channel.**
 
 ```
 Server:
- > Kronos (login.twinstar-wow.com)
+ ► Kronos (login.twinstar-wow.com)
    Kronos mirror 2 (login2.twinstar-wow.com)
    Kronos mirror 3 (login3.twinstar-wow.com)
    Other address
 
 Channel:
- > Stable: the current release
+ ► Stable: the current release
    Beta: newer changes, less testing
 ```
 
@@ -115,13 +122,18 @@ play scripts, sets `ServerAddress`, and writes `Play Kronos.cmd`.
 `WTF\Config.wtf` (previous file kept as `Config.wtf.bak`), then asks:
 
 ```
-Install the JimsPlus addon? [Y/n]
-Create a desktop shortcut "Play Kronos"? [Y/n]
+Install the JimsPlus addon?
+ ► Yes
+   No
+
+Create a desktop shortcut "Play Kronos"?
+ ► Yes
+   No
 ```
 
 **Step 6 of 6: Done.** Prints a summary (installation folder, proxy version, client folder, game
 executable, client archive if one was extracted, server, channel, addon, shortcut, Play command,
-log path) and asks `Start the game now? [Y/n]`.
+log path) and asks `Start the game now?` (Yes or No, Yes highlighted).
 
 ---
 
@@ -141,7 +153,7 @@ the installer shows:
 
 ```
 Select:
- > Update the proxy
+ ► Update the proxy
    Reconfigure (server, channel)
    Uninstall
    Quit
@@ -155,10 +167,11 @@ Select:
 - **Uninstall** asks for confirmation (from this menu), offers to move `AccountData` to
   `<root>\JimsProxy-AccountData-backup`, deletes `Hermes`, deletes `Interface\AddOns\JimsPlus`
   if the installer created it, removes the `SET portal` line only if it points at `127.0.0.1`,
-  and deletes the shortcut.
+  and deletes the desktop shortcut if it still starts this installation.
 
 Update and Uninstall refuse to run while `JimsProxy.exe` is running (exit code 2). Reconfigure
-and Uninstall skip the Step 1 network check.
+and Uninstall work offline. If the installation folder was copied or moved (for example to
+multibox), these actions change only the copy that was selected.
 
 ---
 
@@ -175,19 +188,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ClientDir "D:
 |---|---|
 | `-ClientDir <path>` | The `_classic_era_` folder |
 | `-ClientArchive <path>` | A client archive to extract |
-| `-ExtractTo <path>` | Destination for `-ClientArchive` (empty or absent); without it the destination is asked, or the default is used with `-Yes` |
-| `-CopyTo <path>` | When the client already has a `Hermes` the installer did not create: copy the client to this empty or new folder and install there |
+| `-ExtractTo <path>` | Destination for `-ClientArchive` (empty or absent); without it the destination is asked, or the default is used with `-Yes`. Running the same command again after a failure continues there |
+| `-CopyTo <path>` | When the client already has a `Hermes` the installer did not create, or its folder cannot be written: copy the client to this empty or new folder and install there. Running the same command again after a failure continues there |
 | `-Server` | `kronos`, `kronos2` or `kronos3` (mirrors), or a login address |
 | `-Channel` | `stable` or `beta` |
 | `-NoAddon`, `-NoShortcut` | Skip the addon or the shortcut |
 | `-Yes` | Accept all defaults; no prompts (the welcome screen is skipped) |
-| `-Update`, `-Reconfigure`, `-Uninstall` | Run that action on an existing installation, without confirmation |
+| `-Update`, `-Reconfigure`, `-Uninstall` | Run that action on a finished quick-start installation, without confirmation. `-Uninstall` also removes an unfinished one. Anything else is refused (exit code 3); they cannot be combined with `-ClientArchive`, `-ExtractTo` or `-CopyTo` |
 | `-Root <path>` | The folder containing `Hermes`, for `-Update`, `-Reconfigure` and `-Uninstall` |
 
-Exit codes: `0` success; `1` unexpected error or invalid parameter; `2` a Step 1 check failed,
-or the proxy is running; `3` no usable client selected (including a refused destination, an
-existing `Hermes` the installer did not create without `-CopyTo`, or no installation at
-`-Root`); `4` a download
+Exit codes: `0` success; `1` unexpected error or invalid parameter; `2` a check failed (this
+PC, or a host unreachable before a download), or the proxy is running; `3` no usable client
+selected (including a refused destination, an existing `Hermes` the installer did not create or
+a folder that cannot be written, without `-CopyTo`, no installation at `-Root`, or an action
+switch on something that is not a finished installation); `4` a download
 failed or the channel is paused; `5` a downloaded or extracted file failed verification; `6`
 cancelled (`Q` or `Ctrl+C`).
 
@@ -202,7 +216,7 @@ cancelled (`Q` or `Ctrl+C`).
 | `<root>\Hermes-backup-<date>\` | The previous `Hermes`, renamed, only when installing in place over a launcher or manual installation |
 | `_classic_era_\WTF\Config.wtf` | `SET portal` line set; previous file kept as `Config.wtf.bak`; created if absent |
 | `_classic_era_\Interface\AddOns\JimsPlus\` | Created or updated, if accepted |
-| Desktop | `Play Kronos.lnk`, if accepted |
+| Desktop | `Play Kronos.lnk`, if accepted; `Play Kronos (<installation folder>).lnk` when that name already belongs to another installation |
 
 Nothing else in the client is modified, and nothing is deleted.
 
