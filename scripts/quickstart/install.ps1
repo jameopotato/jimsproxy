@@ -638,6 +638,7 @@ function Find-Candidates {
     $visited = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $completed = $true
     $interactive = Test-InteractiveConsole
+    $counter = $interactive -and [Console]::WindowWidth -ge 60   # the counter line is about 50 columns
     # Temporary folders never hold a real installation; other programs' test copies there only
     # add noise to the list.
     foreach ($t in @($env:TEMP, $env:TMP, (Join-Path $env:LOCALAPPDATA 'Temp'))) {
@@ -653,7 +654,7 @@ function Find-Candidates {
             if (-not $Deep -and $clock.Elapsed.TotalSeconds -ge $ScanSeconds) { $completed = $false; break }
             if ($Deep -and ($visited.Count % 500) -eq 0) {
                 if ($interactive) {
-                    Write-Host -NoNewline ("`r  searched {0:N0} folders, found {1} client(s)   " -f $visited.Count, ($eraDirs.Count + $zips.Count))
+                    if ($counter) { Write-Host -NoNewline ("`r  searched {0:N0} folders, found {1} client(s)   " -f $visited.Count, ($eraDirs.Count + $zips.Count)) }
                     if ([Console]::KeyAvailable -and [Console]::ReadKey($true).Key -eq 'Escape') { $completed = $false; break }
                 }
             }
@@ -687,7 +688,7 @@ function Find-Candidates {
         }
         if (-not $completed) { break }
     }
-    if ($Deep -and $interactive) { Write-Host '' }
+    if ($Deep -and $counter) { Write-Host '' }
     if ($Deep) { Out-Log ("Searched {0:N0} folders in {1:mm\:ss}{2}." -f $visited.Count, $clock.Elapsed, $(if ($completed) { '' } else { ' (stopped with Esc)' })) }
     elseif (-not $completed) {
         Out-Log "The scan stopped after $ScanSeconds seconds; folders not reached are not listed. Use Keep searching or Browse."
@@ -1092,14 +1093,14 @@ function Get-State {
     # paths are re-based onto RootDir, so Update, Reconfigure and Uninstall can never act on the
     # original installation. The original's desktop shortcut is not this installation's.
     param([string]$RootDir)
+    try { $here = Get-NormalPath $RootDir } catch { return $null }
     # Path.Combine, not Join-Path: Join-Path fails for a drive that does not exist (a typed
     # -CopyTo or -ExtractTo), which must reach Test-Destination's message instead.
-    $p = [System.IO.Path]::Combine($RootDir, 'Hermes', 'quickstart.json')
+    $p = [System.IO.Path]::Combine($here, 'Hermes', 'quickstart.json')
     if (-not [System.IO.File]::Exists($p)) { return $null }
     try { $s = (Read-TextFile $p).Text | ConvertFrom-Json } catch { return $null }
     if ($null -eq $s -or $s -isnot [System.Management.Automation.PSCustomObject]) { return $null }
     try {
-        $here = Get-NormalPath $RootDir
         $was = "$(Get-StateValue $s 'root')"
         if ($was) { $was = Get-NormalPath $was }
     } catch { return $null }
@@ -1108,6 +1109,9 @@ function Get-State {
         $wasPrefix = $was.TrimEnd('\') + '\'
         foreach ($field in $fields) {
             $v = "$(Get-StateValue $s $field)"
+            if (-not $v) { continue }
+            # Normalised like the root, so a short (8.3) or differently written path still matches.
+            try { $v = Get-NormalPath $v } catch { return $null }
             if ($v.StartsWith($wasPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { Set-StateValue $s $field ($here.TrimEnd('\') + '\' + $v.Substring($wasPrefix.Length)) }
         }
         if (Get-StateValue $s 'shortcut') { $s.shortcut = $null }
@@ -1916,7 +1920,7 @@ try {
     if ($Root) {
         $rootFull = Get-NormalPath ($Root.Trim().Trim('"'))
         $state = Get-State $rootFull
-        if ($null -eq $state) { Stop-Install 3 "No quick-start installation found in $Root (Hermes\quickstart.json is missing)." 'Pass the folder that contains Hermes, or run the installer without -Root.' }
+        if ($null -eq $state) { Stop-Install 3 "No quick-start installation found in $Root (Hermes\quickstart.json is missing, or does not describe this folder)." 'Pass the folder that contains Hermes, or run the installer without -Root.' }
         if ($script:MovedFrom.ContainsKey($rootFull)) { Out-Log "This installation was copied or moved from $($script:MovedFrom[$rootFull]); only $rootFull is changed." }
         if ($state.status -ne 'installed' -and -not $Uninstall) {
             if ($Update -or $Reconfigure) { Stop-Install 3 "The installation in $(Join-Path $rootFull 'Hermes') is unfinished." 'Run the installer without -Update or -Reconfigure to finish it, or with -Uninstall to remove it.' }
@@ -2031,9 +2035,10 @@ finally {
     if (-not $script:Finished) { Out-Log 'Cancelled (Ctrl+C).' }
     # Started by double-clicking Install JimsProxy.cmd: keep the window open until the result
     # has been read, whatever the outcome (success, failure, Q, or Ctrl+C). The marker file
-    # tells the .cmd that the window already waited; without it, the .cmd waits itself.
+    # tells the .cmd that the script ran and took care of the window (waited, or not because of
+    # -Yes or redirection); without it, PowerShell never got here and the .cmd waits itself.
+    if ($env:JIMSPROXY_QS_PAUSE -eq '1') { try { [System.IO.File]::WriteAllText((Join-Path $env:TEMP 'jimsproxy-quickstart.paused'), '') } catch { } }
     if ($env:JIMSPROXY_QS_PAUSE -eq '1' -and -not $Yes -and (Test-InteractiveConsole)) {
-        try { [System.IO.File]::WriteAllText((Join-Path $env:TEMP 'jimsproxy-quickstart.paused'), '') } catch { }
         Clear-KeyBuffer
         Write-Host ''
         Write-Host 'Press any key to close this window.' -ForegroundColor DarkGray

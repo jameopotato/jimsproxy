@@ -39,8 +39,8 @@ Files failed late with an unexpected error. Separately, the yes/no questions wer
 - Links are recognised by link type (junction or symbolic link), not by the reparse-point
   attribute; `Remove-Tree` deletes bottom-up; the scan descends into OneDrive folders.
 - The installer waits for a key at the end of every interactive run started from the `.cmd`
-  (success, failure, `Q` or Ctrl+C) and leaves a marker file when it does; without the marker
-  the `.cmd` pauses after a failure itself (a script blocked by policy or antivirus, or damaged).
+  (success, failure, `Q` or Ctrl+C) and leaves a marker file for the `.cmd`; without the marker
+  (a script blocked by policy or antivirus, or damaged) the `.cmd` pauses after a failure itself.
 - Menus that do not fit the window, or whose window shrinks, use numbered choices; so do
   windows narrower than 50 columns. The progress bar needs 72 columns and the summary frame 60;
   narrower windows get plain lines.
@@ -49,7 +49,7 @@ Files failed late with an unexpected error. Separately, the yes/no questions wer
   the welcome prompt.
 - In-place: the state (with the backup's path) is saved before `AccountData` is copied; a copy
   interrupted before it finished is repeated on resume, a finished one never (changes made since
-  are kept). Uninstall names the `Hermes-backup-<date>` it keeps.
+  are kept). Uninstall names the `Hermes-backup-<date>` it keeps (recorded from 1.1.2 on).
 - Step 1 only warns about an unreachable host; installing checks again before the first copy,
   extraction or download.
 - A folder that `-CopyTo` or `-ExtractTo` (or the menu) already filled is continued on the next
@@ -87,7 +87,7 @@ Files failed late with an unexpected error. Separately, the yes/no questions wer
 review fixes (window stays open, offline Uninstall and Reconfigure, copies, resumable
 destinations, action-switch rules, exit codes).
 
-**Verification:** scripted suites of 80 checks, all passing: a copied installation updated and
+**Verification:** scripted suites of 82 checks, all passing: a copied installation updated and
 uninstalled while the original's `Hermes`, addon and portal line stayed intact; action switches
 refused or uninstalling (never installing); junctions vs. OneDrive folders; `Remove-Tree` on a
 tree with a read-only file and a junction; an empty manifest; in-place resume (one backup,
@@ -101,7 +101,8 @@ leaves a shortcut that now starts another installation; a destination under `C:\
 user; an installation at a drive root (a `subst` drive) with its own shortcut name, uninstalled
 with `-Root X:\` from inside another installation, which stayed intact; a state pointing at
 another client refused; a missing drive; the `.cmd` pausing when the script cannot run, and not
-pausing twice. The drive-root, `C:\` and outside-state checks were also run without these fixes
+pausing twice or after a failed `-Yes` run; a state recorded with a short (8.3) folder name
+re-based onto its copy. The drive-root, `C:\` and outside-state checks were also run without these fixes
 and failed there. In Windows
 Terminal, driven by keypresses (screenshots checked): the window waiting after a successful
 Update; Ctrl+C during an extraction keeping its messages on screen; Esc pressed twice during

@@ -169,7 +169,8 @@ Select:
   `<root>\JimsProxy-AccountData-backup`, deletes `Hermes`, deletes `Interface\AddOns\JimsPlus`
   if the installer created it, removes the `SET portal` line only if it points at `127.0.0.1`,
   and deletes the desktop shortcut if it still starts this installation. A `Hermes-backup-<date>`
-  from an in-place install is kept, and its path is shown.
+  from an in-place install is kept (installations made with installer 1.1.2 or later show its
+  path).
 
 Update and Uninstall refuse to run while `JimsProxy.exe` is running (exit code 2). Reconfigure
 and Uninstall work offline. If the installation folder was copied or moved (for example to
@@ -203,8 +204,9 @@ Exit codes: `0` success; `1` unexpected error or invalid parameter; `2` a check 
 PC, or a host unreachable before a copy, extraction or download), the proxy or the game is
 running, or a client file could not be copied or the old `Hermes` renamed; `3` no usable client
 selected (including a refused destination, an existing `Hermes` the installer did not create or
-a folder that cannot be written, without `-CopyTo`, no installation at `-Root`, or `-Update` or
-`-Reconfigure` on something that is not a finished installation); `4` a download
+a folder that cannot be written, without `-CopyTo`, no installation at `-Root`, an action switch
+on a client without a quick-start installation or on an archive, or `-Update` or `-Reconfigure`
+on an unfinished installation); `4` a download
 failed or the channel is paused; `5` a downloaded or extracted file failed verification; `6`
 cancelled (`Q` or `Ctrl+C`).
 
