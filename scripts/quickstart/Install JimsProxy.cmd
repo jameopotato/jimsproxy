@@ -12,18 +12,21 @@ if defined TEMP (
 )
 if defined AFTER if not "%AFTER%"=="%HERE%" goto :inzip
 
-rem install.ps1 keeps the window open itself until a key is pressed (exit codes 0 to 6).
+rem install.ps1 keeps the window open itself until a key is pressed and leaves a marker file
+rem when it did. Without the marker, PowerShell did not get that far (blocked by policy or
+rem antivirus, or a damaged file), so a failure pauses here instead.
 set "JIMSPROXY_QS_PAUSE=1"
+set "PAUSED=%TEMP%\jimsproxy-quickstart.paused"
+if exist "%PAUSED%" del /q "%PAUSED%" >nul 2>&1
 powershell -NoProfile -ExecutionPolicy Bypass -File "%HERE%install.ps1" %*
 set "RC=%ERRORLEVEL%"
-if %RC% GTR 6 goto :failed
-if %RC% LSS 0 goto :failed
-exit /b %RC%
-
-:failed
-rem Any other exit code means PowerShell could not run the installer at all.
+if exist "%PAUSED%" (
+  del /q "%PAUSED%" >nul 2>&1
+  exit /b %RC%
+)
+if "%RC%"=="0" exit /b 0
 echo.
-echo The installer could not run (exit code %RC%).
+echo The installer stopped with exit code %RC%. The messages above explain why.
 pause
 exit /b %RC%
 

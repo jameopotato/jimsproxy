@@ -30,24 +30,38 @@ Files failed late with an unexpected error. Separately, the yes/no questions wer
 
 **Change (review fixes):** `scripts/quickstart/install.ps1`, `Install JimsProxy.cmd`:
 - `Get-State` re-bases a copied or moved `quickstart.json` onto the folder it was read from
-  (and drops the original's shortcut), so maintenance acts only on the selected copy.
+  (and drops the original's shortcut), so maintenance acts only on the selected copy. A state
+  whose recorded paths lie outside its own folder is not used. Drive roots stay `X:\`, so
+  `-Root C:\` acts on `C:\`.
 - `-Update` and `-Reconfigure` act only on a finished installation (exit 3 otherwise);
   `-Uninstall` also removes an unfinished one; no action switch falls through to installing;
   action switches cannot be combined with `-ClientArchive`, `-ExtractTo` or `-CopyTo`.
 - Links are recognised by link type (junction or symbolic link), not by the reparse-point
   attribute; `Remove-Tree` deletes bottom-up; the scan descends into OneDrive folders.
 - The installer waits for a key at the end of every interactive run started from the `.cmd`
-  (success, failure, `Q` or Ctrl+C); the `.cmd` pauses itself only if PowerShell cannot run.
-- Menus that do not fit the window, or whose window shrinks, use numbered choices.
+  (success, failure, `Q` or Ctrl+C) and leaves a marker file when it does; without the marker
+  the `.cmd` pauses after a failure itself (a script blocked by policy or antivirus, or damaged).
+- Menus that do not fit the window, or whose window shrinks, use numbered choices; so do
+  windows narrower than 50 columns. The progress bar needs 72 columns and the summary frame 60;
+  narrower windows get plain lines.
 - An empty, `null` or `{}` `latest.json` is treated as unreadable (warning, fallback).
-- Keys typed while the installer is busy are discarded before each menu and the welcome prompt.
-- In-place: the state (with the backup's path) is saved before `AccountData` is copied; the copy
-  is repeated on resume.
-- Step 1 only warns about an unreachable host; the hard check runs before the first download.
+- Keys typed while the installer is busy are discarded before each menu (numbered ones too) and
+  the welcome prompt.
+- In-place: the state (with the backup's path) is saved before `AccountData` is copied; a copy
+  interrupted before it finished is repeated on resume, a finished one never (changes made since
+  are kept). Uninstall names the `Hermes-backup-<date>` it keeps.
+- Step 1 only warns about an unreachable host; installing checks again before the first copy,
+  extraction or download.
 - A folder that `-CopyTo` or `-ExtractTo` (or the menu) already filled is continued on the next
   run instead of refused.
 - A root that cannot be written offers the copy route (or `-CopyTo`); destinations are checked
-  for write access.
+  for write access the way the installer writes (a new folder, then a file in it), so a standard
+  user's `C:\Games\Kronos` is accepted. A destination on a drive that does not exist is reported
+  as such.
+- Interactive `-ClientDir` on a client with a `Hermes` the installer did not create offers the
+  copy / in-place menu (1.1.1 stopped with exit 3); its last choice is Quit, and declining the
+  in-place install returns to that menu.
+- The scan does not open online-only cloud files (opening one would download it).
 - The copy route waits until the game is closed (Retry / Quit; `-Yes` stops with exit 2), and a
   file that still cannot be copied stops with one instruction naming it, instead of the generic
   "run again" advice contradicting "delete the incomplete folder".
@@ -73,20 +87,29 @@ Files failed late with an unexpected error. Separately, the yes/no questions wer
 review fixes (window stays open, offline Uninstall and Reconfigure, copies, resumable
 destinations, action-switch rules, exit codes).
 
-**Verification:** a scripted suite of 36 checks, all passing: a copied installation updated and
+**Verification:** scripted suites of 80 checks, all passing: a copied installation updated and
 uninstalled while the original's `Hermes`, addon and portal line stayed intact; action switches
 refused or uninstalling (never installing); junctions vs. OneDrive folders; `Remove-Tree` on a
 tree with a read-only file and a junction; an empty manifest; in-place resume (one backup,
-`AccountData` re-copied); offline Uninstall and offline install; `-CopyTo` and `-ExtractTo`
+`AccountData` changed after the copy kept, an interrupted copy repeated, a copied installation
+reporting its own backup at uninstall); offline Uninstall, offline install, and offline
+`-CopyTo` / `-ExtractTo` stopping before any copy; `-CopyTo` and `-ExtractTo`
 resumed by the same command; a read-only root refused, then installed via `-CopyTo`; a running
 game blocks the copy (exit 2 unattended; Retry continues once it is closed); a copy destination
 inside the source refused; a second installation's shortcut gets its own name, and uninstalling
-leaves a shortcut that now starts another installation. In Windows
+leaves a shortcut that now starts another installation; a destination under `C:\` as a standard
+user; an installation at a drive root (a `subst` drive) with its own shortcut name, uninstalled
+with `-Root X:\` from inside another installation, which stayed intact; a state pointing at
+another client refused; a missing drive; the `.cmd` pausing when the script cannot run, and not
+pausing twice. The drive-root, `C:\` and outside-state checks were also run without these fixes
+and failed there. In Windows
 Terminal, driven by keypresses (screenshots checked): the window waiting after a successful
 Update; Ctrl+C during an extraction keeping its messages on screen; Esc pressed twice during
 Keep searching; a full install with the new look, the progress bar, the framed summary, a failure
 block, the yes/no menus. In the classic console: a menu taller than the window and a window
-shrunk during a menu both fall back to numbered choices. Redirected and `-Yes` runs unchanged.
+shrunk during a menu both fall back to numbered choices; a 45-column window gets numbered menus,
+no progress bar and no frame; the `-ClientDir` menu ends with Quit and returns to itself after a
+declined in-place install. Redirected and `-Yes` runs unchanged.
 
 ## 2026-10-01 — Quick-start installer 1.1.1: Kronos login mirrors; guide corrections
 

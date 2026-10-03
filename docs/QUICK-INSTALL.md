@@ -52,8 +52,8 @@ restore it and add the `Hermes` folder to the exclusion list.
 **Step 1 of 6: Check this PC.** Operating system, PowerShell version, TLS 1.2, free disk space,
 and whether both hosts can be reached. A failed check is reported and the installer exits
 (code 2); an unreachable host is only a warning here, because Uninstall and Reconfigure work
-offline. Installing and updating stop with code 2 if a host is still unreachable when the
-download starts.
+offline. Installing and updating stop with code 2 if a host is still unreachable before the
+first copy, extraction or download.
 
 **Step 2 of 6: Find the client.** The installer scans the usual installation locations and the
 fixed drives (four folder levels deep) for `_classic_era_` folders, and the Downloads, Desktop,
@@ -93,7 +93,8 @@ offers two routes. A client in a folder that cannot be written without administr
   until the backup is renamed back.
 
 For an archive or a copy, the installer asks for a destination (default `<drive>:\Games\Kronos`,
-or **Browse**; it must be empty or absent, with room for the client) and writes the client to
+or **Browse**; it must be empty or absent, writable without administrator rights, with room for
+the client) and writes the client to
 `<destination>\World of Warcraft\`. A copy's destination must be outside the client being
 copied, and the game must be closed while it is copied (the installer waits, with Retry). An
 archive's build is checked before extraction; the archive and the original client are not
@@ -167,7 +168,8 @@ Select:
 - **Uninstall** asks for confirmation (from this menu), offers to move `AccountData` to
   `<root>\JimsProxy-AccountData-backup`, deletes `Hermes`, deletes `Interface\AddOns\JimsPlus`
   if the installer created it, removes the `SET portal` line only if it points at `127.0.0.1`,
-  and deletes the desktop shortcut if it still starts this installation.
+  and deletes the desktop shortcut if it still starts this installation. A `Hermes-backup-<date>`
+  from an in-place install is kept, and its path is shown.
 
 Update and Uninstall refuse to run while `JimsProxy.exe` is running (exit code 2). Reconfigure
 and Uninstall work offline. If the installation folder was copied or moved (for example to
@@ -188,20 +190,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ClientDir "D:
 |---|---|
 | `-ClientDir <path>` | The `_classic_era_` folder |
 | `-ClientArchive <path>` | A client archive to extract |
-| `-ExtractTo <path>` | Destination for `-ClientArchive` (empty or absent); without it the destination is asked, or the default is used with `-Yes`. Running the same command again after a failure continues there |
-| `-CopyTo <path>` | When the client already has a `Hermes` the installer did not create, or its folder cannot be written: copy the client to this empty or new folder and install there. Running the same command again after a failure continues there |
+| `-ExtractTo <path>` | Destination for `-ClientArchive` (empty or absent); without it the destination is asked, or the default is used with `-Yes`. After a failure in a later step, running the same command again continues there |
+| `-CopyTo <path>` | When the client already has a `Hermes` the installer did not create, or its folder cannot be written: copy the client to this empty or new folder and install there. After a failure in a later step, running the same command again continues there |
 | `-Server` | `kronos`, `kronos2` or `kronos3` (mirrors), or a login address |
 | `-Channel` | `stable` or `beta` |
 | `-NoAddon`, `-NoShortcut` | Skip the addon or the shortcut |
 | `-Yes` | Accept all defaults; no prompts (the welcome screen is skipped) |
-| `-Update`, `-Reconfigure`, `-Uninstall` | Run that action on a finished quick-start installation, without confirmation. `-Uninstall` also removes an unfinished one. Anything else is refused (exit code 3); they cannot be combined with `-ClientArchive`, `-ExtractTo` or `-CopyTo` |
+| `-Update`, `-Reconfigure`, `-Uninstall` | Run that action on a finished quick-start installation, without confirmation. `-Uninstall` also removes an unfinished one. On anything else they stop with exit code 3. Combined with `-ClientArchive`, `-ExtractTo` or `-CopyTo` they stop with exit code 1 |
 | `-Root <path>` | The folder containing `Hermes`, for `-Update`, `-Reconfigure` and `-Uninstall` |
 
 Exit codes: `0` success; `1` unexpected error or invalid parameter; `2` a check failed (this
-PC, or a host unreachable before a download), or the proxy is running; `3` no usable client
+PC, or a host unreachable before a copy, extraction or download), the proxy or the game is
+running, or a client file could not be copied or the old `Hermes` renamed; `3` no usable client
 selected (including a refused destination, an existing `Hermes` the installer did not create or
-a folder that cannot be written, without `-CopyTo`, no installation at `-Root`, or an action
-switch on something that is not a finished installation); `4` a download
+a folder that cannot be written, without `-CopyTo`, no installation at `-Root`, or `-Update` or
+`-Reconfigure` on something that is not a finished installation); `4` a download
 failed or the channel is paused; `5` a downloaded or extracted file failed verification; `6`
 cancelled (`Q` or `Ctrl+C`).
 
@@ -233,15 +236,17 @@ looks everywhere, and **Browse** selects a client folder directly. For a 1.15 cl
 `.build.info` and `_classic_era_\WowClassic_ForCustomServers.exe`. The scan lists only zips
 larger than 1 GB; **Extract a client archive** selects a smaller one.
 
-**The destination is refused.** It must be an empty or non-existent folder on a drive with room
-for the client. An interrupted extraction or copy leaves an incomplete folder that must be
-deleted before running again.
+**The destination is refused.** It must be an empty or non-existent folder outside the client
+being copied, writable without administrator rights, on a drive with room for the client. An
+interrupted extraction or copy leaves an incomplete folder that must be deleted before running
+again.
 
 **An in-place install broke the launcher.** Delete the new `Hermes` and rename
 `Hermes-backup-<date>` back to `Hermes`.
 
-**Download failed (exit code 4).** A host was unreachable, or the channel is paused while a
-release is published; retry later.
+**Download failed (exit code 4).** The download broke off, or the channel is paused while a
+release is published; retry later. A host that cannot be reached at all stops the installer
+earlier, with exit code 2.
 
 **Verification failed (exit code 5), or the warning "SHA-256 not verified".** The download did
 not match the channel manifest, or the manifest could not be read and the archive was fetched

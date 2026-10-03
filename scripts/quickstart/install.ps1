@@ -55,6 +55,7 @@ $MinFreeBytes     = 500MB
 $ScanSeconds      = 20
 $ClientDepth      = 4       # folder levels below each scan root searched for _classic_era_
 $MinArchiveBytes  = 1GB     # zips at or below this size are not opened during the scan
+$CloudOnlyAttributes = 0x1000 -bor 0x40000 -bor 0x400000   # Offline, RecallOnOpen, RecallOnDataAccess
 $PlayCmdName      = 'Play Kronos.cmd'
 
 # Test hook, not documented for users: serve a local folder in place of both hosts, laid out as
@@ -187,6 +188,12 @@ function End-ProgressBar {
     if ($script:BarShown) { Write-Host ''; $script:BarShown = $false }
 }
 
+function Test-ProgressBarFits {
+    # The bar line is about 70 columns; in a narrower window every redraw would wrap onto a new
+    # line, so the milestone lines are shown instead.
+    return ((Test-InteractiveConsole) -and [Console]::WindowWidth -ge 72)
+}
+
 function Read-Line {
     param([string]$Prompt)
     Write-Host -NoNewline "$Prompt "
@@ -276,8 +283,9 @@ function Show-Menu {
     if ($Yes) { Write-Host $Title; Out-Log "  -> $($Items[$idx].Text) (accepted by -Yes)"; return $Items[$idx].Key }
 
     # Numbered choices when input or output is redirected, or when the menu cannot fit the
-    # window (a console buffer can be exactly as tall as the window).
-    if (-not (Test-InteractiveConsole) -or ($Items.Count + 3) -gt [Console]::WindowHeight) {
+    # window (a console buffer can be exactly as tall as the window; the key hint needs 47
+    # columns).
+    if (-not (Test-InteractiveConsole) -or ($Items.Count + 3) -gt [Console]::WindowHeight -or [Console]::WindowWidth -lt 50) {
         return Show-NumberedMenu $Title $Items $idx
     }
 
@@ -354,6 +362,7 @@ function Show-NumberedMenu {
     # The same menu as numbered choices: used when input or output is redirected, or the menu
     # does not fit the console window.
     param([string]$Title, [object[]]$Items, [int]$DefaultIndex)
+    Clear-KeyBuffer
     Write-Host $Title
     $map = @{}; $n = 0; $defaultNumber = '1'
     for ($i = 0; $i -lt $Items.Count; $i++) {
@@ -383,6 +392,16 @@ function New-TempPath {
     $p = Join-Path $env:TEMP ("jimsproxy-quickstart-{0}{1}" -f [guid]::NewGuid().ToString('N').Substring(0, 12), $Suffix)
     $script:TempPaths.Add($p)
     return $p
+}
+
+function Get-NormalPath {
+    # Full path without a trailing backslash, except a drive root, which stays "X:\". ("X:"
+    # alone means the current folder on that drive, so it is read as the root too.)
+    param([string]$Path)
+    if ($Path -match '^[A-Za-z]:$') { $Path += '\' }
+    $full = [System.IO.Path]::GetFullPath($Path)
+    if ($full.Length -gt 3) { $full = $full.TrimEnd('\') }
+    return $full
 }
 
 function Test-IsLink {
@@ -649,7 +668,9 @@ function Find-Candidates {
             if ($level -le $root.ZipDepth) {
                 try {
                     foreach ($f in ([System.IO.DirectoryInfo]$dir).GetFiles('*.zip')) {
-                        if ($f.Length -gt $MinArchiveBytes) { [void]$zips.Add($f.FullName) }
+                        # An online-only cloud file (OneDrive and similar) is not listed: opening
+                        # it to read its build would download it.
+                        if ($f.Length -gt $MinArchiveBytes -and -not ([int]$f.Attributes -band $CloudOnlyAttributes)) { [void]$zips.Add($f.FullName) }
                     }
                 } catch { }
             }
@@ -718,7 +739,8 @@ function Test-Destination {
     if ([System.IO.Directory]::Exists($Dest) -and @([System.IO.Directory]::EnumerateFileSystemEntries($Dest)).Count -gt 0) {
         return "Destination is not empty: $Dest. Choose an empty or new folder."
     }
-    if (-not (Test-Writable $Dest)) { return "$Dest cannot be written without administrator rights. Choose a folder such as D:\Games\Kronos." }
+    if (-not [System.IO.Directory]::Exists([System.IO.Path]::GetPathRoot($Dest))) { return "Drive not available for: $Dest" }
+    if (-not (Test-Writable $Dest)) { return "$Dest cannot be written without administrator rights. Choose a folder you can write to, such as $(Join-Path $env:USERPROFILE 'Games\Kronos')." }
     $need = $RequiredBytes + $MinFreeBytes
     try { $free = Get-FreeBytes $Dest } catch { return "Drive not available for: $Dest" }
     if ($free -lt $need) { return "Not enough free space on $([System.IO.Path]::GetPathRoot($Dest)): $(Format-Size $need) required, $(Format-Size $free) free." }
@@ -730,7 +752,7 @@ function Select-Destination {
     # -ExtractTo or -CopyTo, which skips the menu.
     param([string]$Purpose, [long]$RequiredBytes, [string]$NearPath, [string]$Given, [string]$Inside = '')
     if ($Given) {
-        $dest = [System.IO.Path]::GetFullPath($Given.Trim().Trim('"'))
+        $dest = Get-NormalPath ($Given.Trim().Trim('"'))
         $why = Test-Destination $dest $RequiredBytes $Inside
         if ($why) { Stop-Install 3 $why 'Choose an empty or new folder on a drive with enough free space, and run the installer again.' }
         return $dest
@@ -802,7 +824,7 @@ function Copy-Client {
     $script:Extracting = $Dest; $script:ExtractVerb = 'copy'
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $count = 0; $bytes = [long]0; $lastCount = 0; $lastBytes = [long]0
-    $bar = Test-InteractiveConsole
+    $bar = Test-ProgressBarFits
     foreach ($rel in $Plan.Files) {
         $src = Join-Path $game $rel
         $dst = Join-Path $target $rel
@@ -845,7 +867,7 @@ function Get-PendingClient {
     # otherwise $null.
     param([string]$Folder)
     if (-not $Folder) { return $null }
-    try { $full = [System.IO.Path]::GetFullPath($Folder.Trim().Trim('"')) } catch { return $null }
+    try { $full = Get-NormalPath ($Folder.Trim().Trim('"')) } catch { return $null }
     $prev = Get-State $full
     if ($null -eq $prev -or $prev.status -ne 'installing') { return $null }
     $c = Get-FolderCandidate "$($prev.clientDir)"
@@ -861,6 +883,8 @@ function Invoke-CopyRoute {
     $pending = Get-PendingClient $Given
     if ($pending) { return $pending }
     if ($Announce) { Out-Log $Announce }
+    # The installation needs the download server: find out before spending minutes on a copy.
+    Assert-Network
     $game = Split-Path -Parent $Client.Path
     if ($null -eq $Plan) { $Plan = Get-CopyPlan $game }
     $dest = Select-Destination 'copied' $Plan.Bytes (Get-InstallRoot $Client.Path) $Given $game
@@ -902,13 +926,20 @@ function Wait-GameClosed {
 }
 
 function Test-Writable {
-    # True when a file can be created in Folder (the nearest existing parent for a new folder).
+    # True when the installer can write at Folder. It always creates a folder there (Hermes, or
+    # World of Warcraft) and then files inside it, so the probe does the same in the nearest
+    # existing parent: a standard user may create folders in C:\ but not files.
     param([string]$Folder)
     $d = $Folder
     while ($d -and -not [System.IO.Directory]::Exists($d)) { $d = Split-Path -Parent $d }
     if (-not $d) { return $false }
     $probe = Join-Path $d (".jimsproxy-write-test-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
-    try { [System.IO.File]::WriteAllText($probe, ''); [System.IO.File]::Delete($probe); return $true } catch { return $false }
+    try {
+        [void][System.IO.Directory]::CreateDirectory($probe)
+        [System.IO.File]::WriteAllText((Join-Path $probe 'test'), '')
+        return $true
+    } catch { return $false }
+    finally { try { if ([System.IO.Directory]::Exists($probe)) { [System.IO.Directory]::Delete($probe, $true) } } catch { } }
 }
 
 function Select-ExistingHermesAction {
@@ -926,28 +957,33 @@ function Select-ExistingHermesAction {
     else { Out-Log "$hermes already exists: this client has a Classic WoW Launcher or manual JimsProxy/HermesProxy installation." }
     Out-Log 'Measuring the client...'
     $plan = Get-CopyPlan $game
-    $items = @(
-        (New-MenuItem -Key 'copy' -Text 'Copy the client to a new folder and install there (recommended)'),
-        (New-MenuItem -Dim -Text "Clean install. The current client is not touched. Needs $(Format-Size $plan.Bytes) of additional disk space.")
-    )
-    if ($Reason -ne 'readonly') {
-        $items += (New-MenuItem -Key 'inplace' -Text 'Install here, keeping the current Hermes as a backup')
-        $items += (New-MenuItem -Dim -Text 'Renames Hermes to Hermes-backup-<date>. A launcher using this folder stops working until it is renamed back.')
+    while ($true) {
+        $items = @(
+            (New-MenuItem -Key 'copy' -Text 'Copy the client to a new folder and install there (recommended)'),
+            (New-MenuItem -Dim -Text "Clean install. The current client is not touched. Needs $(Format-Size $plan.Bytes) of additional disk space.")
+        )
+        if ($Reason -ne 'readonly') {
+            $items += (New-MenuItem -Key 'inplace' -Text 'Install here, keeping the current Hermes as a backup')
+            $items += (New-MenuItem -Dim -Text 'Renames Hermes to Hermes-backup-<date>. A launcher using this folder stops working until it is renamed back.')
+        }
+        $items += (New-MenuItem -Text '')
+        # -ClientDir names the client, so there is no other one to choose.
+        if ($ClientDir) { $items += (New-MenuItem -Key 'quit' -Text 'Quit') }
+        else { $items += (New-MenuItem -Key 'back' -Text 'Choose a different client') }
+        $k = Show-Menu 'How should the installer proceed?' $items 'copy'
+        if ($k -eq 'quit') { Stop-Install 6 'Cancelled; nothing was changed.' $null }
+        if ($k -eq 'back') { return @{ Action = 'back'; Client = $null } }
+        if ($k -eq 'inplace') {
+            Out-Log ''
+            Out-Log "WARNING: $hermes will be renamed to Hermes-backup-<date> and a new Hermes installed."
+            Out-Log '         If the Classic WoW Launcher or another installation uses this folder, it stops working' -Color Yellow
+            Out-Log '         until you delete the new Hermes and rename the backup to Hermes. If you are not sure' -Color Yellow
+            Out-Log '         whether anything else uses this folder, choose the copy instead.' -Color Yellow
+            if (-not (Read-YesNo 'Install here anyway?' $false)) { Out-Log ''; continue }
+            return @{ Action = 'inplace'; Client = $Client }
+        }
+        return @{ Action = 'copy'; Client = (Invoke-CopyRoute $Client $null $plan) }
     }
-    $items += (New-MenuItem -Text '')
-    $items += (New-MenuItem -Key 'back' -Text 'Choose a different client')
-    $k = Show-Menu 'How should the installer proceed?' $items 'copy'
-    if ($k -eq 'back') { return @{ Action = 'back'; Client = $null } }
-    if ($k -eq 'inplace') {
-        Out-Log ''
-        Out-Log "WARNING: $hermes will be renamed to Hermes-backup-<date> and a new Hermes installed."
-        Out-Log '         If the Classic WoW Launcher or another installation uses this folder, it stops working' -Color Yellow
-        Out-Log '         until you delete the new Hermes and rename the backup to Hermes. If you are not sure' -Color Yellow
-        Out-Log '         whether anything else uses this folder, choose the copy instead.' -Color Yellow
-        if (-not (Read-YesNo 'Install here anyway?' $false)) { return @{ Action = 'back'; Client = $null } }
-        return @{ Action = 'inplace'; Client = $Client }
-    }
-    return @{ Action = 'copy'; Client = (Invoke-CopyRoute $Client $null $plan) }
 }
 
 function Backup-ExistingHermes {
@@ -969,17 +1005,21 @@ function Backup-ExistingHermes {
 }
 
 function Copy-BackupAccountData {
-    # Carries AccountData from the renamed Hermes into the new one. Merges, so running it again
-    # on resume completes an interrupted copy.
+    # Carries AccountData from the renamed Hermes into the new one, once. A run interrupted
+    # during the copy repeats it on resume; a finished copy is recorded and never repeated, so
+    # keybindings or macros changed since are not overwritten by the backup's older files.
     param([pscustomobject]$State, [string]$HermesDir)
     $backup = Get-StateValue $State 'hermesBackup'
-    if (-not $backup) { return }
+    if (-not $backup -or (Get-StateValue $State 'accountDataCopied')) { return }
     $src = Join-Path $backup 'AccountData'
-    if (-not [System.IO.Directory]::Exists($src)) { return }
-    $dst = Join-Path $HermesDir 'AccountData'
-    [void][System.IO.Directory]::CreateDirectory($dst)
-    Copy-Item -Path (Join-Path ([WildcardPattern]::Escape($src)) '*') -Destination $dst -Recurse -Force
-    Out-Log "  copied AccountData from $backup"
+    if ([System.IO.Directory]::Exists($src)) {
+        $dst = Join-Path $HermesDir 'AccountData'
+        [void][System.IO.Directory]::CreateDirectory($dst)
+        Copy-Item -Path (Join-Path ([WildcardPattern]::Escape($src)) '*') -Destination $dst -Recurse -Force
+        Out-Log "  copied AccountData from $backup"
+    }
+    Set-StateValue $State 'accountDataCopied' $true
+    Save-State $State
 }
 
 function Set-StateValue {
@@ -1002,7 +1042,7 @@ function Expand-ClientArchive {
     $zip = [System.IO.Compression.ZipFile]::OpenRead($Archive.Path)
     try {
         $count = 0; $bytes = [long]0; $lastCount = 0; $lastBytes = [long]0; $skipped = 0
-        $bar = Test-InteractiveConsole
+        $bar = Test-ProgressBarFits
         foreach ($e in $zip.Entries) {
             $n = $e.FullName.Replace('\', '/')
             if (-not $n.StartsWith($Archive.Prefix, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
@@ -1052,20 +1092,34 @@ function Get-State {
     # paths are re-based onto RootDir, so Update, Reconfigure and Uninstall can never act on the
     # original installation. The original's desktop shortcut is not this installation's.
     param([string]$RootDir)
-    $p = Join-Path $RootDir 'Hermes\quickstart.json'
+    # Path.Combine, not Join-Path: Join-Path fails for a drive that does not exist (a typed
+    # -CopyTo or -ExtractTo), which must reach Test-Destination's message instead.
+    $p = [System.IO.Path]::Combine($RootDir, 'Hermes', 'quickstart.json')
     if (-not [System.IO.File]::Exists($p)) { return $null }
     try { $s = (Read-TextFile $p).Text | ConvertFrom-Json } catch { return $null }
     if ($null -eq $s -or $s -isnot [System.Management.Automation.PSCustomObject]) { return $null }
-    $here = [System.IO.Path]::GetFullPath($RootDir).TrimEnd('\')
-    $was = "$(Get-StateValue $s 'root')".TrimEnd('\')
+    try {
+        $here = Get-NormalPath $RootDir
+        $was = "$(Get-StateValue $s 'root')"
+        if ($was) { $was = Get-NormalPath $was }
+    } catch { return $null }
+    $fields = 'clientDir', 'gameExe', 'hermesBackup'
     if ($was -and $was -ine $here) {
-        foreach ($field in 'clientDir', 'gameExe') {
+        $wasPrefix = $was.TrimEnd('\') + '\'
+        foreach ($field in $fields) {
             $v = "$(Get-StateValue $s $field)"
-            if ($v.StartsWith($was + '\', [System.StringComparison]::OrdinalIgnoreCase)) { $s.$field = $here + $v.Substring($was.Length) }
+            if ($v.StartsWith($wasPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { Set-StateValue $s $field ($here.TrimEnd('\') + '\' + $v.Substring($wasPrefix.Length)) }
         }
         if (Get-StateValue $s 'shortcut') { $s.shortcut = $null }
         $s.root = $here
         $script:MovedFrom[$here] = $was
+    }
+    # Every recorded path lies inside the installation's folder; a state that points anywhere
+    # else is not trusted (nothing outside the selected folder is ever changed).
+    foreach ($field in $fields) {
+        $v = "$(Get-StateValue $s $field)"
+        if (-not $v) { continue }
+        try { if (-not (Test-PathInside $v $here)) { return $null } } catch { return $null }
     }
     return $s
 }
@@ -1105,6 +1159,7 @@ function New-State {
         addonCreated     = $false
         shortcut         = $null
         hermesBackup     = $null
+        accountDataCopied = $false
     }
 }
 
@@ -1604,8 +1659,11 @@ function Get-ShortcutPath {
     param([pscustomobject]$State)
     $desktop = [Environment]::GetFolderPath('Desktop')
     $mine = Join-Path (Join-Path $State.root 'Hermes') $PlayCmdName
-    $leaf = Split-Path -Leaf $State.root
-    if (-not $leaf) { $leaf = $State.root.Substring(0, 1) }
+    # The installation folder's name; for a drive root ("D:\") the drive letter.
+    $leaf = [System.IO.Path]::GetFileName($State.root.TrimEnd('\'))
+    if (-not $leaf -or $leaf.Contains(':')) { $leaf = $State.root.Substring(0, 1) }
+    foreach ($ch in [System.IO.Path]::GetInvalidFileNameChars()) { $leaf = $leaf.Replace([string]$ch, '') }
+    if (-not $leaf) { $leaf = 'Kronos' }
     $names = @('Play Kronos', "Play Kronos ($leaf)") + @(2..20 | ForEach-Object { "Play Kronos ($leaf $_)" })
     foreach ($n in $names) {
         $path = Join-Path $desktop "$n.lnk"
@@ -1650,7 +1708,7 @@ function Write-Summary {
     & $add 'Log' $script:LogPath
     Out-Log ''
     foreach ($r in $rows) { Write-LogOnly ('{0,-20} {1}' -f $r[0], $r[1]) }
-    if (-not (Test-InteractiveConsole)) {
+    if (-not (Test-InteractiveConsole) -or [Console]::WindowWidth -lt 60) {
         foreach ($r in $rows) { Write-Host ('{0,-20} {1}' -f $r[0], $r[1]) }
         return
     }
@@ -1676,7 +1734,11 @@ function Invoke-Install {
     param([hashtable]$Selection)
     $client = $Selection.Client
     $archive = $Selection.Archive
-    if ($archive) { $client = Expand-ClientArchive $archive (Select-ExtractDestination $archive) }
+    if ($archive) {
+        # The installation needs the download server: find out before a long extraction.
+        Assert-Network
+        $client = Expand-ClientArchive $archive (Select-ExtractDestination $archive)
+    }
     $settings = Select-ServerAndChannel $null $null
     $rootDir = Get-InstallRoot $client.Path
     $hermes = Join-Path $rootDir 'Hermes'
@@ -1775,8 +1837,8 @@ function Invoke-Uninstall {
 
     $accountData = Join-Path $hermes 'AccountData'
     if ([System.IO.Directory]::Exists($accountData) -and @([System.IO.Directory]::EnumerateFileSystemEntries($accountData)).Count -gt 0) {
-        if (Read-YesNo "Move AccountData to $($State.root)\JimsProxy-AccountData-backup before deleting?" $true) {
-            $backup = Join-Path $State.root 'JimsProxy-AccountData-backup'
+        $backup = Join-Path $State.root 'JimsProxy-AccountData-backup'
+        if (Read-YesNo "Move AccountData to $backup before deleting?" $true) {
             if (Test-Path -LiteralPath $backup) { $backup = "$backup-$((Get-Date).ToString('yyyyMMdd-HHmmss'))" }
             Move-Item -LiteralPath $accountData -Destination $backup
             Out-Log "  AccountData moved to $backup"
@@ -1797,6 +1859,10 @@ function Invoke-Uninstall {
         # may have taken the name since.
         if ((Get-ShortcutTarget $State.shortcut) -ieq (Join-Path $hermes $PlayCmdName)) { Remove-Item -LiteralPath $State.shortcut -Force; Out-Log "  deleted $($State.shortcut)" }
         else { Out-Log "  $($State.shortcut) now starts another installation; left in place" }
+    }
+    $earlier = "$(Get-StateValue $State 'hermesBackup')"
+    if ($earlier -and [System.IO.Directory]::Exists($earlier)) {
+        Out-Log "  kept $earlier, the Hermes that was here before this installation; rename it to Hermes to use it again"
     }
     Out-Log ''
     Out-Log 'JimsProxy is uninstalled. The game client was not modified beyond the items listed above.'
@@ -1848,16 +1914,16 @@ try {
     $state = $null
     $selection = $null
     if ($Root) {
-        $rootFull = [System.IO.Path]::GetFullPath($Root.Trim().Trim('"')).TrimEnd('\')
+        $rootFull = Get-NormalPath ($Root.Trim().Trim('"'))
         $state = Get-State $rootFull
         if ($null -eq $state) { Stop-Install 3 "No quick-start installation found in $Root (Hermes\quickstart.json is missing)." 'Pass the folder that contains Hermes, or run the installer without -Root.' }
         if ($script:MovedFrom.ContainsKey($rootFull)) { Out-Log "This installation was copied or moved from $($script:MovedFrom[$rootFull]); only $rootFull is changed." }
         if ($state.status -ne 'installed' -and -not $Uninstall) {
-            if ($Update -or $Reconfigure) { Stop-Install 3 "The installation in $rootFull\Hermes is unfinished." 'Run the installer without -Update or -Reconfigure to finish it, or with -Uninstall to remove it.' }
+            if ($Update -or $Reconfigure) { Stop-Install 3 "The installation in $(Join-Path $rootFull 'Hermes') is unfinished." 'Run the installer without -Update or -Reconfigure to finish it, or with -Uninstall to remove it.' }
             # -Root alone on an unfinished installation: finish it.
             $c = Get-FolderCandidate "$($state.clientDir)"
             if (-not $c.Usable) { Stop-Install 3 "The client recorded for $rootFull is $($c.Status)." $RequirementText }
-            Out-Log "Resuming the unfinished installation in $rootFull\Hermes."
+            Out-Log "Resuming the unfinished installation in $(Join-Path $rootFull 'Hermes')."
             $selection = @{ Client = $c; Archive = $null }
             $state = $null
         }
@@ -1919,7 +1985,7 @@ try {
         elseif ($Reconfigure) { Invoke-Reconfigure $state }
         elseif ($Uninstall) { Invoke-Uninstall $state $false }
         else {
-            Write-Heading "Existing installation in $($state.root)\Hermes"
+            Write-Heading "Existing installation in $(Join-Path $state.root 'Hermes')"
             Out-Log "Proxy $(Get-ProxyVersion (Join-Path $state.root 'Hermes')), $($state.channel) channel, server $($state.serverAddress)"
             $items = @(
                 (New-MenuItem -Key 'update' -Text 'Update the proxy'),
@@ -1964,8 +2030,10 @@ finally {
     }
     if (-not $script:Finished) { Out-Log 'Cancelled (Ctrl+C).' }
     # Started by double-clicking Install JimsProxy.cmd: keep the window open until the result
-    # has been read, whatever the outcome (success, failure, Q, or Ctrl+C).
+    # has been read, whatever the outcome (success, failure, Q, or Ctrl+C). The marker file
+    # tells the .cmd that the window already waited; without it, the .cmd waits itself.
     if ($env:JIMSPROXY_QS_PAUSE -eq '1' -and -not $Yes -and (Test-InteractiveConsole)) {
+        try { [System.IO.File]::WriteAllText((Join-Path $env:TEMP 'jimsproxy-quickstart.paused'), '') } catch { }
         Clear-KeyBuffer
         Write-Host ''
         Write-Host 'Press any key to close this window.' -ForegroundColor DarkGray
