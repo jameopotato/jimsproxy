@@ -526,4 +526,33 @@ public partial class WorldClient
         enchantment.Enchantment = packet.ReadInt32();
         SendPacketToClient(enchantment);
     }
+
+    // JimsProxy (2026-10-06): 1.12 sends SMSG_ITEM_TIME_UPDATE [item guid][seconds left] once when a
+    // timed item lands in the bags and once per timed item at login (vmangos
+    // Player::AddItemDurations / SendItemDurations, whose comment says the client needs it to
+    // display the remaining time even though the item's duration field is also set). The modern
+    // packet is the same two fields. It was never translated, so every timed quest item in
+    // Classic (161 of them: Shadowforge Torch, Fresh Carcass, the Un'Goro samples, the Alterac
+    // Assault Orders, the Hallow's End masks) showed no countdown and vanished without warning.
+    //
+    // If Kronos front-loads the login copies before SMSG_LOGIN_VERIFY_WORLD the way it does
+    // SMSG_SET_PROFICIENCY (#410), the 1.14 client is not in world yet and would drop them; hold
+    // those until the verify-world flush, the same way. Mid-session copies go straight through.
+    [PacketHandler(Opcode.SMSG_ITEM_TIME_UPDATE)]
+    void HandleItemTimeUpdate(WorldPacket packet)
+    {
+        ItemTimeUpdate update = ParseItemTimeUpdate(packet, GetSession().GameState);
+        if (!GetSession().GameState.IsInWorld)
+            SendPacketToClient(update, Opcode.SMSG_LOGIN_VERIFY_WORLD);
+        else
+            SendPacketToClient(update);
+    }
+
+    internal static ItemTimeUpdate ParseItemTimeUpdate(WorldPacket packet, GameSessionData gameState)
+    {
+        ItemTimeUpdate update = new();
+        update.ItemGuid = packet.ReadGuid().To128(gameState);
+        update.DurationLeft = packet.ReadUInt32();
+        return update;
+    }
 }
