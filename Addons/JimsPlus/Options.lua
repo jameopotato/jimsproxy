@@ -206,6 +206,11 @@ local cbPerf = CreateCheckbox(panel, y,
     "For crowded fights (battlegrounds, big pulls) where FPS tanks: fully suspends the\ncast-bar engine — stops rendering, stops per-event tracking, and tells the proxy to\nstop sending cast data entirely. Toggle on when it's a zerg, off when it clears.\n\nAll other JimsPlus fixes stay active. Shortcut: /jp perf")
 y = y - 32
 
+local cbPetLock = CreateCheckbox(panel, y,
+    "Lock pet command & stance buttons",
+    "Hunters and warlocks: keep Attack, Follow, Stay and the\nAggressive/Defensive/Passive buttons on the pet bar, and\nput them back if a spell gets dropped onto one and knocks\nit off. Off by default. Turn it on only if you've lost those\nbuttons or want them protected.\n\nShortcut: /jp petlock")
+y = y - 32
+
 ---------------------------------------------------------------------------
 -- Tools
 ---------------------------------------------------------------------------
@@ -215,6 +220,12 @@ y = y - 26
 local btnBagAudit = CreateButton(panel, y, "Bag Audit", 150,
     "Moves non-key items out of your keyring and into your bags.\nUse it if a character has items stuck in the keyring from a past\nbug. Keys are left in place.")
 btnBagAudit:SetScript("OnClick", KR_StartCleanup)
+
+local btnPetReset = CreateButton(panel, y, "Reset Pet Bar", 150,
+    "Rebuilds your pet's command and stance buttons right now,\nwithout a resummon. Works best with the lock above turned\non, otherwise it comes back the next time you summon.\n\nShortcut: /jp petreset")
+btnPetReset:ClearAllPoints()
+btnPetReset:SetPoint("LEFT", btnBagAudit, "RIGHT", 8, 0)
+btnPetReset:SetScript("OnClick", function() namespace:ResetPetBar() end)
 y = y - 30
 
 local cbBagSort = CreateCheckbox(panel, y,
@@ -244,6 +255,7 @@ local function RefreshCheckboxes()
     end
 
     cbPerf:SetChecked((namespace.db and namespace.db.performanceMode) and true or false)
+    cbPetLock:SetChecked(JimsPlusCharDB and JimsPlusCharDB.petBarLock and true or false)
 end
 panel:SetScript("OnShow", RefreshCheckboxes)
 panel.refresh = RefreshCheckboxes
@@ -305,6 +317,10 @@ cbPerf:SetScript("OnClick", function(self)
     namespace:SetPerformanceMode(self:GetChecked() and true or false)
 end)
 
+cbPetLock:SetScript("OnClick", function(self)
+    namespace:SetPetBarLock(self:GetChecked() and true or false)
+end)
+
 for _, info in ipairs(castbarUnits) do
     local key = info.key
     castbarCBs[key]:SetScript("OnClick", function(self)
@@ -331,6 +347,15 @@ SlashCmdList["JIMSPLUS"] = function(msg)
     msg = (msg or ""):lower():gsub("%s+", "")
     if msg == "perf" or msg == "performance" then
         namespace:SetPerformanceMode(not (namespace.db and namespace.db.performanceMode))
+        if panel.refresh then panel.refresh() end
+        return
+    end
+    if msg == "petreset" or msg == "pet" then
+        namespace:ResetPetBar()
+        return
+    end
+    if msg == "petlock" then
+        namespace:SetPetBarLock(not namespace:IsPetBarLocked())
         if panel.refresh then panel.refresh() end
         return
     end
