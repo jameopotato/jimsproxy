@@ -118,29 +118,64 @@ local function KR_StartCleanup()
 end
 
 ---------------------------------------------------------------------------
--- Panel
+-- Panels: the "JimsPlus" page carries the client fixes, with a Pet Bar and a
+-- Bags section; Cast Bars is the one sub-page in the Interface Options left
+-- tree (it is the largest, most distinct group). Kept deliberately shallow.
 ---------------------------------------------------------------------------
-local panel = CreateFrame("Frame", "JimsPlusOptionsPanel", UIParent)
-panel.name = "JimsPlus"
+local root = CreateFrame("Frame", "JimsPlusOptionsPanel", UIParent)
+root.name = "JimsPlus"
+do
+    local title = root:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+    title:SetPoint("TOPLEFT", 16, -16)
+    title:SetText("|cFF00FF00JimsPlus|r Settings")
+    local subtitle = root:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -4)
+    subtitle:SetText("v" .. (namespace.VERSION or "?"))
+end
 
-local title = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
-title:SetPoint("TOPLEFT", 16, -16)
-title:SetText("|cFF00FF00JimsPlus|r Settings")
+local panelCast = CreateFrame("Frame", nil, UIParent)
+panelCast.name = "Cast Bars"
+panelCast.parent = "JimsPlus"
+do
+    local t = panelCast:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+    t:SetPoint("TOPLEFT", 16, -16)
+    t:SetText("|cFF00FF00JimsPlus|r  Cast Bars")
+end
 
-local subtitle = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -4)
-subtitle:SetText("v" .. (namespace.VERSION or "?"))
+local function OpenPanel(p)
+    -- Classic InterfaceOptionsFrame_OpenToCategory needs two calls to actually open.
+    InterfaceOptionsFrame_OpenToCategory(p)
+    InterfaceOptionsFrame_OpenToCategory(p)
+end
+
+-- Top-right shortcut to the Cast Bars sub-page (also reachable from the left tree).
+local btnCastTop = CreateButton(root, -16, "Cast Bars  >", 120,
+    "Open the Cast Bars page: cast bars for targets, nameplates, focus,\nparty members, and your own bar, plus Performance Mode.")
+btnCastTop:ClearAllPoints()
+btnCastTop:SetPoint("TOPRIGHT", root, "TOPRIGHT", -16, -16)
+btnCastTop:SetScript("OnClick", function() OpenPanel(panelCast) end)
+
+-- A section header with a thin rule beneath it, so the groups read as distinct blocks.
+local function CreateSection(parent, text, yOffset)
+    local fs = CreateHeader(parent, text, yOffset)
+    local line = parent:CreateTexture(nil, "ARTWORK")
+    line:SetColorTexture(1, 0.82, 0, 0.30)
+    line:SetHeight(1)
+    line:SetPoint("TOPLEFT", fs, "BOTTOMLEFT", 0, -5)
+    line:SetPoint("RIGHT", parent, "RIGHT", -16, 0)
+    return fs
+end
 
 ---------------------------------------------------------------------------
--- Client Fixes (always on by default — these fix real bugs)
+-- Main page: Client Fixes
 ---------------------------------------------------------------------------
-local y = -60
-CreateHeader(panel, "Client Fixes", y)
-y = y - 18
-CreateDescription(panel, "These fix bugs in the 1.14 client when connected to a vanilla server. All enabled by default.", y)
-y = y - 22
+local y = -56
+CreateSection(root, "Client Fixes", y)
+y = y - 26
+CreateDescription(root, "These fix bugs in the 1.14 client when connected to a vanilla server. The greyed ones are always on.", y)
+y = y - 26
 
-local cbPetFix = CreateCheckbox(panel, y,
+local cbPetFix = CreateCheckbox(root, y,
     "Pet UI crash fix  |cFF888888(always on)|r",
     "Prevents Lua errors when opening the pet stats or stable UI.\nHunter pets from vanilla servers don't have a player class,\nwhich crashes the 1.14 client's FrameXML code.\n\nThis fix cannot be disabled — without it the pet UI is broken.")
 cbPetFix:SetChecked(true)
@@ -148,7 +183,7 @@ cbPetFix:Disable()
 cbPetFix.Text:SetTextColor(0.5, 0.5, 0.5)
 y = y - 28
 
-local cbTaxiFix = CreateCheckbox(panel, y,
+local cbTaxiFix = CreateCheckbox(root, y,
     "Hide early-landing button  |cFF888888(always on)|r",
     "Hides the \"Stop at next flight path\" button during flights.\nVanilla servers don't support early landing — clicking it\ndoes nothing.\n\nThis fix cannot be disabled — the button has no function on vanilla servers.")
 cbTaxiFix:SetChecked(true)
@@ -156,35 +191,64 @@ cbTaxiFix:Disable()
 cbTaxiFix.Text:SetTextColor(0.5, 0.5, 0.5)
 y = y - 28
 
-local cbTooltipFix = CreateCheckbox(panel, y,
+local cbTooltipFix = CreateCheckbox(root, y,
     "Off-class armor / weapon red text  |cFFFF6600(reload required)|r",
     "Recolors armor type and weapon type to red on item tooltips and vendor\nrows when your class can't use the item (e.g. \"Mail\" on a rogue, \"Plate\"\non a hunter), based on the proficiencies you've actually trained.\n\nThe 1.14 Classic Era client gets this signal from a hardcoded table\nthe proxy can't reach over the wire — this addon does the recolor\nclient-side.\n\nChanges take effect after /reload.")
 y = y - 28
 
-local cbMoonkinSound = CreateCheckbox(panel, y,
+local cbMoonkinSound = CreateCheckbox(root, y,
     "Moonkin Form sound  |cFF888888(Druid only)|r",
     "Gives Moonkin Form a distinct transformation sound instead\nof reusing the Bear Form sound.\n\nOnly affects Druid characters.")
-
--- Right column, same row (the panel is already near the container's bottom edge,
--- so new rows go sideways rather than down).
-local cbApiCompat = CreateCheckbox(panel, y,
-    "Modern addon API shims  |cFFFF6600(reload)|r",
-    "Fills in modern APIs that are missing on the 1.14.2 client so newer\naddons and WeakAuras packs stop erroring: C_Container, the\nC_Spell range check, vehicle API stubs, and a scroll-frame helper.\n\nOnly ever adds what is missing; never overrides anything the\nclient already provides.\n\nBased on HermesCompat by techgeekpr (MIT).\n\nOff by default; turn it on only if an addon you use needs it.\nChanges take effect after /reload.",
-    330)
 y = y - 28
 
-local cbBowSheathe = CreateCheckbox(panel, y,
+local cbApiCompat = CreateCheckbox(root, y,
+    "Modern addon API shims  |cFFFF6600(reload)|r",
+    "Fills in modern APIs that are missing on the 1.14.2 client so newer\naddons and WeakAuras packs stop erroring: C_Container, the\nC_Spell range check, vehicle API stubs, and a scroll-frame helper.\n\nOnly ever adds what is missing; never overrides anything the\nclient already provides.\n\nBased on HermesCompat by techgeekpr (MIT).\n\nOff by default; turn it on only if an addon you use needs it.\nChanges take effect after /reload.")
+y = y - 28
+
+local cbBowSheathe = CreateCheckbox(root, y,
     "Show 2H weapon on back with a bow",
     "Fixes a 1.14 client bug where a sheathed two-handed weapon\n(and your quiver) disappears from your back after combat while\na bow is equipped (guns and crossbows are unaffected).\n\nYour character puts the bow away a few seconds after combat\nends; if the client sheathes on its own first, the addon instantly\nre-sheathes to restore the models.\n\nTakes effect immediately.")
-y = y - 40
+y = y - 42
 
 ---------------------------------------------------------------------------
--- Cast Bars
+-- Main page: Pet Bar (hunters & warlocks)
 ---------------------------------------------------------------------------
-CreateHeader(panel, "Cast Bars", y)
-y = y - 18
-CreateDescription(panel, "Show cast bars for other players and NPCs. The vanilla server sends cast data through the proxy, but the 1.14 client doesn't display it natively — these fill that gap.", y)
+CreateSection(root, "Pet Bar", y)
+y = y - 26
+CreateDescription(root, "Keep the pet's command and stance buttons on the bar; the 1.14 client can't drag them back once a spell knocks one off.", y)
+y = y - 28
+
+local cbPetLock = CreateCheckbox(root, y,
+    "Lock pet command & stance buttons",
+    "Hunters and warlocks: keep Attack, Follow, Stay and the\nAggressive/Defensive/Passive buttons on the pet bar, and\nput them back if a spell gets dropped onto one and knocks\nit off. Off by default. Turn it on only if you've lost those\nbuttons or want them protected.\n\nShortcut: /jp petlock")
+y = y - 32
+
+local btnPetReset = CreateButton(root, y, "Reset Pet Bar", 150,
+    "Rebuilds your pet's command and stance buttons right now,\nwithout a resummon. Works best with the lock above turned\non, otherwise it comes back the next time you summon.\n\nShortcut: /jp petreset")
+btnPetReset:SetScript("OnClick", function() namespace:ResetPetBar() end)
+y = y - 42
+
+---------------------------------------------------------------------------
+-- Main page: Bags
+---------------------------------------------------------------------------
+CreateSection(root, "Bags", y)
+y = y - 26
+local btnBagAudit = CreateButton(root, y, "Bag Audit", 150,
+    "Moves non-key items out of your keyring and into your bags.\nUse it if a character has items stuck in the keyring from a past\nbug. Keys are left in place.")
+btnBagAudit:SetScript("OnClick", KR_StartCleanup)
 y = y - 30
+
+local cbBagSort = CreateCheckbox(root, y,
+    "Custom bag sort order  |cFF888888(Bagnon)|r",
+    "Changes Bagnon's sort button to a curated layout:\npermanent fixtures (hearthstone) first, then profession and\ngathering tools, quest items, soulbound gear, other gear,\nconsumables, everything else, and junk last.\n\nAlso applies to Bagnon's bank sort. Takes effect on the\nnext sort — no reload needed.")
+
+---------------------------------------------------------------------------
+-- Cast Bars sub-page (reached from the "Cast Bars" entry in the left tree)
+---------------------------------------------------------------------------
+y = -44
+CreateDescription(panelCast, "Show cast bars for other players and NPCs. The vanilla server sends cast data through the proxy, but the 1.14 client doesn't display it natively — these fill that gap.", y)
+y = y - 34
 
 local castbarUnits = {
     { key = "target",    label = "Target",     tooltip = "Shows what your current target is casting.\nEssential for interrupting enemy spells." },
@@ -196,47 +260,17 @@ local castbarUnits = {
 
 local castbarCBs = {}
 for _, info in ipairs(castbarUnits) do
-    castbarCBs[info.key] = CreateCheckbox(panel, y, info.label, info.tooltip)
+    castbarCBs[info.key] = CreateCheckbox(panelCast, y, info.label, info.tooltip)
     y = y - 28
 end
 
-y = y - 4
-local cbPerf = CreateCheckbox(panel, y,
+y = y - 8
+local cbPerf = CreateCheckbox(panelCast, y,
     "Performance Mode  |cFFFFD100(suspends cast bars)|r",
     "For crowded fights (battlegrounds, big pulls) where FPS tanks: fully suspends the\ncast-bar engine — stops rendering, stops per-event tracking, and tells the proxy to\nstop sending cast data entirely. Toggle on when it's a zerg, off when it clears.\n\nAll other JimsPlus fixes stay active. Shortcut: /jp perf")
-y = y - 32
-
-local cbPetLock = CreateCheckbox(panel, y,
-    "Lock pet command & stance buttons",
-    "Hunters and warlocks: keep Attack, Follow, Stay and the\nAggressive/Defensive/Passive buttons on the pet bar, and\nput them back if a spell gets dropped onto one and knocks\nit off. Off by default. Turn it on only if you've lost those\nbuttons or want them protected.\n\nShortcut: /jp petlock")
-y = y - 32
 
 ---------------------------------------------------------------------------
--- Tools
----------------------------------------------------------------------------
-y = y - 12
-CreateHeader(panel, "Tools", y)
-y = y - 26
-local btnBagAudit = CreateButton(panel, y, "Bag Audit", 150,
-    "Moves non-key items out of your keyring and into your bags.\nUse it if a character has items stuck in the keyring from a past\nbug. Keys are left in place.")
-btnBagAudit:SetScript("OnClick", KR_StartCleanup)
-
-local btnPetReset = CreateButton(panel, y, "Reset Pet Bar", 150,
-    "Rebuilds your pet's command and stance buttons right now,\nwithout a resummon. Works best with the lock above turned\non, otherwise it comes back the next time you summon.\n\nShortcut: /jp petreset")
-btnPetReset:ClearAllPoints()
-btnPetReset:SetPoint("LEFT", btnBagAudit, "RIGHT", 8, 0)
-btnPetReset:SetScript("OnClick", function() namespace:ResetPetBar() end)
-y = y - 30
-
-local cbBagSort = CreateCheckbox(panel, y,
-    "Custom bag sort order  |cFF888888(Bagnon)|r",
-    "Changes Bagnon's sort button to a curated layout:\npermanent fixtures (hearthstone) first, then profession and\ngathering tools, quest items, soulbound gear, other gear,\nconsumables, everything else, and junk last.\n\nAlso applies to Bagnon's bank sort. Takes effect on the\nnext sort — no reload needed.")
-y = y - 28
-
--- More tool buttons can be added below (decrement y per button).
-
----------------------------------------------------------------------------
--- Sync checkboxes from saved state
+-- Sync checkbox state from saved variables
 ---------------------------------------------------------------------------
 local function RefreshCheckboxes()
     local db = namespace.db or JimsPlusDB or {}
@@ -257,8 +291,8 @@ local function RefreshCheckboxes()
     cbPerf:SetChecked((namespace.db and namespace.db.performanceMode) and true or false)
     cbPetLock:SetChecked(JimsPlusCharDB and JimsPlusCharDB.petBarLock and true or false)
 end
-panel:SetScript("OnShow", RefreshCheckboxes)
-panel.refresh = RefreshCheckboxes
+root:SetScript("OnShow", RefreshCheckboxes)
+panelCast:SetScript("OnShow", RefreshCheckboxes)
 
 local initFrame = CreateFrame("Frame")
 initFrame:RegisterEvent("PLAYER_LOGIN")
@@ -337,9 +371,10 @@ for _, info in ipairs(castbarUnits) do
 end
 
 ---------------------------------------------------------------------------
--- Register
+-- Register (parent first, then the one sub-page)
 ---------------------------------------------------------------------------
-InterfaceOptions_AddCategory(panel)
+InterfaceOptions_AddCategory(root)
+InterfaceOptions_AddCategory(panelCast)
 
 SLASH_JIMSPLUS1 = "/jimsplus"
 SLASH_JIMSPLUS2 = "/jp"
@@ -347,7 +382,7 @@ SlashCmdList["JIMSPLUS"] = function(msg)
     msg = (msg or ""):lower():gsub("%s+", "")
     if msg == "perf" or msg == "performance" then
         namespace:SetPerformanceMode(not (namespace.db and namespace.db.performanceMode))
-        if panel.refresh then panel.refresh() end
+        RefreshCheckboxes()
         return
     end
     if msg == "petreset" or msg == "pet" then
@@ -356,9 +391,8 @@ SlashCmdList["JIMSPLUS"] = function(msg)
     end
     if msg == "petlock" then
         namespace:SetPetBarLock(not namespace:IsPetBarLocked())
-        if panel.refresh then panel.refresh() end
+        RefreshCheckboxes()
         return
     end
-    InterfaceOptionsFrame_OpenToCategory(panel)
-    InterfaceOptionsFrame_OpenToCategory(panel)
+    OpenPanel(root)
 end
