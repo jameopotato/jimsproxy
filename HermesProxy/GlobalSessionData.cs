@@ -380,10 +380,13 @@ public sealed class GameSessionData
     // can feed malformed-packet kick counters on Kronos). 0 means none pending.
     public uint PendingSyntheticTransportClearAckCounter;
 
-    // JimsProxy (zep-relog-diag 2026-05-15): tracks the player's last-observed
-    // TransportGuid across UpdateObject reads so the diagnostic in
-    // UpdateHandler.ReadMovementUpdateBlock fires only on state transitions.
-    public WowGuid128? DiagLastObservedPlayerTransportGuid;
+    // JimsProxy (zep-relog-diag 2026-05-15, load-bearing since #404): the player's
+    // last-observed TransportGuid. Written from the player's own UpdateObject block
+    // (UpdateHandler.ReadMovementUpdateBlock, where it also gates the transport_state
+    // diagnostic to state transitions) and from every own movement packet
+    // (Server MovementHandler.HandlePlayerMove). Read by the TransportClearGate call site
+    // as the gate's source observation; null means never observed.
+    public WowGuid128? LastObservedPlayerTransportGuid;
 
     // JimsProxy (zep-stuck-low-latency-race 2026-05-17): deferred-synth mode.
     // HandleNewWorld / HandleLoginVerifyWorld set this and defer the transport-

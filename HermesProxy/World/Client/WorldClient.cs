@@ -61,8 +61,8 @@ public partial class WorldClient
     uint _lastInboundOpcodeRaw;
     volatile int _lastInboundOpcodeTick;
 
-    // JimsProxy (gap-A modern-death watchdog): flips true the first keepalive tick both modern
-    // sockets (RealmSocket + InstanceSocket) are observed open. Guards the login/handshake window
+    // JimsProxy (gap-A modern-death watchdog): flips true the first keepalive tick at least one
+    // modern socket (RealmSocket or InstanceSocket) is observed open. Guards the login/handshake window
     // (before the sockets are assigned to the session) so the death check never false-fires
     // mid-login -- the mirror of the silent-stall watchdog's `_lastInboundOpcodeTick != 0` guard.
     bool _modernClientWasAlive;
