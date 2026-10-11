@@ -116,6 +116,9 @@ public partial class WorldSocket
         }
     }
 
+    // Test seam (#388, WorldConnectPreAuthGuardTests): run one drainer pass on demand.
+    internal Task DrainQuestQueryBucketForTest() => DrainQuestQueryBucketAsync();
+
     private async Task DrainQuestQueryBucketAsync()
     {
         var state = GetSession().GameState;

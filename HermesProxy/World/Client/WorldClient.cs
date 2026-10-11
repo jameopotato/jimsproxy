@@ -34,6 +34,10 @@ public partial class WorldClient
     GlobalSessionData _globalSession = null!;
     byte[] _authSessionKey = null!; //MIRASU: captured at connect time so we don't depend on GetSession().AuthClient surviving a realm swap
     readonly Lock _sendLock = new();
+    // #388 diagnostics and test seams: writes attempted on the socket, and non-handshake sends
+    // dropped because the legacy handshake had not completed yet.
+    int _writeAttempts;
+    int _droppedBeforeAuth;
     Timer? _keepAliveTimer;
     uint _keepAlivePingSerial;
     const int KeepAliveIntervalMs = 30_000;
@@ -542,6 +546,7 @@ public partial class WorldClient
 
                 buffer.WriteBytes(packet.GetData(), packet.GetSize());
 
+                _writeAttempts++;
                 _clientSocket.Send(buffer.GetData(), SocketFlags.None);
             }
             catch (Exception ex)
@@ -552,6 +557,22 @@ public partial class WorldClient
             }
         }
     }
+
+    // Test seams (#388, WorldConnectPreAuthGuardTests): put the client in the state it has between
+    // BeginConnect and ConnectCallback without any network, read the connect outcome, and count
+    // what the send path did. Same convention as the GlobalSessionData ForTest members.
+    internal void EnterConnectPendingForTest(Socket socket)
+    {
+        _clientSocket = socket;
+        _isSuccessful = null;
+        _delayedPacketsToServer = new Dictionary<Opcode, List<WorldPacket>>();
+        _delayedPacketsToClient = new Dictionary<Opcode, List<ServerPacket>>();
+    }
+
+    internal void MarkAuthenticatedForTest() => _isSuccessful = true;
+    internal bool? ConnectOutcomeForTest => _isSuccessful;
+    internal int WriteAttemptsForTest => _writeAttempts;
+    internal int DroppedBeforeAuthForTest => _droppedBeforeAuth;
 
     public void SendPacketToClient(ServerPacket packet, Opcode delayUntilOpcode = Opcode.MSG_NULL_ACTION)
     {
