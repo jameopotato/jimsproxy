@@ -171,6 +171,7 @@ public partial class WorldClient
 
             GetSession().GameState.WeWantToLeaveGroup = false;
             GetSession().GameState.CurrentGroups[party.PartyIndex] = party;
+            GetSession().GameState.PrunePartyAuraSlots(); // JimsProxy (#513 follow-up)
         }
         else
         {
@@ -190,6 +191,7 @@ public partial class WorldClient
             party.LeaderGUID = WowGuid128.Empty;
             party.MyIndex = -1;
             GetSession().GameState.CurrentGroups[party.PartyIndex] = null;
+            GetSession().GameState.PrunePartyAuraSlots(); // JimsProxy (#513 follow-up)
 
             // JimsProxy: group fully destroyed (kick / disband / leave) -- drop any cached
             // master-loot state so a future group doesn't inherit stale candidates.
@@ -294,6 +296,7 @@ public partial class WorldClient
 
             GetSession().GameState.WeWantToLeaveGroup = false;
             GetSession().GameState.CurrentGroups[party.PartyIndex] = party;
+            GetSession().GameState.PrunePartyAuraSlots(); // JimsProxy (#513 follow-up)
         }
         else
         {
@@ -307,6 +310,7 @@ public partial class WorldClient
             party.LeaderGUID = WowGuid128.Empty;
             party.MyIndex = -1;
             GetSession().GameState.CurrentGroups[party.PartyIndex] = null;
+            GetSession().GameState.PrunePartyAuraSlots(); // JimsProxy (#513 follow-up)
 
             // JimsProxy: group fully destroyed -- drop cached master-loot state so a future
             // group doesn't inherit stale candidates. See HandleGroupListVanilla for full note.
@@ -510,54 +514,39 @@ public partial class WorldClient
             state.Position.Y = packet.ReadInt16();
         }
 
+        // JimsProxy (#513 follow-up, out-of-view party buff lists): the legacy masks are
+        // slot-indexed deltas (bit i = slot i, negative bit j = slot 32 + j, spell id 0 =
+        // cleared), while the 1.14 client REPLACES the member's stored list with every
+        // aura-bearing party state. Forwarding the delta as a standalone list shrank the
+        // member's buff list on screen to the last change until the next full state, and a
+        // SpellId 0 entry stops an addon's buff loop early. Patch the member's slot table and
+        // emit the complete non-zero list instead. Auras stays null when no aura bit is set
+        // (the #435 rule: a non-null empty list wipes the display). See PartyAuraSlotTable.
+        bool memberAuraBitsPresent = false;
+        var memberAuraChanges = new List<PartyAuraSlotTable.SlotChange>();
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.Auras))
         {
-            if (state.Auras == null)
-                state.Auras = new List<PartyMemberAuraStates>();
-
-            var auraMask = packet.ReadUInt32(); // Positive Aura Mask
-
-            byte maxAura = 32;
-
-            for (byte i = 0; i < maxAura; ++i)
-            {
-                if ((auraMask & (1ul << i)) == 0)
-                    continue;
-
-                PartyMemberAuraStates aura = new PartyMemberAuraStates();
-                aura.SpellId = packet.ReadUInt16();
-                if (aura.SpellId != 0)
-                {
-                    aura.ActiveFlags = 1;
-                    aura.AuraFlags = (ushort)AuraFlagsModern.Positive;
-                }
-                state.Auras.Add(aura);
-            }
+            memberAuraBitsPresent = true;
+            var auraMask = packet.ReadUInt32(); // Positive Aura Mask: bit i = slot i
+            for (int i = 0; i < PartyAuraSlotTable.PositiveSlots; ++i)
+                if ((auraMask & (1u << i)) != 0)
+                    memberAuraChanges.Add(new PartyAuraSlotTable.SlotChange(i, packet.ReadUInt16()));
         }
 
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.AurasNegative))
         {
-            if (state.Auras == null)
-                state.Auras = new List<PartyMemberAuraStates>();
+            memberAuraBitsPresent = true;
+            var auraMask = packet.ReadUInt16(); // Negative Aura Mask: bit j = slot 32 + j
+            for (int j = 0; j < PartyAuraSlotTable.NegativeSlots; ++j)
+                if ((auraMask & (1u << j)) != 0)
+                    memberAuraChanges.Add(new PartyAuraSlotTable.SlotChange(PartyAuraSlotTable.PositiveSlots + j, packet.ReadUInt16()));
+        }
 
-            var auraMask = packet.ReadUInt16(); // Negative Aura Mask
-
-            byte maxAura = 48;
-
-            for (byte i = 0; i < maxAura; ++i)
-            {
-                if ((auraMask & (1ul << i)) == 0)
-                    continue;
-
-                PartyMemberAuraStates aura = new PartyMemberAuraStates();
-                aura.SpellId = packet.ReadUInt16();
-                if (aura.SpellId != 0)
-                {
-                    aura.ActiveFlags = 1;
-                    aura.AuraFlags = (ushort)AuraFlagsModern.Negative;
-                }
-                state.Auras.Add(aura);
-            }
+        if (memberAuraBitsPresent)
+        {
+            var memberSlots = GetSession().GameState.GetOrAddPartyAuraSlots(GetSession().GameState.PartyMemberAuraSlots, state.AffectedGUID);
+            PartyAuraSlotTable.ApplyDelta(memberSlots, memberAuraChanges);
+            state.Auras = PartyAuraSlotTable.BuildAuraList(memberSlots);
         }
 
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.PetGuid))
@@ -605,59 +594,36 @@ public partial class WorldClient
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.PetMaxPower))
             packet.ReadInt16(); // Pet Max Power
 
+        // JimsProxy (#513 follow-up): the pet's aura masks get the same slot-table treatment,
+        // keyed by the member guid (a pet's own guid changes on every summon).
+        bool petAuraBitsPresent = false;
+        var petAuraChanges = new List<PartyAuraSlotTable.SlotChange>();
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.PetAuras))
         {
-            if (state.Pet == null)
-                state.Pet = new PartyMemberPetStats();
-            if (state.Pet.Auras == null)
-                state.Pet.Auras = new List<PartyMemberAuraStates>();
-
-            var auraMask = packet.ReadUInt32(); // Pet Positive Aura Mask
-
-            byte maxAura = 32;
-
-            for (byte i = 0; i < maxAura; ++i)
-            {
-                if ((auraMask & (1ul << i)) == 0)
-                    continue;
-
-                PartyMemberAuraStates aura = new PartyMemberAuraStates();
-                aura.SpellId = packet.ReadUInt16();
-                if (aura.SpellId != 0)
-                {
-                    aura.ActiveFlags = 1;
-                    aura.AuraFlags = (ushort)AuraFlagsModern.Positive;
-                }
-                state.Pet.Auras.Add(aura);
-            }
+            petAuraBitsPresent = true;
+            var auraMask = packet.ReadUInt32(); // Pet Positive Aura Mask: bit i = slot i
+            for (int i = 0; i < PartyAuraSlotTable.PositiveSlots; ++i)
+                if ((auraMask & (1u << i)) != 0)
+                    petAuraChanges.Add(new PartyAuraSlotTable.SlotChange(i, packet.ReadUInt16()));
         }
 
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.PetAurasNegative))
         {
+            petAuraBitsPresent = true;
+            var auraMask = packet.ReadUInt16(); // Pet Negative Aura Mask: bit j = slot 32 + j
+            for (int j = 0; j < PartyAuraSlotTable.NegativeSlots; ++j)
+                if ((auraMask & (1u << j)) != 0)
+                    petAuraChanges.Add(new PartyAuraSlotTable.SlotChange(PartyAuraSlotTable.PositiveSlots + j, packet.ReadUInt16()));
+        }
+
+        if (petAuraBitsPresent)
+        {
             if (state.Pet == null)
                 state.Pet = new PartyMemberPetStats();
-            if (state.Pet.Auras == null)
-                state.Pet.Auras = new List<PartyMemberAuraStates>();
-
-            var auraMask = packet.ReadUInt16(); // Pet Negative Aura Mask
-
-            byte maxAura = 48;
-
-            for (byte i = 0; i < maxAura; ++i)
-            {
-                if ((auraMask & (1ul << i)) == 0)
-                    continue;
-
-                PartyMemberAuraStates aura = new PartyMemberAuraStates();
-                aura.SpellId = packet.ReadUInt16();
-                if (aura.SpellId != 0)
-                {
-                    aura.ActiveFlags = 1;
-                    aura.AuraFlags = (ushort)AuraFlagsModern.Negative;
-                }
-                    state.Pet.Auras.Add(aura);
-                }
-            }
+            var petSlots = GetSession().GameState.GetOrAddPartyAuraSlots(GetSession().GameState.PartyPetAuraSlots, state.AffectedGUID);
+            PartyAuraSlotTable.ApplyDelta(petSlots, petAuraChanges);
+            state.Pet.Auras = PartyAuraSlotTable.BuildAuraList(petSlots);
+        }
         } //MIRASU: end try — exit normally with fully-parsed state
         catch (System.IndexOutOfRangeException exM) //MIRASU
         { //MIRASU
@@ -721,6 +687,7 @@ public partial class WorldClient
         {
             // guid arrived as zero — the pet was dismissed, drop the snapshot
             pets.Remove(state.AffectedGUID);
+            gameState.PartyPetAuraSlots.Remove(state.AffectedGUID); // JimsProxy (#513 follow-up)
             if (state.Pet != null)
                 state.Pet.ExplicitClear = true;
             return;
@@ -730,7 +697,13 @@ public partial class WorldClient
         {
             cached ??= new PartyMemberPetStats();
             if (state.Pet.NewPetGuid != default)
+            {
+                // JimsProxy (#513 follow-up): a different pet guid is a new pet; its aura
+                // slots start empty rather than inheriting the previous pet's.
+                if (cached.NewPetGuid != state.Pet.NewPetGuid)
+                    gameState.PartyPetAuraSlots.Remove(state.AffectedGUID);
                 cached.NewPetGuid = state.Pet.NewPetGuid;
+            }
             if (!string.IsNullOrEmpty(state.Pet.NewPetName))
                 cached.NewPetName = state.Pet.NewPetName;
             if (state.Pet.DisplayID.HasValue)
@@ -1038,54 +1011,34 @@ public partial class WorldClient
             state.PositionY = packet.ReadInt16();
         }
 
+        // JimsProxy (#513 follow-up): a full state lists every occupied slot, so rebuild the
+        // member's slot table from it and emit the complete list (a 0 entry is never emitted).
+        // See the partial-state handler and PartyAuraSlotTable.
+        bool memberAuraBitsPresent = false;
+        var memberAuraChanges = new List<PartyAuraSlotTable.SlotChange>();
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.Auras))
         {
-            if (state.Auras == null)
-                state.Auras = new List<PartyMemberAuraStates>();
-
-            var auraMask = packet.ReadUInt32(); // Positive Aura Mask
-
-            byte maxAura = 32;
-
-            for (byte i = 0; i < maxAura; ++i)
-            {
-                if ((auraMask & (1ul << i)) == 0)
-                    continue;
-
-                PartyMemberAuraStates aura = new PartyMemberAuraStates();
-                aura.SpellId = packet.ReadUInt16();
-                if (aura.SpellId != 0)
-                {
-                    aura.ActiveFlags = 1;
-                    aura.AuraFlags = (ushort)AuraFlagsModern.Positive;
-                }
-                state.Auras.Add(aura);
-            }
+            memberAuraBitsPresent = true;
+            var auraMask = packet.ReadUInt32(); // Positive Aura Mask: bit i = slot i
+            for (int i = 0; i < PartyAuraSlotTable.PositiveSlots; ++i)
+                if ((auraMask & (1u << i)) != 0)
+                    memberAuraChanges.Add(new PartyAuraSlotTable.SlotChange(i, packet.ReadUInt16()));
         }
 
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.AurasNegative))
         {
-            if (state.Auras == null)
-                state.Auras = new List<PartyMemberAuraStates>();
+            memberAuraBitsPresent = true;
+            var auraMask = packet.ReadUInt16(); // Negative Aura Mask: bit j = slot 32 + j
+            for (int j = 0; j < PartyAuraSlotTable.NegativeSlots; ++j)
+                if ((auraMask & (1u << j)) != 0)
+                    memberAuraChanges.Add(new PartyAuraSlotTable.SlotChange(PartyAuraSlotTable.PositiveSlots + j, packet.ReadUInt16()));
+        }
 
-            var auraMask = packet.ReadUInt16(); // Negative Aura Mask
-
-            byte maxAura = 48;
-
-            for (byte i = 0; i < maxAura; ++i)
-            {
-                if ((auraMask & (1ul << i)) == 0)
-                    continue;
-
-                PartyMemberAuraStates aura = new PartyMemberAuraStates();
-                aura.SpellId = packet.ReadUInt16();
-                if (aura.SpellId != 0)
-                {
-                    aura.ActiveFlags = 1;
-                    aura.AuraFlags = (ushort)AuraFlagsModern.Negative;
-                }
-                state.Auras.Add(aura);
-            }
+        if (memberAuraBitsPresent)
+        {
+            var memberSlots = GetSession().GameState.GetOrAddPartyAuraSlots(GetSession().GameState.PartyMemberAuraSlots, state.MemberGuid);
+            PartyAuraSlotTable.RebuildFromFull(memberSlots, memberAuraChanges);
+            state.Auras = PartyAuraSlotTable.BuildAuraList(memberSlots);
         }
 
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.PetGuid))
@@ -1133,58 +1086,34 @@ public partial class WorldClient
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.PetMaxPower))
             packet.ReadInt16(); // Pet Max Power
 
+        // JimsProxy (#513 follow-up): pet auras in a full state rebuild the pet's slot table.
+        bool petAuraBitsPresent = false;
+        var petAuraChanges = new List<PartyAuraSlotTable.SlotChange>();
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.PetAuras))
         {
-            if (state.Pet == null)
-                state.Pet = new PartyMemberPetStats();
-            if (state.Pet.Auras == null)
-                state.Pet.Auras = new List<PartyMemberAuraStates>();
-
-            var auraMask = packet.ReadUInt32(); // Pet Positive Aura Mask
-
-            byte maxAura = 32;
-
-            for (byte i = 0; i < maxAura; ++i)
-            {
-                if ((auraMask & (1ul << i)) == 0)
-                    continue;
-
-                PartyMemberAuraStates aura = new PartyMemberAuraStates();
-                aura.SpellId = packet.ReadUInt16();
-                if (aura.SpellId != 0)
-                {
-                    aura.ActiveFlags = 1;
-                    aura.AuraFlags = (ushort)AuraFlagsModern.Positive;
-                }
-                state.Pet.Auras.Add(aura);
-            }
+            petAuraBitsPresent = true;
+            var auraMask = packet.ReadUInt32(); // Pet Positive Aura Mask: bit i = slot i
+            for (int i = 0; i < PartyAuraSlotTable.PositiveSlots; ++i)
+                if ((auraMask & (1u << i)) != 0)
+                    petAuraChanges.Add(new PartyAuraSlotTable.SlotChange(i, packet.ReadUInt16()));
         }
 
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.PetAurasNegative))
         {
+            petAuraBitsPresent = true;
+            var auraMask = packet.ReadUInt16(); // Pet Negative Aura Mask: bit j = slot 32 + j
+            for (int j = 0; j < PartyAuraSlotTable.NegativeSlots; ++j)
+                if ((auraMask & (1u << j)) != 0)
+                    petAuraChanges.Add(new PartyAuraSlotTable.SlotChange(PartyAuraSlotTable.PositiveSlots + j, packet.ReadUInt16()));
+        }
+
+        if (petAuraBitsPresent)
+        {
             if (state.Pet == null)
                 state.Pet = new PartyMemberPetStats();
-            if (state.Pet.Auras == null)
-                state.Pet.Auras = new List<PartyMemberAuraStates>();
-
-            var auraMask = packet.ReadUInt16(); // Pet Negative Aura Mask
-
-            byte maxAura = 48;
-
-            for (byte i = 0; i < maxAura; ++i)
-            {
-                if ((auraMask & (1ul << i)) == 0)
-                    continue;
-
-                PartyMemberAuraStates aura = new PartyMemberAuraStates();
-                aura.SpellId = packet.ReadUInt16();
-                if (aura.SpellId != 0)
-                {
-                    aura.ActiveFlags = 1;
-                    aura.AuraFlags = (ushort)AuraFlagsModern.Negative;
-                }
-                state.Pet.Auras.Add(aura);
-            }
+            var petSlots = GetSession().GameState.GetOrAddPartyAuraSlots(GetSession().GameState.PartyPetAuraSlots, state.MemberGuid);
+            PartyAuraSlotTable.RebuildFromFull(petSlots, petAuraChanges);
+            state.Pet.Auras = PartyAuraSlotTable.BuildAuraList(petSlots);
         }
         SnapshotPartyStatsFromFull(state, updateFlags.HasFlag(GroupUpdateFlagVanilla.PetGuid), updateFlags.HasFlag(GroupUpdateFlagVanilla.Level));
         CachePartyPetName(state.Pet);

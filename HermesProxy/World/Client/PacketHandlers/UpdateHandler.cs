@@ -232,6 +232,11 @@ public partial class WorldClient
         // overwrite the old slot data before the addon's first read.
         GetSession().GameState.EvictUnitAuraState(guid);
 
+        // JimsProxy (#513 follow-up): a party member (or party pet) leaving view keeps its
+        // last in-view aura slots in the out-of-view table, so the first party-stats delta
+        // after this patches a complete list. Must run before the field cache is dropped.
+        PrimePartyAuraSlotsOnLeaveView(guid);
+
         lock (GetSession().GameState.ObjectCacheLock)
         {
             GetSession().GameState.ObjectCacheLegacy.Remove(guid);
@@ -759,6 +764,39 @@ public partial class WorldClient
         }
     }
 
+    // JimsProxy (#513 follow-up, out-of-view party buff lists): snapshot a party member's (or a
+    // party pet's) UNIT_FIELD_AURA slots from the legacy field cache into the out-of-view table
+    // the party-stats handlers patch. Without it, the first slot-indexed delta after the unit
+    // leaves view would be emitted as a one-entry list and the 1.14 client, which replaces the
+    // member's list with every aura-bearing state, would show only that one buff. Receive-thread
+    // only, like the tables themselves.
+    void PrimePartyAuraSlotsOnLeaveView(WowGuid128 guid)
+    {
+        var gameState = GetSession().GameState;
+        Dictionary<WowGuid128, uint[]> store;
+        WowGuid128 key;
+        if (gameState.IsGroupMemberGuid(guid))
+        {
+            store = gameState.PartyMemberAuraSlots;
+            key = guid;
+        }
+        else if (gameState.GroupMemberOwningPet(guid) is WowGuid128 owner)
+        {
+            store = gameState.PartyPetAuraSlots;
+            key = owner;
+        }
+        else
+            return;
+
+        var fields = gameState.GetCachedObjectFieldsLegacy(guid);
+        if (fields == null)
+            return;
+        int auraFieldBase = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
+        if (auraFieldBase < 0)
+            return;
+        PartyAuraSlotTable.PrimeFromUnitFields(gameState.GetOrAddPartyAuraSlots(store, key), fields, auraFieldBase);
+    }
+
     public void ReadFarObjectsBlock(WorldPacket packet, UpdateObject updateObject, object index)
     {
         var objCount = packet.ReadInt32();
@@ -772,6 +810,10 @@ public partial class WorldClient
             if (guid == GetSession().GameState.CurrentPlayerGuid)
                 continue;
             PrintString($"Guid = {objCount}", index, j);
+
+            // JimsProxy (#513 follow-up): same priming as the destroy path (the out-of-range
+            // list is the other way a party member leaves view). Before the cache is dropped.
+            PrimePartyAuraSlotsOnLeaveView(guid);
 
             lock (GetSession().GameState.ObjectCacheLock)
             {
