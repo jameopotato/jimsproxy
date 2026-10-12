@@ -129,6 +129,7 @@ public partial class WorldClient
                 member.Name = packet.ReadCString();
                 member.GUID = packet.ReadGuid().To128(GetSession().GameState);
                 member.Status = (GroupMemberOnlineStatus)packet.ReadUInt8();
+                NotePartyMemberOnlineEdge(member.GUID, member.Status.HasFlag(GroupMemberOnlineStatus.Online)); // JimsProxy (#513, rule 5)
                 byte subGroupAndFlags = packet.ReadUInt8();
                 member.Subgroup = (byte)(subGroupAndFlags & 0xF);
                 member.Flags = (subGroupAndFlags & 0x80) != 0 ? GroupMemberFlags.Assistant : GroupMemberFlags.None;
@@ -256,6 +257,7 @@ public partial class WorldClient
                 member.Name = packet.ReadCString();
                 member.GUID = packet.ReadGuid().To128(GetSession().GameState);
                 member.Status = (GroupMemberOnlineStatus)packet.ReadUInt8();
+                NotePartyMemberOnlineEdge(member.GUID, member.Status.HasFlag(GroupMemberOnlineStatus.Online)); // JimsProxy (#513, rule 5)
                 member.Subgroup = packet.ReadUInt8();
                 member.Flags = (GroupMemberFlags)packet.ReadUInt8();
                 
@@ -484,7 +486,10 @@ public partial class WorldClient
             try //MIRASU: OOB-tolerant region — see HandlePartyMemberStatsFull
             {
                 if (updateFlags.HasFlag(GroupUpdateFlagVanilla.Status))
+                {
                     state.StatusFlags = packet.ReadUInt8();// GroupMemberOnlineStatus
+                    NotePartyMemberOnlineEdge(state.AffectedGUID, (state.StatusFlags.Value & (ushort)GroupMemberOnlineStatus.Online) != 0); // JimsProxy (#513, rule 5)
+                }
 
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.CurrentHealth))
             state.CurrentHealth = packet.ReadUInt16();
@@ -545,6 +550,9 @@ public partial class WorldClient
         if (memberAuraBitsPresent)
         {
             var memberSlots = GetSession().GameState.GetOrAddPartyAuraSlots(GetSession().GameState.PartyMemberAuraSlots, state.AffectedGUID);
+            // JimsProxy (#513): stamp out-of-view starts and removals against the table as it
+            // was before this delta (the previous occupants decide first-seen versus relist).
+            StampPartyAuraStartsFromDelta(state.AffectedGUID, memberSlots, memberAuraChanges, updateFlags.HasFlag(GroupUpdateFlagVanilla.Status));
             PartyAuraSlotTable.ApplyDelta(memberSlots, memberAuraChanges);
             state.Auras = PartyAuraSlotTable.BuildAuraList(memberSlots);
         }
@@ -669,6 +677,123 @@ public partial class WorldClient
                 pet_health = state.Pet?.Health,
             });
         SendPacketToClient(state);
+    }
+
+    // JimsProxy (#513, stats start classes): out-of-view party buffs. A spell newly listed in a
+    // non-bulk partial state was applied within about one second of this packet (the server
+    // sends these deltas on a short grid), so its start is known to that bound:
+    // STATS_FIRST_SEEN. The same spell relisted alone in a later non-bulk partial is a refresh:
+    // STATS_RELIST. A bulk listing (a full state, a status-flag partial, two or more restates,
+    // or a partial that restates the member's last full list within 3 s of it) records
+    // nothing (rule 2). A cleared or swapped slot drops the old spell's record unless the same
+    // spell sits in another slot (rule 4). Pet buffs are not stamped (a pet's guid changes with
+    // every summon). The decisions are in AuraTimerProvenance; the records are consumed by the
+    // aura emit path when the member comes back into view.
+    void StampPartyAuraStartsFromDelta(WowGuid128 member, uint[] tableBefore, List<PartyAuraSlotTable.SlotChange> changes, bool hasStatusFlag)
+    {
+        var gameState = GetSession().GameState;
+        // A member in view is timed by the in-view paths; a stats delta racing a view entry must
+        // not stamp a running buff as fresh or wipe the in-view slot state.
+        if (gameState.GetCachedObjectFieldsLegacy(member) != null)
+            return;
+        gameState.PartyMemberLastFullAuras.TryGetValue(member, out var lastFull);
+        long? sinceFull = lastFull.Spells != null ? Environment.TickCount64 - lastFull.Tick : null;
+        var result = AuraTimerProvenance.ClassifyPartyDelta(tableBefore, changes, hasStatusFlag, lastFull.Spells, sinceFull,
+            GameData.GetModernSpellId, GameData.GetAuraSpellDuration,
+            id => GameData.TalentDurationModifiers.ContainsKey(id), GameData.IsComboPointFinisher);
+
+        foreach (var cleared in result.Cleared)
+            ClearPartyAuraRecordForSlot(member, cleared.Slot, cleared.LegacySpellId, cleared.SpellStillElsewhere);
+
+        if (result.Bulk)
+        {
+            if (Framework.Settings.DebugOutput)
+                Log.Event("party.aura.bulk_listing", new
+                {
+                    member_low = member.GetCounter(),
+                    has_status = hasStatusFlag,
+                    restated = result.RestatedCount,
+                    ms_since_full = sinceFull,
+                });
+            return;
+        }
+
+        // Not knowable out of view (a variable duration, or one too short for the one-second
+        // bound): a fresh application must not inherit an older record of the same spell.
+        foreach (var modernId in result.UnknownFreshModernIds)
+            gameState.ClearAuraExpiry(member, (int)modernId);
+
+        foreach (var stamp in result.Stamps)
+        {
+            gameState.RecordAuraExpiry(member, (int)stamp.ModernSpellId, stamp.FullMs, stamp.StartClass, stamp.Source, stamp.FullMs, AuraTimerProvenance.StatsStartBoundMs);
+            Log.Event("party.aura.start_stamped", new
+            {
+                member_low = member.GetCounter(),
+                slot = stamp.Slot,
+                spell_id = stamp.ModernSpellId,
+                start_class = stamp.StartClass.ToString(),
+                full_ms = stamp.FullMs,
+            });
+        }
+    }
+
+    // Rule 4: a slot that lost its spell (cleared or swapped out of view) drops that spell's
+    // record unless the same spell still sits in another slot, and drops the slot's state.
+    void ClearPartyAuraRecordForSlot(WowGuid128 member, int slot, uint legacySpellId, bool spellStillElsewhere)
+    {
+        var gameState = GetSession().GameState;
+        if (!spellStillElsewhere)
+            gameState.ClearAuraExpiry(member, (int)GameData.GetModernSpellId(legacySpellId));
+        gameState.ClearAuraDuration(member, (byte)slot);
+        gameState.ClearAuraCaster(member, (byte)slot);
+        gameState.ClearLastEmittedAura(member, (byte)slot);
+    }
+
+    // Rule 2 (bulk) and rule 4 (removals) for a full state: remember the list and when it
+    // came, and clear the records of spells the full list no longer carries.
+    void NotePartyAuraFullState(WowGuid128 member, uint[] tableBefore, List<PartyAuraSlotTable.SlotChange> changes)
+    {
+        var gameState = GetSession().GameState;
+        var listedModern = new HashSet<uint>();
+        var listedLegacy = new HashSet<uint>();
+        foreach (var change in changes)
+        {
+            if (change.LegacySpellId == 0)
+                continue;
+            listedLegacy.Add(change.LegacySpellId);
+            listedModern.Add(GameData.GetModernSpellId(change.LegacySpellId));
+        }
+        if (gameState.GetCachedObjectFieldsLegacy(member) == null)
+        {
+            for (int s = 0; s < tableBefore.Length; s++)
+            {
+                uint before = tableBefore[s];
+                if (before != 0 && !listedLegacy.Contains(before))
+                    ClearPartyAuraRecordForSlot(member, s, before, spellStillElsewhere: false);
+            }
+            // Records of spells the full list does not carry are stale whatever the table held
+            // (after a relog the table starts empty, the carried-over map does not).
+            var keep = new HashSet<int>();
+            foreach (var id in listedModern)
+                keep.Add((int)id);
+            gameState.DropAuraExpiriesForUnitExcept(member, keep);
+        }
+        gameState.PartyMemberLastFullAuras[member] = (Environment.TickCount64, listedModern);
+    }
+
+    // Rule 5: a member's online-to-offline edge drops every expiry recorded for them. The
+    // server may pause their buffs while they are away, so a wall-clock value would run
+    // short when they return; they start unknown again.
+    void NotePartyMemberOnlineEdge(WowGuid128 member, bool online)
+    {
+        var gameState = GetSession().GameState;
+        if (gameState.PartyMemberLastOnline.TryGetValue(member, out bool wasOnline) && wasOnline && !online)
+        {
+            int dropped = gameState.DropAuraExpiriesForUnit(member);
+            if (dropped > 0)
+                Log.Event("party.aura.offline_drop", new { member_low = member.GetCounter(), dropped });
+        }
+        gameState.PartyMemberLastOnline[member] = online;
     }
 
     // The legacy server only re-sends party fields when they change, but the modern
@@ -976,13 +1101,19 @@ public partial class WorldClient
             var statusOnlyM = new PartyMemberPartialState(); //MIRASU
             statusOnlyM.AffectedGUID = state.MemberGuid; //MIRASU
             if (updateFlags.HasFlag(GroupUpdateFlagVanilla.Status)) //MIRASU
+            { //MIRASU
                 statusOnlyM.StatusFlags = (ushort)(GroupMemberOnlineStatus)packet.ReadUInt8(); //MIRASU
+                NotePartyMemberOnlineEdge(state.MemberGuid, (statusOnlyM.StatusFlags.Value & (ushort)GroupMemberOnlineStatus.Online) != 0); // JimsProxy (#513, rule 5)
+            } //MIRASU
             MergeAndRefreshPartyStats(statusOnlyM, false);
             SendPacketToClient(statusOnlyM); //MIRASU
             return; //MIRASU - skip the full-state build entirely
         } //MIRASU  
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.Status))
+        {
             state.StatusFlags = (GroupMemberOnlineStatus)packet.ReadUInt8();
+            NotePartyMemberOnlineEdge(state.MemberGuid, state.StatusFlags.HasFlag(GroupMemberOnlineStatus.Online)); // JimsProxy (#513, rule 5)
+        }
 
         if (updateFlags.HasFlag(GroupUpdateFlagVanilla.CurrentHealth))
             state.CurrentHealth = packet.ReadUInt16();
@@ -1037,6 +1168,10 @@ public partial class WorldClient
         if (memberAuraBitsPresent)
         {
             var memberSlots = GetSession().GameState.GetOrAddPartyAuraSlots(GetSession().GameState.PartyMemberAuraSlots, state.MemberGuid);
+            // JimsProxy (#513, rule 2): a full state is a bulk listing and records no start; it
+            // only remembers what it listed (for the bulk-window check on the partials that
+            // follow) and clears the records of spells the list no longer carries (rule 4).
+            NotePartyAuraFullState(state.MemberGuid, memberSlots, memberAuraChanges);
             PartyAuraSlotTable.RebuildFromFull(memberSlots, memberAuraChanges);
             state.Auras = PartyAuraSlotTable.BuildAuraList(memberSlots);
         }

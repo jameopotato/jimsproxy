@@ -1,15 +1,17 @@
 using System;
 using HermesProxy;
 using HermesProxy.World;
+using HermesProxy.World.Client;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
 using Xunit;
 
 namespace HermesProxy.Tests.World;
 
-// Covers the wall-clock aura expiry map (UnitAuraExpiryTick) that restores buff
+// Covers the wall-clock aura expiry map (UnitAuraExpiry) that restores buff
 // timers after relog / unit destroy (PallyPower blessing timers restarting at
-// full duration was the reported bug).
+// full duration was the reported bug). JimsProxy (#513): entries now carry the
+// start class and duration source that made the value known.
 public class AuraExpiryPersistenceTests
 {
     private static WowGuid128 MakeUnit(ulong counter) =>
@@ -18,14 +20,25 @@ public class AuraExpiryPersistenceTests
     private const int BlessingOfMight = 25291;
     private const int FifteenMinutesMs = 15 * 60 * 1000;
 
+    private static void Record(GameSessionData state, WowGuid128 unit, int spellId, int remainingMs) =>
+        state.RecordAuraExpiry(unit, spellId, remainingMs, AuraStartClass.ObservedGo, AuraDurationSource.Fixed, FifteenMinutesMs);
+
+    private static int? Remaining(GameSessionData state, WowGuid128 unit, int spellId)
+    {
+        var record = state.TryGetAuraExpiry(unit, spellId);
+        if (record == null)
+            return null;
+        return (int)(record.Value.ExpiryTick - Environment.TickCount64);
+    }
+
     [Fact]
     public void RecordThenTryGet_ReturnsRemainingWithinRecordedWindow()
     {
         var state = GameSessionData.CreateForTesting();
         var rogue = MakeUnit(1);
 
-        state.RecordAuraExpiry(rogue, BlessingOfMight, FifteenMinutesMs);
-        int? remaining = state.TryGetAuraRemainingMs(rogue, BlessingOfMight);
+        Record(state, rogue, BlessingOfMight, FifteenMinutesMs);
+        int? remaining = Remaining(state, rogue, BlessingOfMight);
 
         Assert.NotNull(remaining);
         Assert.InRange(remaining!.Value, 1, FifteenMinutesMs);
@@ -35,7 +48,7 @@ public class AuraExpiryPersistenceTests
     public void TryGet_UnknownEntry_ReturnsNull()
     {
         var state = GameSessionData.CreateForTesting();
-        Assert.Null(state.TryGetAuraRemainingMs(MakeUnit(1), BlessingOfMight));
+        Assert.Null(state.TryGetAuraExpiry(MakeUnit(1), BlessingOfMight));
     }
 
     [Fact]
@@ -44,10 +57,10 @@ public class AuraExpiryPersistenceTests
         var state = GameSessionData.CreateForTesting();
         var rogue = MakeUnit(1);
 
-        state.RecordAuraExpiry(rogue, BlessingOfMight, 0);
-        state.RecordAuraExpiry(rogue, BlessingOfMight, -5000);
+        Record(state, rogue, BlessingOfMight, 0);
+        Record(state, rogue, BlessingOfMight, -5000);
 
-        Assert.Empty(state.UnitAuraExpiryTick);
+        Assert.Empty(state.UnitAuraExpiry);
     }
 
     [Fact]
@@ -56,10 +69,11 @@ public class AuraExpiryPersistenceTests
         var state = GameSessionData.CreateForTesting();
         var rogue = MakeUnit(1);
 
-        state.UnitAuraExpiryTick[(rogue, BlessingOfMight)] = Environment.TickCount64 - 1;
+        state.UnitAuraExpiry[(rogue, BlessingOfMight)] = new AuraExpiryRecord(
+            Environment.TickCount64 - 1, AuraStartClass.ObservedGo, AuraDurationSource.Fixed, FifteenMinutesMs, 0);
 
-        Assert.Null(state.TryGetAuraRemainingMs(rogue, BlessingOfMight));
-        Assert.Empty(state.UnitAuraExpiryTick);
+        Assert.Null(state.TryGetAuraExpiry(rogue, BlessingOfMight));
+        Assert.Empty(state.UnitAuraExpiry);
     }
 
     [Fact]
@@ -69,15 +83,15 @@ public class AuraExpiryPersistenceTests
         var rogue = MakeUnit(1);
         var mage = MakeUnit(2);
 
-        state.RecordAuraExpiry(rogue, BlessingOfMight, FifteenMinutesMs);
-        state.RecordAuraExpiry(rogue, 1126, FifteenMinutesMs);
-        state.RecordAuraExpiry(mage, BlessingOfMight, FifteenMinutesMs);
+        Record(state, rogue, BlessingOfMight, FifteenMinutesMs);
+        Record(state, rogue, 1126, FifteenMinutesMs);
+        Record(state, mage, BlessingOfMight, FifteenMinutesMs);
 
         state.ClearAuraExpiry(rogue, BlessingOfMight);
 
-        Assert.Null(state.TryGetAuraRemainingMs(rogue, BlessingOfMight));
-        Assert.NotNull(state.TryGetAuraRemainingMs(rogue, 1126));
-        Assert.NotNull(state.TryGetAuraRemainingMs(mage, BlessingOfMight));
+        Assert.Null(state.TryGetAuraExpiry(rogue, BlessingOfMight));
+        Assert.NotNull(state.TryGetAuraExpiry(rogue, 1126));
+        Assert.NotNull(state.TryGetAuraExpiry(mage, BlessingOfMight));
     }
 
     [Fact]
@@ -87,12 +101,12 @@ public class AuraExpiryPersistenceTests
         var rogue = MakeUnit(1);
 
         state.StoreAuraDurationLeft(rogue, slot: 0, duration: 30000, currentTime: 1000);
-        state.RecordAuraExpiry(rogue, BlessingOfMight, FifteenMinutesMs);
+        Record(state, rogue, BlessingOfMight, FifteenMinutesMs);
 
         state.EvictUnitAuraState(rogue);
 
         Assert.False(state.UnitAuraDurationLeft.ContainsKey(rogue));
-        Assert.NotNull(state.TryGetAuraRemainingMs(rogue, BlessingOfMight));
+        Assert.NotNull(state.TryGetAuraExpiry(rogue, BlessingOfMight));
     }
 
     [Fact]
@@ -101,10 +115,10 @@ public class AuraExpiryPersistenceTests
         var state = GameSessionData.CreateForTesting();
         var rogue = MakeUnit(1);
 
-        state.RecordAuraExpiry(rogue, BlessingOfMight, 1000);
-        state.RecordAuraExpiry(rogue, BlessingOfMight, FifteenMinutesMs);
+        Record(state, rogue, BlessingOfMight, 1000);
+        Record(state, rogue, BlessingOfMight, FifteenMinutesMs);
 
-        int? remaining = state.TryGetAuraRemainingMs(rogue, BlessingOfMight);
+        int? remaining = Remaining(state, rogue, BlessingOfMight);
         Assert.NotNull(remaining);
         Assert.True(remaining!.Value > 1000, $"rebuff should extend the timer, got {remaining}");
     }
@@ -116,13 +130,14 @@ public class AuraExpiryPersistenceTests
         var live = MakeUnit(999_999);
 
         for (ulong i = 0; i < 4200; i++)
-            state.UnitAuraExpiryTick[(MakeUnit(i), (int)i)] = Environment.TickCount64 - 1;
-        state.RecordAuraExpiry(live, BlessingOfMight, FifteenMinutesMs);
+            state.UnitAuraExpiry[(MakeUnit(i), (int)i)] = new AuraExpiryRecord(
+                Environment.TickCount64 - 1, AuraStartClass.ObservedGo, AuraDurationSource.Fixed, 1000, 0);
+        Record(state, live, BlessingOfMight, FifteenMinutesMs);
 
-        state.RecordAuraExpiry(MakeUnit(5000), 1126, FifteenMinutesMs);
+        Record(state, MakeUnit(5000), 1126, FifteenMinutesMs);
 
-        Assert.NotNull(state.TryGetAuraRemainingMs(live, BlessingOfMight));
-        Assert.True(state.UnitAuraExpiryTick.Count <= 3, $"expired entries should be pruned, count={state.UnitAuraExpiryTick.Count}");
+        Assert.NotNull(state.TryGetAuraExpiry(live, BlessingOfMight));
+        Assert.True(state.UnitAuraExpiry.Count <= 3, $"expired entries should be pruned, count={state.UnitAuraExpiry.Count}");
     }
 
     // The relog carry-over: a recreated GameSessionData must keep the same expiry
@@ -132,10 +147,10 @@ public class AuraExpiryPersistenceTests
     {
         var before = GameSessionData.CreateForTesting();
         var rogue = MakeUnit(1);
-        before.RecordAuraExpiry(rogue, BlessingOfMight, FifteenMinutesMs);
+        Record(before, rogue, BlessingOfMight, FifteenMinutesMs);
 
         var after = GameSessionData.CreateForTesting(previous: before);
 
-        Assert.NotNull(after.TryGetAuraRemainingMs(rogue, BlessingOfMight));
+        Assert.NotNull(after.TryGetAuraExpiry(rogue, BlessingOfMight));
     }
 }
