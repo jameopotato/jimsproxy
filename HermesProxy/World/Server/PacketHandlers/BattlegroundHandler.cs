@@ -57,7 +57,7 @@ public partial class WorldSocket
     void HandlePvPLogData(PVPLogDataRequest log)
     {
         // JimsProxy (pvp-log-data-throttle 2026-05-17): forward at most once
-        // per 10 seconds per session. Kronos / vanilla-emu servers treat
+        // per ThrottleWindowMs per session. Kronos / vanilla-emu servers treat
         // sustained CMSG_PVP_LOG_DATA above ~10/min as a spam-bot signal and
         // silently queue a kick (observed BG-exit DC, log
         // jimsproxy-20260516-...-BGDC.jsonl). Common BG-addons hammer this:
@@ -67,8 +67,17 @@ public partial class WorldSocket
         // current and future misbehaving addon. Side effect for dropped
         // requests: the client won't fire UPDATE_BATTLEFIELD_SCORE for THIS
         // drop, but the last forwarded request's response still populated
-        // the cache — 10s staleness is fine for BG scoreboards.
-        const long ThrottleWindowMs = 10_000;
+        // the cache.
+        // JimsProxy (#505): window 10 s -> 4.9 s. The stock scoreboard requests
+        // the board every 5 s while it is open (FrameXML WorldStateFrame.xml
+        // binds OnUpdate to RequestBattlefieldScoreData; on the wire the requests
+        // arrive 5,000 to 5,016 ms apart), so at 10 s every other request was
+        // dropped and an open frame refreshed only every 10 s. The window is
+        // measured from the last FORWARD, so it must sit under the 5 s gap to let
+        // every stock request through; 4.9 s does, and caps a misbehaving addon
+        // at about 12 forwards per minute, close to the figure the throttle was
+        // built for (the kick was observed at about 30 per minute).
+        const long ThrottleWindowMs = 4_900;
         long now = Environment.TickCount64;
         long last = GetSession().GameState.LastForwardedPvpLogDataTickMs;
         long deltaMs = last == 0 ? long.MaxValue : now - last;

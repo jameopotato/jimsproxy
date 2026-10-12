@@ -1957,6 +1957,15 @@ public sealed class GameSessionData
             return GameData.IsAllianceRace(cache.RaceId);
         return false;
     }
+    // JimsProxy (#504): map id of the last battleground-map fallback logged, so the event fires once
+    // per map instead of on every call (this method runs on chat, party and threat paths).
+    private uint _inBattlegroundFallbackLoggedMap;
+    // JimsProxy (#504): the battleground map whose queue slot just ENDED while the character was
+    // still standing on it. Between that status and the teleport out, the server restores the home
+    // group (its group list arrives on the battleground map), so the map fallback must not count
+    // that window as "in the battleground" or a home raid would be filed in the battleground slot.
+    private uint _battlegroundExitedMapId;
+
     public bool IsInBattleground()
     {
         if (CurrentMapId == null)
@@ -1968,23 +1977,56 @@ public sealed class GameSessionData
             return false;
         }
 
-        // Only if we are properly queued for the BG.
-        foreach (var queue in BattleFieldQueueTypes)
+        bool inBattleground = DecideInBattleground(CurrentMapId, bgId, BattleFieldQueueTypes.Values,
+            LegacyVersion.RemovedInVersion(Enums.ClientVersionBuild.V2_0_1_6180), _battlegroundExitedMapId, out bool usedFallback);
+
+        if (usedFallback && _inBattlegroundFallbackLoggedMap != CurrentMapId)
         {
-            if (LegacyVersion.RemovedInVersion(Enums.ClientVersionBuild.V2_0_1_6180))
+            _inBattlegroundFallbackLoggedMap = (uint)CurrentMapId;
+            Log.Event("battleground.in_bg.map_fallback", new
             {
-                if (queue.Value == CurrentMapId)
-                    return true;
-            }
-            else
+                map_id = CurrentMapId,
+                bg_id = bgId,
+                queue_entries = BattleFieldQueueTypes.Count,
+            });
+        }
+        return inBattleground;
+    }
+
+    // JimsProxy (#504): a stored queue entry for the current battleground decides as before (vanilla
+    // stores the map id, TBC+ the battleground id). With none, a battleground map still counts
+    // (after a disconnect and rejoin the queue-slot table is not carried over and the server does
+    // not re-send the status, so battleground chat went out as party chat and the raid was filed
+    // in group slot 0), EXCEPT on the map whose slot just ended (the exit window, see
+    // MarkBattlegroundExited). Pure, so the decision table is unit-tested.
+    internal static bool DecideInBattleground(uint? currentMapId, uint bgId, Dictionary<uint, uint>.ValueCollection? queueValues, bool legacyIsVanilla, uint exitedMapId, out bool usedFallback)
+    {
+        usedFallback = false;
+        if (currentMapId == null || bgId == 0)
+            return false;
+
+        if (queueValues != null)
+        {
+            foreach (var value in queueValues)
             {
-                if (queue.Value == bgId)
+                if (legacyIsVanilla ? value == currentMapId : value == bgId)
                     return true;
             }
         }
 
-        return false;
+        if (exitedMapId != 0 && exitedMapId == currentMapId)
+            return false;
+
+        usedFallback = true;
+        return true;
     }
+
+    // JimsProxy (#504): called by the status handler when a slot ends while the character still
+    // stands on that battleground map (the exit window), and cleared again when any status names
+    // a map (a new queue or a re-entry).
+    public void MarkBattlegroundExited(uint mapId) => _battlegroundExitedMapId = mapId;
+    public void ClearBattlegroundExited() => _battlegroundExitedMapId = 0;
+    public bool HasBattleFieldQueueType(uint queueSlot) => BattleFieldQueueTypes.ContainsKey(queueSlot);
     public long GetBattleFieldQueueTime(uint queueSlot)
     {
         if (BattleFieldQueueTimes.TryGetValue(queueSlot, out var time))

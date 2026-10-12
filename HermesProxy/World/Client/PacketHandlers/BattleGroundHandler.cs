@@ -143,8 +143,19 @@ public partial class WorldClient
         else
         {
             uint queuedMapId = GetSession().GameState.GetBattleFieldQueueType(hdr.Ticket.Id);
+            // JimsProxy (#504): after a disconnect and rejoin inside a battleground the queue slot
+            // has never been seen (nothing was stored since the relog), so no stored value can
+            // match the current map. The raid was filed in slot 1 by the map fallback in that
+            // state, so clear it on the same evidence: a never-seen slot ending while the character
+            // is still on the battleground map. A slot queued after the relog stores its map at
+            // queue time, and a slot that already ended stores 0; neither is mistaken for this one.
+            // Known residual: an invite for ANOTHER battleground that was pending at the disconnect
+            // and expires afterwards ends a never-seen slot too and would clear the raid early.
+            bool unknownSlotEndingInBattleground = !GetSession().GameState.HasBattleFieldQueueType(hdr.Ticket.Id) &&
+                GetSession().GameState.CurrentGroups[1] != null &&
+                GetSession().GameState.IsInBattleground();
             if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180) &&
-                queuedMapId == GetSession().GameState.CurrentMapId)
+                (queuedMapId == GetSession().GameState.CurrentMapId || unknownSlotEndingInBattleground))
             {
                 // Clear BG group properly on vanilla servers.
                 var bgGroup = GetSession().GameState.CurrentGroups[1];
@@ -170,6 +181,19 @@ public partial class WorldClient
             GetSession().GameState.BattleFieldQueueTimes.Remove(hdr.Ticket.Id);
         }
         GetSession().GameState.StoreBattleFieldQueueType(hdr.Ticket.Id, mapId);
+
+        // JimsProxy (#504): a slot ending while the character still stands on a battleground map
+        // opens the exit window: the server restores the home group before the teleport out, and
+        // that group list must not be filed as the battleground raid by the map fallback. Any
+        // status that names a map (a new queue, a re-entry) closes the window again.
+        if (mapId == 0)
+        {
+            uint? currentMap = GetSession().GameState.CurrentMapId;
+            if (currentMap != null && GameData.GetBattlegroundIdFromMapId(currentMap.Value) != 0)
+                GetSession().GameState.MarkBattlegroundExited(currentMap.Value);
+        }
+        else
+            GetSession().GameState.ClearBattlegroundExited();
     }
 
     [PacketHandler(Opcode.SMSG_BATTLEFIELD_STATUS, ClientVersionBuild.V2_0_1_6180)]
@@ -266,6 +290,10 @@ public partial class WorldClient
         if (packet.ReadBool()) // Has Winner
             pvp.Winner = packet.ReadUInt8();
 
+        // JimsProxy (#505): rows the player cache cannot resolve are placed by raid membership.
+        bool? localIsAlliance = GetScoreboardLocalFaction();
+        int placeholdersLogged = 0;
+
         int count = packet.ReadInt32();
         for (int i = 0; i < count; i++)
         {
@@ -282,22 +310,14 @@ public partial class WorldClient
             for (int j = 0; j < statsCount; j++)
                 player.Stats.Add(packet.ReadUInt32());
 
-            PlayerCache? cache;
-            if (GetSession().GameState.CachedPlayers.TryGetValue(player.PlayerGUID, out cache))
-            {
-                player.Sex = cache.SexId;
-                player.PlayerRace = cache.RaceId;
-                player.PlayerClass = cache.ClassId;
-                player.Faction = GameData.IsAllianceRace(cache.RaceId);
-            }
-            else
-            {
-                player.Sex = Gender.Male;
-                player.PlayerRace = Race.Human;
-                player.PlayerClass = Class.Warrior;
-            }
+            // JimsProxy (#505): every row is still read off the wire; none past the 80-row bound is sent.
+            if (pvp.Statistics.Count >= ScoreboardRowResolver.MaxRows)
+                continue;
+
+            ApplyBattlegroundScoreboardRow(pvp, player, localIsAlliance, ref placeholdersLogged);
             pvp.Statistics.Add(player);
         }
+        LogScoreboardRowsCapped(count, pvp.Statistics.Count);
         SendPacketToClient(pvp);
     }
 
@@ -328,6 +348,12 @@ public partial class WorldClient
         if (packet.ReadBool()) // Has Winner
             pvp.Winner = packet.ReadUInt8();
 
+        // JimsProxy (#505): arena rows take their faction from the wire, so only a battleground
+        // board needs the local side to place rows the player cache cannot resolve.
+        bool isArena = pvp.ArenaTeams != null;
+        bool? localIsAlliance = isArena ? null : GetScoreboardLocalFaction();
+        int placeholdersLogged = 0;
+
         int count = packet.ReadInt32();
         for (int i = 0; i < count; i++)
         {
@@ -335,7 +361,7 @@ public partial class WorldClient
             player.PlayerGUID = packet.ReadGuid().To128(GetSession().GameState);
             player.Kills = packet.ReadUInt32();
 
-            if (pvp.ArenaTeams == null)
+            if (!isArena)
             {
                 player.Honor = new();
                 player.Honor.HonorKills = packet.ReadUInt32();
@@ -355,25 +381,96 @@ public partial class WorldClient
             for (int j = 0; j < statsCount; j++)
                 player.Stats.Add(packet.ReadUInt32());
 
-            PlayerCache? cache;
-            if (GetSession().GameState.CachedPlayers.TryGetValue(player.PlayerGUID, out cache))
-            {
-                player.Sex = cache.SexId;
-                player.PlayerRace = cache.RaceId;
-                player.PlayerClass = cache.ClassId;
+            // JimsProxy (#505): every row is still read off the wire; none past the 80-row bound is sent.
+            if (pvp.Statistics.Count >= ScoreboardRowResolver.MaxRows)
+                continue;
 
-                if (pvp.ArenaTeams == null)
-                    player.Faction = GameData.IsAllianceRace(cache.RaceId);
+            if (isArena)
+            {
+                // JimsProxy (#505): the wire faction and count above stand; a miss keeps the old placeholder.
+                GetSession().GameState.CachedPlayers.TryGetValue(player.PlayerGUID, out var cache);
+                var row = ScoreboardRowResolver.ResolveUnplaced(cache);
+                player.Sex = row.Sex;
+                player.PlayerRace = row.Race;
+                player.PlayerClass = row.Class;
             }
             else
-            {
-                player.Sex = Gender.Male;
-                player.PlayerRace = Race.Human;
-                player.PlayerClass = Class.Warrior;
-            }
+                ApplyBattlegroundScoreboardRow(pvp, player, localIsAlliance, ref placeholdersLogged);
             pvp.Statistics.Add(player);
         }
+        LogScoreboardRowsCapped(count, pvp.Statistics.Count);
         SendPacketToClient(pvp);
+    }
+
+    // JimsProxy (#505): the local player's faction, read once per battleground board. Trusted only
+    // when the player cache holds the local character's race, because IsAlliancePlayer reads a
+    // missing or race-less entry as Horde. Null means unknown: rows the cache cannot resolve then
+    // keep the pre-#505 placeholder (Faction false, Male Human).
+    bool _scoreboardLocalFactionUnknownLogged; // JimsProxy (#505): log the unknown local faction once per session
+
+    bool? GetScoreboardLocalFaction()
+    {
+        var gameState = GetSession().GameState;
+        var self = gameState.CurrentPlayerGuid;
+        if (gameState.CachedPlayers.TryGetValue(self, out var cache) && cache.RaceId != Race.None)
+            return gameState.IsAlliancePlayer(self);
+
+        if (!_scoreboardLocalFactionUnknownLogged)
+        {
+            _scoreboardLocalFactionUnknownLogged = true;
+            Log.Event("battleground.scoreboard.local_faction_unknown", new
+            {
+                player_low = self.GetCounter(),
+                cached = cache != null,
+            });
+        }
+        return null;
+    }
+
+    // JimsProxy (#505): fills Sex/Race/Class/Faction of one battleground (not arena) row and counts
+    // it in PlayerCount, which the stock frame shows next to each faction tab (the vanilla board
+    // used to leave both counts at 0).
+    void ApplyBattlegroundScoreboardRow(PVPMatchStatisticsMessage pvp, PVPMatchPlayerStatistics player, bool? localIsAlliance, ref int placeholdersLogged)
+    {
+        var gameState = GetSession().GameState;
+        gameState.CachedPlayers.TryGetValue(player.PlayerGUID, out var cache);
+
+        // Raid membership only matters for a row the cache cannot resolve.
+        bool ownTeam = !ScoreboardRowResolver.HasRace(cache)
+            && ScoreboardRowResolver.IsOwnTeam(player.PlayerGUID, gameState.CurrentPlayerGuid, gameState.CurrentGroups);
+        var row = localIsAlliance is bool local
+            ? ScoreboardRowResolver.Resolve(cache, ownTeam, local)
+            : ScoreboardRowResolver.ResolveUnplaced(cache);
+
+        player.Sex = row.Sex;
+        player.PlayerRace = row.Race;
+        player.PlayerClass = row.Class;
+        player.Faction = row.Faction;
+        ScoreboardRowResolver.CountByFaction(pvp.PlayerCount, row.Faction);
+
+        if (!row.FromCache && placeholdersLogged < ScoreboardRowResolver.MaxPlaceholderLogsPerBoard)
+        {
+            placeholdersLogged++;
+            Log.Event("battleground.scoreboard.row_placeholder", new
+            {
+                player_low = player.PlayerGUID.GetCounter(),
+                own_team = ownTeam,
+                faction_alliance = row.Faction,
+            });
+        }
+    }
+
+    // JimsProxy (#505): once per board, when the wire carried more rows than the 80-row bound.
+    static void LogScoreboardRowsCapped(int rowsOnWire, int rowsSent)
+    {
+        if (rowsOnWire <= ScoreboardRowResolver.MaxRows)
+            return;
+
+        Log.Event("battleground.scoreboard.rows_capped", new
+        {
+            rows_on_wire = rowsOnWire,
+            rows_sent = rowsSent,
+        });
     }
 
     BattlegroundPlayerPosition ReadBattlegroundPlayerPosition(WorldPacket packet)
