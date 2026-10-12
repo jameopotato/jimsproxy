@@ -140,7 +140,7 @@ public class ObjectUpdate
             if (GameObjectData.ParentRotation[3] == null)
                 GameObjectData.ParentRotation[3] = 1;
             if (GameObjectData.StateAnimID == null)
-                GameObjectData.StateAnimID = ModernVersion.GetGameObjectStateAnimId();
+                GameObjectData.StateAnimID = ModernVersion.GetEmptyStateAnimId();
             if (Guid.GetHighType() == HighGuidType.Transport)
             {
                 var transportTimer = CreateData.MoveInfo!.TransportPathTimer;
@@ -204,6 +204,12 @@ public class ObjectUpdate
                 UnitData.ScaleDuration = 100;
             if (UnitData.LookAtControllerID == null)
                 UnitData.LookAtControllerID = -1;
+            // JimsProxy (#135, #14): a native server sends the empty state-animation id on every
+            // unit and player create, the same value game objects get above. A 1.12 server has
+            // no such field, so the proxy never sent it and the client kept its default (0, a
+            // forced Stand) on top of the idle it selects, which hid the stealth crouch idle.
+            if (UnitData.StateAnimID == null)
+                UnitData.StateAnimID = ModernVersion.GetEmptyStateAnimId();
             if (UnitData.ChannelObject == null &&
                 Guid == GlobalSession.GameState.CurrentPlayerGuid)
                 UnitData.ChannelObject = WowGuid128.Empty;
