@@ -553,6 +553,64 @@ public sealed class GameSessionData
     // hasn't seen refreshed — these snapshots get re-attached to forwarded updates.
     public Dictionary<WowGuid128, World.Server.Packets.PartyMemberPetStats> PartyPetStats = new();
     public Dictionary<WowGuid128, ushort> PartyMemberLevels = new();
+    // JimsProxy (#513 follow-up, out-of-view party buff lists): the 48 aura slots of each party
+    // member (and of each member's pet, keyed by the MEMBER guid) as last reported by the legacy
+    // server's slot-indexed party stats, primed from the unit's own aura fields when it leaves
+    // view. The 1.14 client replaces a member's list with every aura-bearing party state, so the
+    // proxy emits the complete list from here instead of the raw delta. Written and read on the
+    // WorldClient receive thread only. See World.Client.PartyAuraSlotTable.
+    public Dictionary<WowGuid128, uint[]> PartyMemberAuraSlots = new();
+    public Dictionary<WowGuid128, uint[]> PartyPetAuraSlots = new();
+
+    public uint[] GetOrAddPartyAuraSlots(Dictionary<WowGuid128, uint[]> store, WowGuid128 key)
+    {
+        if (!store.TryGetValue(key, out var table))
+        {
+            table = World.Client.PartyAuraSlotTable.NewTable();
+            store[key] = table;
+        }
+        return table;
+    }
+
+    // True when the guid is a member of either current group (slot 1 is the battleground raid).
+    public bool IsGroupMemberGuid(WowGuid128 guid)
+    {
+        foreach (var group in CurrentGroups)
+        {
+            if (group == null)
+                continue;
+            foreach (var member in group.PlayerList)
+                if (member.GUID == guid)
+                    return true;
+        }
+        return false;
+    }
+
+    // The party member whose last known pet is this guid, or null.
+    public WowGuid128? GroupMemberOwningPet(WowGuid128 petGuid)
+    {
+        if (petGuid == default)
+            return null;
+        foreach (var kv in PartyPetStats)
+            if (kv.Value.NewPetGuid == petGuid)
+                return kv.Key;
+        return null;
+    }
+
+    // Drop the aura slot tables of anyone who is no longer in either group (called when a
+    // group list arrives or a group is destroyed), so a member who rejoins starts clean.
+    public void PrunePartyAuraSlots()
+    {
+        var stale = new List<WowGuid128>();
+        foreach (var key in PartyMemberAuraSlots.Keys)
+            if (!IsGroupMemberGuid(key))
+                stale.Add(key);
+        foreach (var key in stale)
+        {
+            PartyMemberAuraSlots.Remove(key);
+            PartyPetAuraSlots.Remove(key);
+        }
+    }
     // Tracks quest ids the proxy has issued its own CMSG_QUERY_QUEST_INFO for.
     public HashSet<uint> ProxyIssuedQuestInfoQueries = new();
     // JimsProxy: client-originated CMSG_QUERY_QUEST_INFO gating. Questie's filter-toggle
