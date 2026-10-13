@@ -535,9 +535,11 @@ public partial class WorldClient
             // the previous character's quest-query drainer was that sender in every field
             // failure. A pre-auth packet from any other sender is dropped here with an
             // always-on event: with the drainer fix it should never fire, so a hit is an
-            // unexpected-edge signature worth seeing in any log.
-            bool isHandshake = packet.GetUniversalOpcode(false) == Opcode.CMSG_AUTH_SESSION;
-            if (!isHandshake && _isSuccessful != true)
+            // unexpected-edge signature worth seeing in any log. The opcode lookup runs
+            // only before the handshake completes; a steady-state send pays one compare.
+            bool preAuth = _isSuccessful != true;
+            bool isHandshake = preAuth && packet.GetUniversalOpcode(false) == Opcode.CMSG_AUTH_SESSION;
+            if (preAuth && !isHandshake)
             {
                 _droppedBeforeAuth++;
                 Log.Event("c2s.dropped_before_world_auth", new

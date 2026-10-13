@@ -137,11 +137,14 @@ public partial class WorldSocket
                 // restart a drainer for it. The next character re-asks what it needs.
                 if (!ReferenceEquals(GetSession().GameState, state))
                 {
-                    Framework.Logging.Log.Event("quest.query.bucket_drain_abandoned", new
-                    {
-                        reason = "gamestate_replaced",
-                        dropped = state.PendingQuestQueryQueue.Count,
-                    });
+                    // The drainer exiting here is the fix doing its job, not an unexpected
+                    // edge: DebugOutput only (review of #544).
+                    if (Framework.Settings.DebugOutput)
+                        Framework.Logging.Log.Event("quest.query.bucket_drain_abandoned", new
+                        {
+                            reason = "gamestate_replaced",
+                            dropped = state.PendingQuestQueryQueue.Count,
+                        });
                     state.PendingQuestQueryQueue.Clear();
                     break;
                 }
