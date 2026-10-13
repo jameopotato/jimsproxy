@@ -80,7 +80,7 @@ public class CombatLogPacketTests
         log.Entries.Add(new SpellLogMissEntry { Victim = WowGuid128.Create(HighGuidType703.Creature, 0, 1234, 56), MissReason = SpellMissInfo.Resist });
 
         log.WritePacketData();
-        var wire = new WorldPacket(0, log.GetData()!);
+        var wire = new WorldPacket(log.GetOpcode(), log.GetData()!);
 
         Assert.Equal(25771u, wire.ReadUInt32());
         Assert.Equal(log.Caster, wire.ReadPackedGuid128());
@@ -113,7 +113,7 @@ public class CombatLogPacketTests
         resist.SpellID = 12970;
 
         resist.WritePacketData();
-        var wire = new WorldPacket(0, resist.GetData()!);
+        var wire = new WorldPacket(resist.GetOpcode(), resist.GetData()!);
 
         Assert.Equal(resist.Caster, wire.ReadPackedGuid128());
         Assert.Equal(resist.Target, wire.ReadPackedGuid128());
@@ -146,7 +146,7 @@ public class CombatLogPacketTests
         immune.SpellID = 1833;
 
         immune.WritePacketData();
-        var wire = new WorldPacket(0, immune.GetData()!);
+        var wire = new WorldPacket(immune.GetOpcode(), immune.GetData()!);
 
         Assert.Equal(immune.CasterGUID, wire.ReadPackedGuid128());
         Assert.Equal(immune.VictimGUID, wire.ReadPackedGuid128());
