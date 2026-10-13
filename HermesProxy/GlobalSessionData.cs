@@ -562,6 +562,13 @@ public sealed class GameSessionData
     public Dictionary<WowGuid128, uint[]> PartyMemberAuraSlots = new();
     public Dictionary<WowGuid128, uint[]> PartyPetAuraSlots = new();
 
+    // JimsProxy (#513, rules 2 and 5): per member, when their last full party state arrived
+    // and which (modern) spell ids it listed, so a partial that merely restates that list
+    // right after it is not mistaken for a fresh application; and the last online status
+    // seen, so the offline edge can drop their recorded expiries.
+    public Dictionary<WowGuid128, (long Tick, HashSet<uint> Spells)> PartyMemberLastFullAuras = new();
+    public Dictionary<WowGuid128, bool> PartyMemberLastOnline = new();
+
     public uint[] GetOrAddPartyAuraSlots(Dictionary<WowGuid128, uint[]> store, WowGuid128 key)
     {
         if (!store.TryGetValue(key, out var table))
@@ -609,6 +616,16 @@ public sealed class GameSessionData
         {
             PartyMemberAuraSlots.Remove(key);
             PartyPetAuraSlots.Remove(key);
+            PartyMemberLastFullAuras.Remove(key);
+        }
+        var staleOnline = new List<WowGuid128>();
+        foreach (var key in PartyMemberLastOnline.Keys)
+            if (!IsGroupMemberGuid(key))
+                staleOnline.Add(key);
+        foreach (var key in staleOnline)
+        {
+            PartyMemberLastOnline.Remove(key);
+            PartyMemberOfflineSince.Remove(key);
         }
     }
     // Tracks quest ids the proxy has issued its own CMSG_QUERY_QUEST_INFO for.
@@ -1432,11 +1449,13 @@ public sealed class GameSessionData
     public Dictionary<WowGuid128, (uint Seconds, int Tick)> PendingItemTimeUpdates = [];
     public List<(WowGuid128 ItemGuid, uint DurationSeconds)>? PendingItemTimeReemits;
     public Dictionary<WowGuid128, Dictionary<byte, WowGuid128>> UnitAuraCaster = [];
-    // Wall-clock aura expiry per (unit, spell). Unlike the per-slot caches above this
-    // survives unit destroys AND relogs (carried over in CreateNewGameSessionData), so a
-    // buff re-seen on a group member resumes its real remaining time instead of
-    // restarting at full duration (PallyPower blessing timers after relog/stealth).
-    public Dictionary<(WowGuid128, int), long> UnitAuraExpiryTick = [];
+    // Wall-clock aura expiry per (unit, spell), with how the proxy learned it (#513). Unlike
+    // the per-slot caches above this survives unit destroys AND relogs (carried over in
+    // CreateNewGameSessionData), so a buff re-seen on a group member resumes its real
+    // remaining time instead of restarting at full duration (PallyPower blessing timers
+    // after relog/stealth). Only KNOWN values are recorded here; a guessed remaining time is
+    // never written (see World.Client.AuraTimerProvenance). Keys use the modern spell id.
+    public Dictionary<(WowGuid128, int), World.Client.AuraExpiryRecord> UnitAuraExpiry = [];
 
     // MIRASU (stack-aura-decrement): last AuraDataInfo emitted for each (unit, slot).
     // Used to detect AURAAPPLICATIONS-quad-only updates where a single slot's app
@@ -1660,7 +1679,7 @@ public sealed class GameSessionData
         self.IgnoredPlayers = previous.IgnoredPlayers;
         // Buff expiries are wall-clock facts about other units — a /camp doesn't
         // change when the rogue's blessing runs out.
-        self.UnitAuraExpiryTick = previous.UnitAuraExpiryTick;
+        self.UnitAuraExpiry = previous.UnitAuraExpiry;
     }
 
     /// <summary>
@@ -2303,44 +2322,133 @@ public sealed class GameSessionData
         UnitAuraDurationPushTime.Remove(guid);
         UnitAuraCaster.Remove(guid);
         UnitAuraLastEmitted.Remove(guid);
-        // UnitAuraExpiryTick deliberately survives — it restores remaining buff time
+        // UnitAuraExpiry deliberately survives: it restores remaining buff time
         // when the unit re-enters view.
         return evicted;
     }
 
-    public void RecordAuraExpiry(WowGuid128 guid, int spellId, int remainingMs)
+    // JimsProxy (#513, rule 6): the duration tables only (the out-of-range leave). The slot
+    // casters and the last-emitted entries stay, so the unit's debuffs keep their caster.
+    public void EvictUnitAuraDurations(WowGuid128 guid)
     {
-        if (remainingMs <= 0)
+        UnitAuraDurationUpdateTime.Remove(guid);
+        UnitAuraDurationLeft.Remove(guid);
+        UnitAuraDurationFull.Remove(guid);
+        UnitAuraDurationPushTime.Remove(guid);
+    }
+
+    // JimsProxy (#513, rule 4): a listing that names EVERY aura on a unit (a create, a full party
+    // state) makes any record of a spell it does not carry stale: the buff ended while the unit was
+    // out of view. Drop those records. Returns the number dropped.
+    public int DropAuraExpiriesForUnitExcept(WowGuid128 guid, HashSet<int> keepSpellIds)
+    {
+        List<(WowGuid128, int)> keys = [];
+        foreach (var kvp in UnitAuraExpiry)
+            if (kvp.Key.Item1 == guid && !keepSpellIds.Contains(kvp.Key.Item2))
+                keys.Add(kvp.Key);
+        foreach (var key in keys)
+            UnitAuraExpiry.Remove(key);
+        return keys.Count;
+    }
+
+    // JimsProxy (#513): record a KNOWN expiry only. The caller names the start class and the
+    // duration source that made the value known; a guess must never reach this map.
+    public void RecordAuraExpiry(WowGuid128 guid, int spellId, int remainingMs,
+        World.Client.AuraStartClass startClass, World.Client.AuraDurationSource source, int fullMs, int boundMs = 0,
+        WowGuid128 caster = default)
+    {
+        if (remainingMs <= 0 || startClass == World.Client.AuraStartClass.Unknown)
             return;
-        if (UnitAuraExpiryTick.Count > 4096)
+        if (UnitAuraExpiry.Count > 4096)
         {
             long now = Environment.TickCount64;
             List<(WowGuid128, int)> expired = [];
-            foreach (var kvp in UnitAuraExpiryTick)
-                if (kvp.Value <= now)
+            foreach (var kvp in UnitAuraExpiry)
+                if (kvp.Value.ExpiryTick <= now && !PartyMemberOfflineSince.ContainsKey(kvp.Key.Item1))
                     expired.Add(kvp.Key);
             foreach (var key in expired)
-                UnitAuraExpiryTick.Remove(key);
+                UnitAuraExpiry.Remove(key);
         }
-        UnitAuraExpiryTick[(guid, spellId)] = Environment.TickCount64 + remainingMs;
+        if (fullMs < remainingMs)
+            fullMs = remainingMs;
+        // Keep a caster already on record when the new write does not know one (a restore
+        // re-records the decayed value; the stats classes never see the caster).
+        if (caster == default && UnitAuraExpiry.TryGetValue((guid, spellId), out var previous))
+            caster = previous.Caster;
+        UnitAuraExpiry[(guid, spellId)] = new World.Client.AuraExpiryRecord(
+            Environment.TickCount64 + remainingMs, startClass, source, fullMs, boundMs, caster);
     }
 
-    public int? TryGetAuraRemainingMs(WowGuid128 guid, int spellId)
+    // JimsProxy (#513, rule 5 as verified in the field 2026-10-12): the server PAUSES a party
+    // member's buffs while they are offline (their own Fortitude came back 7.0 s longer than
+    // wall clock after a 7.1 s logout). So the offline edge marks the member, and the return
+    // edge (their online status, or their create, whichever the proxy sees first) shifts every
+    // record of theirs by the offline interval instead of dropping it.
+    public Dictionary<WowGuid128, long> PartyMemberOfflineSince = new();
+
+    public void MarkPartyMemberOffline(WowGuid128 guid)
     {
-        if (!UnitAuraExpiryTick.TryGetValue((guid, spellId), out var expiry))
+        if (!PartyMemberOfflineSince.ContainsKey(guid))
+            PartyMemberOfflineSince[guid] = Environment.TickCount64;
+    }
+
+    // Returns the offline interval applied, or null when the member was not marked.
+    public (long OfflineMs, int Shifted)? ShiftAuraExpiriesIfReturning(WowGuid128 guid)
+    {
+        if (!PartyMemberOfflineSince.Remove(guid, out long since))
             return null;
-        long remaining = expiry - Environment.TickCount64;
-        if (remaining <= 0)
+        long offlineMs = Environment.TickCount64 - since;
+        if (offlineMs < 0)
+            offlineMs = 0;
+        return (offlineMs, ShiftAuraExpiriesForUnit(guid, offlineMs));
+    }
+
+    public int ShiftAuraExpiriesForUnit(WowGuid128 guid, long deltaMs)
+    {
+        if (deltaMs <= 0)
+            return 0;
+        List<(WowGuid128, int)> keys = [];
+        foreach (var kvp in UnitAuraExpiry)
+            if (kvp.Key.Item1 == guid)
+                keys.Add(kvp.Key);
+        foreach (var key in keys)
         {
-            UnitAuraExpiryTick.Remove((guid, spellId));
+            var record = UnitAuraExpiry[key];
+            UnitAuraExpiry[key] = record with { ExpiryTick = record.ExpiryTick + deltaMs };
+        }
+        return keys.Count;
+    }
+
+    // The recorded entry, or null when there is none or it has run out (then it is dropped).
+    public World.Client.AuraExpiryRecord? TryGetAuraExpiry(WowGuid128 guid, int spellId)
+    {
+        if (!UnitAuraExpiry.TryGetValue((guid, spellId), out var record))
+            return null;
+        if (record.ExpiryTick - Environment.TickCount64 <= 0)
+        {
+            UnitAuraExpiry.Remove((guid, spellId));
             return null;
         }
-        return (int)Math.Min(remaining, int.MaxValue);
+        return record;
     }
 
     public void ClearAuraExpiry(WowGuid128 guid, int spellId)
     {
-        UnitAuraExpiryTick.Remove((guid, spellId));
+        UnitAuraExpiry.Remove((guid, spellId));
+    }
+
+    // JimsProxy (#513, rule 5): a party member's offline edge drops everything recorded for
+    // that member. The server may pause their buffs while they are away, so any wall-clock
+    // value would run short on their return. Returns the number of entries dropped.
+    public int DropAuraExpiriesForUnit(WowGuid128 guid)
+    {
+        List<(WowGuid128, int)> keys = [];
+        foreach (var kvp in UnitAuraExpiry)
+            if (kvp.Key.Item1 == guid)
+                keys.Add(kvp.Key);
+        foreach (var key in keys)
+            UnitAuraExpiry.Remove(key);
+        return keys.Count;
     }
     // A single values update can move an aura to a lower free slot (set at B, clear at
     // old A, B < A). The clear must not delete the expiry the set just recorded.

@@ -2673,7 +2673,12 @@ public partial class WorldClient
                 var updateFields = GetSession().GameState.GetCachedObjectFieldsLegacy(target);
                 if (updateFields != null)
                 {
-                    int existingSlot = FindAuraSlotBySpellId(target, spellId, updateFields);
+                    // JimsProxy (#513): a refresh belongs to THIS caster's slot. Damage-over-time
+                    // debuffs from different casters sit in separate slots on 1.12, so the first
+                    // slot holding the spell may be someone else's; refreshing it would reset or
+                    // blank their timer. Pick the slot whose caster matches, else one with no
+                    // caster on record, else none (the new slot then arrives as a fresh application).
+                    int existingSlot = FindAuraSlotBySpellIdForCaster(target, spellId, spell.Cast.CasterUnit, updateFields);
                     if (existingSlot >= 0)
                     {
                         // Aura refresh detected - send AuraUpdate to refresh the duration timer
@@ -4308,8 +4313,9 @@ public partial class WorldClient
         aura.AuraData.Duration = duration;
         aura.AuraData.Remaining = duration;
         // Server-authoritative self duration — keep the durable expiry map in sync so a
-        // later relog doesn't restore a stale CSV-guessed value for our own buffs.
-        GetSession().GameState.RecordAuraExpiry(guid, (int)aura.AuraData.SpellID, duration);
+        // later relog doesn't restore a stale value for our own buffs (SELF class, #513).
+        GetSession().GameState.RecordAuraExpiry(guid, (int)aura.AuraData.SpellID, duration,
+            AuraStartClass.Self, AuraDurationSource.Local, duration, 0, GetSession().GameState.GetAuraCaster(guid, slot, (uint)aura.AuraData.SpellID));
 
         //MIRASU: Populate CastUnit and set NoCaster when caster is unknown — same rule as
         //MIRASU: the UpdateHandler aura loop. SMSG_UPDATE_AURA_DURATION arrives during login
@@ -4461,6 +4467,30 @@ public partial class WorldClient
     /// Finds the aura slot containing the specified spell on a target.
     /// Returns -1 if the spell is not found in any aura slot.
     /// </summary>
+    // JimsProxy (#513): the slot of this spell that this caster owns: a slot whose tracked caster
+    // is the given one, else a slot with no caster on record, else -1.
+    private int FindAuraSlotBySpellIdForCaster(WowGuid128 target, uint spellId, WowGuid128 caster, Dictionary<int, UpdateField> updateFields)
+    {
+        int UNIT_FIELD_AURA = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
+        if (UNIT_FIELD_AURA < 0)
+            return -1;
+
+        int unownedSlot = -1;
+        int aurasCount = LegacyVersion.GetAuraSlotsCount();
+        for (int i = 0; i < aurasCount; i++)
+        {
+            if (!updateFields.TryGetValue(UNIT_FIELD_AURA + i, out var field) || field.UInt32Value != spellId)
+                continue;
+            var slotCaster = GetSession().GameState.GetAuraCaster(target, (byte)i);
+            if (slotCaster == caster)
+                return i;
+            if (slotCaster == default && unownedSlot < 0)
+                unownedSlot = i;
+        }
+
+        return unownedSlot;
+    }
+
     private int FindAuraSlotBySpellId(WowGuid128 target, uint spellId, Dictionary<int, UpdateField> updateFields)
     {
         int UNIT_FIELD_AURA = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
@@ -4500,44 +4530,65 @@ public partial class WorldClient
 
         if (!isCurrentPlayer)
         {
-            // For other targets (enemy debuffs, party buffs), use best-guess duration
-            // since they don't receive SMSG_UPDATE_AURA_DURATION.
-
-            // JimsProxy (Rupture-DoT-Lingering-Icon): for vanilla CP-scaling finishers
-            // (Rupture, Kidney Shot), the snapshot must win over the cache because each
-            // cast can consume a different CP count and rewrite the aura. The cache holds
-            // the *previous* cast's duration; without this override a 3 CP recast on a
-            // mob that already had a 5 CP Rupture would inherit the stale 16 s. Snapshot
-            // returns null for non-finishers, so non-CP-scaling spells skip this branch.
-            int? finisherDurationMs = GetSession().GameState.TryGetPendingFinisherDurationMs(spellId, target);
-            int durationLeft;
-            int durationFull;
-            if (finisherDurationMs is int snapMs && snapMs > 0)
+            // JimsProxy (#513): a seen cast hit is an OBSERVED_GO start, so the timer restarts
+            // at the full duration now, never at the previous application's decayed remaining
+            // (the old refresh re-sent the decayed value, which then ran short by the age of
+            // the previous application). The full duration is known only when it does not
+            // depend on the caster (rule 3): a talent-modified spell or a combo-point finisher
+            // cast by someone else goes out without values, so the client drops its timer
+            // instead of showing a guess. forceFullRemaining is kept for its caller; full
+            // remaining is now the rule for every seen refresh.
+            bool localCast = caster == GetSession().GameState.CurrentPlayerGuid;
+            bool talentSpell = GameData.TalentDurationModifiers.ContainsKey(spellId);
+            bool finisher = GameData.IsComboPointFinisher(spellId);
+            int fixedMs = GameData.GetAuraSpellDuration(spellId);
+            var source = AuraTimerProvenance.DurationSourceFor(fixedMs > 0, localCast, talentSpell, finisher);
+            int durationFull = 0;
+            if (source == AuraDurationSource.Local)
             {
-                durationFull = snapMs;
-                durationLeft = snapMs;
+                // JimsProxy (Rupture-DoT-Lingering-Icon): the combo-point snapshot wins for the
+                // local player's finishers (each cast can consume a different CP count); a
+                // talent-modified spell takes the talent table; else the fixed value.
+                int? finisherDurationMs = finisher
+                    ? GetSession().GameState.TryGetPendingFinisherDurationMs(spellId, target) : null;
+                int? talentDur = talentSpell
+                    ? GameData.TryGetTalentDuration(spellId, GetSession().GameState.CurrentPlayerKnownSpells) : null;
+                durationFull = finisherDurationMs is int snapMs && snapMs > 0 ? snapMs : (talentDur ?? fixedMs);
             }
-            else
+            else if (source == AuraDurationSource.Fixed)
             {
-                GetSession().GameState.GetAuraDuration(target, slot, out durationLeft, out durationFull);
-                if (durationFull <= 0)
-                {
-                    int? talentDur = GameData.TryGetTalentDuration(spellId, GetSession().GameState.CurrentPlayerKnownSpells);
-                    durationFull = talentDur ?? GameData.GetAuraSpellDuration(spellId);
-                }
+                durationFull = fixedMs;
             }
 
-            if (durationFull > 0)
+            if (AuraTimerProvenance.IsKnown(AuraStartClass.ObservedGo, source, durationFull, 0))
             {
                 auraData.Flags |= AuraFlagsModern.Duration;
                 auraData.Duration = durationFull;
-                auraData.Remaining = forceFullRemaining ? durationFull : (durationLeft > 0 ? durationLeft : durationFull);
+                auraData.Remaining = durationFull;
 
                 GetSession().GameState.StoreAuraDurationLeft(target, slot, durationFull, Environment.TickCount);
                 GetSession().GameState.StoreAuraDurationFull(target, slot, durationFull);
-                // Mirror the cache seed above (recast → duration restarts at full), not the
-                // possibly-decayed Remaining, so the durable map never lags the cache.
-                GetSession().GameState.RecordAuraExpiry(target, (int)spellId, durationFull);
+                // The map is keyed by the modern spell id (the id the emit path records under).
+                GetSession().GameState.RecordAuraExpiry(target, (int)GameData.GetModernSpellId(spellId), durationFull,
+                    AuraStartClass.ObservedGo, source, durationFull, 0, caster);
+            }
+            else
+            {
+                auraData.Flags &= ~AuraFlagsModern.Duration;
+                auraData.Duration = null;
+                auraData.Remaining = null;
+                GetSession().GameState.ClearAuraDuration(target, slot);
+                GetSession().GameState.ClearAuraExpiry(target, (int)GameData.GetModernSpellId(spellId));
+                // Per hit target on every other caster's recast of such a spell: DebugOutput only.
+                if (Framework.Settings.DebugOutput)
+                    Framework.Logging.Log.Event("aura.refresh.unknown_duration", new
+                    {
+                        target_low = target.GetCounter(),
+                        slot = (int)slot,
+                        spell_id = spellId,
+                        local_cast = localCast,
+                        duration_source = source.ToString(),
+                    });
             }
         }
 
