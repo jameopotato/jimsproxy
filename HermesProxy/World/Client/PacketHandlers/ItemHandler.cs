@@ -535,17 +535,29 @@ public partial class WorldClient
     // Classic (161 of them: Shadowforge Torch, Fresh Carcass, the Un'Goro samples, the Alterac
     // Assault Orders, the Hallow's End masks) showed no countdown and vanished without warning.
     //
-    // If Kronos front-loads the login copies before SMSG_LOGIN_VERIFY_WORLD the way it does
-    // SMSG_SET_PROFICIENCY (#410), the 1.14 client is not in world yet and would drop them; hold
-    // those until the verify-world flush, the same way. Mid-session copies go straight through.
+    // Same rule as the enchant-time stash above (#503): Kronos front-loads the login copies
+    // before the item creates, and the client discards a time update for a guid it has not
+    // constructed. Forward when the item already exists client-side (mid-session copies: the
+    // server stores the item with an immediate create, then sends the time); otherwise stash
+    // the seconds and let the item's create translation re-emit them after the create is out.
     [PacketHandler(Opcode.SMSG_ITEM_TIME_UPDATE)]
     void HandleItemTimeUpdate(WorldPacket packet)
     {
         ItemTimeUpdate update = ParseItemTimeUpdate(packet, GetSession().GameState);
-        if (!GetSession().GameState.IsInWorld)
-            SendPacketToClient(update, Opcode.SMSG_LOGIN_VERIFY_WORLD);
-        else
-            SendPacketToClient(update);
+        if (GetSession().GameState.GetCachedObjectFieldsLegacy(update.ItemGuid) == null)
+        {
+            GetSession().GameState.StorePendingItemTimeUpdate(update.ItemGuid, update.DurationLeft, Environment.TickCount);
+            if (Framework.Settings.DebugOutput)
+            {
+                Log.Event("item.time.stashed_precreate", new
+                {
+                    item_guid = update.ItemGuid.ToString(),
+                    duration_seconds = update.DurationLeft,
+                });
+            }
+            return;
+        }
+        SendPacketToClient(update);
     }
 
     internal static ItemTimeUpdate ParseItemTimeUpdate(WorldPacket packet, GameSessionData gameState)

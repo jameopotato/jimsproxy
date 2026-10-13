@@ -685,6 +685,28 @@ public partial class WorldClient
             }
         }
 
+        // JimsProxy (item-time-at-login, #539): the same for timed items whose server push
+        // beat the item's create; the countdown the tooltip shows reads this packet only.
+        var itemTimeReemits = GetSession().GameState.TakeItemTimeReemits();
+        if (itemTimeReemits != null)
+        {
+            foreach (var (itemGuid, durationSeconds) in itemTimeReemits)
+            {
+                ItemTimeUpdate itemTime = new ItemTimeUpdate();
+                itemTime.ItemGuid = itemGuid;
+                itemTime.DurationLeft = durationSeconds;
+                SendPacketToClient(itemTime);
+                if (Settings.DebugOutput)
+                {
+                    Log.Event("item.time.reemitted_post_create", new
+                    {
+                        item_guid = itemGuid.ToString(),
+                        duration_seconds = durationSeconds,
+                    });
+                }
+            }
+        }
+
         // JimsProxy (camp stun lock, step 2): this update carried the login's first
         // self create block (marked in DetectStuckLogoutStunAtSelfCreate) — release
         // any control ops held from before it, in arrival order, now that the create
@@ -2740,6 +2762,10 @@ public partial class WorldClient
                         foreach (var (legacySlot, durationMs) in pendingEnchants)
                             GetSession().GameState.ArmEnchantTimeReemit(guid, TranslateEnchantmentSlotToModern(legacySlot), durationMs);
                     }
+                    // JimsProxy (item-time-at-login, #539): a stashed pre-create
+                    // SMSG_ITEM_TIME_UPDATE gets the same treatment as the enchant time.
+                    if (GetSession().GameState.ConsumePendingItemTimeUpdate(guid, Environment.TickCount) is uint itemTimeSeconds)
+                        GetSession().GameState.ArmItemTimeReemit(guid, itemTimeSeconds);
                 }
 
                 uint?[] gems = new uint?[ItemConst.MaxGemSockets];

@@ -1364,6 +1364,15 @@ public sealed class GameSessionData
     // been sent to the client — the proxy-layer equivalent of the servers' own
     // SendEnchantmentDurations-after-add-to-map ordering.
     public List<(WowGuid128 ItemGuid, uint ModernSlot, uint DurationSeconds)>? PendingEnchantTimeReemits;
+    // JimsProxy (item-time-at-login, #539): the same rule for SMSG_ITEM_TIME_UPDATE. The
+    // server sends one per timed item at login; Kronos front-loads them before the item
+    // creates and the client discards a time update for a guid it has not constructed.
+    // Seconds plus receipt tick per item guid, stashed when the push arrives pre-create,
+    // consumed when the item's create is translated and re-emitted after that create has
+    // been sent (PendingItemTimeReemits). A bank item's entry waits until the bank is
+    // opened. Not carried across sessions: each login gets fresh pushes.
+    public Dictionary<WowGuid128, (uint Seconds, int Tick)> PendingItemTimeUpdates = [];
+    public List<(WowGuid128 ItemGuid, uint DurationSeconds)>? PendingItemTimeReemits;
     public Dictionary<WowGuid128, Dictionary<byte, WowGuid128>> UnitAuraCaster = [];
     // Wall-clock aura expiry per (unit, spell). Unlike the per-slot caches above this
     // survives unit destroys AND relogs (carried over in CreateNewGameSessionData), so a
@@ -2134,6 +2143,37 @@ public sealed class GameSessionData
     {
         var reemits = PendingEnchantTimeReemits;
         PendingEnchantTimeReemits = null;
+        return reemits;
+    }
+    // JimsProxy (item-time-at-login, #539): see PendingItemTimeUpdates. A zero push is the
+    // server's own expiry signal and the item is about to be removed, so it is not stashed.
+    public void StorePendingItemTimeUpdate(WowGuid128 itemGuid, uint durationSeconds, int nowTick)
+    {
+        if (durationSeconds == 0)
+            return;
+        PendingItemTimeUpdates[itemGuid] = (durationSeconds, nowTick);
+    }
+    // The stashed seconds decayed by the time spent in the stash, or null when nothing was
+    // stashed or the remainder truncates to zero (the server's expiry is due within the second).
+    public uint? ConsumePendingItemTimeUpdate(WowGuid128 itemGuid, int nowTick)
+    {
+        if (!PendingItemTimeUpdates.Remove(itemGuid, out var push))
+            return null;
+        int elapsed = unchecked(nowTick - push.Tick);
+        if (elapsed < 0)
+            elapsed = 0;
+        long remainingSeconds = push.Seconds - elapsed / 1000;
+        return remainingSeconds > 0 ? (uint)remainingSeconds : null;
+    }
+    public void ArmItemTimeReemit(WowGuid128 itemGuid, uint durationSeconds)
+    {
+        PendingItemTimeReemits ??= [];
+        PendingItemTimeReemits.Add((itemGuid, durationSeconds));
+    }
+    public List<(WowGuid128 ItemGuid, uint DurationSeconds)>? TakeItemTimeReemits()
+    {
+        var reemits = PendingItemTimeReemits;
+        PendingItemTimeReemits = null;
         return reemits;
     }
     public void StoreAuraCaster(WowGuid128 target, byte slot, WowGuid128 caster)
