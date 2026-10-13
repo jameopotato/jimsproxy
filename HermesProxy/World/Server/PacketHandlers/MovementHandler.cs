@@ -390,6 +390,33 @@ public partial class WorldSocket
                       or Opcode.CMSG_MOVE_FORCE_FLIGHT_BACK_SPEED_CHANGE_ACK)
             return; // This is probably an ack by our swim to fly speed change for vanilla
 
+        // JimsProxy (#479 PvP fear statue, D1 test build 2026-10-10): at the onset of a
+        // speed-raising fear the server sends a forced speed change; the 1.14 client, having
+        // just lost control, acknowledges it with Falling, fall time 0 and zero jump speeds.
+        // Forwarded unchanged that report is the common factor of every decoded statue (the
+        // server adopts it and never starts the flee legs it sends to native victims, which
+        // answer with flags 0 here). Clear the modern moving mask so the legacy ack goes out
+        // as flags 0 / fall time 0; the gate leaves any real fall and any in-control ack alone.
+        // See FearOnsetAckGate for the truth table.
+        var ackInfo = speed.Ack.MoveInfo;
+        if (FearOnsetAckGate.IsOnsetTransientFallingAck(
+                GetSession().GameState.LastObservedHasControl,
+                ackInfo.Flags, ackInfo.FallTime, ackInfo.JumpVerticalSpeed, ackInfo.JumpHorizontalSpeed))
+        {
+            uint flagsBefore = ackInfo.Flags;
+            ackInfo.Flags = FearOnsetAckGate.ClearMovingMask(ackInfo.Flags);
+            // Fix-working breadcrumb (once per matched onset): DebugOutput only (review of #548).
+            if (Framework.Settings.DebugOutput)
+                Framework.Logging.Log.Event("movement.force_speed_ack.moving_mask_cleared", new
+                {
+                    opcode = opcode.ToString(),
+                    flags_before = flagsBefore,
+                    flags_after = ackInfo.Flags,
+                    speed = speed.Speed,
+                    move_counter = speed.Ack.MoveCounter,
+                });
+        }
+
         WorldPacket packet = new WorldPacket(opcode);
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_2_0_10192))
             packet.WritePackedGuid(speed.MoverGUID.To64());
