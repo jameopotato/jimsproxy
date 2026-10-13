@@ -81,6 +81,27 @@ public class PetSpells : ServerPacket
     public List<uint> Actions = new();
     public List<PetSpellCooldown> Cooldowns = new();
     public List<PetSpellHistory> SpellHistory = new();
+
+    // JimsProxy pet-bar fix: a ServerPacket serializes once, so the snapshot kept in GameState is
+    // never the instance that went to the client, and a bounce re-send needs its own copy.
+    // Cooldowns and charge history are left out on purpose: they were relative to the original
+    // send and the client already has them.
+    public PetSpells CloneWithoutCooldowns()
+    {
+        var copy = new PetSpells
+        {
+            PetGUID = PetGUID,
+            CreatureFamily = CreatureFamily,
+            Specialization = Specialization,
+            TimeLimit = TimeLimit,
+            ReactState = ReactState,
+            CommandState = CommandState,
+            Flag = Flag,
+        };
+        Array.Copy(ActionButtons, copy.ActionButtons, copy.ActionButtons.Length);
+        copy.Actions.AddRange(Actions);
+        return copy;
+    }
 }
 
 public class PetSpellCooldown

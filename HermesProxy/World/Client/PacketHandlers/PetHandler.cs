@@ -51,6 +51,8 @@ public partial class WorldClient
                 // same low-counter (unlikely but possible) doesn't inherit the
                 // old family.
                 GetSession().GameState.CachedPetCreatureFamily.Clear();
+                lock (GetSession().GameState.PetBarLock)
+                    GetSession().GameState.LastPetSpells = null;
                 PetClearSpells clear = new();
                 SendPacketToClient(clear);
                 return;
@@ -155,6 +157,24 @@ public partial class WorldClient
                 packet_size = dbgPacketSize,
             });
 
+            // JimsProxy pet-bar lock (opt-in): the 1.12 server won't store the command/stance
+            // slots (a spell dropped on one sticks, the control button doesn't come back), so
+            // when the player has turned the lock on in JimsPlus we force those six slots to
+            // their canonical buttons on every bar we forward. A broken pet heals on its next
+            // summon; a healthy bar is untouched. With the lock off we leave the bar exactly as
+            // the server sent it. Either way, remember it for a one-shot reset or a write bounce.
+            if (GetSession().GameState.PetControlLockEnabled &&
+                PetActionBar.EnforceControlSlots(spells.ActionButtons))
+                Log.Event("pet.bar.control_slots_enforced", new
+                {
+                    pet_guid = spells.PetGUID.ToString(),
+                    buttons = string.Join(",", Array.ConvertAll(spells.ActionButtons, b => b.ToString("X8"))),
+                });
+            lock (GetSession().GameState.PetBarLock)
+            {
+                GetSession().GameState.LastPetSpells = spells.CloneWithoutCooldowns();
+                GetSession().GameState.LastPetSpellsTick = Environment.TickCount64;
+            }
             SendPacketToClient(spells);
         }
         catch (Exception ex)
@@ -207,6 +227,14 @@ public partial class WorldClient
                     reason = "parse_failed",
                     parsed_packet_size = dbgPacketSize,
                 });
+                // Give even a parse-failed pet working command and stance buttons, when locked.
+                if (GetSession().GameState.PetControlLockEnabled)
+                    PetActionBar.EnforceControlSlots(fallback.ActionButtons);
+                lock (GetSession().GameState.PetBarLock)
+                {
+                    GetSession().GameState.LastPetSpells = fallback.CloneWithoutCooldowns();
+                    GetSession().GameState.LastPetSpellsTick = Environment.TickCount64;
+                }
                 SendPacketToClient(fallback);
             }
         }

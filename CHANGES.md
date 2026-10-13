@@ -13,6 +13,42 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-10-07 — Pet action bar: opt-in lock for the command and stance buttons (JimsPlus)
+
+**Issue:** a player dropped a pet spell onto the Attack button (or a stance button) and could
+not get it back. The 1.12 server stores the pet bar per pet, but it only honours a
+CMSG_PET_SET_ACTION that writes a *spell*. A write of a command (Attack/Follow/Stay) or
+reaction (Aggressive/Defensive/Passive) button is silently dropped, and the 1.14 client has no
+pet-command spellbook entries to drag, so once a spell displaces one of those six control
+buttons it is gone for good, surviving relog and resummon. Proven with the modern packet
+capture `jimsproxy-20261007-232558`: within one repair, the ability write to an ability slot
+persisted while the Attack and stance writes came back on the next summon still holding the
+spells that had displaced them.
+
+**Change:** the proxy can keep those six slots correct, but only when the player opts in, so a
+deliberate layout (for example a hunter who parks a fifth ability on the Attack slot) is never
+touched. `GameState.PetControlLockEnabled` defaults off; with it off the proxy does nothing to
+any pet bar. JimsPlus 1.2.5 adds a "Lock pet command & stance buttons" checkbox (off by
+default, saved per character) and a "Reset Pet Bar" button, plus `/jp petlock` and
+`/jp petreset`. The checkbox sends the JP `P\tLOCK\t<0|1>` addon sideband (the same channel as
+the zone sync, both ends ours, no secure-frame hooking); JimsPlus re-asserts the saved state on
+every login because the proxy flag is per session. When the lock is on,
+`World/Client/PacketHandlers/PetHandler.cs` forces the control slots to their canonical buttons
+on every forwarded SMSG_PET_SPELLS (`World/PetActionBar.cs` `EnforceControlSlots`: Attack/Follow/
+Stay in 0-2, Aggressive/Defensive/Passive in 7-9, a spell found in one of those rescued into a
+free ability slot, a healthy bar untouched), so a broken pet heals on its next summon, and
+`World/Server/PacketHandlers/PetHandler.cs` refuses a CMSG_PET_SET_ACTION that would drop a
+spell onto a control slot and re-sends the corrected bar. "Reset Pet Bar" / `P\tRESET` repaints
+the current pet at once; turning the lock on does the same immediately. New `ActiveStates` enum
+in `PetDefines.cs`; `GameState.LastPetSpells` snapshot (`PetBarLock`) holds the last forwarded
+bar.
+
+**Verification:** `PetActionBarEnforceTests` (14 cases, including the exact broken bar decoded
+from the capture) cover the enforce and write-allow rules; full suite green. In-game: with the
+lock on, a bar broken earlier was whole again on load and stayed whole across resummon and
+relog, confirmed against the proxy's `pet.bar.control_slots_enforced` / `control_write_blocked`
+events. The drag that displaces a locked button bounces back to a correct bar.
+
 ## 2026-10-02 — Quick-start installer 1.1.2: review fixes, yes/no menus, console look
 
 **Issue:** a code review of the installer found, among others: Update, Reconfigure and Uninstall

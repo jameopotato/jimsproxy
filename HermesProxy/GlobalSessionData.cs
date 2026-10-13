@@ -704,6 +704,20 @@ public sealed class GameSessionData
     public long AuctionOwnerWalkLastFinalizedTickMs;
     public uint LastWhoRequestId;
     public WowGuid128 CurrentPetGuid;
+    // JimsProxy pet-bar lock (opt-in, JimsPlus): when true, the proxy keeps the pet's command
+    // and stance buttons in place on every forwarded SMSG_PET_SPELLS and refuses a client write
+    // that would displace one. Default false = the proxy does nothing to any pet bar, so a
+    // player who hasn't turned the lock on in JimsPlus is unaffected. Set per session over the
+    // JP "P\tLOCK\t<0|1>" sideband; JimsPlus re-asserts it on every login.
+    public bool PetControlLockEnabled;
+    // The last SMSG_PET_SPELLS as forwarded to the client (control slots enforced when the lock
+    // is on), its ability buttons kept current from every forwarded castable or empty
+    // CMSG_PET_SET_ACTION write; null
+    // while there is no pet. Written on the legacy read path, read on the modern one; both under
+    // PetBarLock. Kept even when the lock is off, so a one-shot "/jp petreset" can still repaint.
+    public PetSpells? LastPetSpells;
+    public long LastPetSpellsTick;
+    public readonly Lock PetBarLock = new();
     public WowGuid128 CurrentSelection;
     public WowGuid64 CurrentAttackTarget;        // active CMSG_ATTACK_SWING victim, cleared on ATTACK_STOP/CANCEL_COMBAT
     public bool WaitingForAttackStart;           // true between CMSG_ATTACK_SWING and SMSG_ATTACK_START

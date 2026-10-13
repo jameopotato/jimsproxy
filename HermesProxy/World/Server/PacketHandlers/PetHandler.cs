@@ -1,4 +1,5 @@
 ﻿using Framework.Constants;
+using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World;
 using HermesProxy.World.Enums;
@@ -29,12 +30,46 @@ public partial class WorldSocket
     }
 
     [PacketHandler(Opcode.CMSG_PET_SET_ACTION)]
-    void HandlePetStopAttack(PetSetAction action)
+    void HandlePetSetAction(PetSetAction action)
     {
+        var gs = GetSession().GameState;
+
+        // JimsProxy pet-bar lock (opt-in): when the player has the lock on, refuse a write that
+        // would drop a spell onto a command or stance slot. The 1.12 server would silently
+        // ignore it anyway, but the client moves the button optimistically, so the bar ends up
+        // with a spell where Attack or a stance belongs and no way to restore it. Drop the write
+        // and snap the client's bar back to the one we last forwarded. With the lock off, every
+        // write passes through exactly as before. Ability-slot writes always pass through.
+        if (gs.PetControlLockEnabled && !PetActionBar.IsClientWriteAllowed(action.Index, action.Action))
+        {
+            Log.Event("pet.bar.control_write_blocked", new
+            {
+                pet_guid = action.PetGUID.ToString(),
+                index = action.Index,
+                action = action.Action.ToString("X8"),
+            });
+            ResendPetBarToClient(action.PetGUID);
+            return;
+        }
+
         WorldPacket packet = new WorldPacket(Opcode.CMSG_PET_SET_ACTION);
         packet.WriteGuid(action.PetGUID.To64());
         packet.WriteUInt32(action.Index);
         packet.WriteUInt32(action.Action);
+
+        // Keep the cached bar in step with the ability slot the client just rearranged, so
+        // a later reset or control-write bounce re-sends the right abilities. Only a castable
+        // spell or an empty slot is mirrored: the second half of a drag can write a command
+        // or stance button into an ability slot, which the server ignores and a re-send must
+        // not paint (review of #542).
+        lock (gs.PetBarLock)
+        {
+            var snap = gs.LastPetSpells;
+            if (snap != null && snap.PetGUID == action.PetGUID && action.Index < (uint)snap.ActionButtons.Length &&
+                (PetActionBar.IsCastable(action.Action) || PetActionBar.ActionOf(action.Action) == 0))
+                snap.ActionButtons[action.Index] = action.Action;
+        }
+
         SendPacketToServer(packet);
     }
 
@@ -133,5 +168,59 @@ public partial class WorldSocket
         SendPacketToServer(packet);
 
     }
-}
 
+    // JimsProxy pet-bar lock: re-send the last bar we forwarded, control slots re-enforced, so a
+    // misplaced button bounces back visibly instead of lingering until the next summon. Used
+    // after a refused control-write and by the one-shot reset. Returns whether a bar was sent
+    // (false if we have no bar for this pet yet).
+    private bool ResendPetBarToClient(WowGuid128 petGuid)
+    {
+        var gs = GetSession().GameState;
+        PetSpells? resend = null;
+        lock (gs.PetBarLock)
+        {
+            var snap = gs.LastPetSpells;
+            if (snap != null && snap.PetGUID == petGuid)
+            {
+                PetActionBar.EnforceControlSlots(snap.ActionButtons);
+                resend = snap.CloneWithoutCooldowns();
+                if (resend.TimeLimit != 0)
+                {
+                    // Temporary pets count down from the original send; keep the client's timer honest.
+                    long elapsed = Environment.TickCount64 - gs.LastPetSpellsTick;
+                    resend.TimeLimit = (uint)Math.Max(0, resend.TimeLimit - elapsed);
+                }
+            }
+        }
+
+        if (resend == null)
+            return false;
+        GetSession().WorldClient?.SendPacketToClient(resend);
+        return true;
+    }
+
+    // JimsProxy pet-bar lock: turn the opt-in command/stance lock on or off for this session
+    // (JimsPlus "P\tLOCK\t<0|1>"). Turning it on immediately rebuilds the current pet's bar so
+    // the player sees it fixed without resummoning.
+    internal void SetPetControlLock(bool enabled)
+    {
+        var gs = GetSession().GameState;
+        gs.PetControlLockEnabled = enabled;
+        Log.Event("pet.bar.lock_set", new { enabled });
+        if (enabled)
+            ResendPetBarToClient(gs.CurrentPetGuid);
+    }
+
+    // JimsProxy pet-bar lock: one-shot repaint of the current pet's bar (JimsPlus "P\tRESET").
+    // Works whether or not the lock is on; without the lock it reverts on the next summon.
+    internal void ResetPetBarNow()
+    {
+        var gs = GetSession().GameState;
+        bool sent = !gs.CurrentPetGuid.IsEmpty() && ResendPetBarToClient(gs.CurrentPetGuid);
+        Log.Event("pet.bar.reset_requested", new { pet_guid = gs.CurrentPetGuid.ToString(), sent });
+        if (sent)
+            GetSession().SendHermesTextMessage("Pet bar reset: Attack, Follow and Stay are back on the left and the stances on the right.");
+        else
+            GetSession().SendHermesTextMessage("No pet out to reset. Summon or call your pet first.", isError: true);
+    }
+}
