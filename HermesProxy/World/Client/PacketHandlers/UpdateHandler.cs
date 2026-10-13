@@ -3833,6 +3833,19 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                 // JimsProxy (#513, rule 4): the spells a create lists, so records of spells it
                 // does not list (buffs that ended while the unit was out of view) can be dropped.
                 HashSet<int>? createAuraSpellIds = isCreate ? new HashSet<int>() : null;
+                // JimsProxy (#513, rule 5): a party member coming back from a relog may be created
+                // before their online status arrives; shift their records by the offline interval
+                // before any slot below reads them.
+                if (isCreate && GetSession().GameState.ShiftAuraExpiriesIfReturning(guid) is var (offlineMs, shifted))
+                {
+                    Framework.Logging.Log.Event("party.aura.offline_shift", new
+                    {
+                        member_low = guid.GetCounter(),
+                        offline_ms = offlineMs,
+                        shifted,
+                        source = "create",
+                    });
+                }
                 for (byte i = 0; i < aurasCount; i++)
                 {
                     // Process slot i when EITHER:
@@ -4058,6 +4071,10 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                                         durationLeft = remaining;
                                         GetSession().GameState.StoreAuraDurationFull(guid, i, durationFull);
                                         GetSession().GameState.StoreAuraDurationLeft(guid, i, remaining, Environment.TickCount);
+                                        // The record also carries who applied it: a re-created member
+                                        // keeps the viewer's own buffs listed on the raid frame.
+                                        if (known.Caster != default && GetSession().GameState.GetAuraCaster(guid, i) == default)
+                                            GetSession().GameState.StoreAuraCaster(guid, i, known.Caster);
                                         Framework.Logging.Log.Event("aura.duration.restored_from_expiry", new
                                         {
                                             target_low = guid.GetCounter(),
@@ -4082,6 +4099,8 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                                 }
                             }
 
+                            if (castUnit == default)
+                                castUnit = GetSession().GameState.GetAuraCaster(guid, i, aura.AuraData.SpellID);
                             bool timerKnown = durationLeft > 0 &&
                                 AuraTimerProvenance.IsKnown(timerClass, timerSource, durationFull, boundMs);
                             if (timerKnown)
@@ -4090,7 +4109,7 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                                 aura.AuraData.Duration = durationFull;
                                 aura.AuraData.Remaining = durationLeft;
                                 GetSession().GameState.RecordAuraExpiry(guid, (int)auraSpellId, durationLeft,
-                                    timerClass, timerSource, durationFull, boundMs);
+                                    timerClass, timerSource, durationFull, boundMs, castUnit);
                             }
                             else
                             {
@@ -4134,8 +4153,6 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                             //MIRASU: The WotLK branch in VersionChecker.ConvertAuraFlags already sets
                             //MIRASU: NoCaster from a wire bit; 1.12's AuraFlagsVanilla has no such bit,
                             //MIRASU: so we infer it here from the caster-lookup result.
-                            if (castUnit == default)
-                                castUnit = GetSession().GameState.GetAuraCaster(guid, i, aura.AuraData.SpellID);
                             aura.AuraData.CastUnit = castUnit;
                             if (castUnit == default)
                                 aura.AuraData.Flags |= AuraFlagsModern.NoCaster;

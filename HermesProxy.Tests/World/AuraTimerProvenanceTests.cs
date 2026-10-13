@@ -359,4 +359,54 @@ public class AuraExpiryMapTests
 
         Assert.Null(state.TryGetAuraExpiry(Member, 1243));
     }
+
+    // The record carries the caster, and a re-record without one keeps the one on file.
+    [Fact]
+    public void Record_KeepsTheCasterAcrossARerecordWithoutOne()
+    {
+        var state = GameSessionData.CreateForTesting();
+        state.RecordAuraExpiry(Member, 1243, 100_000, AuraStartClass.ObservedGo, AuraDurationSource.Fixed, 100_000, 0, Other);
+
+        state.RecordAuraExpiry(Member, 1243, 90_000, AuraStartClass.ObservedGo, AuraDurationSource.Fixed, 100_000);
+
+        Assert.Equal(Other, state.TryGetAuraExpiry(Member, 1243)!.Value.Caster);
+    }
+
+    // Rule 5 as verified in the field: the member's buffs pause while they are offline, so the
+    // return shifts their records by the offline interval instead of dropping them.
+    [Fact]
+    public void OfflineMark_ThenReturn_ShiftsThatMembersEntries()
+    {
+        var state = GameSessionData.CreateForTesting();
+        state.RecordAuraExpiry(Member, 1243, 100_000, AuraStartClass.ObservedGo, AuraDurationSource.Fixed, 100_000);
+        state.RecordAuraExpiry(Other, 1243, 100_000, AuraStartClass.ObservedGo, AuraDurationSource.Fixed, 100_000);
+        long before = state.TryGetAuraExpiry(Member, 1243)!.Value.ExpiryTick;
+        long otherBefore = state.TryGetAuraExpiry(Other, 1243)!.Value.ExpiryTick;
+
+        state.MarkPartyMemberOffline(Member);
+        // Simulate 7 s offline without sleeping.
+        state.PartyMemberOfflineSince[Member] -= 7_000;
+        var result = state.ShiftAuraExpiriesIfReturning(Member);
+
+        Assert.NotNull(result);
+        Assert.InRange(result.Value.OfflineMs, 7_000, 7_500);
+        Assert.Equal(1, result.Value.Shifted);
+        Assert.InRange(state.TryGetAuraExpiry(Member, 1243)!.Value.ExpiryTick - before, 7_000, 7_500);
+        Assert.Equal(otherBefore, state.TryGetAuraExpiry(Other, 1243)!.Value.ExpiryTick);
+        // A second return without a mark does nothing.
+        Assert.Null(state.ShiftAuraExpiriesIfReturning(Member));
+    }
+
+    [Fact]
+    public void OfflineMark_IsNotReset_ByARepeatedOfflineStatus()
+    {
+        var state = GameSessionData.CreateForTesting();
+        state.MarkPartyMemberOffline(Member);
+        long first = state.PartyMemberOfflineSince[Member];
+
+        state.PartyMemberOfflineSince[Member] = first - 5_000;
+        state.MarkPartyMemberOffline(Member);
+
+        Assert.Equal(first - 5_000, state.PartyMemberOfflineSince[Member]);
+    }
 }

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using HermesProxy.World.Objects;
 
 namespace HermesProxy.World.Client;
 
@@ -42,13 +43,20 @@ public enum AuraDurationSource : byte
     Variable,
 }
 
-/// <summary>One expiry-map entry: when the aura ends and how the proxy knows.</summary>
+/// <summary>
+/// One expiry-map entry: when the aura ends, how the proxy knows, and who applied it when that
+/// was seen (default = unknown). The caster matters beyond the timer: the stock raid frame lists
+/// only the buffs the viewing player cast (FrameXML CompactUnitFrame_UtilShouldDisplayBuff), so a
+/// member's re-create after a relog must carry the caster back or the viewer's own buffs vanish
+/// from the raid frame.
+/// </summary>
 public readonly record struct AuraExpiryRecord(
     long ExpiryTick,
     AuraStartClass StartClass,
     AuraDurationSource Source,
     int FullMs,
-    int BoundMs);
+    int BoundMs,
+    WowGuid128 Caster = default);
 
 /// <summary>
 /// JimsProxy (#513): the rules that decide whether an aura timer goes on the wire. Pure

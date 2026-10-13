@@ -781,17 +781,23 @@ public partial class WorldClient
         gameState.PartyMemberLastFullAuras[member] = (Environment.TickCount64, listedModern);
     }
 
-    // Rule 5: a member's online-to-offline edge drops every expiry recorded for them. The
-    // server may pause their buffs while they are away, so a wall-clock value would run
-    // short when they return; they start unknown again.
+    // Rule 5: the server pauses a member's buffs while they are offline (field-verified
+    // 2026-10-12: a member's own Fortitude came back 7.0 s longer after a 7.1 s logout). The
+    // offline edge marks the member; the return edge (this status, or their create, whichever
+    // comes first) shifts every expiry recorded for them by the offline interval, so the
+    // watcher's timer and the buff's caster survive the member's relog.
     void NotePartyMemberOnlineEdge(WowGuid128 member, bool online)
     {
         var gameState = GetSession().GameState;
-        if (gameState.PartyMemberLastOnline.TryGetValue(member, out bool wasOnline) && wasOnline && !online)
+        gameState.PartyMemberLastOnline.TryGetValue(member, out bool wasOnline);
+        if (wasOnline && !online)
         {
-            int dropped = gameState.DropAuraExpiriesForUnit(member);
-            if (dropped > 0)
-                Log.Event("party.aura.offline_drop", new { member_low = member.GetCounter(), dropped });
+            gameState.MarkPartyMemberOffline(member);
+            Log.Event("party.aura.offline_mark", new { member_low = member.GetCounter() });
+        }
+        else if (online && gameState.ShiftAuraExpiriesIfReturning(member) is var (offlineMs, shifted))
+        {
+            Log.Event("party.aura.offline_shift", new { member_low = member.GetCounter(), offline_ms = offlineMs, shifted, source = "status" });
         }
         gameState.PartyMemberLastOnline[member] = online;
     }

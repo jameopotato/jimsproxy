@@ -4315,7 +4315,7 @@ public partial class WorldClient
         // Server-authoritative self duration — keep the durable expiry map in sync so a
         // later relog doesn't restore a stale value for our own buffs (SELF class, #513).
         GetSession().GameState.RecordAuraExpiry(guid, (int)aura.AuraData.SpellID, duration,
-            AuraStartClass.Self, AuraDurationSource.Local, duration);
+            AuraStartClass.Self, AuraDurationSource.Local, duration, 0, GetSession().GameState.GetAuraCaster(guid, slot, (uint)aura.AuraData.SpellID));
 
         //MIRASU: Populate CastUnit and set NoCaster when caster is unknown — same rule as
         //MIRASU: the UpdateHandler aura loop. SMSG_UPDATE_AURA_DURATION arrives during login
@@ -4570,7 +4570,7 @@ public partial class WorldClient
                 GetSession().GameState.StoreAuraDurationFull(target, slot, durationFull);
                 // The map is keyed by the modern spell id (the id the emit path records under).
                 GetSession().GameState.RecordAuraExpiry(target, (int)GameData.GetModernSpellId(spellId), durationFull,
-                    AuraStartClass.ObservedGo, source, durationFull);
+                    AuraStartClass.ObservedGo, source, durationFull, 0, caster);
             }
             else
             {
