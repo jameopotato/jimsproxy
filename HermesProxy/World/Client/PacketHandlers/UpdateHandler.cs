@@ -3838,13 +3838,15 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                 // before any slot below reads them.
                 if (isCreate && GetSession().GameState.ShiftAuraExpiriesIfReturning(guid) is var (offlineMs, shifted))
                 {
-                    Framework.Logging.Log.Event("party.aura.offline_shift", new
-                    {
-                        member_low = guid.GetCounter(),
-                        offline_ms = offlineMs,
-                        shifted,
-                        source = "create",
-                    });
+                    // Fix-working breadcrumb: DebugOutput only (review of #547).
+                    if (Framework.Settings.DebugOutput)
+                        Framework.Logging.Log.Event("party.aura.offline_shift", new
+                        {
+                            member_low = guid.GetCounter(),
+                            offline_ms = offlineMs,
+                            shifted,
+                            source = "create",
+                        });
                 }
                 for (byte i = 0; i < aurasCount; i++)
                 {
@@ -4121,22 +4123,24 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                                 durationFull = 0;
                                 durationLeft = 0;
                             }
-                            Framework.Logging.Log.Event("aura.slot.set", new
-                            {
-                                target_low = guid.GetCounter(),
-                                slot = i,
-                                spell_id = aura.AuraData.SpellID,
-                                slot_field_value = _slotSpellId,
-                                duration_full = durationFull,
-                                duration_left = durationLeft,
-                                timer_class = timerClass.ToString(),
-                                timer_source = timerSource.ToString(),
-                                timer_on_wire = timerKnown,
-                                mask_aura = _maskAura,
-                                mask_levels = _maskLevels,
-                                mask_apps = _maskApps,
-                                is_player_target = guid == GetSession().GameState.CurrentPlayerGuid,
-                            });
+                            // Per emitted slot on every unit update: DebugOutput only (review of #547; was always-on).
+                            if (Framework.Settings.DebugOutput)
+                                Framework.Logging.Log.Event("aura.slot.set", new
+                                {
+                                    target_low = guid.GetCounter(),
+                                    slot = i,
+                                    spell_id = aura.AuraData.SpellID,
+                                    slot_field_value = _slotSpellId,
+                                    duration_full = durationFull,
+                                    duration_left = durationLeft,
+                                    timer_class = timerClass.ToString(),
+                                    timer_source = timerSource.ToString(),
+                                    timer_on_wire = timerKnown,
+                                    mask_aura = _maskAura,
+                                    mask_levels = _maskLevels,
+                                    mask_apps = _maskApps,
+                                    is_player_target = guid == GetSession().GameState.CurrentPlayerGuid,
+                                });
                             //MIRASU: Set NoCaster flag when caster lookup fails, or the 1.14.2 client's
                             //MIRASU: UI buff-bar treats the aura as malformed-for-display (icon hidden)
                             //MIRASU: even though the effect engine still applies stat mods from the spell
@@ -4215,7 +4219,11 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                         }
                     }
                 }
-                if (createAuraSpellIds != null)
+                // Only group members and the local player can carry a record of a buff that ended
+                // out of view; a mob's records expire on their own, so the whole-map scan is not
+                // paid on every unit create (review of #547).
+                if (createAuraSpellIds != null &&
+                    (guid == GetSession().GameState.CurrentPlayerGuid || GetSession().GameState.IsGroupMemberGuid(guid)))
                     GetSession().GameState.DropAuraExpiriesForUnitExcept(guid, createAuraSpellIds);
             }
         }

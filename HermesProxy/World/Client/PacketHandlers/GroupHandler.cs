@@ -726,14 +726,16 @@ public partial class WorldClient
         foreach (var stamp in result.Stamps)
         {
             gameState.RecordAuraExpiry(member, (int)stamp.ModernSpellId, stamp.FullMs, stamp.StartClass, stamp.Source, stamp.FullMs, AuraTimerProvenance.StatsStartBoundMs);
-            Log.Event("party.aura.start_stamped", new
-            {
-                member_low = member.GetCounter(),
-                slot = stamp.Slot,
-                spell_id = stamp.ModernSpellId,
-                start_class = stamp.StartClass.ToString(),
-                full_ms = stamp.FullMs,
-            });
+            // Fix-working breadcrumb, frequent in a raid: DebugOutput only (review of #547).
+            if (Framework.Settings.DebugOutput)
+                Log.Event("party.aura.start_stamped", new
+                {
+                    member_low = member.GetCounter(),
+                    slot = stamp.Slot,
+                    spell_id = stamp.ModernSpellId,
+                    start_class = stamp.StartClass.ToString(),
+                    full_ms = stamp.FullMs,
+                });
         }
     }
 
@@ -793,11 +795,15 @@ public partial class WorldClient
         if (wasOnline && !online)
         {
             gameState.MarkPartyMemberOffline(member);
-            Log.Event("party.aura.offline_mark", new { member_low = member.GetCounter() });
+            // Fix-working breadcrumb: DebugOutput only (review of #547).
+            if (Framework.Settings.DebugOutput)
+                Log.Event("party.aura.offline_mark", new { member_low = member.GetCounter() });
         }
         else if (online && gameState.ShiftAuraExpiriesIfReturning(member) is var (offlineMs, shifted))
         {
-            Log.Event("party.aura.offline_shift", new { member_low = member.GetCounter(), offline_ms = offlineMs, shifted, source = "status" });
+            // Fix-working breadcrumb: DebugOutput only (review of #547).
+            if (Framework.Settings.DebugOutput)
+                Log.Event("party.aura.offline_shift", new { member_low = member.GetCounter(), offline_ms = offlineMs, shifted, source = "status" });
         }
         gameState.PartyMemberLastOnline[member] = online;
     }
