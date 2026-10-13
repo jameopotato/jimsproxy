@@ -58,11 +58,15 @@ public partial class WorldSocket
         packet.WriteUInt32(action.Action);
 
         // Keep the cached bar in step with the ability slot the client just rearranged, so
-        // a later reset or control-write bounce re-sends the right abilities.
+        // a later reset or control-write bounce re-sends the right abilities. Only a castable
+        // spell or an empty slot is mirrored: the second half of a drag can write a command
+        // or stance button into an ability slot, which the server ignores and a re-send must
+        // not paint (review of #542).
         lock (gs.PetBarLock)
         {
             var snap = gs.LastPetSpells;
-            if (snap != null && snap.PetGUID == action.PetGUID && action.Index < (uint)snap.ActionButtons.Length)
+            if (snap != null && snap.PetGUID == action.PetGUID && action.Index < (uint)snap.ActionButtons.Length &&
+                (PetActionBar.IsCastable(action.Action) || PetActionBar.ActionOf(action.Action) == 0))
                 snap.ActionButtons[action.Index] = action.Action;
         }
 

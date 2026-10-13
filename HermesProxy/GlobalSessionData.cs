@@ -708,7 +708,8 @@ public sealed class GameSessionData
     // JP "P\tLOCK\t<0|1>" sideband; JimsPlus re-asserts it on every login.
     public bool PetControlLockEnabled;
     // The last SMSG_PET_SPELLS as forwarded to the client (control slots enforced when the lock
-    // is on), its ability buttons kept current from every forwarded CMSG_PET_SET_ACTION; null
+    // is on), its ability buttons kept current from every forwarded castable or empty
+    // CMSG_PET_SET_ACTION write; null
     // while there is no pet. Written on the legacy read path, read on the modern one; both under
     // PetBarLock. Kept even when the lock is off, so a one-shot "/jp petreset" can still repaint.
     public PetSpells? LastPetSpells;
