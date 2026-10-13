@@ -526,4 +526,45 @@ public partial class WorldClient
         enchantment.Enchantment = packet.ReadInt32();
         SendPacketToClient(enchantment);
     }
+
+    // JimsProxy (2026-10-06): 1.12 sends SMSG_ITEM_TIME_UPDATE [item guid][seconds left] once when a
+    // timed item lands in the bags and once per timed item at login (vmangos
+    // Player::AddItemDurations / SendItemDurations, whose comment says the client needs it to
+    // display the remaining time even though the item's duration field is also set). The modern
+    // packet is the same two fields. It was never translated, so every timed quest item in
+    // Classic (161 of them: Shadowforge Torch, Fresh Carcass, the Un'Goro samples, the Alterac
+    // Assault Orders, the Hallow's End masks) showed no countdown and vanished without warning.
+    //
+    // Same rule as the enchant-time stash above (#503): Kronos front-loads the login copies
+    // before the item creates, and the client discards a time update for a guid it has not
+    // constructed. Forward when the item already exists client-side (mid-session copies: the
+    // server stores the item with an immediate create, then sends the time); otherwise stash
+    // the seconds and let the item's create translation re-emit them after the create is out.
+    [PacketHandler(Opcode.SMSG_ITEM_TIME_UPDATE)]
+    void HandleItemTimeUpdate(WorldPacket packet)
+    {
+        ItemTimeUpdate update = ParseItemTimeUpdate(packet, GetSession().GameState);
+        if (GetSession().GameState.GetCachedObjectFieldsLegacy(update.ItemGuid) == null)
+        {
+            GetSession().GameState.StorePendingItemTimeUpdate(update.ItemGuid, update.DurationLeft, Environment.TickCount);
+            if (Framework.Settings.DebugOutput)
+            {
+                Log.Event("item.time.stashed_precreate", new
+                {
+                    item_guid = update.ItemGuid.ToString(),
+                    duration_seconds = update.DurationLeft,
+                });
+            }
+            return;
+        }
+        SendPacketToClient(update);
+    }
+
+    internal static ItemTimeUpdate ParseItemTimeUpdate(WorldPacket packet, GameSessionData gameState)
+    {
+        ItemTimeUpdate update = new();
+        update.ItemGuid = packet.ReadGuid().To128(gameState);
+        update.DurationLeft = packet.ReadUInt32();
+        return update;
+    }
 }

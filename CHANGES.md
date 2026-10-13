@@ -1125,3 +1125,11 @@ Config kill switch `LoginEvictionMerge` (default true). Events: `login.eviction_
 **Change:** `HermesProxy/World/Client/PacketHandlers/SpellHandler.cs`: the per-target decode moved into `ParseSpellExecuteLog` with a per-effect record-size table (1.12 ids from mangos-classic `SpellEffectDefines.h`), raw 8-byte guid reads, no payload for the summon family, and a hard stop on any effect not in the table (one deduplicated `combat.execute_log.unknown_layout` event per spell/effect per session instead of a guess). The try/catch backstop and the `parse_failed` event stay.
 
 **Verification:** `HermesProxy.Tests/World/SpellExecuteLogParseTests.cs` drives the parser with the exact bytes from the 2026-10-05 capture (Mining on Rich Thorium Vein 175404), plus Dragon's Call, Redemption, Counterspell, Fishing, an unknown effect and a truncated record. Field check: mine a node and taunt a mob; the console shows no `[HighGuidLegacy]` warning and no `SpellExecuteLog parse failed` line.
+
+## 2026-10-06 - Translate SMSG_ITEM_TIME_UPDATE so timed items show their countdown
+
+**Issue:** The packet was untranslated (`packet.untranslated` on 2026-09-26, looting a Shadowforge Torch). 1.12 sends it once when a timed item lands in the bags and once per timed item at login; the vmangos sender carries the comment that the client needs it to display the remaining time even though the duration field is set. The 1.14 client uses the same packet for the same job. Every timed quest item in Classic (161 of them: Shadowforge Torch, Fresh Carcass, the Un'Goro samples, the Alterac Assault Orders, the Hallow's End masks) showed no countdown and vanished without warning.
+
+**Change:** `HermesProxy/World/Server/Packets/ItemPackets.cs` adds the modern `ItemTimeUpdate` (packed guid, seconds; Realm connection as native). `HermesProxy/World/Client/PacketHandlers/ItemHandler.cs` adds the handler and `ParseItemTimeUpdate`; a copy that arrives before the item's create (the login copies on Kronos) is stashed and re-emitted after the create, the same rule as the #503 enchant-time stash, because the client drops a time update for a guid it has not built.
+
+**Verification:** `HermesProxy.Tests/World/ItemTimeUpdateTests.cs`. Field: carry any timed quest item through a relog; the tooltip shows the remaining time and counts down.
