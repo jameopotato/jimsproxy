@@ -2318,7 +2318,9 @@ public partial class WorldClient
             return;
 
         SendPacketToClient(OnHoldCooldownsAtLogin.BuildPacket(guid, held));
-        Log.Event("cooldown.held_armed_at_login", new { spell_ids = held });
+        // Fix-working breadcrumb (once per stealthed login): DebugOutput only (review of #551).
+        if (Framework.Settings.DebugOutput)
+            Log.Event("cooldown.held_armed_at_login", new { spell_ids = held });
     }
 
     private void DetectStuckLogoutStunAtSelfCreate(WowGuid128 guid, Dictionary<int, UpdateField> updates, bool isCreate, ObjectUpdate updateData)
