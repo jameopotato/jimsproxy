@@ -41,7 +41,7 @@ public class ItemTimeUpdateTests
         update.DurationLeft = 300;
 
         update.WritePacketData();
-        var wire = new WorldPacket(0, update.GetData()!);
+        var wire = new WorldPacket(update.GetOpcode(), update.GetData()!);
 
         Assert.Equal(update.ItemGuid, wire.ReadPackedGuid128());
         Assert.Equal(300u, wire.ReadUInt32());
