@@ -448,7 +448,8 @@ public partial class WorldClient
         player.Faction = row.Faction;
         ScoreboardRowResolver.CountByFaction(pvp.PlayerCount, row.Faction);
 
-        if (!row.FromCache && placeholdersLogged < ScoreboardRowResolver.MaxPlaceholderLogsPerBoard)
+        // Fix-working breadcrumb on a board that repaints every 5 s: DebugOutput only (review of #546).
+        if (Framework.Settings.DebugOutput && !row.FromCache && placeholdersLogged < ScoreboardRowResolver.MaxPlaceholderLogsPerBoard)
         {
             placeholdersLogged++;
             Log.Event("battleground.scoreboard.row_placeholder", new

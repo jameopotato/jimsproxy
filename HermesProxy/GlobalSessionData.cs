@@ -1980,7 +1980,8 @@ public sealed class GameSessionData
         bool inBattleground = DecideInBattleground(CurrentMapId, bgId, BattleFieldQueueTypes.Values,
             LegacyVersion.RemovedInVersion(Enums.ClientVersionBuild.V2_0_1_6180), _battlegroundExitedMapId, out bool usedFallback);
 
-        if (usedFallback && _inBattlegroundFallbackLoggedMap != CurrentMapId)
+        // Fix-working breadcrumb (the fallback deciding is the #504 fix in use): DebugOutput only (review of #546).
+        if (usedFallback && Framework.Settings.DebugOutput && _inBattlegroundFallbackLoggedMap != CurrentMapId)
         {
             _inBattlegroundFallbackLoggedMap = (uint)CurrentMapId;
             Log.Event("battleground.in_bg.map_fallback", new
