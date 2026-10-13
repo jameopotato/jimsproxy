@@ -1133,3 +1133,11 @@ Config kill switch `LoginEvictionMerge` (default true). Events: `login.eviction_
 **Change:** `HermesProxy/World/Server/Packets/ItemPackets.cs` adds the modern `ItemTimeUpdate` (packed guid, seconds; Realm connection as native). `HermesProxy/World/Client/PacketHandlers/ItemHandler.cs` adds the handler and `ParseItemTimeUpdate`; a copy that arrives before the item's create (the login copies on Kronos) is stashed and re-emitted after the create, the same rule as the #503 enchant-time stash, because the client drops a time update for a guid it has not built.
 
 **Verification:** `HermesProxy.Tests/World/ItemTimeUpdateTests.cs`. Field: carry any timed quest item through a relog; the tooltip shows the remaining time and counts down.
+
+## 2026-10-06 - Translate the three untranslated 1.12 combat-log packets
+
+**Issue:** `packet.untranslated` over ten days of logs: SMSG_PROC_RESIST 64, SMSG_SPELL_OR_DAMAGE_IMMUNE 12, SMSG_SPELL_MISS_LOG 7. The cases a cast's own SMSG_SPELL_GO covers (miss, resist, immune on the cast itself) already reach the client; these three are the ones with no cast behind them. On 1.12 a periodic tick or damage shield that fully resists shows a "Resist" float and one that lands on an immune target shows "Immune" (vmangos SpellAuras periodic handlers, Unit::TriggerDamageShields); on ours the tick looked like it silently skipped. SMSG_PROC_RESIST is a proc that resisted after a melee or ranged hit and only feeds the combat log tab (Kronos sends it; cmangos defines the writer but never calls it).
+
+**Change:** `HermesProxy/World/Server/Packets/SpellPackets.cs` adds `SpellMissLog`, `ProcResist` and `SpellOrDamageImmune` (WowPacketParser V6 CombatLogHandler layouts, shared by the 1.14 and 2.5 tables; connections as native). `HermesProxy/World/Client/PacketHandlers/SpellHandler.cs` adds the three handlers and their `Parse*` functions (cmangos Unit.cpp writers; the sizes match the Kronos captures).
+
+**Verification:** `HermesProxy.Tests/World/CombatLogPacketTests.cs`. Field: a DoT ticking on a bubbled paladin shows "Immune"; the combat log tab shows resisted procs after a few minutes of melee.

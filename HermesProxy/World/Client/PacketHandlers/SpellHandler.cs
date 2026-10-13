@@ -4114,6 +4114,77 @@ public partial class WorldClient
         GetSession().ThreatTracker.OnDamage(spell.CasterGUID, spell.VictimGUID, (int)spell.SpellID, spell.Damage);
     }
 
+    // JimsProxy (2026-10-06): three 1.12 combat-log packets that were never translated. The cases
+    // a cast's own SMSG_SPELL_GO covers (miss, resist, immune on the cast itself) already reach the
+    // client; these are the ones with no cast behind them.
+    //   SMSG_SPELL_MISS_LOG: a periodic tick or damage shield that fully missed or resisted
+    //     (vmangos SpellAuras periodic handlers, Unit::TriggerDamageShields). On 1.12 that is the
+    //     "Resist" float over the target; without it the tick looked like it silently skipped.
+    //   SMSG_SPELL_OR_DAMAGE_IMMUNE: a periodic tick or damage shield on an immune target (same
+    //     senders). On 1.12 that is the "Immune" float, e.g. a DoT ticking on a bubbled paladin.
+    //   SMSG_PROC_RESIST: a proc that resisted after a melee or ranged hit. Kronos sends it
+    //     (cmangos defines SendSpellDamageResist but never calls it); it only feeds the combat
+    //     log tab.
+    // Legacy layouts are the cmangos Unit.cpp writers; the sizes match the Kronos captures
+    // (28, 23 and 23 bytes with the opcode). Modern layouts are the WowPacketParser V6
+    // CombatLogHandler ones, which the 1.14 and 2.5 tables share.
+    [PacketHandler(Opcode.SMSG_SPELL_MISS_LOG)]
+    void HandleSpellMissLog(WorldPacket packet)
+    {
+        SendPacketToClient(ParseSpellMissLog(packet, GetSession().GameState));
+    }
+
+    internal static SpellMissLog ParseSpellMissLog(WorldPacket packet, GameSessionData gameState)
+    {
+        SpellMissLog log = new();
+        log.SpellID = packet.ReadUInt32();
+        log.Caster = packet.ReadGuid().To128(gameState);
+        packet.ReadUInt8(); // log format: 0 default, 1 debug; 1.12 cores always write 0
+        uint count = packet.ReadUInt32();
+        for (uint i = 0; i < count && packet.CanRead(9); i++)
+        {
+            SpellLogMissEntry entry = new();
+            entry.Victim = packet.ReadGuid().To128(gameState);
+            entry.MissReason = (SpellMissInfo)packet.ReadUInt8(); // same values on both sides
+            log.Entries.Add(entry);
+        }
+        return log;
+    }
+
+    [PacketHandler(Opcode.SMSG_PROC_RESIST)]
+    void HandleProcResist(WorldPacket packet)
+    {
+        SendPacketToClient(ParseProcResist(packet, GetSession().GameState));
+    }
+
+    internal static ProcResist ParseProcResist(WorldPacket packet, GameSessionData gameState)
+    {
+        ProcResist resist = new();
+        resist.Caster = packet.ReadGuid().To128(gameState);
+        resist.Target = packet.ReadGuid().To128(gameState);
+        resist.SpellID = packet.ReadUInt32();
+        // The trailing byte is the log format (0 default, 1 debug). The modern Rolled/Needed
+        // floats only exist in the debug format, which 1.12 never sends.
+        return resist;
+    }
+
+    [PacketHandler(Opcode.SMSG_SPELL_OR_DAMAGE_IMMUNE)]
+    void HandleSpellOrDamageImmune(WorldPacket packet)
+    {
+        SendPacketToClient(ParseSpellOrDamageImmune(packet, GetSession().GameState));
+    }
+
+    internal static SpellOrDamageImmune ParseSpellOrDamageImmune(WorldPacket packet, GameSessionData gameState)
+    {
+        SpellOrDamageImmune immune = new();
+        immune.CasterGUID = packet.ReadGuid().To128(gameState);
+        immune.VictimGUID = packet.ReadGuid().To128(gameState);
+        immune.SpellID = packet.ReadUInt32();
+        // The trailing byte is the log format on 1.12, not a periodic flag. The client shows the
+        // same "Immune" either way, so IsPeriodic stays false.
+        return immune;
+    }
+
     [PacketHandler(Opcode.SMSG_ENVIRONMENTAL_DAMAGE_LOG)]
     void HandleEnvironmentalDamageLog(WorldPacket packet)
     {
