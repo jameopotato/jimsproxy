@@ -3551,134 +3551,177 @@ public partial class WorldClient
         GetSession().ThreatTracker.OnDamage(spell.CasterGUID, spell.TargetGUID, (int)spell.SpellID, spell.Damage);
     }
 
+    // JimsProxy (2026-10-06): one decoded SMSG_SPELL_EXECUTE_LOG. Diagnostic only: nothing in it
+    // is forwarded to the modern client. It exists so the Kronos byte layout can be driven through
+    // the parser in tests, and so a parse that dies half-way still leaves breadcrumbs for the
+    // error line.
+    internal sealed class SpellExecuteLogParse
+    {
+        public WowGuid128 Caster = WowGuid128.Empty;
+        public uint SpellId;
+        public uint EffectCount;
+        public uint LastEffectIndex;
+        public uint LastEffectType;
+        public uint LastTargetCount;
+        public uint LastTargetIndex;
+        public List<SpellExecuteLogTarget> Targets = new();
+        // Set when an effect's per-target layout is not in the table, or the packet ends before
+        // the record it promised. Decoding stops there; nothing after it is read or guessed.
+        public uint? UnknownEffectType;
+    }
+
+    internal readonly record struct SpellExecuteLogTarget(uint EffectType, WowGuid128 Target, uint Value1, uint Value2, float Multiplier);
+
+    // Bytes one per-target record occupies on Kronos for this effect, or -1 when the layout is
+    // not in the table. Ids are 1.12 values (mangos-classic SpellEffectDefines.h).
+    //
+    // Kronos writes every per-target guid as a plain 8-byte guid, never packed the way the
+    // mangos/cmangos writers do. Verified 2026-10-05: the mined node's guid taken from the
+    // SMSG_LOOT_RESPONSE that follows each Mining hit reproduces, byte for byte, every
+    // "Unknown legacy high-guid" warning the packed read had produced over ten days of logs
+    // (Mining, Taunt, Growl, Counterspell, Cleanse, Remove Curse, Redemption, Rebirth).
+    // Summon-family effects carry no per-target payload at all (Dragon's Call 13049 and the NPC
+    // guardian summons were the "SpellExecuteLog parse failed" errors); totem slots add four
+    // bytes this table leaves unread.
+    internal static int SpellExecuteLogRecordSize(uint effectType) => effectType switch
+    {
+        8 => 8 + 4 + 4 + 4,                                   // POWER_DRAIN: target, amount, power, multiplier
+        19 or 68 => 8 + 4,                                    // ADD_EXTRA_ATTACKS: target, count / INTERRUPT_CAST: target, spell
+        111 => 8 + 4 + 4,                                     // DURABILITY_DAMAGE: target, item, slot
+        24 or 101 => 4,                                       // CREATE_ITEM / FEED_PET: item id
+        1 or 18 or 33 or 38 or 59 or 102 or 113 or 114 => 8,  // INSTAKILL, RESURRECT, OPEN_LOCK, DISPEL, OPEN_LOCK_ITEM,
+                                                              // DISMISS_PET, RESURRECT_NEW, ATTACK_ME: target
+        3 or 50 or 69 or 77 => 0,                             // DUMMY, TRANS_DOOR, DISTRACT, SCRIPT_EFFECT
+        28 or 41 or 42 or 56 or 73 or 74 or 76 or 93 or 97 or 112
+            or (>= 87 and <= 90) or (>= 104 and <= 107) => 0, // summon family
+        _ => -1,
+    };
+
+    internal static SpellExecuteLogParse ParseSpellExecuteLog(WorldPacket packet, GameSessionData gameState)
+    {
+        var log = new SpellExecuteLogParse();
+        ParseSpellExecuteLog(packet, gameState, log);
+        return log;
+    }
+
+    internal static void ParseSpellExecuteLog(WorldPacket packet, GameSessionData gameState, SpellExecuteLogParse log)
+    {
+        log.Caster = packet.ReadPackedGuid().To128(gameState); // the caster is packed; only the targets are not
+        log.SpellId = packet.ReadUInt32();
+        log.EffectCount = packet.ReadUInt32();
+
+        for (uint i = 0; i < log.EffectCount; i++)
+        {
+            uint effectType = packet.ReadUInt32();
+            uint targetCount = packet.ReadUInt32();
+            log.LastEffectIndex = i;
+            log.LastEffectType = effectType;
+            log.LastTargetCount = targetCount;
+            int recordSize = SpellExecuteLogRecordSize(effectType);
+
+            for (uint t = 0; t < targetCount; t++)
+            {
+                log.LastTargetIndex = t;
+                if (recordSize < 0 || !packet.CanRead(recordSize))
+                {
+                    log.UnknownEffectType = effectType;
+                    return;
+                }
+
+                WowGuid128 target = WowGuid128.Empty;
+                uint value1 = 0;
+                uint value2 = 0;
+                float multiplier = 0;
+                switch (effectType)
+                {
+                    case 8:
+                        target = packet.ReadGuid().To128(gameState);
+                        value1 = packet.ReadUInt32();
+                        value2 = packet.ReadUInt32();
+                        multiplier = packet.ReadFloat();
+                        break;
+                    case 19:
+                    case 68:
+                        target = packet.ReadGuid().To128(gameState);
+                        value1 = packet.ReadUInt32();
+                        break;
+                    case 111:
+                        target = packet.ReadGuid().To128(gameState);
+                        value1 = packet.ReadUInt32();
+                        value2 = packet.ReadUInt32();
+                        break;
+                    case 24:
+                    case 101:
+                        value1 = packet.ReadUInt32();
+                        break;
+                    case 1:
+                    case 18:
+                    case 33:
+                    case 38:
+                    case 59:
+                    case 102:
+                    case 113:
+                    case 114:
+                        target = packet.ReadGuid().To128(gameState);
+                        break;
+                    default:
+                        break; // no-payload effect (recordSize == 0)
+                }
+                log.Targets.Add(new SpellExecuteLogTarget(effectType, target, value1, value2, multiplier));
+            }
+        }
+    }
+
+    // Once per (spell, effect) per session: the breadcrumb for a layout the table does not know,
+    // without spamming the JSONL.
+    private readonly HashSet<(uint SpellId, uint EffectType)> _executeLogUnknownLayouts = new();
+
     [PacketHandler(Opcode.SMSG_SPELL_EXECUTE_LOG)]
     void HandleSpellExecuteLog(WorldPacket packet)
     {
-        // SMSG_SPELL_EXECUTE_LOG is diagnostic-only — nothing here is forwarded to
-        // the modern client. So if any byte misalignment / unknown effect format
-        // trips a parse exception, we MUST NOT let it bubble up — it would tear
-        // down the entire ReceiveLoop and force a random disconnect.
-        //
-        // Two known triggers found in the wild, both effects that report targetCount
-        // > 0 on the wire but emit no per-target payload — falling through to the
-        // default GUID-read branch reads off the end of the packet:
-        //   - Effect 50 (TRANS_DOOR): Priest Lightwell, Mage portals, etc.
-        //   - Effect 69 (DISTRACT): Rogue spell 1725 — anyone in range casting it
-        //     would DC every other player.
-        // Try/catch wrapper is the durable fix for the next surprise effect type;
-        // explicit cases just keep the error log clean.
-        // Breadcrumbs for the parse-failed event — capture as much state as we
-        // got through before the exception so future captures tell us which spell
-        // / effect type we need to whitelist next.
-        uint dbgSpellId = 0;
-        uint dbgEffectIndex = 0;
-        uint dbgEffectType = 0;
-        uint dbgTargetCount = 0;
-        uint dbgTargetIndex = 0;
+        // SMSG_SPELL_EXECUTE_LOG is diagnostic-only: nothing here is forwarded to the modern
+        // client, so a parse problem must never reach the ReceiveLoop (it would DC the player).
+        // ParseSpellExecuteLog carries the Kronos layout table and stops instead of guessing;
+        // the try/catch is the backstop for a packet without even a sane header.
+        var log = new SpellExecuteLogParse();
         try
         {
-            var casterGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
-            uint spellId = packet.ReadUInt32();
-            dbgSpellId = spellId;
-            uint effectCount = packet.ReadUInt32();
+            ParseSpellExecuteLog(packet, GetSession().GameState, log);
 
-            bool verbose = Log.VerboseLogEnabled;
-            if (verbose)
-                Log.Print(LogType.Server, $"SpellExecuteLog: caster={casterGuid} spell={spellId} effects={effectCount}");
-
-            for (uint i = 0; i < effectCount; i++)
+            if (log.UnknownEffectType is uint unknownEffect
+                && _executeLogUnknownLayouts.Add((log.SpellId, unknownEffect)))
             {
-                dbgEffectIndex = i;
-                uint effectType = packet.ReadUInt32();
-                uint targetCount = packet.ReadUInt32();
-                dbgEffectType = effectType;
-                dbgTargetCount = targetCount;
-
-                if (verbose)
-                    Log.Print(LogType.Server, $"  Effect[{i}]: type={effectType} targets={targetCount}");
-
-                for (uint t = 0; t < targetCount; t++)
+                Log.Event("combat.execute_log.unknown_layout", new
                 {
-                    dbgTargetIndex = t;
-                    switch (effectType)
-                    {
-                        case 8: // POWER_DRAIN
-                            var pdGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
-                            uint pdAmount = packet.ReadUInt32();
-                            uint pdPowerType = packet.ReadUInt32();
-                            float pdMultiplier = packet.ReadFloat();
-                            if (verbose) Log.Print(LogType.Server, $"PowerDrain: target={pdGuid} amount={pdAmount} power={pdPowerType}");
-                            break;
-                        case 10: // HEAL
-                            var hGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
-                            uint hAmount = packet.ReadUInt32();
-                            uint hCrit = packet.ReadUInt32();
-                            if (verbose) Log.Print(LogType.Server, $"Heal: target={hGuid} amount={hAmount} crit={hCrit}");
-                            break;
-                        case 30: // ENERGIZE
-                            var eGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
-                            uint eAmount = packet.ReadUInt32();
-                            uint ePowerType = packet.ReadUInt32();
-                            if (verbose) Log.Print(LogType.Server, $"Energize: target={eGuid} amount={eAmount} power={ePowerType}");
-                            break;
-                        case 32: // EXTRA_ATTACKS (vanilla value 32)
-                            var eaGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
-                            uint eaCount = packet.ReadUInt32();
-                            if (verbose) Log.Print(LogType.Server, $"ExtraAttacks: target={eaGuid} count={eaCount}");
-                            break;
-                        case 24: // CREATE_ITEM
-                            uint ciItemId = packet.ReadUInt32();
-                            if (verbose) Log.Print(LogType.Server, $"CreateItem: item={ciItemId}");
-                            break;
-                        case 41: // INTERRUPT_CAST
-                            var icGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
-                            uint icSpellId = packet.ReadUInt32();
-                            if (verbose) Log.Print(LogType.Server, $"InterruptCast: target={icGuid} spell={icSpellId}");
-                            break;
-                        case 3: // DUMMY — server-side script triggers the real mechanic.
-                                // Paladin Holy Shock (20930), various Judgements, etc.
-                                // No per-target payload follows.
-                        case 50: // TRANS_DOOR — Lightwell, Mage Portal, etc. No per-target payload.
-                        case 69: // DISTRACT — positional spell, no per-target payload.
-                        case 77: // SCRIPT_EFFECT — Judgement (20271) and many other script-driven spells.
-                        case 56:  // SUMMON_PET
-                        case 63:  // TAMECREATURE
-                        case 102: // Dismiss Pet
-                        case 104: // Hunter abilities — no per-target payload.
-                            if (verbose) Log.Print(LogType.Server, $"NoPayload(type={effectType}): no target payload");
-                            break;
-                        case 101: // FEED_PET
-                            uint fpItemId = packet.ReadUInt32();
-                            if (verbose) Log.Print(LogType.Server, $"FeedPet: item={fpItemId}");
-                            break;
-                        case 113: // DURABILITY_DAMAGE
-                            var ddGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
-                            uint ddItemId = packet.ReadUInt32();
-                            uint ddAmount = packet.ReadUInt32();
-                            if (verbose) Log.Print(LogType.Server, $"DurabilityDmg: target={ddGuid} item={ddItemId} amount={ddAmount}");
-                            break;
-                        default: // INSTAKILL, RESURRECT, DISPEL, SUMMON, etc — just a GUID
-                            var defaultGuid = packet.ReadPackedGuid().To128(GetSession().GameState);
-                            if (verbose) Log.Print(LogType.Server, $"Default(type={effectType}): target={defaultGuid}");
-                            break;
-                    }
-                }
+                    spell_id = log.SpellId,
+                    effect_type = unknownEffect,
+                    target_count = log.LastTargetCount,
+                    packet_size = packet.GetSize(),
+                });
+            }
+
+            if (Log.VerboseLogEnabled)
+            {
+                Log.Print(LogType.Server, $"SpellExecuteLog: caster={log.Caster} spell={log.SpellId} effects={log.EffectCount}");
+                foreach (var entry in log.Targets)
+                    Log.Print(LogType.Server, $"  Effect {entry.EffectType}: target={entry.Target} value1={entry.Value1} value2={entry.Value2} multiplier={entry.Multiplier}");
+                if (log.UnknownEffectType is uint stoppedAt)
+                    Log.Print(LogType.Server, $"  Effect {stoppedAt}: layout not in table, decoding stopped");
             }
         }
         catch (Exception ex)
         {
-            // SMSG_SPELL_EXECUTE_LOG is read for diagnostic logging only; an unknown
-            // effect format here must never disconnect the player. Log and drop.
-            Log.Print(LogType.Error, $"SpellExecuteLog parse failed (non-fatal, packet dropped): spell={dbgSpellId} effectType={dbgEffectType} {ex.GetType().Name}: {ex.Message}");
+            // Read for diagnostic logging only; a malformed packet must never disconnect the player.
+            Log.Print(LogType.Error, $"SpellExecuteLog parse failed (non-fatal, packet dropped): spell={log.SpellId} effectType={log.LastEffectType} {ex.GetType().Name}: {ex.Message}");
             Log.Event("combat.execute_log.parse_failed", new
             {
                 exception_type = ex.GetType().Name,
                 exception_message = ex.Message,
-                spell_id = dbgSpellId,
-                effect_index = dbgEffectIndex,
-                effect_type = dbgEffectType,
-                target_count = dbgTargetCount,
-                target_index = dbgTargetIndex,
+                spell_id = log.SpellId,
+                effect_index = log.LastEffectIndex,
+                effect_type = log.LastEffectType,
+                target_count = log.LastTargetCount,
+                target_index = log.LastTargetIndex,
                 packet_size = packet.GetSize(),
             });
         }
