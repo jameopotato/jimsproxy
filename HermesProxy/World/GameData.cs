@@ -686,6 +686,23 @@ public static partial class GameData
 
     public static bool IsJudgementDebuff(uint spellId) => JudgementDebuffSpells.Contains(spellId);
 
+    // JimsProxy (stealth cooldown after a stealthed login): vanilla 1.12 player auras whose
+    // cooldown starts when the aura ENDS (spell attribute "disabled while active"): the server
+    // announces the start with SMSG_COOLDOWN_EVENT at removal, and a native server keeps the
+    // cooldown "on hold" from the cast so the client has an entry to start. The 1.12 login
+    // cooldown list carries only running cooldowns, so a character who logs in with one of
+    // these up gets no held entry and no sweep at the cancel. See OnHoldCooldownsAtLogin.
+    // Player auras only (a pet's own Prowl lives on the pet's table and the pet is dismissed at
+    // logout). Extend only with ids verified to carry the attribute.
+    public static readonly FrozenSet<uint> CooldownStartsOnAuraRemovalSpells = new uint[]
+    {
+        1784, 1785, 1786, 1787,   // Stealth R1-R4
+        5215, 6783, 9913,         // Prowl R1-R3
+        20580,                    // Shadowmeld
+    }.ToFrozenSet();
+
+    public static bool CooldownStartsOnAuraRemoval(uint spellId) => CooldownStartsOnAuraRemovalSpells.Contains(spellId);
+
     // JimsProxy (#379 form-exit): vanilla 1.12 player-cancellable SPELL_AURA_MOD_SHAPESHIFT
     // form auras. Cancelling one of these via CMSG_CANCEL_AURA opens the form-exit defer
     // window (see Settings.FormExitStartDeferMs). Deliberately excludes warrior stances
