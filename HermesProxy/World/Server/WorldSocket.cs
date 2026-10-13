@@ -120,6 +120,15 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
 
     public GlobalSessionData Session => _globalSession;
 
+    // Test seam (#388, WorldConnectPreAuthGuardTests): a WorldSocket bound to a session with no
+    // real socket, for driving Server-side handlers that only need GetSession().
+    internal static WorldSocket CreateForTest(GlobalSessionData session)
+    {
+        var socket = (WorldSocket)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(WorldSocket));
+        socket._globalSession = session;
+        return socket;
+    }
+
     public override void Accept()
     {
         string ip_address = GetRemoteIpAddress()!.ToString();

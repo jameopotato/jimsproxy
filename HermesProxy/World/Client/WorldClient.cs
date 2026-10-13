@@ -34,6 +34,10 @@ public partial class WorldClient
     GlobalSessionData _globalSession = null!;
     byte[] _authSessionKey = null!; //MIRASU: captured at connect time so we don't depend on GetSession().AuthClient surviving a realm swap
     readonly Lock _sendLock = new();
+    // #388 diagnostics and test seams: writes attempted on the socket, and non-handshake sends
+    // dropped because the legacy handshake had not completed yet.
+    int _writeAttempts;
+    int _droppedBeforeAuth;
     Timer? _keepAliveTimer;
     uint _keepAlivePingSerial;
     const int KeepAliveIntervalMs = 30_000;
@@ -523,6 +527,28 @@ public partial class WorldClient
     {
         lock (_sendLock)
         {
+            // JimsProxy (#388 World Server Down on a fast character switch): until this
+            // connection's legacy handshake completes (AUTH_OK or AUTH_WAIT_QUEUE), only
+            // CMSG_AUTH_SESSION may reach the socket, and only that write may decide the
+            // connect outcome. On origin/beta any send that landed while the TCP connect was
+            // still pending threw NotConnected and the catch below marked the connect failed;
+            // the previous character's quest-query drainer was that sender in every field
+            // failure. A pre-auth packet from any other sender is dropped here with an
+            // always-on event: with the drainer fix it should never fire, so a hit is an
+            // unexpected-edge signature worth seeing in any log. The opcode lookup runs
+            // only before the handshake completes; a steady-state send pays one compare.
+            bool preAuth = _isSuccessful != true;
+            bool isHandshake = preAuth && packet.GetUniversalOpcode(false) == Opcode.CMSG_AUTH_SESSION;
+            if (preAuth && !isHandshake)
+            {
+                _droppedBeforeAuth++;
+                Log.Event("c2s.dropped_before_world_auth", new
+                {
+                    opcode = packet.GetUniversalOpcode(false).ToString(),
+                    connect_state = _isSuccessful == null ? "pending" : "failed",
+                });
+                return;
+            }
             try
             {
                 ByteBuffer buffer = new ByteBuffer();
@@ -542,16 +568,36 @@ public partial class WorldClient
 
                 buffer.WriteBytes(packet.GetData(), packet.GetSize());
 
+                _writeAttempts++;
                 _clientSocket.Send(buffer.GetData(), SocketFlags.None);
             }
             catch (Exception ex)
             {
                 Log.PrintNet(LogType.Error, LogNetDir.P2S, $"Packet Write Error: {ex.Message}");
-                if (_isSuccessful == null)
+                // Only the handshake write may end the connect spin (it has no timeout). Every
+                // other pre-auth write is already dropped above; a post-auth write error says
+                // nothing about the connect.
+                if (isHandshake && _isSuccessful == null)
                     _isSuccessful = false;
             }
         }
     }
+
+    // Test seams (#388, WorldConnectPreAuthGuardTests): put the client in the state it has between
+    // BeginConnect and ConnectCallback without any network, read the connect outcome, and count
+    // what the send path did. Same convention as the GlobalSessionData ForTest members.
+    internal void EnterConnectPendingForTest(Socket socket)
+    {
+        _clientSocket = socket;
+        _isSuccessful = null;
+        _delayedPacketsToServer = new Dictionary<Opcode, List<WorldPacket>>();
+        _delayedPacketsToClient = new Dictionary<Opcode, List<ServerPacket>>();
+    }
+
+    internal void MarkAuthenticatedForTest() => _isSuccessful = true;
+    internal bool? ConnectOutcomeForTest => _isSuccessful;
+    internal int WriteAttemptsForTest => _writeAttempts;
+    internal int DroppedBeforeAuthForTest => _droppedBeforeAuth;
 
     public void SendPacketToClient(ServerPacket packet, Opcode delayUntilOpcode = Opcode.MSG_NULL_ACTION)
     {

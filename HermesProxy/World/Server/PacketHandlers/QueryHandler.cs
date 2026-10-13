@@ -116,6 +116,9 @@ public partial class WorldSocket
         }
     }
 
+    // Test seam (#388, WorldConnectPreAuthGuardTests): run one drainer pass on demand.
+    internal Task DrainQuestQueryBucketForTest() => DrainQuestQueryBucketAsync();
+
     private async Task DrainQuestQueryBucketAsync()
     {
         var state = GetSession().GameState;
@@ -125,6 +128,26 @@ public partial class WorldSocket
             {
                 int waitMs = MsUntilNextQuestQueryToken(state);
                 if (waitMs > 0) await Task.Delay(waitMs).ConfigureAwait(false);
+                // JimsProxy (#388): checked after the token wait, right before any send. If the
+                // session has moved on (logout swapped the GameState, or OnDisconnect rebuilt it),
+                // this backlog belongs to a character that is gone: the legacy server does not
+                // answer quest queries from a session with no player in world, and on origin/beta
+                // the next send could land on the next character's half-built world connection
+                // and fail it. Clear the queue before leaving so the finally below does not
+                // restart a drainer for it. The next character re-asks what it needs.
+                if (!ReferenceEquals(GetSession().GameState, state))
+                {
+                    // The drainer exiting here is the fix doing its job, not an unexpected
+                    // edge: DebugOutput only (review of #544).
+                    if (Framework.Settings.DebugOutput)
+                        Framework.Logging.Log.Event("quest.query.bucket_drain_abandoned", new
+                        {
+                            reason = "gamestate_replaced",
+                            dropped = state.PendingQuestQueryQueue.Count,
+                        });
+                    state.PendingQuestQueryQueue.Clear();
+                    break;
+                }
                 if (!state.PendingQuestQueryQueue.TryDequeue(out uint questId))
                     break;
                 // Cache may have been populated by a parallel proxy-issued query
