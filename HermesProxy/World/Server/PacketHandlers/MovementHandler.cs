@@ -397,7 +397,7 @@ public partial class WorldSocket
         // server adopts it and never starts the flee legs it sends to native victims, which
         // answer with flags 0 here). Clear the modern moving mask so the legacy ack goes out
         // as flags 0 / fall time 0; the gate leaves any real fall and any in-control ack alone.
-        // See FearOnsetAckGate for the truth table. Breadcrumb fires only on this rare shape.
+        // See FearOnsetAckGate for the truth table.
         var ackInfo = speed.Ack.MoveInfo;
         if (FearOnsetAckGate.IsOnsetTransientFallingAck(
                 GetSession().GameState.LastObservedHasControl,
@@ -405,14 +405,16 @@ public partial class WorldSocket
         {
             uint flagsBefore = ackInfo.Flags;
             ackInfo.Flags = FearOnsetAckGate.ClearMovingMask(ackInfo.Flags);
-            Framework.Logging.Log.Event("movement.force_speed_ack.moving_mask_cleared", new
-            {
-                opcode = opcode.ToString(),
-                flags_before = flagsBefore,
-                flags_after = ackInfo.Flags,
-                speed = speed.Speed,
-                move_counter = speed.Ack.MoveCounter,
-            });
+            // Fix-working breadcrumb (once per matched onset): DebugOutput only (review of #548).
+            if (Framework.Settings.DebugOutput)
+                Framework.Logging.Log.Event("movement.force_speed_ack.moving_mask_cleared", new
+                {
+                    opcode = opcode.ToString(),
+                    flags_before = flagsBefore,
+                    flags_after = ackInfo.Flags,
+                    speed = speed.Speed,
+                    move_counter = speed.Ack.MoveCounter,
+                });
         }
 
         WorldPacket packet = new WorldPacket(opcode);
