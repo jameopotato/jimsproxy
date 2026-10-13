@@ -48,7 +48,7 @@ public partial class WorldSocket
     void HandlePlayerMove(ClientPlayerMovement movement)
     {
         // JimsProxy (transport-clear source-gate, staleness fix): keep the gate's source
-        // observation TRUE. DiagLastObservedPlayerTransportGuid was only written from the
+        // observation TRUE. LastObservedPlayerTransportGuid was only written from the
         // player's own UpdateObject block — which never fires for mid-session boarding (own
         // movement is client-authoritative and arrives HERE, not via UpdateObject) — so a
         // player who logged in on land and then boarded a boat/zeppelin was still "observed
@@ -57,7 +57,7 @@ public partial class WorldSocket
         // any login/teleport. Every own movement packet carries current transport state
         // (empty when off-transport); stamp it so the observation tracks truth continuously.
         // Stamped before the CHANGE_TRANSPORT drop below so boarding via that opcode counts.
-        GetSession().GameState.DiagLastObservedPlayerTransportGuid = movement.MoveInfo.TransportGuid;
+        GetSession().GameState.LastObservedPlayerTransportGuid = movement.MoveInfo.TransportGuid;
 
         // JimsProxy (charge strafe-latch cure 2026-08-28, re-anchored 2026-08-29):
         // fire the cure the moment the orphan is observed — the armed pend's real

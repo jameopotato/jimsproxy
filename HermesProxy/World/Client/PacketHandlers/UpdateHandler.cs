@@ -1359,7 +1359,7 @@ public partial class WorldClient
             // hook for triaging zep / boat transport bugs from JSONL bundles.
             if (guid == GetSession().GameState.CurrentPlayerGuid)
             {
-                var prevTransport = GetSession().GameState.DiagLastObservedPlayerTransportGuid;
+                var prevTransport = GetSession().GameState.LastObservedPlayerTransportGuid;
                 if (prevTransport == null || prevTransport.Value != moveInfo.TransportGuid)
                 {
                     Framework.Logging.Log.Event("movement.player_update.transport_state", new
@@ -1375,7 +1375,7 @@ public partial class WorldClient
                         map_id = GetSession().GameState.CurrentMapId,
                     });
 
-                    GetSession().GameState.DiagLastObservedPlayerTransportGuid = moveInfo.TransportGuid;
+                    GetSession().GameState.LastObservedPlayerTransportGuid = moveInfo.TransportGuid;
                 }
 
                 // JimsProxy (zep-stuck-low-latency-race 2026-05-17): deferred
