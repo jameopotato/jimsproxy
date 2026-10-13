@@ -2117,6 +2117,7 @@ public partial class WorldClient
     private void AfterStoreObjectUpdateHook(WowGuid128 guid, ObjectType objectType, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, AuraUpdate auraUpdate, PowerUpdate? powerUpdate, bool isCreate, ObjectUpdate updateData, BitArray changedValuesMask)
     {
         DetectStuckLogoutStunAtSelfCreate(guid, updates, isCreate, updateData);
+        ArmHeldCooldownsAtSelfCreate(guid, updates, isCreate);
         SynthStandOnFearCcOnset(guid, updates);
 
         // JimsProxy (fishing recast wedge): remember our newest bobber so a recast's
@@ -2289,6 +2290,37 @@ public partial class WorldClient
     //              (Settings.StuckLogoutStunClientStrip) so turn/cast input isn't locked
     //              client-side even if the server ignores the cancel. The server still rejects
     //              real casts until ITS state clears; the strip only restores input.
+    // JimsProxy (stealth cooldown after a stealthed login): a native server lists a held
+    // cooldown (Stealth, Prowl, Shadowmeld: the cooldown starts when the aura ends) in the login
+    // spell history, OnHold set, so the client has an entry for the cooldown event that follows
+    // the cancel. The 1.12 login list carries only running cooldowns, so after the local
+    // player's create at login send one held-cooldown packet for such auras it carries; the
+    // client takes the spell's own duration and shows nothing until the server's cooldown
+    // event starts it. Pre-existing on every build before this; field-found 2026-10-12.
+    private void ArmHeldCooldownsAtSelfCreate(WowGuid128 guid, Dictionary<int, UpdateField> updates, bool isCreate)
+    {
+        if (!isCreate || guid != GetSession().GameState.CurrentPlayerGuid)
+            return;
+        if (!LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+            return;
+        int UNIT_FIELD_AURA = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
+        if (UNIT_FIELD_AURA < 0)
+            return;
+
+        List<uint> auraSpellIds = new();
+        for (int i = 0; i < VanillaAuraSlotCount; i++)
+        {
+            if (updates.TryGetValue(UNIT_FIELD_AURA + i, out var slot) && slot.UInt32Value != 0)
+                auraSpellIds.Add(slot.UInt32Value);
+        }
+        var held = OnHoldCooldownsAtLogin.Select(auraSpellIds, GameData.CooldownStartsOnAuraRemoval);
+        if (held.Count == 0)
+            return;
+
+        SendPacketToClient(OnHoldCooldownsAtLogin.BuildPacket(guid, held));
+        Log.Event("cooldown.held_armed_at_login", new { spell_ids = held });
+    }
+
     private void DetectStuckLogoutStunAtSelfCreate(WowGuid128 guid, Dictionary<int, UpdateField> updates, bool isCreate, ObjectUpdate updateData)
     {
         if (!isCreate || GetSession().GameState.StuckStunLoginCheckDone)
