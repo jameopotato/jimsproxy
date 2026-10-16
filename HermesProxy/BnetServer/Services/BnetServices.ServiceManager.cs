@@ -113,6 +113,13 @@ public partial class BnetServices
             }
             else
             {
+                // No response parameter: Ok sends nothing. That is only correct
+                // for one-way methods (NO_RESPONSE in the bgs proto, e.g.
+                // ConnectionService.KeepAlive), where the client never waits.
+                // A method whose proto response type is NoData must declare a
+                // `NoData response` parameter so the Ok reply above closes the
+                // client's request token; otherwise it stays open until the
+                // client's RPC deadline fires.
                 status = (BattlenetRpcErrorCode)handler.MethodCaller.DynamicInvoke(_serviceHolder, request)!;
 
                 if (status != BattlenetRpcErrorCode.Ok)
