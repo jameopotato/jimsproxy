@@ -53,7 +53,7 @@ public partial class BnetServices
     }
 
     [Service(ServiceRequirement.Unauthorized, OriginalHash.AuthenticationService, 7)]
-    BattlenetRpcErrorCode HandleVerifyWebCredentials(VerifyWebCredentialsRequest verifyWebCredentialsRequest)
+    BattlenetRpcErrorCode HandleVerifyWebCredentials(VerifyWebCredentialsRequest verifyWebCredentialsRequest, NoData response)
     {
         if (!BnetSessionTicketStorage.SessionsByTicket.TryGetValue(verifyWebCredentialsRequest.WebCredentials.ToStringUtf8(), out var tmpSession))
             return BattlenetRpcErrorCode.Denied;
