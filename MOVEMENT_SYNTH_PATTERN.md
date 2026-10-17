@@ -5,6 +5,23 @@ Quick reference for anyone (human or AI) adding a proxy → client synthesized
 modern client. Background and rationale are in commits `dc39c39`, `fc86903`,
 `a3e763a`, `f414896`.
 
+**Status 2026-10-17 (P1-2): the transport-clear synth described here is
+deleted**, together with everything that existed only for it: the dispatcher
+in `UpdateHandler.ReadMovementUpdateBlock`, `DeferredTransportSynthMode`,
+`PendingDeferredTransportSynth`, `TransportClearGate`,
+`FireDeferredTransportClearSynth`, the 0xFFFFFFFF ack sentinel with its drop
+in `HandleMoveTeleportAck`, and the `movement.transport_clear.*` events. The
+field logs have it sent 752 times across 490 logs and acknowledged 0 times
+(an applied teleport is always acknowledged). It was built inside the
+player's own create, so it always left 1 to 3 packets ahead of the
+UpdateObject that creates the player, and the client drops a movement packet
+for a unit it has not received yet. Its one recorded delivery after the
+create (the 2026-05-17 experiment below) teleported a passenger off a
+zeppelin into the ocean. The post-teleport run-speed reassert, built in the
+same movement block and redundant with the create's own run speed, is
+deleted with it. The rest of this file is the record of the trap and of why
+the synth existed; the code it names is gone.
+
 ## TL;DR
 
 If you're synthesizing a movement-state packet after the proxy receives
@@ -114,28 +131,12 @@ If you genuinely need "synth lands after destination state with no race",
 stash + fire after `SendPacketToClient(updateObject)` works at the wire
 level. Make sure your synth payload is correct for that ordering.
 
-**Update 2026-10-16 (P1-2): the synth is now sent after the UpdateObject.**
-The inline order above turned out to make the login and world-port synths
-no-ops: captures show none of them acknowledged, because the client ignores
-a movement packet for a unit it has not received yet, and the synth left
-1-3 packets ahead of the UpdateObject that creates the player. For the
-NewWorld mode the dispatcher now hands the synth to
-`PreCreateOpHold.DeferPastSelfCreate`, and `HandleUpdateObject` sends it
-right after that UpdateObject, behind any control ops the pre-create hold
-releases. The Login mode builds nothing (see "Why Login is no longer
-special-cased" below). The post-teleport run-speed reassert (built in the
-same movement block) takes the same route. The transport-clear's ack is
-dropped by its 0xFFFFFFFF counter alone, whether or not
-`PendingSyntheticTransportClearAckCounter` is still set. Wire order today:
-
-  1. modern UpdateObject (the player's create)
-  2. control ops held by the pre-create hold, if any
-  3. the deferred synth(s), in the order they were built
-
-This is the "updateObject → synth" order of the 2026-05-17 experiment; the
-failure seen then was the on-transport destination, which the dispatcher
-skips (`TransportClearGate`). New synths built inside a self create's
-movement block should use `DeferPastSelfCreate` rather than sending inline.
+**Update 2026-10-17 (P1-2):** the inline order above made this synth a no-op
+at every latency, not only a race: it was never acknowledged in the field.
+A new synth for the player at world entry must reach the client after the
+UpdateObject that creates the player, and must carry its own MoveCounter
+(`World/Client/SynthMoveCounters.cs`, its acknowledgement kept in the proxy)
+so that the acknowledgement shows it applied.
 
 ## Why Login is no longer special-cased
 
@@ -163,16 +164,11 @@ the gate without dismount, revisit.
 For non-transport logins, the synth is a harmless no-op (clearing a
 transport flag that wasn't set) — fires safely.
 
-Since P1-2 (2026-10-16) the Login mode is a no-op: when the gate would fire,
-the dispatcher logs `movement.transport_clear.login_noop` (DebugOutput only)
-and builds nothing. The login create carries no transport flag, so there is
-nothing to clear, and before P1-2 the inline send left ahead of the create
-and the client ignored it. Sending it after
-the create would add a self teleport to every login, where the arrival
-ceremony runs. The arming in `HandleLoginVerifyWorld` stays, so the mode
-still reaches the dispatcher and its events.
-
 ## Diagnostic events to grep when triaging
+
+The `movement.transport_clear.*` events below are deleted since P1-2
+(2026-10-17) and appear only in older logs; `movement.player_update.transport_state`
+is still emitted.
 
 - `movement.transport_clear.synthesized` — the synth fired. Includes
   `deferred: true` and `mode` (NewWorld | Login).
@@ -181,11 +177,6 @@ still reaches the dispatcher and its events.
   transport. `mode` field tells you which path armed (NewWorld | Login).
 - `movement.transport_clear.send_completed` / `send_failed` — outbound
   send wrapper diagnostics.
-- `movement.transport_clear.login_noop` (DebugOutput only, since P1-2): a
-  Login-mode arming that passed the gate and was deliberately not built.
-- `movement.transport_clear.ack_dropped`: the client's ack of the synth,
-  dropped by its 0xFFFFFFFF counter. `pending_was_set: false` means a server
-  teleport or NEW_WORLD had cleared the pending marker first.
 - `movement.player_update.transport_state` — fires once per
   transport-state transition on the player. Useful for confirming the
   destination's attachment state.

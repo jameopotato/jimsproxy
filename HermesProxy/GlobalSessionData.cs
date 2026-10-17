@@ -57,20 +57,6 @@ public sealed class TradeSession
     public uint ServerStateIndex = 1; // incremented by any trade action
 }
 
-// JimsProxy (zep-stuck-low-latency-race 2026-05-17): which deferred-synth path
-// armed the PendingDeferredTransportSynth flag. NewWorld defers + conditionally
-// skips when destination has player on transport (natural NEW_WORLD load already
-// unlocks the client). Login always fires the synth because there's no loading
-// screen at login to unlock the modern client's turn-input gate.
-// P1-2: Login is now a no-op in the dispatcher (UpdateHandler.ReadMovementUpdateBlock);
-// only NewWorld builds and sends the teleport.
-public enum DeferredTransportSynthMode
-{
-    None = 0,
-    NewWorld = 1,
-    Login = 2,
-}
-
 // JimsProxy (empty-victim wedge): what an SMSG_ATTACK_STOP naming the local player did to the
 // auto-attack handshake state. Returned by GameSessionData.ApplyLocalPlayerAttackStop so the
 // socket layer only has to decide whether to forward a CMSG_ATTACK_STOP.
@@ -158,8 +144,6 @@ public sealed class GameSessionData
     public uint LastLocalFearConfuseFlags;
     // JimsProxy (speed-stuck-after-fear-while-mounted): cached for reassert; see memory.
     public float LastKnownPlayerRunSpeed = 7.0f;
-    // JimsProxy (speed-stuck-after-bg-end-while-mounted): deferred reassert flag; see memory.
-    public bool PendingPostTeleportRunSpeedReassert;
     // JimsProxy (taxi-flight-robustness): when set, signals a pending taxi-dismount Task
     // scheduled to fire at TaxiDismountFiresAtTickMs. The CTS is cancelled+disposed on
     // (a) clean session disconnect, (b) early landing CMSG, (c) a fresh taxi spline
@@ -387,47 +371,13 @@ public sealed class GameSessionData
     // free the player early.
     public long ChargePendLatchArmedAtMs;
     public uint ChargePendLatchArmedFlags;           // the arming packet's modern movement flags, for the cure breadcrumb
-    // JimsProxy (zep-stuck-no-move 2026-05-14): set to a sentinel MoveCounter when
-    // HandleNewWorld emits a synthesized SMSG_MOVE_TELEPORT to clear the modern
-    // client's stale MOVEMENTFLAG_ONTRANSPORT after a cross-continent transport
-    // (zep/boat) zone change. The legacy server never sent that teleport, so the
-    // matching CMSG_MOVE_TELEPORT_ACK must be dropped before reaching the legacy
-    // server (per project_kronos_three_delayed_kick_sources, a spurious teleport-ack
-    // can feed malformed-packet kick counters on Kronos). 0 means none pending.
-    public uint PendingSyntheticTransportClearAckCounter;
-
-    // JimsProxy (zep-relog-diag 2026-05-15, load-bearing since #404): the player's
-    // last-observed TransportGuid. Written from the player's own UpdateObject block
-    // (UpdateHandler.ReadMovementUpdateBlock, where it also gates the transport_state
-    // diagnostic to state transitions) and from every own movement packet
-    // (Server MovementHandler.HandlePlayerMove). Read by the TransportClearGate call site
-    // as the gate's source observation; null means never observed.
+    // JimsProxy (zep-relog-diag 2026-05-15): the player's last-observed TransportGuid.
+    // Written from the player's own UpdateObject block (UpdateHandler.ReadMovementUpdateBlock,
+    // where it gates the transport_state diagnostic to state transitions) and from every own
+    // movement packet (Server MovementHandler.HandlePlayerMove); null means never observed.
+    // From #404 until P1-2 it was also the source observation of the transport-clear synth's
+    // gate; that synth is deleted, and the diagnostic is its only reader now.
     public WowGuid128? LastObservedPlayerTransportGuid;
-
-    // JimsProxy (zep-stuck-low-latency-race 2026-05-17): deferred-synth mode.
-    // HandleNewWorld / HandleLoginVerifyWorld set this and defer the transport-
-    // clear MoveTeleport synth until the player's first post-NEW_WORLD (or
-    // post-login) UpdateObject is processed in UpdateHandler. Two reasons to
-    // defer:
-    //   1. NewWorld path — at low latency (~35ms) the inline synth fired
-    //      BEFORE the destination map's COMPRESSED_UPDATE_OBJECT arrived; the
-    //      server's subsequent natural player-update re-attached
-    //      MOVEMENTFLAG_ONTRANSPORT (player landed on destination zep tower /
-    //      boat deck), and the rapid clear→re-attach wedged the modern client.
-    //      Deferred path skips the synth entirely when the destination's
-    //      player UpdateObject confirms the player is on a destination
-    //      transport (no synth needed — the natural NEW_WORLD flow already
-    //      unlocks the client's movement state on map load).
-    //   2. Login path — when the client logs in already on a transport, the
-    //      modern client gates turn-input (CMSG_MOVE_SET_FACING / START_TURN_*)
-    //      and never sends them until something resets its movement state.
-    //      There's no loading screen at login, so the natural NEW_WORLD reset
-    //      doesn't fire. Synthesizing the transport-clear MoveTeleport gives
-    //      the gate the kick it needs to release. Login path ALWAYS synths
-    //      regardless of transport state.
-    // Cleared by the deferred path in UpdateHandler.ReadMovementUpdateBlock
-    // once it fires or skips.
-    public DeferredTransportSynthMode PendingDeferredTransportSynth;
 
     public bool IsFirstEnterWorld;
     public bool IsConnectedToInstance;

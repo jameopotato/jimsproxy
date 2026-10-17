@@ -468,14 +468,8 @@ public partial class WorldClient
             teleport.Vehicle = new();
             teleport.Vehicle.VehicleSeatIndex = moveInfo.TransportSeat;
         }
-        // JimsProxy (zep-stuck-no-move 2026-05-14, belt-and-suspenders): a real
-        // teleport from the legacy server supersedes any pending synthetic
-        // transport-clear ack we were watching for. Clear the sentinel so a future
-        // legitimate ack carrying the same MoveCounter cannot be eaten.
         if (guid == GetSession().GameState.CurrentPlayerGuid)
         {
-            GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
-
             // JimsProxy (carried-root cure, same-map variant): hearth/tele/portal
             // within a map is a MoveTeleport, not a NEW_WORLD — a stranded root
             // crosses this loading screen too. Belief-only gate (the teleport's
@@ -495,11 +489,7 @@ public partial class WorldClient
 
             // JimsProxy (camp stun lock, step 2): a SERVER-originated self teleport
             // before the login's first self create block joins the pre-create hold
-            // (R56 op set). Our own transport-clear synth doesn't route through this
-            // handler and is not one of the held ops: it is present on every healthy
-            // login and provably not part of the lock recipe. Since P1-2 the Login-mode
-            // synth is a no-op, and the NewWorld one is deferred past the self create
-            // separately (PreCreateOpHold.DeferPastSelfCreate), after any ops held here.
+            // (R56 op set).
             if (GetSession().GameState.PreCreateOpHold.TryCapture(teleport))
                 return;
         }
@@ -657,13 +647,6 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_NEW_WORLD)]
     void HandleNewWorld(WorldPacket packet)
     {
-        // JimsProxy (zep-stuck-no-move 2026-05-14, belt-and-suspenders): clear any
-        // stale synthetic transport-clear ack sentinel. If the modern client failed
-        // to ack our previous synth MoveTeleport, the sentinel would otherwise
-        // linger forever and could eat a future legitimate teleport ack that
-        // happened to carry the same MoveCounter value.
-        GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
-
         NewWorld teleport = new NewWorld();
         var previousMapId = GetSession().GameState.CurrentMapId;
         GetSession().GameState.CurrentMapId = teleport.MapID = packet.ReadUInt32();
@@ -682,8 +665,7 @@ public partial class WorldClient
         // IsFirstEnterWorld deliberately stays TRUE — the client is still doing its
         // first world entry, and the login-initial handlers gated on it (the
         // SMSG_INITIALIZE_FACTIONS TimeSyncRequest synth the client needs to be
-        // able to move, SMSG_LOGIN_SET_TIME_SPEED) may run after the merge. The
-        // deferred transport synth likewise stays in Login mode. No
+        // able to move, SMSG_LOGIN_SET_TIME_SPEED) may run after the merge. No
         // IsWaitingForWorldPortAck: the client will never ack a transfer it never
         // saw.
         var evictionHold = GetSession().GameState.LoginEvictionHold;
@@ -795,22 +777,6 @@ public partial class WorldClient
             // unroot is synthesized at the player's first destination update.
             GetSession().GameState.WorldEntryPendingCarriedRootCheck = true;
 
-            // JimsProxy (zep-stuck-low-latency-race 2026-05-17): defer the
-            // transport-clear synth until the player's first post-NEW_WORLD
-            // UpdateObject lands. Firing inline here at NEW_WORLD time worked at
-            // ~150ms latency (synth happened to arrive at the modern client AFTER
-            // the destination COMPRESSED_UPDATE_OBJECT) but raced at ~35ms (synth
-            // arrived BEFORE the destination state, the server's subsequent
-            // player-update re-attached the transport flag, and the rapid
-            // clear→re-attach wedged the modern client into a no-MOVE_START_*
-            // state when the destination position was on a transport — Grom'gol
-            // zep tower platform, Ratchet boat deck). The deferred path in
-            // UpdateHandler.ReadMovementUpdateBlock inspects moveInfo.TransportGuid
-            // and only synths when the destination has the player OFF a transport,
-            // preserving the dc39c39 original use case (cross-continent land
-            // destinations) without breaking the on-transport destinations.
-            GetSession().GameState.PendingDeferredTransportSynth = DeferredTransportSynthMode.NewWorld;
-
             if (teleport.MapID > 1)
             {
                 UpdateLastInstance instance = new();
@@ -825,84 +791,6 @@ public partial class WorldClient
                 resume.Reason = 1;
                 SendPacketToClient(resume);
             }
-        }
-    }
-
-    // JimsProxy (zep-stuck-low-latency-race 2026-05-17): synthesizes a player-targeted
-    // SMSG_MOVE_TELEPORT with TransportGUID=default to force the modern client to clear
-    // any stale MOVEMENTFLAG_ONTRANSPORT carried across from the source map's transport.
-    // Fired from the deferred path in UpdateHandler.ReadMovementUpdateBlock only when the
-    // destination's player UpdateObject confirms the player is NOT on a transport (zep
-    // tower / boat deck) at the destination. The MoveCounter sentinel is dropped by the
-    // server-side HandleMoveTeleportAck so the legacy server never sees the spurious ack.
-    internal void FireDeferredTransportClearSynth(WowGuid128 playerGuid, Vector3 position, float orientation, string mode)
-    {
-        if (playerGuid.IsEmpty())
-            return;
-
-        const uint SyntheticTeleportAckSentinel = SynthMoveCounters.TransportClearTeleport;
-        MoveTeleport transportClear = new MoveTeleport();
-        transportClear.MoverGUID = playerGuid;
-        transportClear.MoveCounter = SyntheticTeleportAckSentinel;
-        transportClear.Position = position;
-        transportClear.Orientation = orientation;
-        transportClear.PreloadWorld = 0;
-        transportClear.TransportGUID = default;
-        // Leave transportClear.Vehicle at its default null! sentinel — assigning
-        // null trips the non-nullable-ref-type check; the existing MoveTeleport
-        // path uses this same pattern for non-vehicle teleports.
-
-        GetSession().GameState.PendingSyntheticTransportClearAckCounter =
-            SyntheticTeleportAckSentinel;
-
-        Framework.Logging.Log.Event("movement.transport_clear.synthesized", new
-        {
-            map_id = GetSession().GameState.CurrentMapId,
-            player_low = playerGuid.GetCounter(),
-            position = $"{position.X:F2},{position.Y:F2},{position.Z:F2}",
-            deferred = true,
-            mode = mode,
-        });
-
-        // JimsProxy (P1-2, D-06): this runs inside the movement block of the player's own
-        // create, so sending here put the teleport ahead of the UPDATE_OBJECT that creates
-        // the player, and the client ignored it (the captures show none acknowledged).
-        // The pre-create hold keeps it back; the end of HandleUpdateObject sends it right
-        // after that update (SendSelfSynthPastSelfCreate). This completes the 2026-05-17
-        // intent above: the synth now lands after the destination state, not just after
-        // it was read.
-        GetSession().GameState.PreCreateOpHold.DeferPastSelfCreate(transportClear);
-    }
-
-    // JimsProxy (P1-2, D-06): sends one self synth the pre-create hold kept back until the
-    // self create's UPDATE_OBJECT was out. The transport-clear teleport keeps the send
-    // events and the catch it had when it was sent inline; any other synth (the
-    // post-teleport run-speed reassert) is sent plainly, as it was inline.
-    void SendSelfSynthPastSelfCreate(ServerPacket synth)
-    {
-        if (synth is not MoveTeleport transportClear)
-        {
-            SendPacketToClient(synth);
-            return;
-        }
-
-        try
-        {
-            SendPacketToClient(transportClear);
-            Framework.Logging.Log.Event("movement.transport_clear.send_completed", new
-            {
-                player_low = transportClear.MoverGUID.GetCounter(),
-                sentinel_counter = transportClear.MoveCounter,
-            });
-        }
-        catch (System.Exception ex)
-        {
-            Framework.Logging.Log.Event("movement.transport_clear.send_failed", new
-            {
-                player_low = transportClear.MoverGUID.GetCounter(),
-                exception_type = ex.GetType().Name,
-                exception_message = ex.Message,
-            });
         }
     }
 
