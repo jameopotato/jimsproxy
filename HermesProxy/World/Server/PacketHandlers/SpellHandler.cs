@@ -1238,6 +1238,17 @@ public partial class WorldSocket
         }
     }
 
+    // JimsProxy: the player's own cached UNIT_FIELD_MOUNTDISPLAYID is non-zero. The taxi path cancels
+    // mount auras only when this holds, so a stale aura slot can never cancel anything on an unmounted
+    // player (the client decides the same way: a non-zero mount display id).
+    internal bool IsPlayerMountedPerCache()
+    {
+        WowGuid128 guid = GetSession().GameState.CurrentPlayerGuid;
+        if (guid == default)
+            return false;
+        return GetSession().GameState.GetLegacyFieldValueUInt32(guid, UnitField.UNIT_FIELD_MOUNTDISPLAYID) != 0;
+    }
+
     // JimsProxy: the 1.12 translation of a mount cancel. The legacy server has no mount-cancel
     // opcode; the proxy cancels every mount aura it sees in the player's cached aura slots.
     // Shared by CMSG_CANCEL_MOUNT_AURA and by the taxi activation (TaxiHandler), which must
