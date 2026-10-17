@@ -13,6 +13,14 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-10-17 — Quest reward page left open after a turn-in from an NPC's quest list
+
+**Issue:** After turning in a quest picked from an NPC's quest list, the reward page (the one with Complete Quest) sometimes stayed open; the player had to close it and click the NPC again. In the captures this happened in 12 of 12 turn-ins where the list still held another quest and the completion carried neither launch bit, and in 0 of 111 other turn-ins with both bits clear. The client sends CMSG_CLOSE_INTERACTION 4 to 22 ms after the completion when it closes the page itself; in the stuck cases that packet came 1.3 to 5.5 s later, from the player. A native server sets LaunchQuest for every quest-giver turn-in and the client then re-asks the NPC; the proxy set it only when a follow-up quest was known from a cached template (2026-05-02 change), which left the client in a state no native server produces.
+
+**Change:** `World/Client/PacketHandlers/QuestHandler.cs`: the quest-list handler records the greeting (giver, quest IDs) in the session state, and the completion translator sets LaunchQuest when that greeting, for the current NPC, listed anything besides the completed quest; the legacy server answers the client's hello with the remaining list or the single remaining quest's dialog, which refills the page. Follow-up quests and gossip NPCs decide as before (`GameSessionData.DecideQuestCompleteLaunch`). `World/Server/PacketHandlers/QuestHandler.cs`: a forwarded CMSG_QUEST_GIVER_HELLO clears the recorded greeting. `GlobalSessionData.cs`: the greeting record and the decision. The `quest.complete.launch_decision` event gains `npc_has_gossip_flag` and `greeting_other_entries`. No timers, no synthesized packets.
+
+**Verification:** `QuestCompleteLaunchDecisionTests` (13). Field: pending on the `JimsProxy-re-questlist` test build; expected: after a turn-in at an NPC with other quests the NPC's list reappears and the page never stays.
+
 ## 2026-10-13 — Party buff timers by provenance; known starts served across leave, return and relog (#513 part A, PR #547)
 
 **Issue:** The 1.12 server never tells the proxy how long another unit's buff has left. For a buff first seen already running the proxy filled Duration and Remaining with the spell's full CSV value, recorded that guess as the expiry and served it again later with the Duration flag set, so a 25-minute-old Fortitude showed 30:00 after a relog, a destroy and re-create, or an out-of-range trip (#513). Next to it: a seen recast re-sent the previous application's decayed Remaining instead of the full duration, stack and charge re-emits re-sent the last values undecayed, and the out-of-range leave kept the per-slot duration cache alive so it was read before the durable map.
