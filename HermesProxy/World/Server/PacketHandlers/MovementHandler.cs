@@ -373,6 +373,25 @@ public partial class WorldSocket
         SendPacketToServer(packet);
     }
 
+    // JimsProxy (P1-2, check D-01): an acknowledgement carrying one of the counters the proxy
+    // gives its own SET-class packets (World.Client.SynthMoveCounters) answers a change the
+    // 1.12 server never sent. Forwarded, it reached the server as an ack for a change of its
+    // own (the server's counter is always 0, the value these synths used to carry). Swallow
+    // it. Fix-working breadcrumb, so DebugOutput-gated.
+    bool SwallowSynthAck(Opcode opcode, uint moveCounter)
+    {
+        if (!World.Client.SynthMoveCounters.IsSynthAckCounter(moveCounter))
+            return false;
+
+        if (Framework.Settings.DebugOutput)
+            Log.Event("movement.synth_ack_swallowed", new
+            {
+                opcode = opcode.ToString(),
+                move_counter = moveCounter,
+            });
+        return true;
+    }
+
     [PacketHandler(Opcode.CMSG_MOVE_FORCE_FLIGHT_BACK_SPEED_CHANGE_ACK)]
     [PacketHandler(Opcode.CMSG_MOVE_FORCE_FLIGHT_SPEED_CHANGE_ACK)]
     [PacketHandler(Opcode.CMSG_MOVE_FORCE_PITCH_RATE_CHANGE_ACK)]
@@ -385,6 +404,11 @@ public partial class WorldSocket
     void HandleMoveForceSpeedChangeAck(MovementSpeedAck speed)
     {
         var opcode = speed.GetUniversalOpcode();
+        // P1-2: the ack of a proxy-synthesized speed change (regain-control restore,
+        // post-teleport reassert). The server never sent that change; keep the ack here.
+        if (SwallowSynthAck(opcode, speed.Ack.MoveCounter))
+            return;
+
         if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180)
             && opcode is Opcode.CMSG_MOVE_FORCE_FLIGHT_SPEED_CHANGE_ACK
                       or Opcode.CMSG_MOVE_FORCE_FLIGHT_BACK_SPEED_CHANGE_ACK)
@@ -523,6 +547,11 @@ public partial class WorldSocket
                 });
             return;
         }
+
+        // P1-2: the FORCE_UNROOT ack of a taxi-landing unroot the proxy synthesized. Checked
+        // before the carried-root range test below, whose range these counters share.
+        if (SwallowSynthAck(universalOpcode, movementAck.Ack.MoveCounter))
+            return;
 
         // JimsProxy (carried-root cure): the ack for the proxy-synthesized cure
         // unroot carries a sentinel counter. The legacy server never sent that op,

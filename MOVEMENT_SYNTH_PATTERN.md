@@ -114,6 +114,26 @@ If you genuinely need "synth lands after destination state with no race",
 stash + fire after `SendPacketToClient(updateObject)` works at the wire
 level. Make sure your synth payload is correct for that ordering.
 
+**Update 2026-10-16 (P1-2): the synth is now sent after the UpdateObject.**
+The inline order above turned out to make the login and world-port synths
+no-ops: captures show none of them acknowledged, because the client ignores
+a movement packet for a unit it has not received yet, and the synth left
+1-3 packets ahead of the UpdateObject that creates the player. The
+dispatcher now hands the synth to `PreCreateOpHold.DeferPastSelfCreate`,
+and `HandleUpdateObject` sends it right after that UpdateObject, behind any
+control ops the pre-create hold releases. The post-teleport run-speed
+reassert (built in the same movement block) takes the same route. Wire
+order today:
+
+  1. modern UpdateObject (the player's create)
+  2. control ops held by the pre-create hold, if any
+  3. the deferred synth(s), in the order they were built
+
+This is the "updateObject → synth" order of the 2026-05-17 experiment; the
+failure seen then was the on-transport destination, which the dispatcher
+skips (`TransportClearGate`). New synths built inside a self create's
+movement block should use `DeferPastSelfCreate` rather than sending inline.
+
 ## Why Login is no longer special-cased
 
 Earlier drafts of this pattern always-fired the Login synth, including
@@ -139,6 +159,12 @@ the gate without dismount, revisit.
 
 For non-transport logins, the synth is a harmless no-op (clearing a
 transport flag that wasn't set) — fires safely.
+
+Since P1-2 (2026-10-16) that login synth actually reaches the client after
+the create (see the update under "Wire ordering caveat"): it is a teleport
+to the create's own position with no transport, the client acknowledges
+it, and the proxy drops the ack (the 0xFFFFFFFF sentinel). Before P1-2 the
+client ignored it, so its effect on the wire is new with P1-2.
 
 ## Diagnostic events to grep when triaging
 
