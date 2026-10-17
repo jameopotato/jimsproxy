@@ -368,6 +368,9 @@ public partial class WorldClient
         // TransportGUID=default; the server's natural player-update re-attaches
         // the legitimate transport right after, but the brief off-transport
         // pulse is what releases the client's turn-input gate.
+        // P1-2: the dispatcher treats Login mode as a no-op (an on-transport login
+        // is skipped by the gate, and an off-transport login has nothing to clear);
+        // the arming stays so the mode reaches the dispatcher and its events.
         GetSession().GameState.PendingDeferredTransportSynth =
             DeferredTransportSynthMode.Login;
 

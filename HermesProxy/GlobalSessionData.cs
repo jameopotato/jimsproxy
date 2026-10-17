@@ -62,6 +62,8 @@ public sealed class TradeSession
 // skips when destination has player on transport (natural NEW_WORLD load already
 // unlocks the client). Login always fires the synth because there's no loading
 // screen at login to unlock the modern client's turn-input gate.
+// P1-2: Login is now a no-op in the dispatcher (UpdateHandler.ReadMovementUpdateBlock);
+// only NewWorld builds and sends the teleport.
 public enum DeferredTransportSynthMode
 {
     None = 0,

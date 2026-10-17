@@ -1483,8 +1483,8 @@ public partial class WorldClient
                 // Synth fires only when destination is NOT on a transport —
                 // the dc39c39 stale-flag-clear use case (player rode through
                 // a portal mid-zep, or the legacy server's UpdateObject lost
-                // the transport attach by destination). Same payload for
-                // both NewWorld and Login paths in this branch.
+                // the transport attach by destination). Since P1-2 only the
+                // NewWorld path sends it; Login mode is a no-op (see below).
                 var pendingMode = GetSession().GameState.PendingDeferredTransportSynth;
                 if (pendingMode != DeferredTransportSynthMode.None)
                 {
@@ -1497,7 +1497,25 @@ public partial class WorldClient
                     // (TransportGUID=empty) that leaves the client (esp. at EU latency) unable to
                     // walk until /reload. prevTransport = the source state captured above (this
                     // player UpdateObject's prior observation); moveInfo.TransportGuid = destination.
-                    if (TransportClearGate.ShouldFire(prevTransport, moveInfo.TransportGuid))
+                    bool gateFires = TransportClearGate.ShouldFire(prevTransport, moveInfo.TransportGuid);
+                    if (gateFires && pendingMode == DeferredTransportSynthMode.Login)
+                    {
+                        // P1-2: Login mode stays a no-op. The login create carries no
+                        // transport flag, so the teleport would clear nothing; built here it
+                        // used to leave ahead of the create and was never applied, so sending
+                        // it now (after the create) would add a self-teleport to every login,
+                        // where the arrival ceremony runs. Only NewWorld builds and sends it.
+                        if (Framework.Settings.DebugOutput)
+                        {
+                            Framework.Logging.Log.Event("movement.transport_clear.login_noop", new
+                            {
+                                map_id = GetSession().GameState.CurrentMapId,
+                                player_low = guid.GetCounter(),
+                                mode = pendingMode.ToString(),
+                            });
+                        }
+                    }
+                    else if (gateFires)
                     {
                         FireDeferredTransportClearSynth(guid, moveInfo.Position, moveInfo.Orientation, pendingMode.ToString());
                     }

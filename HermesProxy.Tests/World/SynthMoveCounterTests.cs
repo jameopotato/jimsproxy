@@ -21,10 +21,12 @@ namespace HermesProxy.Tests.World;
 //     the value the 1.12 server puts on every SET it sends, so the client's acknowledgement was
 //     forwarded to the server as an ack for a change the server never sent. Each site now
 //     carries its own counter (SynthMoveCounters) and the ack handlers keep those acks.
-// (b) The login-time transport-clear teleport and the post-teleport run-speed reassert are built
+// (b) The world-port transport-clear teleport and the post-teleport run-speed reassert are built
 //     inside the movement block of the player's own create, so they used to leave ahead of the
 //     UPDATE_OBJECT that creates the player. The client ignores a movement packet for a unit it
-//     has not received yet; they are now sent right after that UPDATE_OBJECT.
+//     has not received yet; they are now sent right after that UPDATE_OBJECT. The Login-mode
+//     transport-clear stays a no-op (nothing to clear at login), and the transport-clear's ack
+//     is dropped by its counter alone.
 public class SynthMoveCounterTests
 {
     private static readonly WowGuid64 LegacyPlayer = new(HighGuidTypeLegacy.Player, 4242);
@@ -337,16 +339,70 @@ public class SynthMoveCounterTests
         Assert.Equal(0, server.Legacy.WriteAttemptsForTest);
     }
 
+    // The transport-clear teleport's ack is dropped by its 0xFFFFFFFF counter even when a server
+    // self teleport or NEW_WORLD cleared the pending marker inside the round trip: nothing reaches
+    // the server, and our own synth's ack never fires the carried-root cure that waits for the ack
+    // of a server teleport.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TransportClearAck_PendingCleared_IsDroppedAndFiresNoCure(bool cureArmed)
+    {
+        using var h = new ServerHarness();
+        h.State.PendingSyntheticTransportClearAckCounter = 0;    // cleared inside the round trip
+        h.State.WorldEntryCureAfterTeleportAck = cureArmed;
+        h.State.ClientBelievesRooted = cureArmed;
+        var writer = new WorldPacket(ModernVersion.GetCurrentOpcode(Opcode.CMSG_MOVE_TELEPORT_ACK));
+        writer.WritePackedGuid128(h.State.CurrentPlayerGuid);
+        writer.WriteUInt32(0xFFFFFFFFu);                         // the transport-clear sentinel
+        writer.WriteUInt32(123456);                              // move time
+
+        // The test socket has no connection; a cure send would throw here.
+        var thrown = Record.Exception(() => h.Receive(new WorldPacket(writer.GetOpcode(), writer.GetData())));
+
+        Assert.Null(thrown);
+        Assert.Equal(0, h.Legacy.WriteAttemptsForTest);
+        Assert.Equal(cureArmed, h.State.WorldEntryCureAfterTeleportAck); // still armed: cure not sent
+        Assert.Equal(cureArmed, h.State.ClientBelievesRooted);
+    }
+
     // ---------------------------------------------------------------- (b) order vs the self create
 
-    // Login with the pre-create hold armed (the normal fresh login): the transport-clear teleport
-    // fires inside the self create's movement block and must leave after that UPDATE_OBJECT.
+    // Login mode stays a no-op: the login create carries no transport flag, so there is nothing
+    // to clear, and beta never put this teleport in front of the client. With the hold armed (a
+    // fresh login) or not (seamless reconnect, hold switched off), nothing is built or sent.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void LoginTransportClear_IsANoOp_NothingSent(bool holdArmed)
+    {
+        var h = new ClientHarness();
+        if (holdArmed)
+            h.State.PreCreateOpHold.Arm(Environment.TickCount64);
+        h.State.PendingDeferredTransportSynth = DeferredTransportSynthMode.Login;
+
+        h.Dispatch(SelfCreate(runSpeed: 7f));
+
+        var sent = h.Sent;
+        Assert.True(IndexOf(sent, Opcode.SMSG_UPDATE_OBJECT) >= 0, "the self create was not sent");
+        int teleport = IndexOf(sent, Opcode.SMSG_MOVE_TELEPORT);
+        Assert.True(teleport == -1, $"a login transport-clear was sent at {teleport}");
+        Assert.Equal(0u, h.State.PendingSyntheticTransportClearAckCounter);
+        Assert.Equal(DeferredTransportSynthMode.None, h.State.PendingDeferredTransportSynth); // consumed
+        Assert.Equal(0, h.State.PreCreateOpHold.DeferredCount);
+        Assert.Equal(PreCreateOpHold.HoldPhase.Inactive, h.State.PreCreateOpHold.Phase);
+    }
+
+    // NewWorld mode still builds the transport-clear and sends it after the self create. With the
+    // hold armed (a transfer that lands before a login's first self create) the synth waits for
+    // the create, then follows the ops the hold releases.
     [Fact]
-    public void LoginTransportClear_IsSentAfterTheSelfCreate()
+    public void NewWorldTransportClear_HoldArmed_IsSentAfterTheSelfCreate()
     {
         var h = new ClientHarness();
         h.State.PreCreateOpHold.Arm(Environment.TickCount64);
-        h.State.PendingDeferredTransportSynth = DeferredTransportSynthMode.Login;
+        h.State.PendingDeferredTransportSynth = DeferredTransportSynthMode.NewWorld;
+        h.State.LastObservedPlayerTransportGuid = WowGuid128.Create(HighGuidType703.Transport, 0, 176495, 1);
 
         h.Dispatch(SelfCreate(runSpeed: 7f));
 
@@ -360,23 +416,6 @@ public class SynthMoveCounterTests
         Assert.Equal(0xFFFFFFFFu, h.State.PendingSyntheticTransportClearAckCounter);
         Assert.Equal(DeferredTransportSynthMode.None, h.State.PendingDeferredTransportSynth);
         Assert.Equal(PreCreateOpHold.HoldPhase.Inactive, h.State.PreCreateOpHold.Phase);
-    }
-
-    // Same, with the hold not armed (seamless-reconnect verify, or the control-op hold switched
-    // off): the synth still follows the create, released at the end of the same update.
-    [Fact]
-    public void LoginTransportClear_HoldNotArmed_IsStillSentAfterTheSelfCreate()
-    {
-        var h = new ClientHarness();
-        h.State.PendingDeferredTransportSynth = DeferredTransportSynthMode.Login;
-
-        h.Dispatch(SelfCreate(runSpeed: 7f));
-
-        var sent = h.Sent;
-        int create = IndexOf(sent, Opcode.SMSG_UPDATE_OBJECT);
-        int teleport = IndexOf(sent, Opcode.SMSG_MOVE_TELEPORT);
-        Assert.True(create >= 0, "the self create was not sent");
-        Assert.True(teleport > create, $"transport-clear at {teleport}, self create at {create}");
     }
 
     // A world port off a transport: the destination self create carries both the NewWorld-mode

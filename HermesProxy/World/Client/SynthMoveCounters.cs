@@ -26,6 +26,13 @@ public static class SynthMoveCounters
     /// <summary>SMSG_MOVE_SET_RUN_SPEED reasserted on the first destination self update after a world port.</summary>
     public const uint PostTeleportRunSpeed = 0xFFFFFF08;
 
+    /// <summary>
+    /// SMSG_MOVE_TELEPORT of the deferred transport-clear (NewWorld mode). Its ack goes to
+    /// HandleMoveTeleportAck, which drops it by this value; it is deliberately not part of
+    /// <see cref="IsSynthAckCounter"/>, which covers the speed-change and force acks.
+    /// </summary>
+    public const uint TransportClearTeleport = 0xFFFFFFFF;
+
     public static bool IsSynthAckCounter(uint moveCounter)
         => moveCounter is RegainControlRunSpeed
             or TaxiResumeDismountUnroot

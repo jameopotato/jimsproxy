@@ -118,12 +118,15 @@ level. Make sure your synth payload is correct for that ordering.
 The inline order above turned out to make the login and world-port synths
 no-ops: captures show none of them acknowledged, because the client ignores
 a movement packet for a unit it has not received yet, and the synth left
-1-3 packets ahead of the UpdateObject that creates the player. The
-dispatcher now hands the synth to `PreCreateOpHold.DeferPastSelfCreate`,
-and `HandleUpdateObject` sends it right after that UpdateObject, behind any
-control ops the pre-create hold releases. The post-teleport run-speed
-reassert (built in the same movement block) takes the same route. Wire
-order today:
+1-3 packets ahead of the UpdateObject that creates the player. For the
+NewWorld mode the dispatcher now hands the synth to
+`PreCreateOpHold.DeferPastSelfCreate`, and `HandleUpdateObject` sends it
+right after that UpdateObject, behind any control ops the pre-create hold
+releases. The Login mode builds nothing (see "Why Login is no longer
+special-cased" below). The post-teleport run-speed reassert (built in the
+same movement block) takes the same route. The transport-clear's ack is
+dropped by its 0xFFFFFFFF counter alone, whether or not
+`PendingSyntheticTransportClearAckCounter` is still set. Wire order today:
 
   1. modern UpdateObject (the player's create)
   2. control ops held by the pre-create hold, if any
@@ -160,11 +163,14 @@ the gate without dismount, revisit.
 For non-transport logins, the synth is a harmless no-op (clearing a
 transport flag that wasn't set) — fires safely.
 
-Since P1-2 (2026-10-16) that login synth actually reaches the client after
-the create (see the update under "Wire ordering caveat"): it is a teleport
-to the create's own position with no transport, the client acknowledges
-it, and the proxy drops the ack (the 0xFFFFFFFF sentinel). Before P1-2 the
-client ignored it, so its effect on the wire is new with P1-2.
+Since P1-2 (2026-10-16) the Login mode is a no-op: when the gate would fire,
+the dispatcher logs `movement.transport_clear.login_noop` (DebugOutput only)
+and builds nothing. The login create carries no transport flag, so there is
+nothing to clear, and before P1-2 the inline send left ahead of the create
+and the client ignored it. Sending it after
+the create would add a self teleport to every login, where the arrival
+ceremony runs. The arming in `HandleLoginVerifyWorld` stays, so the mode
+still reaches the dispatcher and its events.
 
 ## Diagnostic events to grep when triaging
 
@@ -175,6 +181,11 @@ client ignored it, so its effect on the wire is new with P1-2.
   transport. `mode` field tells you which path armed (NewWorld | Login).
 - `movement.transport_clear.send_completed` / `send_failed` — outbound
   send wrapper diagnostics.
+- `movement.transport_clear.login_noop` (DebugOutput only, since P1-2): a
+  Login-mode arming that passed the gate and was deliberately not built.
+- `movement.transport_clear.ack_dropped`: the client's ack of the synth,
+  dropped by its 0xFFFFFFFF counter. `pending_was_set: false` means a server
+  teleport or NEW_WORLD had cleared the pending marker first.
 - `movement.player_update.transport_state` — fires once per
   transport-state transition on the player. Useful for confirming the
   destination's attachment state.
