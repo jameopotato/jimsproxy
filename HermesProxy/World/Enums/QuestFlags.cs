@@ -12,6 +12,7 @@ public enum QuestFlags : uint
     None                  = 0x00000000,
     StayAlive             = 0x00000001,
     PartyAccept           = 0x00000002,
+    CompletionEvent       = 0x00000002, // the same bit as the 1.14 client reads it: the quest completes by a server event
     Exploration           = 0x00000004,
     Sharable              = 0x00000008,
     HasCondition          = 0x00000010,

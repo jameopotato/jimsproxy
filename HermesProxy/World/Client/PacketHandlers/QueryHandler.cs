@@ -289,6 +289,16 @@ public partial class WorldClient
                 match.Description = objectiveText;
         }
 
+        // JimsProxy (#193): an exploration quest reaches the client with no objectives (the proxy
+        // builds none for it) and the 1.12 Exploration flag (0x4); the server completes it by
+        // setting the log slot's completion bit. The 1.14 client shows the quest's single objective
+        // line complete from that bit alone, but tags the title "(Complete)" for a quest with no
+        // objectives only when Flags also carry CompletionEvent (0x2), so the title stayed untagged
+        // until turn-in. 1.12 escort quests already carry 0x2. Objective-less quests with neither
+        // bit (deliveries: speak with, travel to) are left alone, as are quests with objectives.
+        if (quest.Objectives.Count == 0 && (quest.Flags & (uint)QuestFlags.Exploration) != 0)
+            quest.Flags |= (uint)QuestFlags.CompletionEvent;
+
         // Placeholders
         quest.QuestMaxScalingLevel = 255;
         quest.RewardXPMultiplier = 1;
