@@ -288,6 +288,32 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MOVE_TELEPORT_ACK)]
     void HandleMoveTeleportAck(MoveTeleportAck teleport)
     {
+        // JimsProxy (zep-stuck-no-move 2026-05-14): if this ack corresponds to the
+        // synthesized SMSG_MOVE_TELEPORT emitted for the deferred transport-clear, drop
+        // it: the legacy server never sent the teleport and would treat the
+        // unsolicited MSG_MOVE_TELEPORT_ACK as malformed input.
+        // P1-2: matched by value, ahead of everything else. Since the synth goes out after
+        // the create the client really acks it, and a server self teleport or NEW_WORLD can
+        // clear PendingSyntheticTransportClearAckCounter inside that round trip; the old
+        // pending-gated match would then forward an ack with counter 0xFFFFFFFF for a
+        // teleport the server never sent. The server's counters start at 0, so the value
+        // is unambiguous. Running first also keeps our own synth's ack from firing the
+        // carried-root cure below, which waits for the ack of a server teleport.
+        if (teleport.MoveCounter == World.Client.SynthMoveCounters.TransportClearTeleport &&
+            teleport.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            bool pendingWasSet = GetSession().GameState.PendingSyntheticTransportClearAckCounter != 0;
+            if (pendingWasSet)
+                GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
+            Framework.Logging.Log.Event("movement.transport_clear.ack_dropped", new
+            {
+                player_low = teleport.MoverGUID.GetCounter(),
+                move_counter = teleport.MoveCounter,
+                pending_was_set = pendingWasSet,
+            });
+            return;
+        }
+
         // JimsProxy (carried-root cure, same-map variant): the client just proved it
         // processed the teleport — deliver the missing unroot armed at the self
         // MoveTeleport. Sentinel counter; its ack is swallowed in HandleMoveForceAck2.
@@ -305,25 +331,6 @@ public partial class WorldSocket
                 map_id = GetSession().GameState.CurrentMapId,
                 path = "teleport_ack",
             });
-        }
-
-        // JimsProxy (zep-stuck-no-move 2026-05-14): if this ack corresponds to the
-        // synthesized SMSG_MOVE_TELEPORT emitted by HandleNewWorld to clear stale
-        // MOVEMENTFLAG_ONTRANSPORT, drop it — the legacy server never sent the
-        // teleport and would treat the unsolicited MSG_MOVE_TELEPORT_ACK as
-        // malformed input.
-        uint pendingSentinel = GetSession().GameState.PendingSyntheticTransportClearAckCounter;
-        if (pendingSentinel != 0 &&
-            teleport.MoveCounter == pendingSentinel &&
-            teleport.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
-        {
-            GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
-            Framework.Logging.Log.Event("movement.transport_clear.ack_dropped", new
-            {
-                player_low = teleport.MoverGUID.GetCounter(),
-                move_counter = teleport.MoveCounter,
-            });
-            return;
         }
 
         WorldPacket packet = new WorldPacket(Opcode.MSG_MOVE_TELEPORT_ACK);

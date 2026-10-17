@@ -497,9 +497,9 @@ public partial class WorldClient
             // before the login's first self create block joins the pre-create hold
             // (R56 op set). Our own transport-clear synth doesn't route through this
             // handler and is not one of the held ops: it is present on every healthy
-            // login and provably not part of the lock recipe. Since P1-2 it is deferred
-            // past the self create separately (PreCreateOpHold.DeferPastSelfCreate) and
-            // goes out after any ops held here.
+            // login and provably not part of the lock recipe. Since P1-2 the Login-mode
+            // synth is a no-op, and the NewWorld one is deferred past the self create
+            // separately (PreCreateOpHold.DeferPastSelfCreate), after any ops held here.
             if (GetSession().GameState.PreCreateOpHold.TryCapture(teleport))
                 return;
         }
@@ -840,7 +840,7 @@ public partial class WorldClient
         if (playerGuid.IsEmpty())
             return;
 
-        const uint SyntheticTeleportAckSentinel = 0xFFFFFFFFu;
+        const uint SyntheticTeleportAckSentinel = SynthMoveCounters.TransportClearTeleport;
         MoveTeleport transportClear = new MoveTeleport();
         transportClear.MoverGUID = playerGuid;
         transportClear.MoveCounter = SyntheticTeleportAckSentinel;
