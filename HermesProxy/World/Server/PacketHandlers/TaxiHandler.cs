@@ -44,7 +44,7 @@ public partial class WorldSocket
         // activations in the captures, the only refused flights in the history). Cancel the mount
         // aura first, on the same server connection, so the server reads the dismount before the
         // activation; unmounted players send nothing extra.
-        if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+        if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180) && IsPlayerMountedPerCache())
         {
             List<uint> dismounted = CancelLegacyMountAuras();
             if (dismounted.Count > 0)
