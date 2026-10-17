@@ -53,6 +53,14 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 **Verification:** `QuestCompleteLaunchDecisionTests` (13). Field (Kronos, 2026-10-18, Duke Nicholas Zverenhoff at Light's Hope Chapel, the repeatable Corruptor's Scourgestones with The Archivist still offered): on 5.2.2-beta.1 the reward page stayed open on both turn-ins and was closed by hand 2.9 s and 1.2 s later; with this change the completion carried LaunchQuest, the client asked the NPC again 6 ms later and the quest list came back 0.2 s after that.
 
+## 2026-10-17 — Dismount before a flight activation (flight refused while mounted)
+
+**Issue:** Clicking a flight path while mounted was refused by the 1.12 server ("already mounted", SMSG_ACTIVATE_TAXI_REPLY 8) and the taxi map stayed open; the player dismounted by hand and clicked again. In the captures 22 flights were activated while mounted, 14 refused, each followed by a hand dismount 0.35 to 1.57 s later and a second click; those 14 are the only refused flights in the whole history. The 1.14 client never dismounts for a flight: with its auto-dismount option on (the default) it sends the activation while mounted and expects the server to dismount it, as a modern server does on activation.
+
+**Change:** `World/Server/PacketHandlers/TaxiHandler.cs` (`HandleActivateTaxi`): before the direct or express activation is forwarded, the proxy cancels every mount aura in the player's cached aura slots with the 1.12 CMSG_CANCEL_AURA, on the same server connection, so the server reads the dismount before the activation (event `taxi.dismount_before_activate`). The cancel is the one CMSG_CANCEL_MOUNT_AURA already used, factored into `WorldSocket.CancelLegacyMountAuras` (`World/Server/PacketHandlers/SpellHandler.cs`); the slot selection is `GameSessionData.MountAurasAmong`. Unmounted players send nothing extra.
+
+**Verification:** `TaxiDismountBeforeActivateTests` (4). Field: pending on the `JimsProxy-re-questlist` test build; expected: a flight taken while mounted shows one CMSG_CANCEL_AURA before CMSG_ACTIVATE_TAXI and reply 0, never reply 8.
+
 ## 2026-10-13 — Party buff timers by provenance; known starts served across leave, return and relog (#513 part A, PR #547)
 
 **Issue:** The 1.12 server never tells the proxy how long another unit's buff has left. For a buff first seen already running the proxy filled Duration and Remaining with the spell's full CSV value, recorded that guess as the expiry and served it again later with the Duration flag set, so a 25-minute-old Fortitude showed 30:00 after a relog, a destroy and re-create, or an out-of-range trip (#513). Next to it: a seen recast re-sent the previous application's decayed Remaining instead of the full duration, stack and charge re-emits re-sent the last values undecayed, and the out-of-range leave kept the per-slot duration cache alive so it was read before the durable map.
