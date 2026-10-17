@@ -82,6 +82,42 @@ public class SynthMoveCounterTests
     private static int IndexOf(List<ServerPacket> sent, Opcode opcode)
         => sent.FindIndex(p => p.GetUniversalOpcode() == opcode);
 
+    // 1.12 MSG_MOVE_SET_RUN_SPEED (the broadcast form the server uses for a unit its client does not
+    // control, a charmed player included): packed mover guid, MovementInfo, speed.
+    private static WorldPacket BroadcastRunSpeed(WowGuid64 mover, float speed) => Legacy(Opcode.MSG_MOVE_SET_RUN_SPEED, w =>
+    {
+        w.WritePackedGuid(mover);
+        new MovementInfo().WriteMovementInfoLegacy(w);
+        w.WriteFloat(speed);
+    });
+
+    // User report 2026-10-17: mind-controlled while mounted, then Will of the Forsaken. The dismount the
+    // client requested while charmed reached the proxy only as the broadcast speed form, the cache kept
+    // the mounted speed, and the control-regain reassert put the client at mount speed. The broadcast
+    // form for the player's own guid must feed the cache.
+    [Fact]
+    public void BroadcastRunSpeed_ForTheOwnPlayer_FeedsTheRegainCache()
+    {
+        var h = new ClientHarness();
+        h.State.LastKnownPlayerRunSpeed = 14.0f;                  // mounted speed cached before the charm
+
+        h.Dispatch(BroadcastRunSpeed(LegacyPlayer, 7.0f));        // the dismount, seen while charmed
+
+        Assert.Equal(7.0f, h.State.LastKnownPlayerRunSpeed);
+        Assert.Contains(h.Sent, p => p.GetUniversalOpcode() == Opcode.SMSG_MOVE_UPDATE_RUN_SPEED);
+    }
+
+    [Fact]
+    public void BroadcastRunSpeed_ForAnotherUnit_LeavesTheRegainCache()
+    {
+        var h = new ClientHarness();
+        h.State.LastKnownPlayerRunSpeed = 14.0f;
+
+        h.Dispatch(BroadcastRunSpeed(new WowGuid64(HighGuidTypeLegacy.Player, 9999), 7.0f));
+
+        Assert.Equal(14.0f, h.State.LastKnownPlayerRunSpeed);
+    }
+
     // 1.12 self create: one CREATE_OBJECT2 block, Self|Living movement block, no values set.
     private static WorldPacket SelfCreate(float runSpeed) => Legacy(Opcode.SMSG_UPDATE_OBJECT, w =>
     {
