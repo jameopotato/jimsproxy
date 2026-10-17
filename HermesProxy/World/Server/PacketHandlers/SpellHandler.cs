@@ -6,6 +6,7 @@ using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
 using HermesProxy.World.Server.Packets;
 using System;
+using System.Collections.Generic;
 using Framework.Logging;
 
 namespace HermesProxy.World.Server;
@@ -1233,25 +1234,38 @@ public partial class WorldSocket
         }
         else
         {
-            WowGuid128 guid = GetSession().GameState.CurrentPlayerGuid;
-            var updateFields = GetSession().GameState.GetCachedObjectFieldsLegacy(guid);
-            if (updateFields == null)
-                return;
-
-            for (byte i = 0; i < 32; i++)
-            {
-                var aura = GetSession().WorldClient!.ReadAuraSlot(i, guid, updateFields);
-                if (aura == null)
-                    continue;
-
-                if (GameData.MountAuras.Contains(aura.SpellID))
-                {
-                    WorldPacket packet = new WorldPacket(Opcode.CMSG_CANCEL_AURA);
-                    packet.WriteUInt32(aura.SpellID);
-                    SendPacketToServer(packet);
-                }
-            }
+            CancelLegacyMountAuras();
         }
+    }
+
+    // JimsProxy: the 1.12 translation of a mount cancel. The legacy server has no mount-cancel
+    // opcode; the proxy cancels every mount aura it sees in the player's cached aura slots.
+    // Shared by CMSG_CANCEL_MOUNT_AURA and by the taxi activation (TaxiHandler), which must
+    // dismount the player before the legacy server reads the activation. Returns the spell
+    // IDs cancelled (empty when the player is not mounted or the cache is not ready).
+    internal List<uint> CancelLegacyMountAuras()
+    {
+        WowGuid128 guid = GetSession().GameState.CurrentPlayerGuid;
+        var updateFields = GetSession().GameState.GetCachedObjectFieldsLegacy(guid);
+        if (updateFields == null)
+            return new List<uint>();
+
+        List<uint> slotSpells = new();
+        for (byte i = 0; i < 32; i++)
+        {
+            var aura = GetSession().WorldClient!.ReadAuraSlot(i, guid, updateFields);
+            if (aura != null)
+                slotSpells.Add(aura.SpellID);
+        }
+
+        List<uint> cancelled = GameSessionData.MountAurasAmong(slotSpells, GameData.MountAuras.Contains);
+        foreach (uint spellId in cancelled)
+        {
+            WorldPacket packet = new WorldPacket(Opcode.CMSG_CANCEL_AURA);
+            packet.WriteUInt32(spellId);
+            SendPacketToServer(packet);
+        }
+        return cancelled;
     }
     [PacketHandler(Opcode.CMSG_LEARN_TALENT)]
     void HandleLearnTalent(LearnTalent talent)

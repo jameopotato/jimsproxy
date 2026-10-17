@@ -754,6 +754,18 @@ public sealed class GameSessionData
     public uint CurrentGuildNumAccounts;
     public WowGuid128 CurrentInteractedWithNPC;
     public WowGuid128 CurrentInteractedWithGO;
+
+    // JimsProxy: the mount auras among a unit's aura-slot spell IDs, in slot order. Used by the
+    // 1.12 mount cancel (WorldSocket.CancelLegacyMountAuras) for CMSG_CANCEL_MOUNT_AURA and for
+    // the dismount before a taxi activation.
+    internal static List<uint> MountAurasAmong(IEnumerable<uint> auraSpellIds, Func<uint, bool> isMountAura)
+    {
+        List<uint> result = new();
+        foreach (uint spellId in auraSpellIds)
+            if (isMountAura(spellId))
+                result.Add(spellId);
+        return result;
+    }
     // JimsProxy: Auctionator-style Full Scan synthesis state. CMSG_AUCTION_REPLICATE_ITEMS
     // has no legacy 1.12 equivalent; the proxy walks pages internally via
     // CMSG_AUCTION_LIST_ITEMS at the canonical 6s cooldown and assembles rows

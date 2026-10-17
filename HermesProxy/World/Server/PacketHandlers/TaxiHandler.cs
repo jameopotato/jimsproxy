@@ -36,6 +36,28 @@ public partial class WorldSocket
         uint fromNode = GetSession().GameState.CurrentTaxiNode;
         bool direct = TaxiPathExist(fromNode, taxi.Node);
 
+        // JimsProxy: the 1.14 client never dismounts for a flight. With its auto-dismount option
+        // on (the default) it sends the activation while mounted and expects the server to
+        // dismount it, as a modern server does on activation. The 1.12 server refuses a mounted
+        // player instead (SMSG_ACTIVATE_TAXI_REPLY 8, "already mounted") and leaves the taxi map
+        // open, so the player had to dismount by hand and click again (14 of 22 mounted
+        // activations in the captures, the only refused flights in the history). Cancel the mount
+        // aura first, on the same server connection, so the server reads the dismount before the
+        // activation; unmounted players send nothing extra.
+        if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+        {
+            List<uint> dismounted = CancelLegacyMountAuras();
+            if (dismounted.Count > 0)
+            {
+                Log.Event("taxi.dismount_before_activate", new
+                {
+                    flight_master = taxi.FlightMaster.ToString(),
+                    to_node = taxi.Node,
+                    mount_spell_ids = dismounted,
+                });
+            }
+        }
+
         // direct path exist
         if (direct)
         {
