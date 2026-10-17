@@ -17,16 +17,15 @@ namespace HermesProxy.Tests.World;
 
 // JimsProxy (P1-2, checks D-01 and D-06), driven through the real handlers.
 //
-// (a) Four proxy-synthesized SET-class movement packets went to the client with MoveCounter 0,
+// (a) Three proxy-synthesized SET-class movement packets went to the client with MoveCounter 0,
 //     the value the 1.12 server puts on every SET it sends, so the client's acknowledgement was
 //     forwarded to the server as an ack for a change the server never sent. Each site now
 //     carries its own counter (SynthMoveCounters) and the ack handlers keep those acks.
-// (b) The world-port transport-clear teleport and the post-teleport run-speed reassert are built
-//     inside the movement block of the player's own create, so they used to leave ahead of the
-//     UPDATE_OBJECT that creates the player. The client ignores a movement packet for a unit it
-//     has not received yet; they are now sent right after that UPDATE_OBJECT. The Login-mode
-//     transport-clear stays a no-op (nothing to clear at login), and the transport-clear's ack
-//     is dropped by its counter alone.
+// (b) The transport-clear teleport and the post-teleport run-speed reassert are deleted. Both
+//     were built inside the movement block of the player's own create and left ahead of the
+//     UPDATE_OBJECT that creates the player, so the client never applied them (the field
+//     record has the teleport sent 752 times and acknowledged 0 times), and the reassert only
+//     copied the create's own run speed. A world port's self create brings neither now.
 public class SynthMoveCounterTests
 {
     private static readonly WowGuid64 LegacyPlayer = new(HighGuidTypeLegacy.Player, 4242);
@@ -120,7 +119,6 @@ public class SynthMoveCounterTests
             SynthMoveCounters.RegainControlRunSpeed,
             SynthMoveCounters.TaxiResumeDismountUnroot,
             SynthMoveCounters.TaxiDismountUnroot,
-            SynthMoveCounters.PostTeleportRunSpeed,
         };
 
         Assert.Equal(mine.Length, mine.Distinct().Count());
@@ -131,15 +129,17 @@ public class SynthMoveCounterTests
             Assert.NotEqual(WorldEntryCeremonyTracker.SynthCounterUnroot, counter);
             Assert.False(ChargePendLatchCure.IsCureCounter(counter));
         }
-        // The server's own counter, and the other synths' sentinels, are not swallowed by this check.
+        // The server's own counter, the other synths' sentinels and the values of the deleted
+        // synths (0xFFFFFF08 run-speed reassert, 0xFFFFFFFF transport-clear) are not swallowed here.
         Assert.False(SynthMoveCounters.IsSynthAckCounter(0));
+        Assert.False(SynthMoveCounters.IsSynthAckCounter(0xFFFFFF08));
         Assert.False(SynthMoveCounters.IsSynthAckCounter(0xFFFFFFFF));
         Assert.False(SynthMoveCounters.IsSynthAckCounter(WorldEntryCeremonyTracker.SynthCounterUnroot));
         Assert.False(SynthMoveCounters.IsSynthAckCounter(ChargePendLatchCure.SynthCounterRoot));
         Assert.False(SynthMoveCounters.IsSynthAckCounter(ChargePendLatchCure.SynthCounterUnroot));
     }
 
-    public enum Site { RegainControl, TaxiResumeLanding, TaxiLanding, PostTeleport }
+    public enum Site { RegainControl, TaxiResumeLanding, TaxiLanding }
 
     // Drive one synth site through its real handler and return the synthesized packet.
     private static async Task<(ClientHarness Harness, ServerPacket Synth)> SynthFrom(Site site)
@@ -188,12 +188,6 @@ public class SynthMoveCounterTests
                 Assert.NotNull(unroot);
                 return (h, unroot!);
             }
-
-            // Site 4: the run speed reasserted on the first destination self update after a world port.
-            case Site.PostTeleport:
-                h.State.PendingPostTeleportRunSpeedReassert = true;
-                h.Dispatch(SelfCreate(runSpeed: 11.648f));
-                return (h, Assert.Single(h.Sent.OfType<MoveSetSpeed>()));
         }
         throw new ArgumentOutOfRangeException(nameof(site));
     }
@@ -225,18 +219,6 @@ public class SynthMoveCounterTests
         Assert.Equal(SynthMoveCounters.TaxiDismountUnroot, WireCounter(unroot));
     }
 
-    [Fact]
-    public async Task PostTeleportRunSpeed_CarriesItsOwnCounter()
-    {
-        var (h, synth) = await SynthFrom(Site.PostTeleport);
-
-        var reassert = Assert.IsType<MoveSetSpeed>(synth);
-        Assert.Equal(Opcode.SMSG_MOVE_SET_RUN_SPEED, reassert.GetUniversalOpcode());
-        Assert.Equal(11.648f, reassert.Speed);
-        Assert.Equal(SynthMoveCounters.PostTeleportRunSpeed, WireCounter(reassert));
-        Assert.False(h.State.PendingPostTeleportRunSpeedReassert);
-    }
-
     // ---------------------------------------------------------------- (a) ack swallow
 
     private sealed class ServerHarness : IDisposable
@@ -259,23 +241,25 @@ public class SynthMoveCounterTests
             Socket = WorldSocket.CreateForTest(session);
         }
 
-        // Route through the handler the c2s table would pick for this opcode (same attribute scan
-        // as WorldSocket.InitializePacketHandlers).
-        public void Receive(WorldPacket modern)
-        {
-            var opcode = ModernVersion.GetUniversalOpcode(modern.GetOpcode());
-            foreach (var method in typeof(WorldSocket).GetMethods(BindingFlags.Instance | BindingFlags.NonPublic))
-            {
-                if (method.GetCustomAttributes<PacketHandlerAttribute>().Any(a => a.Opcode == opcode))
-                {
-                    new WorldSocket.PacketHandler(method, method.GetParameters()[0].ParameterType).Invoke(Socket, modern);
-                    return;
-                }
-            }
-            throw new InvalidOperationException($"no c2s handler for {opcode}");
-        }
+        public void Receive(WorldPacket modern) => ReceiveModern(Socket, modern);
 
         public void Dispose() => _socket.Dispose();
+    }
+
+    // Route a modern packet through the handler the c2s table would pick for its opcode (same
+    // attribute scan as WorldSocket.InitializePacketHandlers).
+    private static void ReceiveModern(WorldSocket socket, WorldPacket modern)
+    {
+        var opcode = ModernVersion.GetUniversalOpcode(modern.GetOpcode());
+        foreach (var method in typeof(WorldSocket).GetMethods(BindingFlags.Instance | BindingFlags.NonPublic))
+        {
+            if (method.GetCustomAttributes<PacketHandlerAttribute>().Any(a => a.Opcode == opcode))
+            {
+                new WorldSocket.PacketHandler(method, method.GetParameters()[0].ParameterType).Invoke(socket, modern);
+                return;
+            }
+        }
+        throw new InvalidOperationException($"no c2s handler for {opcode}");
     }
 
     // The 1.14 ack body as the proxy reads it: mover guid + movement info, the ack index, then
@@ -292,7 +276,6 @@ public class SynthMoveCounterTests
 
     [Theory]
     [InlineData(Opcode.CMSG_MOVE_FORCE_RUN_SPEED_CHANGE_ACK, SynthMoveCounters.RegainControlRunSpeed)]
-    [InlineData(Opcode.CMSG_MOVE_FORCE_RUN_SPEED_CHANGE_ACK, SynthMoveCounters.PostTeleportRunSpeed)]
     [InlineData(Opcode.CMSG_MOVE_FORCE_UNROOT_ACK, SynthMoveCounters.TaxiResumeDismountUnroot)]
     [InlineData(Opcode.CMSG_MOVE_FORCE_UNROOT_ACK, SynthMoveCounters.TaxiDismountUnroot)]
     public void SentinelAck_IsSwallowed_NothingReachesTheServer(Opcode ackOpcode, uint counter)
@@ -326,7 +309,6 @@ public class SynthMoveCounterTests
     [InlineData(Site.RegainControl)]
     [InlineData(Site.TaxiResumeLanding)]
     [InlineData(Site.TaxiLanding)]
-    [InlineData(Site.PostTeleport)]
     public async Task SynthAck_EndToEnd_NothingReachesTheServer(Site site)
     {
         var (_, synth) = await SynthFrom(site);
@@ -339,118 +321,52 @@ public class SynthMoveCounterTests
         Assert.Equal(0, server.Legacy.WriteAttemptsForTest);
     }
 
-    // The transport-clear teleport's ack is dropped by its 0xFFFFFFFF counter even when a server
-    // self teleport or NEW_WORLD cleared the pending marker inside the round trip: nothing reaches
-    // the server, and our own synth's ack never fires the carried-root cure that waits for the ack
-    // of a server teleport.
+    // ---------------------------------------------------------------- (b) deleted world-port synths
+
+    public enum SourceTransport { OnTransport, Unobserved, OffTransport }
+
+    // A world port through the real handlers: SMSG_NEW_WORLD, the client's
+    // CMSG_WORLD_PORT_RESPONSE, then the destination self create. Before P1-2 that create's
+    // movement block also produced a transport-clear SMSG_MOVE_TELEPORT (source on a transport
+    // or unobserved, destination off one) and an SMSG_MOVE_SET_RUN_SPEED copy of the create's own
+    // run speed (every port), both ahead of the create. Neither is synthesized now, before or after
+    // the create; the run speed still seeds the regain-control cache.
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void TransportClearAck_PendingCleared_IsDroppedAndFiresNoCure(bool cureArmed)
-    {
-        using var h = new ServerHarness();
-        h.State.PendingSyntheticTransportClearAckCounter = 0;    // cleared inside the round trip
-        h.State.WorldEntryCureAfterTeleportAck = cureArmed;
-        h.State.ClientBelievesRooted = cureArmed;
-        var writer = new WorldPacket(ModernVersion.GetCurrentOpcode(Opcode.CMSG_MOVE_TELEPORT_ACK));
-        writer.WritePackedGuid128(h.State.CurrentPlayerGuid);
-        writer.WriteUInt32(0xFFFFFFFFu);                         // the transport-clear sentinel
-        writer.WriteUInt32(123456);                              // move time
-
-        // The test socket has no connection; a cure send would throw here.
-        var thrown = Record.Exception(() => h.Receive(new WorldPacket(writer.GetOpcode(), writer.GetData())));
-
-        Assert.Null(thrown);
-        Assert.Equal(0, h.Legacy.WriteAttemptsForTest);
-        Assert.Equal(cureArmed, h.State.WorldEntryCureAfterTeleportAck); // still armed: cure not sent
-        Assert.Equal(cureArmed, h.State.ClientBelievesRooted);
-    }
-
-    // ---------------------------------------------------------------- (b) order vs the self create
-
-    // Login mode stays a no-op: the login create carries no transport flag, so there is nothing
-    // to clear, and beta never put this teleport in front of the client. With the hold armed (a
-    // fresh login) or not (seamless reconnect, hold switched off), nothing is built or sent.
-    [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void LoginTransportClear_IsANoOp_NothingSent(bool holdArmed)
+    [InlineData(SourceTransport.OnTransport)]
+    [InlineData(SourceTransport.Unobserved)]
+    [InlineData(SourceTransport.OffTransport)]
+    public void WorldPortSelfCreate_SendsNoTeleportAndNoRunSpeed(SourceTransport source)
     {
         var h = new ClientHarness();
-        if (holdArmed)
-            h.State.PreCreateOpHold.Arm(Environment.TickCount64);
-        h.State.PendingDeferredTransportSynth = DeferredTransportSynthMode.Login;
-
-        h.Dispatch(SelfCreate(runSpeed: 7f));
-
-        var sent = h.Sent;
-        Assert.True(IndexOf(sent, Opcode.SMSG_UPDATE_OBJECT) >= 0, "the self create was not sent");
-        int teleport = IndexOf(sent, Opcode.SMSG_MOVE_TELEPORT);
-        Assert.True(teleport == -1, $"a login transport-clear was sent at {teleport}");
-        Assert.Equal(0u, h.State.PendingSyntheticTransportClearAckCounter);
-        Assert.Equal(DeferredTransportSynthMode.None, h.State.PendingDeferredTransportSynth); // consumed
-        Assert.Equal(0, h.State.PreCreateOpHold.DeferredCount);
-        Assert.Equal(PreCreateOpHold.HoldPhase.Inactive, h.State.PreCreateOpHold.Phase);
-    }
-
-    // NewWorld mode still builds the transport-clear and sends it after the self create. With the
-    // hold armed (a transfer that lands before a login's first self create) the synth waits for
-    // the create, then follows the ops the hold releases.
-    [Fact]
-    public void NewWorldTransportClear_HoldArmed_IsSentAfterTheSelfCreate()
-    {
-        var h = new ClientHarness();
-        h.State.PreCreateOpHold.Arm(Environment.TickCount64);
-        h.State.PendingDeferredTransportSynth = DeferredTransportSynthMode.NewWorld;
-        h.State.LastObservedPlayerTransportGuid = WowGuid128.Create(HighGuidType703.Transport, 0, 176495, 1);
-
-        h.Dispatch(SelfCreate(runSpeed: 7f));
-
-        var sent = h.Sent;
-        int create = IndexOf(sent, Opcode.SMSG_UPDATE_OBJECT);
-        int teleport = IndexOf(sent, Opcode.SMSG_MOVE_TELEPORT);
-        Assert.True(create >= 0, "the self create was not sent");
-        Assert.True(teleport > create, $"transport-clear at {teleport}, self create at {create}");
-        // The existing sentinel and its ack-drop arming are unchanged.
-        Assert.Equal(0xFFFFFFFFu, WireCounter(sent[teleport]));
-        Assert.Equal(0xFFFFFFFFu, h.State.PendingSyntheticTransportClearAckCounter);
-        Assert.Equal(DeferredTransportSynthMode.None, h.State.PendingDeferredTransportSynth);
-        Assert.Equal(PreCreateOpHold.HoldPhase.Inactive, h.State.PreCreateOpHold.Phase);
-    }
-
-    // A world port off a transport: the destination self create carries both the NewWorld-mode
-    // transport-clear and the armed run-speed reassert. Both follow the create, in build order.
-    [Fact]
-    public void WorldPortSynths_AreSentAfterTheSelfCreate_InBuildOrder()
-    {
-        var h = new ClientHarness();
-        h.State.PendingDeferredTransportSynth = DeferredTransportSynthMode.NewWorld;
-        h.State.LastObservedPlayerTransportGuid = WowGuid128.Create(HighGuidType703.Transport, 0, 176495, 1);
-        h.State.PendingPostTeleportRunSpeedReassert = true;
+        h.State.LastObservedPlayerTransportGuid = source switch
+        {
+            SourceTransport.OnTransport => WowGuid128.Create(HighGuidType703.Transport, 0, 176495, 1),
+            SourceTransport.OffTransport => WowGuid128.Empty,
+            _ => null,
+        };
+        h.State.IsWaitingForNewWorld = true;                     // the transfer is pending
+        h.Dispatch(Legacy(Opcode.SMSG_NEW_WORLD, w =>
+        {
+            w.WriteUInt32(1);                                    // destination map
+            w.WriteVector3(new Vector3(1676.21f, -4315.29f, 61.52f));
+            w.WriteFloat(0f);
+        }));
+        Assert.True(h.State.IsWaitingForWorldPortAck);
+        var portResponse = new WorldPacket(ModernVersion.GetCurrentOpcode(Opcode.CMSG_WORLD_PORT_RESPONSE));
+        ReceiveModern(WorldSocket.CreateForTest(h.Session), new WorldPacket(portResponse.GetOpcode(), portResponse.GetData()));
+        Assert.False(h.State.IsWaitingForWorldPortAck);          // the port response handler ran
 
         h.Dispatch(SelfCreate(runSpeed: 11.648f));
 
         var sent = h.Sent;
+        int newWorld = IndexOf(sent, Opcode.SMSG_NEW_WORLD);
         int create = IndexOf(sent, Opcode.SMSG_UPDATE_OBJECT);
+        Assert.True(newWorld >= 0, "the NEW_WORLD was not sent");
+        Assert.True(create > newWorld, $"self create at {create}, NEW_WORLD at {newWorld}");
         int teleport = IndexOf(sent, Opcode.SMSG_MOVE_TELEPORT);
+        Assert.True(teleport == -1, $"a transport-clear teleport was sent at {teleport} (self create at {create})");
         int speed = IndexOf(sent, Opcode.SMSG_MOVE_SET_RUN_SPEED);
-        Assert.True(create >= 0, "the self create was not sent");
-        Assert.True(teleport > create, $"transport-clear at {teleport}, self create at {create}");
-        Assert.True(speed > teleport, $"run-speed reassert at {speed}, transport-clear at {teleport}");
-    }
-
-    // The source-off-transport skip (#329/#331/#332) is untouched: nothing is deferred or sent.
-    [Fact]
-    public void WorldPortTransportClear_SourceOffTransport_IsStillSkipped()
-    {
-        var h = new ClientHarness();
-        h.State.PendingDeferredTransportSynth = DeferredTransportSynthMode.NewWorld;
-        h.State.LastObservedPlayerTransportGuid = WowGuid128.Empty;
-
-        h.Dispatch(SelfCreate(runSpeed: 7f));
-
-        Assert.Equal(-1, IndexOf(h.Sent, Opcode.SMSG_MOVE_TELEPORT));
-        Assert.Equal(0u, h.State.PendingSyntheticTransportClearAckCounter);
-        Assert.Equal(0, h.State.PreCreateOpHold.DeferredCount);
+        Assert.True(speed == -1, $"a run-speed set was sent at {speed} (self create at {create})");
+        Assert.Equal(11.648f, h.State.LastKnownPlayerRunSpeed);
     }
 }

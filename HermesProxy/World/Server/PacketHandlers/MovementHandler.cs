@@ -57,6 +57,8 @@ public partial class WorldSocket
         // any login/teleport. Every own movement packet carries current transport state
         // (empty when off-transport); stamp it so the observation tracks truth continuously.
         // Stamped before the CHANGE_TRANSPORT drop below so boarding via that opcode counts.
+        // P1-2: the transport-clear synth and its gate are deleted; the stamp now keeps the
+        // transitions of the movement.player_update.transport_state diagnostic true.
         GetSession().GameState.LastObservedPlayerTransportGuid = movement.MoveInfo.TransportGuid;
 
         // JimsProxy (charge strafe-latch cure 2026-08-28, re-anchored 2026-08-29):
@@ -288,32 +290,6 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MOVE_TELEPORT_ACK)]
     void HandleMoveTeleportAck(MoveTeleportAck teleport)
     {
-        // JimsProxy (zep-stuck-no-move 2026-05-14): if this ack corresponds to the
-        // synthesized SMSG_MOVE_TELEPORT emitted for the deferred transport-clear, drop
-        // it: the legacy server never sent the teleport and would treat the
-        // unsolicited MSG_MOVE_TELEPORT_ACK as malformed input.
-        // P1-2: matched by value, ahead of everything else. Since the synth goes out after
-        // the create the client really acks it, and a server self teleport or NEW_WORLD can
-        // clear PendingSyntheticTransportClearAckCounter inside that round trip; the old
-        // pending-gated match would then forward an ack with counter 0xFFFFFFFF for a
-        // teleport the server never sent. The server's counters start at 0, so the value
-        // is unambiguous. Running first also keeps our own synth's ack from firing the
-        // carried-root cure below, which waits for the ack of a server teleport.
-        if (teleport.MoveCounter == World.Client.SynthMoveCounters.TransportClearTeleport &&
-            teleport.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
-        {
-            bool pendingWasSet = GetSession().GameState.PendingSyntheticTransportClearAckCounter != 0;
-            if (pendingWasSet)
-                GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
-            Framework.Logging.Log.Event("movement.transport_clear.ack_dropped", new
-            {
-                player_low = teleport.MoverGUID.GetCounter(),
-                move_counter = teleport.MoveCounter,
-                pending_was_set = pendingWasSet,
-            });
-            return;
-        }
-
         // JimsProxy (carried-root cure, same-map variant): the client just proved it
         // processed the teleport — deliver the missing unroot armed at the self
         // MoveTeleport. Sentinel counter; its ack is swallowed in HandleMoveForceAck2.
@@ -374,8 +350,6 @@ public partial class WorldSocket
             gameState.WorldEntryTransferPendingTick = 0;
         }
 
-        // JimsProxy (speed-stuck-after-bg-end-while-mounted): arm post-teleport reassert; see memory.
-        GetSession().GameState.PendingPostTeleportRunSpeedReassert = true;
         WorldPacket packet = new WorldPacket(Opcode.MSG_MOVE_WORLDPORT_ACK);
         SendPacketToServer(packet);
     }
@@ -411,8 +385,8 @@ public partial class WorldSocket
     void HandleMoveForceSpeedChangeAck(MovementSpeedAck speed)
     {
         var opcode = speed.GetUniversalOpcode();
-        // P1-2: the ack of a proxy-synthesized speed change (regain-control restore,
-        // post-teleport reassert). The server never sent that change; keep the ack here.
+        // P1-2: the ack of a proxy-synthesized speed change (the regain-control restore).
+        // The server never sent that change; keep the ack here.
         if (SwallowSynthAck(opcode, speed.Ack.MoveCounter))
             return;
 

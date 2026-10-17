@@ -731,18 +731,6 @@ public partial class WorldClient
             });
         }
 
-        // JimsProxy (P1-2, D-06): the self synths built while this update's player create
-        // was translated (the deferred transport-clear teleport, the post-teleport run-speed
-        // reassert) go out now, behind the create and behind any control ops released
-        // just above, which is their emission order. Null while a login's self create is
-        // still awaited, and on every update that deferred nothing.
-        var selfSynthsReleased = GetSession().GameState.PreCreateOpHold.TakeDeferredForRelease();
-        if (selfSynthsReleased != null)
-        {
-            foreach (var synth in selfSynthsReleased)
-                SendSelfSynthPastSelfCreate(synth);
-        }
-
         // MIRASU (mc-rune-dousing): after the packet's own updates are out, push rune targetability for any boss life-state edges seen in it, and hide respawned circles around doused runes.
         FlushPendingMcRuneResyncs();
         SuppressMcCirclesOnDousedRunes();
@@ -1461,78 +1449,6 @@ public partial class WorldClient
                     GetSession().GameState.LastObservedPlayerTransportGuid = moveInfo.TransportGuid;
                 }
 
-                // JimsProxy (zep-stuck-low-latency-race 2026-05-17): deferred
-                // transport-clear synth dispatcher. Both arming paths SKIP the
-                // synth when the player's destination UpdateObject confirms
-                // they are legitimately on a transport (zep tower / boat deck /
-                // mid-flight zep). Reasons differ but the action is the same:
-                //
-                //   - NewWorld + on transport: the natural NEW_WORLD load
-                //     already unlocked the client's movement state on map
-                //     load; firing the synth would risk re-wedging.
-                //   - Login + on transport: SMSG_MOVE_TELEPORT with
-                //     TransportGUID=empty would dump the player off the
-                //     transport into mid-air / ocean (validated 2026-05-17,
-                //     log jimsproxy-20260517-102517.jsonl — tester fell into
-                //     ocean at Silithus). MoveTeleport semantics don't allow
-                //     a no-op "state-refresh" with TransportGUID preserved;
-                //     the client treats any MoveTeleport as a real teleport.
-                //     Accept the temporary turn-input gate; the next natural
-                //     world transition (zep docking) releases it.
-                //
-                // Synth fires only when destination is NOT on a transport —
-                // the dc39c39 stale-flag-clear use case (player rode through
-                // a portal mid-zep, or the legacy server's UpdateObject lost
-                // the transport attach by destination). Since P1-2 only the
-                // NewWorld path sends it; Login mode is a no-op (see below).
-                var pendingMode = GetSession().GameState.PendingDeferredTransportSynth;
-                if (pendingMode != DeferredTransportSynthMode.None)
-                {
-                    GetSession().GameState.PendingDeferredTransportSynth = DeferredTransportSynthMode.None;
-                    // JimsProxy (#329/#331/#332 transport-clear wedge): fire the fabricated
-                    // transport-clear ONLY when the player carried a transport at the SOURCE
-                    // (or the source was unobserved -> fail-safe fire). Firing it when the player
-                    // was observed OFF a transport at the source is the wedge: a mage-teleport /
-                    // cross-continent / BG-exit transition gets a spurious MoveTeleport
-                    // (TransportGUID=empty) that leaves the client (esp. at EU latency) unable to
-                    // walk until /reload. prevTransport = the source state captured above (this
-                    // player UpdateObject's prior observation); moveInfo.TransportGuid = destination.
-                    bool gateFires = TransportClearGate.ShouldFire(prevTransport, moveInfo.TransportGuid);
-                    if (gateFires && pendingMode == DeferredTransportSynthMode.Login)
-                    {
-                        // P1-2: Login mode stays a no-op. The login create carries no
-                        // transport flag, so the teleport would clear nothing; built here it
-                        // used to leave ahead of the create and was never applied, so sending
-                        // it now (after the create) would add a self-teleport to every login,
-                        // where the arrival ceremony runs. Only NewWorld builds and sends it.
-                        if (Framework.Settings.DebugOutput)
-                        {
-                            Framework.Logging.Log.Event("movement.transport_clear.login_noop", new
-                            {
-                                map_id = GetSession().GameState.CurrentMapId,
-                                player_low = guid.GetCounter(),
-                                mode = pendingMode.ToString(),
-                            });
-                        }
-                    }
-                    else if (gateFires)
-                    {
-                        FireDeferredTransportClearSynth(guid, moveInfo.Position, moveInfo.Orientation, pendingMode.ToString());
-                    }
-                    else
-                    {
-                        Framework.Logging.Log.Event("movement.transport_clear.deferred_skipped", new
-                        {
-                            map_id = GetSession().GameState.CurrentMapId,
-                            player_low = guid.GetCounter(),
-                            source_transport_guid = prevTransport?.ToString() ?? "<unobserved>",
-                            destination_transport_guid = moveInfo.TransportGuid.ToString(),
-                            mode = pendingMode.ToString(),
-                            reason = moveInfo.TransportGuid.IsEmpty() ? "source_off_transport" : "destination_on_transport",
-                        });
-                    }
-                }
-
                 // JimsProxy (carried-root cure 2026-08-03, THE FIX for the BG-exit
                 // movement lockup): a spam-clicked Leave departs while the BG-end
                 // root is being removed; the server's unroot fires between maps and
@@ -1567,23 +1483,11 @@ public partial class WorldClient
 
             moveInfo.WalkSpeed = packet.ReadFloat();
             moveInfo.RunSpeed = packet.ReadFloat();
-            // JimsProxy (speed-stuck-{fear,bg-end}-while-mounted): seed cache + fire BG-end reassert if armed.
+            // JimsProxy (speed-stuck-{fear,bg-end}-while-mounted): seed the cache the regain-control restore reads.
+            // P1-2: the post-teleport run-speed reassert that also fired here is deleted. It copied this same
+            // run speed, which the create already carries to the client, and it left ahead of that create.
             if (guid == GetSession().GameState.CurrentPlayerGuid && moveInfo.RunSpeed > 0)
-            {
                 GetSession().GameState.LastKnownPlayerRunSpeed = moveInfo.RunSpeed;
-                if (GetSession().GameState.PendingPostTeleportRunSpeedReassert)
-                {
-                    GetSession().GameState.PendingPostTeleportRunSpeedReassert = false;
-                    MoveSetSpeed reassert = new MoveSetSpeed(Opcode.SMSG_MOVE_SET_RUN_SPEED);
-                    reassert.MoverGUID = guid;
-                    // P1-2: own counter, so the ack stays in the proxy (the server never sent this change).
-                    reassert.MoveCounter = SynthMoveCounters.PostTeleportRunSpeed;
-                    reassert.Speed = moveInfo.RunSpeed;
-                    // P1-2 (D-06): built inside this create's movement block; sent after the
-                    // UPDATE_OBJECT that creates the player (end of HandleUpdateObject).
-                    GetSession().GameState.PreCreateOpHold.DeferPastSelfCreate(reassert);
-                }
-            }
             moveInfo.RunBackSpeed = packet.ReadFloat();
             moveInfo.SwimSpeed = packet.ReadFloat();
             moveInfo.SwimBackSpeed = packet.ReadFloat();
