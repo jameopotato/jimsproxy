@@ -854,6 +854,18 @@ public partial class WorldClient
         speed.Speed = packet.ReadFloat();
         SendPacketToClient(speed);
 
+        // JimsProxy (user report 2026-10-17: mind-controlled while mounted, Will of the Forsaken, a second at
+        // mount speed, then a disconnect): while the player is charmed the server sends the player's own speed
+        // changes in this broadcast form, not the forced one, so the cache the control-regain reassert reads
+        // kept the mounted speed after the client dismounted itself. The reassert then put the client at mount
+        // speed and the client's acknowledgement of it carried a speed above the server's, which a mangos
+        // server treats as cheating and kicks. Feed the cache from here too.
+        if (universalOpcode == Opcode.SMSG_MOVE_UPDATE_RUN_SPEED &&
+            speed.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            GetSession().GameState.LastKnownPlayerRunSpeed = speed.Speed;
+        }
+
         // Convenience in vanilla to use SwimSpeed as FlySpeed
         if (universalOpcode is Opcode.SMSG_MOVE_UPDATE_SWIM_SPEED
                             or Opcode.SMSG_MOVE_UPDATE_SWIM_BACK_SPEED &&
