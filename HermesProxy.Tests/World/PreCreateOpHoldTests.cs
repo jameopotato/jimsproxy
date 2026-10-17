@@ -188,4 +188,112 @@ public class PreCreateOpHoldTests
         Assert.Equal(0, hold.HeldCount);
         Assert.Equal(2000, hold.ArmTick);
     }
+
+    // --- P1-2 (D-06): self synths built while the self create is translated ---
+
+    static ServerPacket Teleport() => new MoveTeleport();
+    static ServerPacket RunSpeed() => new MoveSetSpeed(Opcode.SMSG_MOVE_SET_RUN_SPEED);
+
+    // Login: the synth is deferred while the hold is still armed (it is built in the create's
+    // movement block, before the create is marked). It waits for the create, then follows
+    // every held op: emission order.
+    [Fact]
+    public void DeferPastSelfCreate_Armed_FollowsTheHeldOpsAfterTheCreate()
+    {
+        var hold = ArmedHold();
+        var root = Root();
+        var teleport = Teleport();
+        Assert.True(hold.TryCapture(root));
+
+        hold.DeferPastSelfCreate(teleport);
+        Assert.Null(hold.TakeDeferredForRelease()); // create not marked yet
+
+        hold.NoteSelfCreateForwarding();
+        Assert.Null(hold.TakeDeferredForRelease()); // held ops not released yet
+        var ops = hold.TakeForRelease();
+        var synths = hold.TakeDeferredForRelease();
+
+        Assert.Same(root, Assert.Single(ops!));
+        Assert.Same(teleport, Assert.Single(synths!));
+        Assert.Equal(0, hold.DeferredCount);
+        Assert.Null(hold.TakeDeferredForRelease()); // released once
+    }
+
+    // World port (the hold is long inactive): released at the end of the same update, in the
+    // order deferred, and the control-op hold itself is not touched.
+    [Fact]
+    public void DeferPastSelfCreate_Inactive_ReleasedAtTheEndOfTheUpdate_HoldUntouched()
+    {
+        var hold = new PreCreateOpHold();
+        var teleport = Teleport();
+        var speed = RunSpeed();
+
+        hold.DeferPastSelfCreate(teleport);
+        hold.DeferPastSelfCreate(speed);
+
+        Assert.Equal(PreCreateOpHold.HoldPhase.Inactive, hold.Phase);
+        Assert.False(hold.TryCapture(Root()));
+        Assert.Null(hold.TakeForRelease());
+        var synths = hold.TakeDeferredForRelease();
+        Assert.NotNull(synths);
+        Assert.Equal(new[] { teleport, speed }, synths);
+    }
+
+    // Deferring never feeds the held list, so a non-empty TakeForRelease (the always-on wedge
+    // event) still means held control ops only.
+    [Fact]
+    public void DeferPastSelfCreate_DoesNotCountAsAHeldOp()
+    {
+        var hold = ArmedHold();
+        hold.DeferPastSelfCreate(Teleport());
+        hold.NoteSelfCreateForwarding();
+
+        var ops = hold.TakeForRelease();
+
+        Assert.NotNull(ops);
+        Assert.Empty(ops);
+        Assert.Equal(0, hold.HeldCount);
+        Assert.Equal(1, hold.DeferredCount);
+    }
+
+    // Nothing deferred: nothing to release on any update.
+    [Fact]
+    public void TakeDeferredForRelease_NothingDeferred_ReturnsNull()
+    {
+        Assert.Null(new PreCreateOpHold().TakeDeferredForRelease());
+    }
+
+    // Login failed / legacy disconnect: the proxy's own synths are dropped, not flushed, in
+    // every phase; the held ops keep their fail-open release.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ReleaseAll_DropsDeferredSynths(bool armed)
+    {
+        var hold = armed ? ArmedHold() : new PreCreateOpHold();
+        var root = Root();
+        if (armed)
+            Assert.True(hold.TryCapture(root));
+        hold.DeferPastSelfCreate(Teleport());
+
+        var released = hold.ReleaseAll();
+
+        if (armed)
+            Assert.Same(root, Assert.Single(released!));
+        else
+            Assert.Null(released);
+        Assert.Equal(0, hold.DeferredCount);
+        Assert.Null(hold.TakeDeferredForRelease());
+    }
+
+    [Fact]
+    public void Arm_DropsStaleDeferredSynths()
+    {
+        var hold = new PreCreateOpHold();
+        hold.DeferPastSelfCreate(Teleport());
+
+        hold.Arm(nowTick: 3000);
+
+        Assert.Equal(0, hold.DeferredCount);
+    }
 }

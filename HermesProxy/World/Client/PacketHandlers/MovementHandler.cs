@@ -320,7 +320,8 @@ public partial class WorldClient
             // JimsProxy (speed-stuck-after-fear-while-mounted): reassert cached speed, not 7.0f; see memory.
             MoveSetSpeed runFix = new MoveSetSpeed(Opcode.SMSG_MOVE_SET_RUN_SPEED);
             runFix.MoverGUID = control.Guid;
-            runFix.MoveCounter = 0;
+            // P1-2: own counter, so the ack stays in the proxy (the server never sent this change).
+            runFix.MoveCounter = SynthMoveCounters.RegainControlRunSpeed;
             runFix.Speed = GetSession().GameState.LastKnownPlayerRunSpeed;
             // step-2 hold: ride behind the held control-update in emission order.
             if (!heldPreCreate || !GetSession().GameState.PreCreateOpHold.TryCapture(runFix))
@@ -346,6 +347,9 @@ public partial class WorldClient
 
         MoveSetFlag unroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
         unroot.MoverGUID = guid;
+        // P1-2: own counter, so the FORCE_UNROOT ack stays in the proxy. The gravity and
+        // can-fly acks need none: 1.12 has no such acks, so they are already discarded.
+        unroot.MoveCounter = SynthMoveCounters.TaxiResumeDismountUnroot;
         SendPacketToClient(unroot);
     }
 
@@ -457,8 +461,10 @@ public partial class WorldClient
             // JimsProxy (camp stun lock, step 2): a SERVER-originated self teleport
             // before the login's first self create block joins the pre-create hold
             // (R56 op set). Our own transport-clear synth doesn't route through this
-            // handler and stays unheld — it is present on every healthy login and
-            // provably not part of the lock recipe.
+            // handler and is not one of the held ops: it is present on every healthy
+            // login and provably not part of the lock recipe. Since P1-2 it is deferred
+            // past the self create separately (PreCreateOpHold.DeferPastSelfCreate) and
+            // goes out after any ops held here.
             if (GetSession().GameState.PreCreateOpHold.TryCapture(teleport))
                 return;
         }
@@ -817,20 +823,42 @@ public partial class WorldClient
             mode = mode,
         });
 
+        // JimsProxy (P1-2, D-06): this runs inside the movement block of the player's own
+        // create, so sending here put the teleport ahead of the UPDATE_OBJECT that creates
+        // the player, and the client ignored it (the captures show none acknowledged).
+        // The pre-create hold keeps it back; the end of HandleUpdateObject sends it right
+        // after that update (SendSelfSynthPastSelfCreate). This completes the 2026-05-17
+        // intent above: the synth now lands after the destination state, not just after
+        // it was read.
+        GetSession().GameState.PreCreateOpHold.DeferPastSelfCreate(transportClear);
+    }
+
+    // JimsProxy (P1-2, D-06): sends one self synth the pre-create hold kept back until the
+    // self create's UPDATE_OBJECT was out. The transport-clear teleport keeps the send
+    // events and the catch it had when it was sent inline; any other synth (the
+    // post-teleport run-speed reassert) is sent plainly, as it was inline.
+    void SendSelfSynthPastSelfCreate(ServerPacket synth)
+    {
+        if (synth is not MoveTeleport transportClear)
+        {
+            SendPacketToClient(synth);
+            return;
+        }
+
         try
         {
             SendPacketToClient(transportClear);
             Framework.Logging.Log.Event("movement.transport_clear.send_completed", new
             {
-                player_low = playerGuid.GetCounter(),
-                sentinel_counter = SyntheticTeleportAckSentinel,
+                player_low = transportClear.MoverGUID.GetCounter(),
+                sentinel_counter = transportClear.MoveCounter,
             });
         }
         catch (System.Exception ex)
         {
             Framework.Logging.Log.Event("movement.transport_clear.send_failed", new
             {
-                player_low = playerGuid.GetCounter(),
+                player_low = transportClear.MoverGUID.GetCounter(),
                 exception_type = ex.GetType().Name,
                 exception_message = ex.Message,
             });
@@ -1594,6 +1622,8 @@ public partial class WorldClient
 
                     MoveSetFlag unroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
                     unroot.MoverGUID = playerGuid;
+                    // P1-2: own counter, so the FORCE_UNROOT ack stays in the proxy (see SendTaxiDismountRestore).
+                    unroot.MoveCounter = SynthMoveCounters.TaxiDismountUnroot;
                     capturedClient.SendPacketToClient(unroot);
 
                     System.Threading.Volatile.Write(ref capturedSession.GameState.IsInTaxiFlight, false);

@@ -599,6 +599,21 @@ public partial class WorldClient
     internal int WriteAttemptsForTest => _writeAttempts;
     internal int DroppedBeforeAuthForTest => _droppedBeforeAuth;
 
+    // Test seams (P1-2, SynthMoveCounterTests): bind a session to a client that never connects,
+    // run a legacy packet through the real handler table, and observe every packet bound for
+    // the modern client, in emission order, instead of routing it to a socket.
+    internal void AttachSessionForTest(GlobalSessionData session)
+    {
+        _globalSession = session;
+        _delayedPacketsToServer ??= new Dictionary<Opcode, List<WorldPacket>>();
+        _delayedPacketsToClient ??= new Dictionary<Opcode, List<ServerPacket>>();
+    }
+
+    internal void DispatchLegacyPacketForTest(WorldPacket packet)
+        => _packetHandlers[packet.GetUniversalOpcode(false)](packet);
+
+    internal Action<ServerPacket>? ClientSendSpyForTest;
+
     public void SendPacketToClient(ServerPacket packet, Opcode delayUntilOpcode = Opcode.MSG_NULL_ACTION)
     {
         Opcode opcode = packet.GetUniversalOpcode();
@@ -621,6 +636,12 @@ public partial class WorldClient
 
     private void SendPacketToClientDirect(ServerPacket packet)
     {
+        if (ClientSendSpyForTest is { } spy)
+        {
+            spy(packet);
+            return;
+        }
+
         // JimsProxy (camp login-eviction merge): while an instanced login-verify is
         // held, every world packet queues behind it in arrival order (flushed by the
         // release sites in MovementHandler/UpdateHandler/Disconnect). Realm packets

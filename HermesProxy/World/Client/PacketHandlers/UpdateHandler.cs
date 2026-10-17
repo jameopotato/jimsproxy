@@ -731,6 +731,18 @@ public partial class WorldClient
             });
         }
 
+        // JimsProxy (P1-2, D-06): the self synths built while this update's player create
+        // was translated (the deferred transport-clear teleport, the post-teleport run-speed
+        // reassert) go out now, behind the create and behind any control ops released
+        // just above, which is their emission order. Null while a login's self create is
+        // still awaited, and on every update that deferred nothing.
+        var selfSynthsReleased = GetSession().GameState.PreCreateOpHold.TakeDeferredForRelease();
+        if (selfSynthsReleased != null)
+        {
+            foreach (var synth in selfSynthsReleased)
+                SendSelfSynthPastSelfCreate(synth);
+        }
+
         // MIRASU (mc-rune-dousing): after the packet's own updates are out, push rune targetability for any boss life-state edges seen in it, and hide respawned circles around doused runes.
         FlushPendingMcRuneResyncs();
         SuppressMcCirclesOnDousedRunes();
@@ -1546,9 +1558,12 @@ public partial class WorldClient
                     GetSession().GameState.PendingPostTeleportRunSpeedReassert = false;
                     MoveSetSpeed reassert = new MoveSetSpeed(Opcode.SMSG_MOVE_SET_RUN_SPEED);
                     reassert.MoverGUID = guid;
-                    reassert.MoveCounter = 0;
+                    // P1-2: own counter, so the ack stays in the proxy (the server never sent this change).
+                    reassert.MoveCounter = SynthMoveCounters.PostTeleportRunSpeed;
                     reassert.Speed = moveInfo.RunSpeed;
-                    SendPacketToClient(reassert);
+                    // P1-2 (D-06): built inside this create's movement block; sent after the
+                    // UPDATE_OBJECT that creates the player (end of HandleUpdateObject).
+                    GetSession().GameState.PreCreateOpHold.DeferPastSelfCreate(reassert);
                 }
             }
             moveInfo.RunBackSpeed = packet.ReadFloat();
