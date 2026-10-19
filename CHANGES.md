@@ -19,7 +19,7 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 **Change:** `Addons/JimsPlus/castbars/CastBars.lua`: a SPELL_MISSED of a channeled spell from the caster within 0.25 s of that spell's success ends the channel bar, as a completed cast; a miss seen just before the success keeps the bar from starting. A miss while the caster is already channeling (a later tick, an Arcane Missiles missile) leaves the bar alone.
 
-**Verification:** Lua 5.1 parse (luaparse) of the patched file and of beta's copy. Field: pending; expected: on the immune Mind Control again, the victim's target bar ends with the cast and shows no channel.
+**Verification:** Lua 5.1 parse (luaparse) of the patched file and of beta's copy. Field (Kronos PTR, two boxes, 2026-10-18): before, at 21:54:49 the victim's target bar showed the priest channeling after an immune Mind Control; with this change the immune casts at 22:23:14, 22:33:50 and 22:34:40 closed the bar with the cast and showed no channel. Confirmed by the owner.
 
 ## 2026-10-13 — Party buff timers by provenance; known starts served across leave, return and relog (#513 part A, PR #547)
 
