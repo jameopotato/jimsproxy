@@ -502,6 +502,26 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
 
     private void SendPacketToServer(WorldPacket packet, Opcode delayUntilOpcode = Opcode.MSG_NULL_ACTION)
     {
+        // JimsProxy (mount speed kept after Will of the Forsaken): while the client's release of a
+        // unit waits for its acknowledgement of that unit's speed change, what it sends is held in
+        // order and goes out right after that acknowledgement (ControlReleaseAckOrder).
+        if (delayUntilOpcode == Opcode.MSG_NULL_ACTION &&
+            GetSession()?.GameState?.ReleaseAckOrder.TryHold(packet, out var overflow) == true)
+        {
+            if (overflow != null)
+            {
+                // Unexpected edge: the acknowledgement never came.
+                Log.Event("movement.release_hold_overflow", new { held = overflow.Count });
+                foreach (var held in overflow)
+                    SendPacketToServerNow(held);
+            }
+            return;
+        }
+        SendPacketToServerNow(packet, delayUntilOpcode);
+    }
+
+    private void SendPacketToServerNow(WorldPacket packet, Opcode delayUntilOpcode = Opcode.MSG_NULL_ACTION)
+    {
         // JimsProxy (teardown TOCTOU): read the field ONCE. The teardown paths (silent-stall
         // watchdog, modern-death watchdog) null session.WorldClient cross-thread, and this
         // method also runs on ThreadPool callbacks with no try/catch above it (the GCD

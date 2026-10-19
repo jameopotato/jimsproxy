@@ -84,6 +84,10 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_FAR_SIGHT)]
     void HandleFarSight(FarSight sight)
     {
+        // JimsProxy (mount speed kept after Will of the Forsaken): far sight changing while the
+        // client still owes the server an acknowledgement for the unit it moves starts a hold
+        // (ControlReleaseAckOrder).
+        GetSession().GameState.ReleaseAckOrder.OnClientMoverChange(null);
         WorldPacket packet = new WorldPacket(Opcode.CMSG_FAR_SIGHT);
         packet.WriteBool(sight.Enable);
         SendPacketToServer(packet);

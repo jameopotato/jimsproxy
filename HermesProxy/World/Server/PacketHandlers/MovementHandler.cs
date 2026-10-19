@@ -425,6 +425,29 @@ public partial class WorldSocket
         packet.WriteUInt32(speed.Ack.MoveCounter);
         speed.Ack.MoveInfo.WriteMovementInfoLegacy(packet);
         packet.WriteFloat(speed.Speed);
+
+        // JimsProxy (mount speed kept after Will of the Forsaken): the client released this unit
+        // before acknowledging its speed change; the acknowledgement goes to the server ahead of the
+        // held release, while the server still counts this client as the unit's mover
+        // (ControlReleaseAckOrder).
+        if (GetSession().GameState.ReleaseAckOrder.OnAck(speed.MoverGUID, opcode, speed.Ack.MoveCounter, out var release))
+        {
+            SendPacketToServerNow(packet);
+            if (release != null)
+            {
+                foreach (var held in release)
+                    SendPacketToServerNow(held);
+                // Fix-working breadcrumb: DebugOutput only.
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("movement.release_ack_first", new
+                    {
+                        opcode = opcode.ToString(),
+                        unit_low = speed.MoverGUID.GetCounter(),
+                        held = release.Count,
+                    });
+            }
+            return;
+        }
         SendPacketToServer(packet);
     }
 
@@ -568,6 +591,9 @@ public partial class WorldSocket
             mover_low = move.MoverGUID.GetCounter(),
             is_self = move.MoverGUID == GetSession().GameState.CurrentPlayerGuid,
         });
+        // JimsProxy (mount speed kept after Will of the Forsaken): releasing a unit whose speed
+        // change is still unacknowledged starts a hold (ControlReleaseAckOrder).
+        GetSession().GameState.ReleaseAckOrder.OnClientMoverChange(move.MoverGUID);
         WorldPacket packet = new WorldPacket(Opcode.CMSG_SET_ACTIVE_MOVER);
         packet.WriteGuid(move.MoverGUID.To64());
         SendPacketToServer(packet);
