@@ -50,9 +50,10 @@ public class UpdateFieldsArray
     }
 
     // JimsProxy: write a whole-word field and mark it changed even when the stored value is the
-    // same. SetUpdateField skips a value equal to the modern cache, which is right for a diff the
-    // client is known to hold; for a field the client may have lost (an UPDATE_OBJECT it discarded),
-    // the server's own resend must reach it. Used for UNIT_FIELD_MOUNTDISPLAYID.
+    // same. SetUpdateField skips a value equal to the modern cache, which is right for a plain diff;
+    // a field the client must get even when it is unchanged here is written with this. Used for
+    // UNIT_FIELD_MOUNTDISPLAYID (#417): the 0 before a remount (MountCacheResetTracker) equals the
+    // cache after an unmounted create.
     public void ForceUpdateField(object index, int value)
     {
         m_updateValues[(int)index].SignedValue = value;

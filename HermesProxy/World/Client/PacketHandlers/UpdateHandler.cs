@@ -3400,8 +3400,8 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                 updateData.UnitData.NativeDisplayID = updates[UNIT_FIELD_NATIVEDISPLAYID].Int32Value;
             }
             int UNIT_FIELD_MOUNTDISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_MOUNTDISPLAYID);
-            // JimsProxy (#417 symptom 2): for another player, a mount this client may hold stale on a
-            // reused object is held back from this update and sent after it, preceded by a 0
+            // JimsProxy (#417 symptom 2): for another player, the same mount again after the player came
+            // back into view unmounted is held back from this update and sent after it, preceded by a 0
             // (MountCacheResetTracker). Every update, mounted or not, is tracked, creates included.
             bool holdMountForCacheReset = false;
             if (UNIT_FIELD_MOUNTDISPLAYID >= 0 && Framework.Settings.MountCacheResetSynth &&

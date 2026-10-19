@@ -898,8 +898,8 @@ public class ObjectUpdateBuilder
             if (unitData.NativeXDisplayScale != null)
                 m_fields.SetUpdateField<float>(UnitField.UNIT_FIELD_NATIVE_X_DISPLAY_SCALE, (float)unitData.NativeXDisplayScale);
             // JimsProxy (#417 symptom 2, mounted speed without the mount): the mount field is emitted
-            // whenever the legacy values block carried it, even when the modern cache already holds the
-            // same value, so a server resend reaches a client that discarded the earlier update.
+            // whenever the update carries it, even when the modern cache already holds the same value:
+            // the 0 before a remount (MountCacheResetTracker) equals the cache after an unmounted create.
             if (unitData.MountDisplayID != null)
                 m_fields.ForceUpdateField(UnitField.UNIT_FIELD_MOUNTDISPLAYID, (int)unitData.MountDisplayID);
             if (unitData.MinDamage != null)
