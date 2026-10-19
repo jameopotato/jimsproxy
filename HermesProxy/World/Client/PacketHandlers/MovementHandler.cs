@@ -142,23 +142,6 @@ public partial class WorldClient
     {
         MoveUpdate moveUpdate = new MoveUpdate();
         moveUpdate.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
-        // JimsProxy (stuck moving after a mind control ends): while another player controls this
-        // character (Mind Control, a charm), the server relays that player's movement packets for it
-        // to every client in range, this one included. The last of them can arrive after control is
-        // back. The client then takes the relayed flags as its own: it keeps running forward until a
-        // movement key is touched, or a relayed stop cancels the key it has just pressed (2026-10-18:
-        // CONTROL_UPDATE(player, On) at 18:27:01.156, the relayed forward at .203, forward heartbeats
-        // with no key from .688). The server sends a player no relay of its own movement while it has
-        // control, so once it has control again such a packet is stale.
-        if (moveUpdate.MoverGUID == GetSession().GameState.CurrentPlayerGuid &&
-            GetSession().GameState.LastObservedHasControl)
-        {
-            Framework.Logging.Log.Event("movement.own_relay_dropped", new
-            {
-                opcode = packet.GetUniversalOpcode(false).ToString(),
-            });
-            return;
-        }
         // JimsProxy (out-of-range-ghost): drop a stray movement packet for a unit we just destroyed/out-of-ranged so it can't re-ghost the unit running-in-place on the modern client. Runs BEFORE the observed-bow move edge — a destroyed unit isn't rendered, so its stray move must neither reach the client nor count as a stop edge (a dead latched shooter is retracted by the death edge; an out-of-ranged one despawns and its latch ages out via the sweep).
         if (moveUpdate.MoverGUID != GetSession().GameState.CurrentPlayerGuid &&
             GetSession().GameState.WasObjectRecentlyDestroyed(moveUpdate.MoverGUID, out long ghostAgoMs))
