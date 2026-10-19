@@ -165,7 +165,7 @@ public sealed class GameSessionData
     public uint LastLoopingEmoteId; // 0 means no active loop
     // JimsProxy (another player stuck dancing): other players whose looping emote this client is
     // still playing, with the emote id. Set by SMSG_EMOTE, cleared by the stop sent on their move start,
-    // by a server SMSG_EMOTE 0, and when they leave this client's view (its teardown ends the loop).
+    // by a server SMSG_EMOTE 0, and when they leave this client's view (the dance ends there too).
     // Server-packet thread only.
     public readonly Dictionary<WowGuid128, uint> ObservedLoopingEmotes = new();
     public long LastLoopingEmoteTickMs;

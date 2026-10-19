@@ -12,9 +12,9 @@ using Xunit;
 
 namespace HermesProxy.Tests.World;
 
-// JimsProxy (another player stuck dancing, 2026-10-17 live Stratholme): the client loops another
-// unit's /dance (SMSG_EMOTE 10) until another looping emote; the unit's movement does not end it. On
-// that unit's next translational move start the proxy gives the client SMSG_EMOTE 0 for it first.
+// JimsProxy (another player stuck dancing, 2026-10-17 live Stratholme): on the client another unit's
+// /dance (SMSG_EMOTE 10) keeps playing through that unit's movement. On that unit's next translational
+// move start the proxy gives the client SMSG_EMOTE 0 for it first.
 // Driven through the real SMSG_EMOTE and movement-relay handlers.
 public class ObservedDanceStopTests
 {
@@ -110,7 +110,7 @@ public class ObservedDanceStopTests
         Assert.Equal(new[] { "emote 0", "move", "move", "move" }, Trace(h, warrior));
     }
 
-    // One-off emotes (eat, flinch) play beside the loop and do not end it, so the stop is still owed.
+    // A one-off emote (eat) in between leaves the dance playing, so the stop is still owed.
     [Fact]
     public void OneOffEmoteInBetween_TheStopIsStillSent()
     {
@@ -125,7 +125,7 @@ public class ObservedDanceStopTests
         Assert.Equal(new[] { "emote 0", "move" }, Trace(h, warrior));
     }
 
-    // A server emote 0 already ended the loop: nothing more is sent.
+    // A server emote 0 already ended the dance: nothing more is sent.
     [Fact]
     public void ServerEmote0_EndsIt_NoStopIsAdded()
     {
@@ -155,7 +155,7 @@ public class ObservedDanceStopTests
         Assert.Equal(new[] { "move", "emote 0", "move" }, Trace(h, warrior));
     }
 
-    // Leaving view ends the loop on the client (its teardown), so no stop is owed when the unit is back.
+    // Leaving view ends the dance, so no stop is owed when the unit is back.
     [Fact]
     public void AfterLeavingView_NoStopIsSent()
     {
