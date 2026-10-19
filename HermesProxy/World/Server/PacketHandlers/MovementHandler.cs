@@ -568,6 +568,7 @@ public partial class WorldSocket
             mover_low = move.MoverGUID.GetCounter(),
             is_self = move.MoverGUID == GetSession().GameState.CurrentPlayerGuid,
         });
+        GetSession().GameState.ClientActiveMover = move.MoverGUID;
         WorldPacket packet = new WorldPacket(Opcode.CMSG_SET_ACTIVE_MOVER);
         packet.WriteGuid(move.MoverGUID.To64());
         SendPacketToServer(packet);
