@@ -174,12 +174,12 @@ public partial class WorldClient
     }
 
     // JimsProxy (another player stuck dancing, 2026-10-17 live Stratholme): Kronos sends /dance as
-    // SMSG_EMOTE 10 only, and the client loops another unit's dance until another looping emote, an
-    // emote-state change, the unit leaving its view or a model refresh; its movement does not end it.
-    // A party member who danced at 22:50:14 kept dancing whenever idle on the owner's client until
-    // 23:16:21. A 1.12 client stops the dance when the dancer moves; on the same translational starts as
-    // the bow retract, the client gets SMSG_EMOTE 0 for the unit first, which ends the loop. The session
-    // player's own dance is ended by the move-start handler on the client side (LastLoopingEmoteId).
+    // SMSG_EMOTE 10 only, with no stop when the dancer moves, and on the client another unit's dance
+    // keeps playing through its movement. A party member who danced at 22:50:14 kept dancing whenever
+    // idle on the owner's client until 23:16:21. On the same translational starts as the bow retract,
+    // the client gets SMSG_EMOTE 0 for the unit first, which ends the dance. The session player's own
+    // dance is ended the same way when the client sends its own move start (World/Server
+    // MovementHandler, LastLoopingEmoteId).
     private void StopObservedLoopingEmoteOnMove(WowGuid128 mover, Opcode opcode)
     {
         var state = GetSession().GameState;
