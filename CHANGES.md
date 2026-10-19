@@ -13,6 +13,14 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-10-18 — A resisted or immune spell no longer leaves its caster stuck in the casting pose
+
+**Issue:** A priest's Mind Control resisted by a player left the priest stuck in the casting pose, seen from the victim's client and kept through the next successful cast (Kronos PTR, 2026-10-18 18:37). The 1.12 SMSG_SPELL_GO for that cast carried a miss-count byte of 2 followed by one miss entry (the target, Resist) and the target section. The proxy's phantom-miss check zeroed any count whose entries would not fit, read the real entry as the target section, failed the parse (`spell.parse_failed`) and dropped the GO, so the client never saw the cast complete. The same shape is in the history twice more: an immune Mind Control on a creature (2026-10-13) and a resisted Drain Soul (2026-08-21); the 87 phantom skips on record all have the byte 1 with no entry.
+
+**Change:** `World/Client/VanillaSpellGoMissCount.cs` (new, pure): on a 1.12 GO the miss count is the declared count, or the first lower one, whose entries (GUID, miss type up to Reflect, the reflect byte) and target section (flags, packed GUIDs, locations, string, then the ammo block for Projectile casts) consume the rest of the packet exactly. `World/Client/PacketHandlers/SpellHandler.cs` (`HandleSpellStartOrGo`) uses it before the phantom check, which now runs only when no count fits. Event `spell.spell_go.misscount_resolved` (declared and resolved counts).
+
+**Verification:** `VanillaSpellGoMissCountTests` (8) with the three captured packets byte for byte, the phantom byte, a matching count, a reflect, a Projectile cast and a packet nothing fits. Field: pending; expected: the next resisted or immune single-target cast completes on every client (no `spell.parse_failed` for it, one `spell.spell_go.misscount_resolved`), and the caster's casting pose ends.
+
 ## 2026-10-13 — Party buff timers by provenance; known starts served across leave, return and relog (#513 part A, PR #547)
 
 **Issue:** The 1.12 server never tells the proxy how long another unit's buff has left. For a buff first seen already running the proxy filled Duration and Remaining with the spell's full CSV value, recorded that guess as the expiry and served it again later with the Duration flag set, so a 25-minute-old Fortitude showed 30:00 after a relog, a destroy and re-create, or an out-of-range trip (#513). Next to it: a seen recast re-sent the previous application's decayed Remaining instead of the full duration, stack and charge re-emits re-sent the last values undecayed, and the out-of-range leave kept the per-slot duration cache alive so it was read before the durable map.
