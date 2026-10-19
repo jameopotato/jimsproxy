@@ -523,6 +523,12 @@ public partial class WorldClient
 
         GetSession().GameState.IsWaitingForNewWorld = true;
 
+        // JimsProxy (mount speed kept after Will of the Forsaken): the suspend pauses the client's
+        // movement, so no awaited speed acknowledgement can come; let a hold in progress go.
+        if (GetSession().GameState.ReleaseAckOrder.Reset() is { } heldAtTransfer)
+            foreach (var held in heldAtTransfer)
+                SendPacketToServer(held);
+
         SuspendToken suspend = new();
         suspend.SequenceIndex = 3;
         suspend.Reason = 1;
@@ -889,6 +895,13 @@ public partial class WorldClient
         }
 
         speed.Speed = packet.ReadFloat();
+        // JimsProxy (mount speed kept after Will of the Forsaken): a speed change for a unit the
+        // client controls other than the player (a Mind Control victim) must be acknowledged to the
+        // server before the client's release of that unit; remember it before the client can answer
+        // (ControlReleaseAckOrder). The player's own acknowledgements are accepted whenever they come.
+        if (speed.MoverGUID != GetSession().GameState.CurrentPlayerGuid &&
+            ForceSpeedAckOpcode(universalOpcode) is var ackOpcode && ackOpcode != Opcode.MSG_NULL_ACTION)
+            GetSession().GameState.ReleaseAckOrder.ExpectAck(speed.MoverGUID, ackOpcode, speed.MoveCounter);
         SendPacketToClient(speed);
 
         // JimsProxy (speed-stuck-after-fear-while-mounted): cache for CC-end reassert.
@@ -911,6 +924,21 @@ public partial class WorldClient
             SendPacketToClient(flySpeed);
         }
     }
+
+    // The client's acknowledgement for each forced speed change it is sent.
+    internal static Opcode ForceSpeedAckOpcode(Opcode setSpeed) => setSpeed switch
+    {
+        Opcode.SMSG_MOVE_SET_WALK_SPEED => Opcode.CMSG_MOVE_FORCE_WALK_SPEED_CHANGE_ACK,
+        Opcode.SMSG_MOVE_SET_RUN_SPEED => Opcode.CMSG_MOVE_FORCE_RUN_SPEED_CHANGE_ACK,
+        Opcode.SMSG_MOVE_SET_RUN_BACK_SPEED => Opcode.CMSG_MOVE_FORCE_RUN_BACK_SPEED_CHANGE_ACK,
+        Opcode.SMSG_MOVE_SET_SWIM_SPEED => Opcode.CMSG_MOVE_FORCE_SWIM_SPEED_CHANGE_ACK,
+        Opcode.SMSG_MOVE_SET_SWIM_BACK_SPEED => Opcode.CMSG_MOVE_FORCE_SWIM_BACK_SPEED_CHANGE_ACK,
+        Opcode.SMSG_MOVE_SET_TURN_RATE => Opcode.CMSG_MOVE_FORCE_TURN_RATE_CHANGE_ACK,
+        Opcode.SMSG_MOVE_SET_FLIGHT_SPEED => Opcode.CMSG_MOVE_FORCE_FLIGHT_SPEED_CHANGE_ACK,
+        Opcode.SMSG_MOVE_SET_FLIGHT_BACK_SPEED => Opcode.CMSG_MOVE_FORCE_FLIGHT_BACK_SPEED_CHANGE_ACK,
+        Opcode.SMSG_MOVE_SET_PITCH_RATE => Opcode.CMSG_MOVE_FORCE_PITCH_RATE_CHANGE_ACK,
+        _ => Opcode.MSG_NULL_ACTION,
+    };
 
     // for other players
     [PacketHandler(Opcode.MSG_MOVE_SET_FLIGHT_BACK_SPEED)]
