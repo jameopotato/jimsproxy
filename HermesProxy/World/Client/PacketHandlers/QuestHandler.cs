@@ -169,11 +169,15 @@ public partial class WorldClient
         quests.GreetEmoteType = packet.ReadUInt32();
 
         byte count = packet.ReadUInt8();
+        List<uint> questIds = new();
         for (int i = 0; i < count; i++)
         {
             ClientGossipQuest quest = ReadGossipQuestOption(packet);
             quests.QuestOptions.Add(quest);
+            questIds.Add(quest.QuestID);
         }
+        // JimsProxy: remembered for the turn-in's launch decision (HandleQuestGiverQuestComplete).
+        GetSession().GameState.RecordQuestGreeting(quests.QuestGiverGUID, questIds);
         SendPacketToClient(quests);
     }
 
@@ -339,33 +343,46 @@ public partial class WorldClient
 
         quest.ItemReward.ItemID = itemId;
 
-        // JimsProxy: LaunchQuest must default to FALSE. The previous logic kept it true
-        // whenever the QuestTemplate was missing (which is the common 1.14-client case,
-        // since the modern client doesn't issue CMSG_QUERY_QUEST_INFO before turn-in —
-        // see the OfferedRewardChoiceItems comment above). LaunchQuest=true tells the
-        // modern client "another quest dialog is coming, keep the giver UI live"; when
-        // no follow-up data arrives the client retries the entire HELLO → COMPLETE →
-        // REQUEST_REWARD → CHOOSE_REWARD chain at ~100ms intervals to recover, which
-        // looks like spam to anti-flood-equipped servers (Twinstar/Kronos drops the
-        // socket after ~15 retries in <2s). Bundle 2026-05-02 073927 captured this
-        // exact pattern. Now: default false; opt in to true only when QuestTemplate
-        // confirms a follow-up quest exists.
+        // JimsProxy: LaunchQuest defaults to FALSE. The original logic kept it true whenever
+        // the QuestTemplate was missing (the common 1.14-client case, since the modern client
+        // doesn't issue CMSG_QUERY_QUEST_INFO before turn-in; see the OfferedRewardChoiceItems
+        // comment above). LaunchQuest=true tells the modern client "another quest dialog is
+        // coming, keep the giver UI live"; with no follow-up data an addon-driven retry of the
+        // HELLO -> COMPLETE -> REQUEST_REWARD -> CHOOSE_REWARD chain at ~100ms intervals followed,
+        // which anti-flood servers (Twinstar/Kronos) punish with a socket drop (bundle
+        // 2026-05-02 073927). So: true only when the follow-up dialog is guaranteed to come.
+        //
+        // Two cases guarantee it. A QuestTemplate with a follow-up quest (the legacy server
+        // sends the next quest's details by itself). And a turn-in reached through the NPC's
+        // quest list (SMSG_QUEST_GIVER_QUEST_LIST_MESSAGE) that listed another quest besides
+        // the completed one: with both launch bits clear the 1.14 client leaves the reward page
+        // open in that state and the player has to close it by hand and click the NPC again
+        // (12 of 12 such turn-ins in the captures, 0 of 111 others). A native server sets
+        // LaunchQuest for every quest giver; the client then re-asks the NPC and the legacy
+        // server answers with the remaining list or the single remaining quest's dialog, which
+        // refills the page. Gossip NPCs keep LaunchGossip (the gossip page follows).
         QuestTemplate? questTemplate = GameData.GetQuestTemplate((uint)quest.QuestID);
         bool hasFollowUpQuest = questTemplate != null && questTemplate.RewardNextQuest != 0;
-        quest.LaunchQuest = hasFollowUpQuest;
 
-        if (!hasFollowUpQuest && GetSession().GameState.CurrentInteractedWithNPC != default)
+        var state = GetSession().GameState;
+        bool npcHasGossipFlag = false;
+        if (state.CurrentInteractedWithNPC != default)
         {
-            uint npcFlags = GetSession().GameState.GetLegacyFieldValueUInt32(GetSession().GameState.CurrentInteractedWithNPC, UnitField.UNIT_NPC_FLAGS);
-            if (npcFlags.HasAnyFlag(NPCFlags.Gossip))
-                quest.LaunchGossip = true;
+            uint npcFlags = state.GetLegacyFieldValueUInt32(state.CurrentInteractedWithNPC, UnitField.UNIT_NPC_FLAGS);
+            npcHasGossipFlag = npcFlags.HasAnyFlag(NPCFlags.Gossip);
         }
+        bool greetingHasOtherEntries = state.QuestGreetingHasOtherEntries(state.CurrentInteractedWithNPC, quest.QuestID);
+        (bool launchQuest, bool launchGossip) = GameSessionData.DecideQuestCompleteLaunch(hasFollowUpQuest, npcHasGossipFlag, greetingHasOtherEntries);
+        quest.LaunchQuest = launchQuest;
+        quest.LaunchGossip = launchGossip;
 
         Log.Event("quest.complete.launch_decision", new
         {
             quest_id = quest.QuestID,
             has_quest_template = questTemplate != null,
             reward_next_quest = questTemplate?.RewardNextQuest ?? 0,
+            npc_has_gossip_flag = npcHasGossipFlag,
+            greeting_other_entries = greetingHasOtherEntries,
             launch_quest = quest.LaunchQuest,
             launch_gossip = quest.LaunchGossip,
         });
