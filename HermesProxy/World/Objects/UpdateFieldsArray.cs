@@ -49,6 +49,16 @@ public class UpdateFieldsArray
         buffer.WriteBytes(fieldBuffer);
     }
 
+    // JimsProxy: write a whole-word field and mark it changed even when the stored value is the
+    // same. SetUpdateField skips a value equal to the modern cache, which is right for a diff the
+    // client is known to hold; for a field the client may have lost (an UPDATE_OBJECT it discarded),
+    // the server's own resend must reach it. Used for UNIT_FIELD_MOUNTDISPLAYID.
+    public void ForceUpdateField(object index, int value)
+    {
+        m_updateValues[(int)index].SignedValue = value;
+        m_updateMask.SetBit((int)index);
+    }
+
     public void SetUpdateField<T>(object index, T value, byte offset = 0) where T : new()
     {
         if (value is byte byteValue)
