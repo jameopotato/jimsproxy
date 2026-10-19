@@ -261,6 +261,9 @@ public partial class WorldClient
 
         // JimsProxy (out-of-range-ghost): suppress any stray trailing movement the legacy server broadcasts for this guid after the destroy, until a CreateObject re-creates it.
         GetSession().GameState.MarkObjectRecentlyDestroyed(guid);
+        // JimsProxy (another player stuck dancing): the client's teardown of a unit that left its view ends
+        // its emote loop, so no stop is owed for it any more.
+        GetSession().GameState.ObservedLoopingEmotes.Remove(guid);
 
         // MIRASU (onyxia-landed-still-hovering): forget hover state on destroy — a missed UNSET_HOVER while out of range must not poison the stable guid; re-approach re-seeds if still airborne.
         SetHoverState(guid, false, "destroyed", synthesize: false);
@@ -896,6 +899,9 @@ public partial class WorldClient
             GetSession().ThreatTracker.OnUnitDestroyed(guid);
             // JimsProxy (out-of-range-ghost): suppress stray trailing movement for this guid until it is re-created on re-approach.
             GetSession().GameState.MarkObjectRecentlyDestroyed(guid);
+            // JimsProxy (another player stuck dancing): the client's teardown of a unit that left its view
+            // ends its emote loop, so no stop is owed for it any more.
+            GetSession().GameState.ObservedLoopingEmotes.Remove(guid);
 
             // MIRASU (onyxia-landed-still-hovering): out-of-range is a visibility loss like destroy — forget hover state so a missed UNSET_HOVER can't poison the guid.
             SetHoverState(guid, false, "out_of_range", synthesize: false);
