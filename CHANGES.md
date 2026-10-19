@@ -19,7 +19,7 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 **Change:** `World/Server/PacketHandlers/TaxiHandler.cs` (`HandleActivateTaxi`): before the direct or express activation is forwarded, the proxy cancels every mount aura in the player's cached aura slots with the 1.12 CMSG_CANCEL_AURA, on the same server connection, so the server reads the dismount before the activation (event `taxi.dismount_before_activate`). The cancel is the one CMSG_CANCEL_MOUNT_AURA already used, factored into `WorldSocket.CancelLegacyMountAuras` (`World/Server/PacketHandlers/SpellHandler.cs`); the slot selection is `GameSessionData.MountAurasAmong`. Unmounted players send nothing extra: the cancel runs only when the player's cached mount display id is non-zero, the same test the client makes, so a stale aura slot can never cancel anything.
 
-**Verification:** `TaxiDismountBeforeActivateTests` (4). Field: pending on the `JimsProxy-re-questlist` test build; expected: a flight taken while mounted shows one CMSG_CANCEL_AURA before CMSG_ACTIVATE_TAXI and reply 0, never reply 8.
+**Verification:** `TaxiDismountBeforeActivateTests` (4). Field (Kronos, 2026-10-18, a warlock on its Felsteed, same flight master and destination on both builds): on 5.2.2-beta.1 the activation was refused (PlayerAlreadyMounted); with this change the proxy cancelled the Felsteed aura (5784) first, the reply was Ok and the flight started.
 
 ## 2026-10-13 — Party buff timers by provenance; known starts served across leave, return and relog (#513 part A, PR #547)
 
