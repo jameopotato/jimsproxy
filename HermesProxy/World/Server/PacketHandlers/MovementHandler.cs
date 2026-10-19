@@ -57,6 +57,8 @@ public partial class WorldSocket
         // any login/teleport. Every own movement packet carries current transport state
         // (empty when off-transport); stamp it so the observation tracks truth continuously.
         // Stamped before the CHANGE_TRANSPORT drop below so boarding via that opcode counts.
+        // P1-2: the transport-clear synth and its gate are deleted; the stamp now keeps the
+        // transitions of the movement.player_update.transport_state diagnostic true.
         GetSession().GameState.LastObservedPlayerTransportGuid = movement.MoveInfo.TransportGuid;
 
         // JimsProxy (charge strafe-latch cure 2026-08-28, re-anchored 2026-08-29):
@@ -307,25 +309,6 @@ public partial class WorldSocket
             });
         }
 
-        // JimsProxy (zep-stuck-no-move 2026-05-14): if this ack corresponds to the
-        // synthesized SMSG_MOVE_TELEPORT emitted by HandleNewWorld to clear stale
-        // MOVEMENTFLAG_ONTRANSPORT, drop it — the legacy server never sent the
-        // teleport and would treat the unsolicited MSG_MOVE_TELEPORT_ACK as
-        // malformed input.
-        uint pendingSentinel = GetSession().GameState.PendingSyntheticTransportClearAckCounter;
-        if (pendingSentinel != 0 &&
-            teleport.MoveCounter == pendingSentinel &&
-            teleport.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
-        {
-            GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
-            Framework.Logging.Log.Event("movement.transport_clear.ack_dropped", new
-            {
-                player_low = teleport.MoverGUID.GetCounter(),
-                move_counter = teleport.MoveCounter,
-            });
-            return;
-        }
-
         WorldPacket packet = new WorldPacket(Opcode.MSG_MOVE_TELEPORT_ACK);
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_2_0_10192))
             packet.WritePackedGuid(teleport.MoverGUID.To64());
@@ -367,10 +350,27 @@ public partial class WorldSocket
             gameState.WorldEntryTransferPendingTick = 0;
         }
 
-        // JimsProxy (speed-stuck-after-bg-end-while-mounted): arm post-teleport reassert; see memory.
-        GetSession().GameState.PendingPostTeleportRunSpeedReassert = true;
         WorldPacket packet = new WorldPacket(Opcode.MSG_MOVE_WORLDPORT_ACK);
         SendPacketToServer(packet);
+    }
+
+    // JimsProxy (P1-2, check D-01): an acknowledgement carrying one of the counters the proxy
+    // gives its own SET-class packets (World.Client.SynthMoveCounters) answers a change the
+    // 1.12 server never sent. Forwarded, it reached the server as an ack for a change of its
+    // own (the server's counter is always 0, the value these synths used to carry). Swallow
+    // it. Fix-working breadcrumb, so DebugOutput-gated.
+    bool SwallowSynthAck(Opcode opcode, uint moveCounter)
+    {
+        if (!World.Client.SynthMoveCounters.IsSynthAckCounter(moveCounter))
+            return false;
+
+        if (Framework.Settings.DebugOutput)
+            Log.Event("movement.synth_ack_swallowed", new
+            {
+                opcode = opcode.ToString(),
+                move_counter = moveCounter,
+            });
+        return true;
     }
 
     [PacketHandler(Opcode.CMSG_MOVE_FORCE_FLIGHT_BACK_SPEED_CHANGE_ACK)]
@@ -385,6 +385,11 @@ public partial class WorldSocket
     void HandleMoveForceSpeedChangeAck(MovementSpeedAck speed)
     {
         var opcode = speed.GetUniversalOpcode();
+        // P1-2: the ack of a proxy-synthesized speed change (the regain-control restore).
+        // The server never sent that change; keep the ack here.
+        if (SwallowSynthAck(opcode, speed.Ack.MoveCounter))
+            return;
+
         if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180)
             && opcode is Opcode.CMSG_MOVE_FORCE_FLIGHT_SPEED_CHANGE_ACK
                       or Opcode.CMSG_MOVE_FORCE_FLIGHT_BACK_SPEED_CHANGE_ACK)
@@ -500,6 +505,11 @@ public partial class WorldSocket
                 });
             return;
         }
+
+        // P1-2: the FORCE_UNROOT ack of a taxi-landing unroot the proxy synthesized. Checked
+        // before the carried-root range test below, whose range these counters share.
+        if (SwallowSynthAck(universalOpcode, movementAck.Ack.MoveCounter))
+            return;
 
         // JimsProxy (carried-root cure): the ack for the proxy-synthesized cure
         // unroot carries a sentinel counter. The legacy server never sent that op,

@@ -93,8 +93,8 @@ public class WorldEntryCeremonyTracker
 
     /// <summary>
     /// Counter for the proxy-synthesized cure unroot. The range is recognizable in
-    /// captures, disjoint from the legacy server's constant 0 and below the
-    /// 0xFFFFFFFF transport-clear teleport sentinel. Acks bearing these counters
+    /// captures, disjoint from the legacy server's constant 0 and below 0xFFFFFFFF
+    /// (the old sentinel of the transport-clear teleport, deleted in P1-2). Acks bearing these counters
     /// are swallowed by the proxy (logged, never forwarded to the legacy server,
     /// which never sent the op). Live-verified 2026-08-03: the 42597 client applies
     /// and acks a force-op carrying this counter.
