@@ -13,6 +13,14 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-10-18 — JimsPlus: no channel bar for a channeled spell that missed
+
+**Issue:** After another player's channeled spell missed its target (resisted or immune), the JimsPlus cast bar showed that player channeling it for the spell's whole duration (60 s for Mind Control). JimsPlus starts a channel bar when the combat log reports the cast's success, and ends it when the proxy reports the caster's channel cleared or the caster's channel aura fades. A missed channel never starts, so neither came (2026-10-18, Kronos PTR: a Mind Control cast into Will of the Forsaken's immunity at 21:54:49; the victim's client got the cast start and the GO with the miss, and no channel). This was hidden until the resisted or immune GO fix (PR #559): before it, that cast's GO was dropped.
+
+**Change:** `Addons/JimsPlus/castbars/CastBars.lua`: a SPELL_MISSED of a channeled spell from the caster within 0.25 s of that spell's success ends the channel bar, as a completed cast; a miss seen just before the success keeps the bar from starting. A miss while the caster is already channeling (a later tick, an Arcane Missiles missile) leaves the bar alone.
+
+**Verification:** Lua 5.1 parse (luaparse) of the patched file and of beta's copy. Field (Kronos PTR, two boxes, 2026-10-18): before, at 21:54:49 the victim's target bar showed the priest channeling after an immune Mind Control; with this change the immune casts at 22:23:14, 22:33:50 and 22:34:40 closed the bar with the cast and showed no channel. Confirmed by the owner.
+
 ## 2026-10-13 — Party buff timers by provenance; known starts served across leave, return and relog (#513 part A, PR #547)
 
 **Issue:** The 1.12 server never tells the proxy how long another unit's buff has left. For a buff first seen already running the proxy filled Duration and Remaining with the spell's full CSV value, recorded that guess as the expiry and served it again later with the Duration flag set, so a 25-minute-old Fortitude showed 30:00 after a relog, a destroy and re-create, or an out-of-range trip (#513). Next to it: a seen recast re-sent the previous application's decayed Remaining instead of the full duration, stack and charge re-emits re-sent the last values undecayed, and the out-of-range leave kept the per-slot duration cache alive so it was read before the durable map.
