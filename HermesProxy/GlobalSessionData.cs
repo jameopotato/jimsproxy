@@ -131,6 +131,9 @@ public sealed class GameSessionData
     // by hardcoding 7.0f. Default true: a player who has never been CC'd is
     // always in control, so the natural login state is "has control already."
     public bool LastObservedHasControl = true;
+    // JimsProxy (#417 symptom 2): what this client was last given as each other player's mount
+    // display, to reset a mount it may hold stale on a reused object (MountCacheResetTracker).
+    public readonly MountCacheResetTracker MountCacheResets = new();
     // JimsProxy (feared-while-sitting, issue #479): the local player's stand state
     // (UNIT_FIELD_BYTES_1 byte 0) as last written by the legacy server, read from the
     // legacy field cache. Gate input for the synthesized stand-up on incoming fear.
