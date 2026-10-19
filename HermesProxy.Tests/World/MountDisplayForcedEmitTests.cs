@@ -4,9 +4,9 @@ using Xunit;
 
 namespace HermesProxy.Tests.World;
 
-// JimsProxy (#417 symptom 2): the mount display field must reach the client every time the server
-// sends it, even when the proxy's modern cache already holds the same value, because the client may
-// have discarded the earlier update. SetUpdateField drops equal values; ForceUpdateField does not.
+// JimsProxy (#417 symptom 2): the mount display field must reach the client every time an update
+// carries it, even when the proxy's modern cache already holds the same value (the 0 before a remount,
+// MountCacheResetTracker). SetUpdateField drops equal values; ForceUpdateField does not.
 public class MountDisplayForcedEmitTests
 {
     private const int Field = (int)UnitField.UNIT_FIELD_MOUNTDISPLAYID;

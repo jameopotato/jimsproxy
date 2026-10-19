@@ -126,9 +126,9 @@ public static class Settings
     // the fix.
     public static bool SynthStandOnFear = true;
     // JimsProxy (#417 symptom 2, another player's mount not shown after a portal): give the client a
-    // mount display of 0 for another player right before a mount it may be holding stale on a reused
-    // object (see MountCacheResetTracker). A synthesized update on a core path, so it has a kill
-    // switch. Default-init true so paths that bypass LoadAndVerifyFrom (tests) get the fix.
+    // mount display of 0 for another player right before the same mount again, after that player came
+    // back into view unmounted (see MountCacheResetTracker). A synthesized update on a core path, so it
+    // has a kill switch. Default-init true so paths that bypass LoadAndVerifyFrom (tests) get the fix.
     public static bool MountCacheResetSynth = true;
     // JimsProxy (clean handshake teardown): bound the realmd auth handshake. If realmd accepts
     // the TCP connection but never sends LOGON_CHALLENGE (half-accepting login server, load-shed,

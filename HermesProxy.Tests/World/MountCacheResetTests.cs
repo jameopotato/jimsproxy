@@ -12,9 +12,9 @@ using Xunit;
 
 namespace HermesProxy.Tests.World;
 
-// JimsProxy (#417 symptom 2): the client keeps a player's object for a while after the player leaves its
-// view and reuses it when the player comes back, mount cache included, and ignores a mount display equal
-// to that cache. The 2026-10-18 two-box order: the observer last saw the dwarf mounted (14346), took a
+// JimsProxy (#417 symptom 2): when the client's last view of another player was mounted and the player
+// comes back into view unmounted, the same mount again shows nothing on the client unless a mount display
+// of 0 comes first. The 2026-10-18 two-box order: the observer last saw the dwarf mounted (14346), took a
 // portal, the dwarf came back unmounted and mounted the same mount, which the observer never showed.
 public class MountCacheResetTests
 {
