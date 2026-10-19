@@ -801,6 +801,16 @@ public partial class WorldClient
                 GetSession().GameState.LastLoopingEmoteId = 0;
             }
         }
+        else if (!emote.Guid.IsEmpty())
+        {
+            // JimsProxy (another player stuck dancing): on the client another unit's dance keeps playing
+            // through that unit's movement, sitting, combat and one-off emotes (eat). Remember it so the
+            // unit's next move start can end it (HandleMovementMessages); a server emote 0 ends it already.
+            if (IsClientLoopingEmote(emote.EmoteID))
+                GetSession().GameState.ObservedLoopingEmotes[emote.Guid] = emote.EmoteID;
+            else if (emote.EmoteID == 0)
+                GetSession().GameState.ObservedLoopingEmotes.Remove(emote.Guid);
+        }
         SendPacketToClient(emote);
     }
 
