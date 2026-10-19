@@ -43,7 +43,7 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 **Change:** `Addons/JimsPlus/castbars/CastBars.lua` (SPELL_AURA_APPLIED): a crowd-control aura with the same name as the unit's current cast, applied by that unit or with no caster, is the cast's own aura and leaves the bar alone. A crowd control from another caster still fails the cast.
 
-**Verification:** Lua 5.1 parse (luaparse) of the patched file. Field: pending; expected: a landed Mind Control shows the priest channeling on the victim's target bar until the Mind Control ends.
+**Verification:** Lua 5.1 parse (luaparse) of the patched file. Field (Kronos PTR, two boxes, 2026-10-18): before, the Mind Control that landed at 22:22:21 showed Failed on the victim's target bar while the priest channeled; with this change the ones that landed at 22:33:29, 22:34:10 and 22:34:52 showed the priest channeling until each ended. Confirmed by the owner.
 
 ## 2026-10-13 — Party buff timers by provenance; known starts served across leave, return and relog (#513 part A, PR #547)
 
