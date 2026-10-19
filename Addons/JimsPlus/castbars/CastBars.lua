@@ -773,11 +773,20 @@ function addon:COMBAT_LOG_EVENT_UNFILTERED()
             return self:DeleteCast(srcGUID, nil, nil, true)
         end
     elseif eventType == "SPELL_AURA_APPLIED" then
-        if activeTimers[dstGUID] then
+        local cast = activeTimers[dstGUID]
+        if cast then
             if crowdControls[spellName] then
-                -- Aura that interrupts cast was applied
-                activeTimers[dstGUID].isFailed = true
-                return self:DeleteCast(dstGUID)
+                -- JimsPlus (a landed Mind Control shown as Failed): on a 1.12 server a landed Mind Control
+                -- also puts a "Mind Control" aura on the priest, the channel's own aura, and through the
+                -- proxy it carries no caster. It is the priest's cast succeeding, not a crowd control on
+                -- the priest. Another caster's crowd control (a caster on record) still fails the cast.
+                local isOwnChannelAura = cast.spellName == spellName
+                    and (not srcGUID or srcGUID == "" or srcGUID == dstGUID)
+                if not isOwnChannelAura then
+                    -- Aura that interrupts cast was applied
+                    cast.isFailed = true
+                    return self:DeleteCast(dstGUID)
+                end
             elseif castTimeIncreases[spellName] then
                 -- cast modifiers doesnt modify already active casts, only the next time the player casts.
                 -- So we force set this to true here to prevent modifying current cast
