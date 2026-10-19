@@ -51,7 +51,7 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 **Change:** `World/Client/PacketHandlers/QuestHandler.cs`: the quest-list handler records the greeting (giver, quest IDs) in the session state, and the completion translator sets LaunchQuest when that greeting, for the current NPC, listed anything besides the completed quest; the legacy server answers the client's hello with the remaining list or the single remaining quest's dialog, which refills the page. Follow-up quests and gossip NPCs decide as before (`GameSessionData.DecideQuestCompleteLaunch`). `World/Server/PacketHandlers/QuestHandler.cs`: a forwarded CMSG_QUEST_GIVER_HELLO clears the recorded greeting. `GlobalSessionData.cs`: the greeting record and the decision. The `quest.complete.launch_decision` event gains `npc_has_gossip_flag` and `greeting_other_entries`. No timers, no synthesized packets.
 
-**Verification:** `QuestCompleteLaunchDecisionTests` (13). Field: pending on the `JimsProxy-re-questlist` test build; expected: after a turn-in at an NPC with other quests the NPC's list reappears and the page never stays.
+**Verification:** `QuestCompleteLaunchDecisionTests` (13). Field (Kronos, 2026-10-18, Duke Nicholas Zverenhoff at Light's Hope Chapel, the repeatable Corruptor's Scourgestones with The Archivist still offered): on 5.2.2-beta.1 the reward page stayed open on both turn-ins and was closed by hand 2.9 s and 1.2 s later; with this change the completion carried LaunchQuest, the client asked the NPC again 6 ms later and the quest list came back 0.2 s after that.
 
 ## 2026-10-13 — Party buff timers by provenance; known starts served across leave, return and relog (#513 part A, PR #547)
 
