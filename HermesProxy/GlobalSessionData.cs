@@ -131,6 +131,16 @@ public sealed class GameSessionData
     // by hardcoding 7.0f. Default true: a player who has never been CC'd is
     // always in control, so the natural login state is "has control already."
     public bool LastObservedHasControl = true;
+    // JimsProxy (stuck moving at the start of a mind control): the unit this client moves, from its
+    // last CMSG_SET_ACTIVE_MOVER (every mover switch the client makes sends one, GUID 0 included). The
+    // client socket's thread writes it and the server thread reads it, so the 16-byte GUID sits in an
+    // immutable box swapped by reference.
+    private volatile StrongBox<WowGuid128>? _clientActiveMover;
+    public WowGuid128 ClientActiveMover
+    {
+        get => _clientActiveMover?.Value ?? default;
+        set => _clientActiveMover = new StrongBox<WowGuid128>(value);
+    }
     // JimsProxy (feared-while-sitting, issue #479): the local player's stand state
     // (UNIT_FIELD_BYTES_1 byte 0) as last written by the legacy server, read from the
     // legacy field cache. Gate input for the synthesized stand-up on incoming fear.
