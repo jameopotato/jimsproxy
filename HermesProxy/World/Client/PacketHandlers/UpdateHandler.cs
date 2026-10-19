@@ -295,6 +295,37 @@ public partial class WorldClient
     // MIRASU (mc-rune-dousing): rune entries whose boss life state flipped mid-packet; flushed after the containing update packet is sent so the resync can't outrun a same-packet rune create.
     private readonly List<uint> _pendingMcRuneResyncs = new();
 
+    // JimsProxy (#417 symptom 2): mounts held back from an update so the client can get a mount display
+    // of 0 for that player first (MountCacheResetTracker); sent after the containing update packet, each
+    // as its own packet, so the 0 is applied before the mount and after everything the server sent first.
+    private readonly List<(WowGuid128 Guid, int MountDisplayId)> _pendingMountCacheResets = new();
+
+    private void FlushPendingMountCacheResets()
+    {
+        if (_pendingMountCacheResets.Count == 0)
+            return;
+        var state = GetSession().GameState;
+        foreach (var (guid, mountDisplayId) in _pendingMountCacheResets)
+        {
+            foreach (int value in new[] { 0, mountDisplayId })
+            {
+                UpdateObject updateObject = new UpdateObject(state);
+                ObjectUpdate update = new ObjectUpdate(guid, UpdateTypeModern.Values, GetSession());
+                update.UnitData.MountDisplayID = value;
+                updateObject.ObjectUpdates.Add(update);
+                SendPacketToClient(updateObject);
+            }
+            // Fix-working breadcrumb: DebugOutput only.
+            if (Framework.Settings.DebugOutput)
+                Log.Event("unit.mount.cache_reset", new
+                {
+                    guid_low = guid.GetCounter(),
+                    mount_display_id = mountDisplayId,
+                });
+        }
+        _pendingMountCacheResets.Clear();
+    }
+
     // MIRASU (mc-rune-dousing): douseable = not yet doused (no legacy InUse) and paired boss not currently known alive; never-seen bosses count as dead, matching what a 1.12 client could attempt.
     private bool IsMcRuneDouseable(uint runeEntry, GameObjectFlagsLegacy legacyFlags)
     {
@@ -734,6 +765,8 @@ public partial class WorldClient
         // MIRASU (mc-rune-dousing): after the packet's own updates are out, push rune targetability for any boss life-state edges seen in it, and hide respawned circles around doused runes.
         FlushPendingMcRuneResyncs();
         SuppressMcCirclesOnDousedRunes();
+        // JimsProxy (#417 symptom 2): after the packet's own updates, the held-back mounts, each preceded by a 0.
+        FlushPendingMountCacheResets();
 
         // JimsProxy (Kronos Chronoboon): repaint the remaining on-use sweep AFTER the aliased create is
         // forwarded — the fresh alias replaced the item the client bound its login cooldown to.
@@ -3367,6 +3400,17 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                 updateData.UnitData.NativeDisplayID = updates[UNIT_FIELD_NATIVEDISPLAYID].Int32Value;
             }
             int UNIT_FIELD_MOUNTDISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_MOUNTDISPLAYID);
+            // JimsProxy (#417 symptom 2): for another player, the same mount again after the player came
+            // back into view unmounted is held back from this update and sent after it, preceded by a 0
+            // (MountCacheResetTracker). Every update, mounted or not, is tracked, creates included.
+            bool holdMountForCacheReset = false;
+            if (UNIT_FIELD_MOUNTDISPLAYID >= 0 && Framework.Settings.MountCacheResetSynth &&
+                objectType == ObjectType.Player && guid != Session.GameState.CurrentPlayerGuid)
+            {
+                bool mountInBlock = updateMaskArray[UNIT_FIELD_MOUNTDISPLAYID];
+                int mountValue = mountInBlock ? updates[UNIT_FIELD_MOUNTDISPLAYID].Int32Value : 0;
+                holdMountForCacheReset = Session.GameState.MountCacheResets.OnUpdate(guid, isCreate, mountInBlock, mountValue);
+            }
             if (UNIT_FIELD_MOUNTDISPLAYID >= 0 && updateMaskArray[UNIT_FIELD_MOUNTDISPLAYID])
             {
                 // JimsProxy (mount-and-quest-diagnostics): log mount display transitions so
@@ -3379,6 +3423,11 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                 int oldMountDisplayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_MOUNTDISPLAYID);
                 int newMountDisplayId = updates[UNIT_FIELD_MOUNTDISPLAYID].Int32Value;
                 updateData.UnitData.MountDisplayID = newMountDisplayId;
+                if (holdMountForCacheReset)
+                {
+                    updateData.UnitData.MountDisplayID = null;
+                    _pendingMountCacheResets.Add((guid, newMountDisplayId));
+                }
 
                 if (oldMountDisplayId != newMountDisplayId)
                 {
