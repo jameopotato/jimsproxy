@@ -91,17 +91,16 @@ public class SynthMoveCounterTests
         w.WriteFloat(speed);
     });
 
-    // User report 2026-10-17: mind-controlled while mounted, then Will of the Forsaken. The dismount the
-    // client requested while charmed reached the proxy only as the broadcast speed form, the cache kept
-    // the mounted speed, and the control-regain reassert put the client at mount speed. The broadcast
-    // form for the player's own guid must feed the cache.
+    // User report 2026-10-17: mind-controlled while mounted, then Will of the Forsaken. The unmounted speed
+    // reaches the player only in the broadcast speed form (the forced form goes to the charmer). Unless that
+    // feeds the cache, the next control-regain reassert re-sends the mounted speed.
     [Fact]
     public void BroadcastRunSpeed_ForTheOwnPlayer_FeedsTheRegainCache()
     {
         var h = new ClientHarness();
         h.State.LastKnownPlayerRunSpeed = 14.0f;                  // mounted speed cached before the charm
 
-        h.Dispatch(BroadcastRunSpeed(LegacyPlayer, 7.0f));        // the dismount, seen while charmed
+        h.Dispatch(BroadcastRunSpeed(LegacyPlayer, 7.0f));        // the unmounted speed, broadcast form
 
         Assert.Equal(7.0f, h.State.LastKnownPlayerRunSpeed);
         Assert.Contains(h.Sent, p => p.GetUniversalOpcode() == Opcode.SMSG_MOVE_UPDATE_RUN_SPEED);

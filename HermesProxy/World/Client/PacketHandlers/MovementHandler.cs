@@ -855,11 +855,11 @@ public partial class WorldClient
         SendPacketToClient(speed);
 
         // JimsProxy (user report 2026-10-17: mind-controlled while mounted, Will of the Forsaken, a second at
-        // mount speed, then a disconnect): while the player is charmed the server sends the player's own speed
-        // changes in this broadcast form, not the forced one, so the cache the control-regain reassert reads
-        // kept the mounted speed after the client dismounted itself. The reassert then put the client at mount
-        // speed and the client's acknowledgement of it carried a speed above the server's, which a mangos
-        // server treats as cheating and kicks. Feed the cache from here too.
+        // mount speed, then a disconnect): a speed change made while the player is charmed goes to the
+        // charmer as the forced form, and the player gets it only in this broadcast form, after control is
+        // back (2026-10-18 18:26:40, 0.2 s after the Will). Without it the cache the control-regain reassert
+        // reads keeps the mounted speed, and the next regain re-sends that to an unmounted player (with it,
+        // the 18:27:01 regain re-sent 7.00). Feed the cache from here too.
         if (universalOpcode == Opcode.SMSG_MOVE_UPDATE_RUN_SPEED &&
             speed.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
         {
