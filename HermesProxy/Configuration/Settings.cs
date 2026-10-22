@@ -136,6 +136,13 @@ public static class Settings
     // dance already does on a move start. A synthesized packet on the movement-relay path, so it has
     // a kill switch. Default-init true so paths that bypass LoadAndVerifyFrom (tests) get the fix.
     public static bool ObservedDanceStopSynth = true;
+
+    // JimsProxy (an aura's looping animation stuck after a loading screen): the loading-screen
+    // aura re-send is skipped when the session player's create came inside that loading screen
+    // (login, far teleport), and after any other loading screen (/reload) an empty full aura
+    // list goes first. A synthesized packet on the world-entry path, so it has a kill switch.
+    // Default-init true so paths that bypass LoadAndVerifyFrom (tests) get the fix.
+    public static bool AuraResendAfterLoadFix = true;
     // JimsProxy (clean handshake teardown): bound the realmd auth handshake. If realmd accepts
     // the TCP connection but never sends LOGON_CHALLENGE (half-accepting login server, load-shed,
     // firewall), the login thread would otherwise block forever ("stuck on Connecting..."). On
@@ -330,6 +337,8 @@ public static class Settings
         MountCacheResetSynth = config.GetBoolean("MountCacheResetSynth", true);
 
         ObservedDanceStopSynth = config.GetBoolean("ObservedDanceStopSynth", true);
+
+        AuraResendAfterLoadFix = config.GetBoolean("AuraResendAfterLoadFix", true);
         AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);
         ClientTcpNoDelay = config.GetBoolean("ClientTcpNoDelay", true);
