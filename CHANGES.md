@@ -13,7 +13,7 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
-## 2026-10-22 — One scale translation for every unit: costumes, gnomes, druid forms, pets and NPCs
+## 2026-10-22 — One scale translation for every unit: costumes, gnomes, druid forms, pets and NPCs (PR #567)
 
 **Issue:** A Hallow's End trick-or-treat Pirate Costume drew the player as a goblin about twice the intended size. The transform update set DisplayID 7113 (CreatureModelScale 1.5) and OBJECT_FIELD_SCALE_X 1.5 together. A 1.12 server puts a unit's whole display size into SCALE_X: Blizzard's own 1.8 server did (in a 2005 Blackwing Lair capture every creature's SCALE_X equals its display's CreatureModelScale, up to 5.0), and Kronos does it for creatures, pets and players (503 logged sessions: gnomes 1.15, female tauren 1.25 = CreatureModelScale 1.0 x ModelScale 1.25, cat form 0.9, travel form 0.8, summoned pets their display scale, hunter pets the family level scale). The modern client applies the display's size from its own data on top of the object scale, so forwarding SCALE_X counted it twice: the costume drew at 2.25, every gnome player and gnome NPC at 1.32, cat form at 0.81, travel form at 0.64, tauren bear at 1.44, the bat costume at 0.09, a voidwalker at 0.64. Since May the proxy had corrected this case by case: an NPC strip heuristic with ratio bands, a 31-display exemption list, per-display force-strip baselines, per-family pet constants, per-model "mesh ratios", a tauren CreatureDisplayInfo hotfix and a MOD_SCALE aura filter on creatures, each tuned by eye. Players were never covered.
 
