@@ -55,7 +55,6 @@ public static partial class GameData
     public static FrozenDictionary<uint, CreatureModelCollisionHeight> CreatureModelCollisionHeights = FrozenDictionary<uint, CreatureModelCollisionHeight>.Empty;
     public static FrozenDictionary<uint, float> HotfixCreatureDisplayScales = FrozenDictionary<uint, float>.Empty;
     public static FrozenDictionary<int, CreatureFamilyData> CreatureFamilies = FrozenDictionary<int, CreatureFamilyData>.Empty;
-    public static FrozenDictionary<uint, float> VanillaCreatureModelScales = FrozenDictionary<uint, float>.Empty;
     public static FrozenDictionary<uint, uint[]> TalentRankPredecessors = FrozenDictionary<uint, uint[]>.Empty;
     public static FrozenDictionary<uint, uint[]> TalentRankSiblings = FrozenDictionary<uint, uint[]>.Empty;
     // JimsProxy (Kronos IsInWorld race defense): spell_id -> immediate predecessor rank.
@@ -781,17 +780,6 @@ public static partial class GameData
         return 0;
     }
 
-    public static float GetUnitCompleteDisplayScale(uint displayId)
-    {
-        var displayData = GetDisplayInfo(displayId);
-        if (displayData.ModelId == 0)
-            return 1.0f;
-
-        var modelData = GetModelData(displayId);
-        return displayData.DisplayScale * modelData.ModelScale;
-    }
-
-
     public static CreatureDisplayInfo GetDisplayInfo(uint displayId)
     {
         if (CreatureDisplayInfos.TryGetValue(displayId, out var info))
@@ -801,7 +789,8 @@ public static partial class GameData
 
     // JimsProxy (collision-visual-parity #359): the CMS the modern client actually renders
     // with — the hotfix override when we push one (CSV/Hotfix/CreatureDisplayInfo*.csv,
-    // e.g. tauren 59/60 carry the K=0.75 render correction), else the stock DB2 value.
+    // e.g. tauren 59/60 still carry the May 2026 K=0.75 rows; unit sizes no longer depend on
+    // them, see UnitScale.cs), else the stock DB2 value.
     // Proxy math that must agree with the on-screen model (synthesized collision height)
     // reads this, never the stock table alone.
     public static float GetClientEffectiveDisplayScale(uint displayId)
@@ -1026,7 +1015,7 @@ public static partial class GameData
             LoadCreatureDisplayInfo,
             LoadCreatureModelCollisionHeights,
             LoadCreatureFamilies,
-            LoadVanillaCreatureModelScales,
+            UnitScale.LoadClientData,
             LoadTalentSpellRanks,
             LoadSpellRankChain,
             LoadTransports,
@@ -1633,34 +1622,6 @@ public static partial class GameData
             dict.Add(id, new CreatureFamilyData(id, minScale, minScaleLevel, maxScale, maxScaleLevel));
         }
         CreatureFamilies = dict.ToFrozenDictionary();
-    }
-
-    public static float GetPetFamilyScale(int familyId)
-    {
-        if (!CreatureFamilies.TryGetValue(familyId, out var f))
-            return 1.0f;
-        return f.MaxScale;
-    }
-
-    public static void LoadVanillaCreatureModelScales()
-    {
-        var path = Path.Combine("CSV", "CreatureDisplayInfoVanilla.csv");
-        if (!File.Exists(path))
-        {
-            Log.Print(LogType.Error, $"MISSING CSV: {path} — reinstall the proxy or re-extract hermes-bundle.zip to restore missing data files");
-            return;
-        }
-        using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
-        var dict = new Dictionary<uint, float>(8500);
-        foreach (var row in reader)
-        {
-            if (!uint.TryParse(row[0].Span, out uint displayId))
-                continue;
-            if (!float.TryParse(row[1].Span, System.Globalization.CultureInfo.InvariantCulture, out float cms))
-                continue;
-            dict[displayId] = cms;
-        }
-        VanillaCreatureModelScales = dict.ToFrozenDictionary();
     }
 
     public static void LoadTalentSpellRanks()
@@ -5227,6 +5188,8 @@ public static partial class GameData
         // math that must agree with what is on screen — the synthesized player collision
         // height — has to read the same values, not the stock CreatureDisplayInfo.csv ones.
         var displayScales = new Dictionary<uint, float>();
+        // JimsProxy (unit-scale): the same rows, whole, for the unit scale factor (UnitScale.cs).
+        var displayRows = new Dictionary<uint, UnitScale.DisplayRow>();
         uint counter = 0;
         foreach (var row in reader)
         {
@@ -5261,6 +5224,7 @@ public static partial class GameData
             int textureVariationFileDataId3 = row[26].Parse<int>();
 
             displayScales[id] = creatureModelScale;
+            displayRows[id] = new UnitScale.DisplayRow(modelId, creatureModelScale, (uint)Math.Max(extendedDisplayInfoId, 0), playerOverrideScale);
 
             HotfixRecord record = new HotfixRecord();
             record.TableHash = DB2Hash.CreatureDisplayInfo;
@@ -5299,12 +5263,19 @@ public static partial class GameData
         }
 
         HotfixCreatureDisplayScales = displayScales.ToFrozenDictionary();
+        UnitScale.SetDisplayHotfixes(displayRows);
     }
     public static void LoadCreatureDisplayInfoExtraHotfixes()
     {
-        var path = Path.Combine("CSV", "Hotfix", $"CreatureDisplayInfoExtra{ModernVersion.ExpansionVersion}.csv");
+        LoadCreatureDisplayInfoExtraHotfixes(Path.Combine("CSV", "Hotfix", $"CreatureDisplayInfoExtra{ModernVersion.ExpansionVersion}.csv"));
+    }
 
+    public static void LoadCreatureDisplayInfoExtraHotfixes(string path)
+    {
         using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+        // JimsProxy (unit-scale): a pushed Extra row replaces the client's, and its race picks
+        // the race model scale in the unit scale factor (UnitScale.cs).
+        var displayRaces = new Dictionary<uint, UnitScale.DisplayRace>();
         uint counter = 0;
         foreach (var row in reader)
         {
@@ -5313,6 +5284,7 @@ public static partial class GameData
             uint id = row[0].Parse<uint>();
             sbyte displayRaceId = row[1].Parse<sbyte>();
             sbyte displaySexId = row[2].Parse<sbyte>();
+            displayRaces[id] = new UnitScale.DisplayRace(displayRaceId, displaySexId);
             sbyte displayClassId = row[3].Parse<sbyte>();
             sbyte skinId = row[4].Parse<sbyte>();
             sbyte faceId = row[5].Parse<sbyte>();
@@ -5349,6 +5321,8 @@ public static partial class GameData
             record.HotfixContent.WriteUInt8(customDisplayOption3);
             Hotfixes.Add(record.HotfixId, record);
         }
+
+        UnitScale.SetDisplayRaceHotfixes(displayRaces);
     }
     public static void LoadCreatureDisplayInfoOptionHotfixes()
     {

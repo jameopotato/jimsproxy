@@ -20,14 +20,6 @@ using System;
 
 namespace HermesProxy;
 
-public sealed record PendingPetScale(
-    WowGuid128 Guid,
-    uint Entry,
-    uint DisplayId,
-    float RawScale,
-    float Cms,
-    bool IsWarlockPet);
-
 public class PlayerCache
 {
     public string? Name;
@@ -655,10 +647,11 @@ public sealed class GameSessionData
     public long QuestQueryLastRefillMs = 0;
     public int QuestQueryDrainerRunning = 0;
     public readonly object QuestQueryBucketLock = new();
-    // JimsProxy (pet-scale-resolve-race): Pet GUIDs whose first SCALE_X arrived
-    // before SMSG_QUERY_CREATURE_RESPONSE landed.
-    public Dictionary<WowGuid128, PendingPetScale> PetScaleResolvePending = new();
-    public HashSet<uint> PetScaleProxyQueriedEntries = new();
+    // JimsProxy (unit-scale): units sized before the proxy knew their creature's family
+    // (unit -> entry), re-sent when the creature query answer arrives; and the entries the
+    // proxy has queried itself this session.
+    public Dictionary<WowGuid128, uint> UnitScaleTemplatePending = new();
+    public HashSet<uint> UnitScaleQueriedEntries = new();
     // JimsProxy: per-(caster, spell) timestamp of the last forwarded SMSG_SPELL_FAILED_OTHER,
     // used to dedupe Kronos's auto-cast retry storm. Pet auto-cast can fire 5+/sec when the
     // target is out of range or being killed, each emitting a fresh SPELL_FAILED_OTHER. The

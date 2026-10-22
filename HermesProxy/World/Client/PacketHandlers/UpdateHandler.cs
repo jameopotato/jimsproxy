@@ -19,77 +19,6 @@ namespace HermesProxy.World.Client;
 
 public partial class WorldClient
 {
-    // JimsProxy (warlock-pet-scale): inverse-CMS pet-scale fix from PR #117 over-bumped
-    // every warlock pet by ~2x at K=1.5 (tester screenshots 2026-05-06: Imp/Felhunter/
-    // Voidwalker/Succubus all uniformly oversized vs 1.12). Halving K for the warlock
-    // family lands them at 1.12 size without disturbing hunter-pet behavior. Detection
-    // is by DisplayID — vanilla warlock pet roster is fixed and small.
-    private static readonly FrozenSet<int> WarlockPetDisplayIds = new[]
-    {
-        4449,   // Imp
-        850,    // Felhunter
-        1132,   // Voidwalker
-        4162,   // Succubus
-        1813,   // Felsteed
-        18223,  // Dreadsteed
-    }.ToFrozenSet();
-
-    // Per-ModelId M_native ratio multiplier on vanilla CMS_v, compensating for
-    // 1.12-vs-1.14 M2 intrinsic ModelScale divergence on the same model file.
-    internal static readonly FrozenDictionary<int, float> M2NativeRatio = new Dictionary<int, float>
-    {
-        { 411, 2.33f },  // FelBat — 1.12 intrinsic ≈ 2.33× modern's (Ressan-validated)
-        { 1531, 4.0f },  // Mini Diablo (entry 11326, display 10992) — 1.14 mesh shrunk vs 1.12; calibrate from in-game test
-    }.ToFrozenDictionary();
-
-    // Per-ModelId render-time compensation for divergences invisible to DBC/M2 files.
-    // Confirmed 2026-05-12 via same-server 1.12 vs 1.14 parity (static-prop reference
-    // proves equal camera): vertex positions, bone hierarchy by key_bone_id, CMS, and
-    // CreatureModelData.ModelScale all agree across builds, yet 1.14 renders tauren
-    // visibly larger. Best hypothesis: a hardcoded race scale in the 1.14 client's
-    // character render path that we can't reach from data. Eye-balled 0.85 from
-    // screenshot pair; tune via the unit.m2_mesh_adjust.applied JSONL event.
-    // ModelId 59 = Male Tauren (NPC + player per ChrRaces.MaleDisplayID),
-    // ModelId 60 = Female Tauren (FemaleDisplayID). Players use same DisplayIDs as
-    // NPCs, so this table covers both via the same model_id lookup.
-    private static readonly FrozenDictionary<int, float> M2MeshAdjust = new Dictionary<int, float>
-    {
-        { 59, 0.75f },
-        { 60, 0.75f },
-    }.ToFrozenDictionary();
-
-    // Spells whose modern Classic SpellEffect.db2 carries an EffectAura=61 (MOD_SCALE)
-    // with positive BasePoints — the 1.14 client applies a flat +N% scale on top of
-    // wire × CMS × ModelScale whenever the unit has one of these auras. Vanilla 1.12
-    // client either didn't parse 17205 as MOD_SCALE or had different effect data, so
-    // mobs that carry the aura by design (Winterfall furbolg are all drunk on
-    // firewater) render ~+24% bigger on 1.14 than on 1.12 native.
-    //
-    // Filter rule (see ShouldDropModScaleAura): drop the aura from outgoing
-    // SMSG_AURA_UPDATE when the unit's high GUID type is Creature. Players, pets, and
-    // vehicles still see the size effect — a player drinking the Winterfall Firewater
-    // ITEM (which casts 17038/17205 on self) still grows; only the world mobs lose it.
-    //
-    // List sourced from wago.tools SpellEffect DB2 build 1.14.2.42597 by filtering
-    // EffectAura==61 AND EffectBasePoints>0. Starting with just the two Winterfall
-    // Firewater rows; extend with sibling spells (Enlarge, Frenzy, Enrage, ...) as
-    // testers report other oversized mobs.
-    private static readonly FrozenSet<uint> ModScaleSpellIds = new HashSet<uint>
-    {
-        8269,   // Enrage (BP=14) — Crushridge Warmonger "goes into a rage after seeing a friend fall in battle"
-        17038,  // Winterfall Firewater (variant A)
-        17205,  // Winterfall Firewater (variant B — observed on Winterfall furbolg)
-    }.ToFrozenSet();
-
-    internal static bool ShouldDropModScaleAura(WowGuid128 guid, uint spellId)
-    {
-        if (LegacyVersion.ExpansionVersion != 1)
-            return false;
-        if (!ModScaleSpellIds.Contains(spellId))
-            return false;
-        return guid.GetHighType() == HighGuidType.Creature;
-    }
-
     // JimsProxy (#382 PetInCombat charm strip): tracking predicate for a PLAYER charmed by
     // ANOTHER PLAYER — all perspectives (victim's own session and the charmer's included:
     // the victim FPS-drops too, and the hybrid state is wrong from every viewpoint). NPC
@@ -123,85 +52,6 @@ public partial class WorldClient
     {
         return leverOn && charmEdgeThisBlock && !flagsInUpdateMask && cachedRawHasPetInCombat;
     }
-
-    // (DisplayId, wire * 1000 rounded) pairs where Twinstar's bias on top of CMS_v
-    // is the deliberate vanilla-intended visible scale, not a pre-scaled sibling.
-    // The wirePreScaled heuristic would otherwise catch and shrink these to CMS_v,
-    // visibly shrinking Cairne Bloodhoof / Mr. Smite / Lady Onyxia and other
-    // leader-class creatures. List built from a vmangos creature_template audit
-    // against the heuristic — these are the 32 entries where post-heuristic render
-    // moved FURTHER from vmangos display_scale1 than pre-heuristic pass-through.
-    // Encoding `wire * 1000` rounded to int avoids float comparison in the hot path.
-    private static readonly FrozenSet<long> ScaleExemptDeliberateBias = new HashSet<long>
-    {
-        EncodeScaleBiasKey(831,   1.50f),  // Large Loch Crocolisk
-        EncodeScaleBiasKey(1941,  1.62f),  // Disciple of Naralex
-        EncodeScaleBiasKey(2017,  1.40f),  // Bleakheart Shadowstalker
-        EncodeScaleBiasKey(2026,  1.62f),  // Mr. Smite
-        EncodeScaleBiasKey(4307,  1.62f),  // Cairne Bloodhoof
-        EncodeScaleBiasKey(4519,  1.62f),  // Arch Druid Hamuul Runetotem
-        EncodeScaleBiasKey(5436,  1.20f),  // Gnome Pit Crewman
-        EncodeScaleBiasKey(5437,  1.20f),  // Gnome Pit Crewman (sibling display)
-        EncodeScaleBiasKey(5438,  1.20f),  // Gnome Pit Boss
-        EncodeScaleBiasKey(5443,  1.20f),  // Rizzle Brassbolts
-        EncodeScaleBiasKey(5647,  1.09f),  // Talvash del Kissel
-        EncodeScaleBiasKey(5781,  1.50f),  // Firesworn
-        EncodeScaleBiasKey(6633,  1.10f),  // Greater Silithid Flayer
-        EncodeScaleBiasKey(6633,  1.40f),  // Supreme Silithid Flayer
-        EncodeScaleBiasKey(6981,  1.26f),  // Leprous Defender
-        EncodeScaleBiasKey(6982,  1.26f),  // Leprous Defender (sibling display)
-        EncodeScaleBiasKey(7350,  1.10f),  // Greater Silithid Flayer
-        EncodeScaleBiasKey(7350,  1.40f),  // Supreme Silithid Flayer
-        EncodeScaleBiasKey(7671,  1.20f),  // Murk Worm
-        EncodeScaleBiasKey(7852,  1.09f),  // Felix Whindlebolt
-        EncodeScaleBiasKey(8309,  1.80f),  // Lady Onyxia
-        EncodeScaleBiasKey(9272,  1.48f),  // Bulrug
-        EncodeScaleBiasKey(9900,  1.21f),  // Pao'ka Swiftmountain
-        EncodeScaleBiasKey(10069, 1.62f),  // Mulgris Deepriver
-        EncodeScaleBiasKey(10989, 1.03f),  // Drag Master Miglen
-        EncodeScaleBiasKey(11091, 1.40f),  // Supreme Silithid Flayer
-        EncodeScaleBiasKey(11096, 1.10f),  // Greater Silithid Flayer
-        EncodeScaleBiasKey(11096, 1.40f),  // Supreme Silithid Flayer
-        EncodeScaleBiasKey(11344, 1.40f),  // Xavian Betrayer
-        EncodeScaleBiasKey(11346, 1.40f),  // Xavian Felsworn
-        EncodeScaleBiasKey(11797, 1.62f),  // Maggran Earthbinder
-    }.ToFrozenSet();
-
-    // Per-display baseline emit for force-strip mode (wirePreScaled fires
-    // regardless of ratio). Default if not in dict: 1.0 (modern client default
-    // scale × CMS × ModelScale render). Lift above 1.0 when CMS × MS alone
-    // looks too small for visually-prominent mob types.
-    //
-    // Use for creatures whose 1.12 native render should be a uniform target
-    // across ALL server-side wire variants (including above the 1.5 × CMS_v
-    // heuristic bound). The Winterfall furbolg entries were set 2026-05-17
-    // after side-by-side iteration with the user.
-    private static readonly FrozenDictionary<int, float> ScaleForceStripBaseline = new Dictionary<int, float>
-    {
-        { 6211,  1.2f  },  // Winterfall Ursa        (entry 7442, CMS_v 1.3, wire 1.3)
-        { 6818,  1.2f  },  // Winterfall Totemic     (entry 7441, CMS_v 1.3, wire 1.62)
-        { 6828,  1.2f  },  // Winterfall Shaman      (entry 7440, CMS_v 1.4 — handles 1.75 unbuffed + 2.1875 buffed)
-        { 6829,  1.2f  },  // Winterfall Pathfinder  (entry 7438, CMS_v 1.5 — handles 1.5 + 1.875 variants)
-        { 6830,  1.2f  },  // Winterfall Den Watcher (entry 7439, CMS_v 1.4 — handles 1.4 + 1.75 variants)
-        { 11568, 0.85f },  // Crushridge Enforcer    (entry 2257, CMS_v 1.9 — base too big at 1.0 strip; 0.85 → render 1.62)
-    }.ToFrozenDictionary();
-
-    // Per-(display, wire) override that wins over ScaleForceStripBaseline. Use
-    // to give "buffed" wire variants a moderate visual bump over the baseline,
-    // preserving the server's wire-ratio intent without piling on the full
-    // +24% MOD_SCALE aura the modern client would otherwise add. Encoding:
-    // same (displayId, wire * 1000) key as ScaleExemptDeliberateBias.
-    private static readonly FrozenDictionary<long, float> ScaleForceStripEmitOverride = new Dictionary<long, float>
-    {
-        // Winterfall Shaman buffed (wire 2.1875 = unbuffed × 1.25). Emit 1.5
-        // = baseline 1.2 × 1.25 → renders 25% larger than unbuffed Shaman
-        // (matches server wire-ratio intent).
-        { EncodeScaleBiasKey(6828, 2.1875f), 1.5f },
-    }.ToFrozenDictionary();
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static long EncodeScaleBiasKey(uint displayId, float wire)
-        => ((long)displayId << 32) | (uint)MathF.Round(wire * 1000f);
 
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_DESTROY_OBJECT)]
@@ -243,6 +93,7 @@ public partial class WorldClient
             GetSession().GameState.ObjectCacheModern.Remove(guid);
         }
         GetSession().GameState.LastAuraCasterOnTarget.Remove(guid);
+        GetSession().GameState.UnitScaleTemplatePending.Remove(guid);
 
         // JimsProxy (fishing recast wedge): the previous bobber's destroy is the anchor
         // that lets a held channel zero-update be dropped as its teardown, and the new
@@ -850,6 +701,7 @@ public partial class WorldClient
                 GetSession().GameState.ObjectCacheModern.Remove(guid);
             }
             GetSession().GameState.LastAuraCasterOnTarget.Remove(guid);
+            GetSession().GameState.UnitScaleTemplatePending.Remove(guid);
             // JimsProxy (aura-refresh-after-far-objects): aura state only
             // applies to units (players, creatures, pets, vehicles). Skip
             // gameobjects, items, dynamic objects, corpses, etc. — sending
@@ -2241,11 +2093,15 @@ public partial class WorldClient
         if (objectType == ObjectType.Player || objectType == ObjectType.ActivePlayer)
         {
             int UNIT_FIELD_NATIVEDISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_NATIVEDISPLAYID);
+            int UNIT_FIELD_DISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_DISPLAYID);
             int UNIT_FIELD_MOUNTDISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_MOUNTDISPLAYID);
             int OBJECT_FIELD_SCALE_X = LegacyVersion.GetUpdateField(ObjectField.OBJECT_FIELD_SCALE_X);
-            if (UNIT_FIELD_NATIVEDISPLAYID >= 0 && UNIT_FIELD_MOUNTDISPLAYID >= 0 && OBJECT_FIELD_SCALE_X >= 0)
+            if (UNIT_FIELD_NATIVEDISPLAYID >= 0 && UNIT_FIELD_DISPLAYID >= 0 && UNIT_FIELD_MOUNTDISPLAYID >= 0 && OBJECT_FIELD_SCALE_X >= 0)
             {
-                if (!changedValuesMask.Get(UNIT_FIELD_NATIVEDISPLAYID) && !changedValuesMask.Get(UNIT_FIELD_MOUNTDISPLAYID) && !changedValuesMask.Get(OBJECT_FIELD_SCALE_X))
+                // The height follows the drawn model (DISPLAYID, which a form or transform
+                // changes) and its size, so any of these re-sends it.
+                if (!changedValuesMask.Get(UNIT_FIELD_NATIVEDISPLAYID) && !changedValuesMask.Get(UNIT_FIELD_DISPLAYID)
+                    && !changedValuesMask.Get(UNIT_FIELD_MOUNTDISPLAYID) && !changedValuesMask.Get(OBJECT_FIELD_SCALE_X))
                     return; // No need for an update
 
                 // Reads UNIT_FIELD_DISPLAYID (the currently rendered, form-aware model), not
@@ -2257,7 +2113,12 @@ public partial class WorldClient
                 if (rawScaleX == 0.0f)
                     return;
 
-                float scaledHeight = ComputeVisualCollisionHeight(currentDisplayId, mountDisplayId, rawScaleX);
+                // JimsProxy (unit-scale): this packet's Scale lands in the same client slot as
+                // ObjectData.Scale (the last one to arrive wins), so it must carry the same
+                // translated value, or a mount or dismount would snap the unit back to the
+                // doubled 1.12 size until its next scale update.
+                float clientScale = ComputeClientUnitScale(objectType, updates, out float displayFactor);
+                float scaledHeight = ComputeVisualCollisionHeight(currentDisplayId, mountDisplayId, clientScale, displayFactor);
                 if (scaledHeight == 0)
                     scaledHeight = mountDisplayId != 0 ? PlayerHeight.Mounted : PlayerHeight.Normal;
 
@@ -2269,7 +2130,7 @@ public partial class WorldClient
                 {
                     MoverGUID = guid,
                     Height = scaledHeight,
-                    Scale = rawScaleX,
+                    Scale = clientScale,
                     Reason = reason,
                     MountDisplayID = (uint) mountDisplayId,
                 };
@@ -2282,47 +2143,12 @@ public partial class WorldClient
                         display_id = currentDisplayId,
                         mount_display_id = mountDisplayId,
                         raw_scale = rawScaleX,
+                        client_scale = clientScale,
                         height = scaledHeight,
                         reason = reason.ToString(),
                     });
             }
         }
-    }
-
-    // JimsProxy (collision-visual-parity #359): the height the modern client's collision
-    // cylinder must have to agree with the model it is rendering. The invariant is
-    // collision ≡ visible height in every state, before and after any form/mount change:
-    //
-    //     height = CollisionHeight(model) × ModelScale(model) × CMS_effective(display) × wire scale
-    //
-    // CreatureModelData.CollisionHeight is Blizzard's authored collision for the mesh at
-    // scale 1.0, and (wire × CMS × ModelScale) is exactly the render scale the 1.14 client
-    // applies (established by direct DB2 parse, 52ab6f88). CMS_effective is hotfix-aware:
-    // when we push a CreatureDisplayInfo CMS override (tauren K=0.75), the client renders
-    // with it, so collision must use it too — the May 2026 render hotfix without this was
-    // the root of #359 (♀ tauren sent 3.299 while rendering at 2.474; Tarren Mill doorway
-    // measured in (3.012, 3.299) — 1.12-native-sized geometry that the inflated cylinder
-    // failed while the visibly taller dire bear at a truthful 3.000 passed).
-    //
-    // Deliberately NOT ported from the upstream formula (_BLU 2023): the
-    // Max(scale, displaySize) hitbox floor — it inflated every CMS<1 form (travel/NE cat/
-    // NE moonkin) above its visible size — and the displayId-keyed GetModelData lookup.
-    // Zero-height models fall back to PlayerHeight at the call site.
-    public static float ComputeVisualCollisionHeight(int displayId, int mountDisplayId, float rawScaleX)
-    {
-        var displayInfo = GameData.GetDisplayInfo((uint)displayId);
-        var model = GameData.GetModelData(displayInfo.ModelId);
-        float cms = GameData.GetClientEffectiveDisplayScale((uint)displayId);
-
-        if (mountDisplayId != 0 && LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
-        { // in vanilla there were no mount collisions
-            var mountDisplayInfo = GameData.GetDisplayInfo((uint)mountDisplayId);
-            var mountModel = GameData.GetModelData(mountDisplayInfo.ModelId);
-            float mountCms = GameData.GetClientEffectiveDisplayScale((uint)mountDisplayId);
-            return rawScaleX * (mountModel.MountHeight * mountCms + model.Height * model.ModelScale * cms * 0.5f);
-        }
-
-        return rawScaleX * cms * model.Height * model.ModelScale;
     }
 
     // JimsProxy (stuck-logout-stun 2026-07-17): vanilla cores implement the logout countdown by
@@ -2611,58 +2437,9 @@ public partial class WorldClient
         int OBJECT_FIELD_SCALE_X = LegacyVersion.GetUpdateField(ObjectField.OBJECT_FIELD_SCALE_X);
         if (OBJECT_FIELD_SCALE_X >= 0 && updateMaskArray[OBJECT_FIELD_SCALE_X])
         {
-            float wireScale = updates[OBJECT_FIELD_SCALE_X].FloatValue;
-            updateData.ObjectData.Scale = wireScale;
-
-            // JimsProxy (npc-scale-vanilla-parity): log per-unit scale context so the
-            // "X is smaller in modern than vanilla" reports (Varimathras, etc.) can be
-            // diagnosed from a JSONL bundle. Captures wire scale, DisplayID, CMS, and
-            // ModelScale so we can reconstruct the rendering math without a repro.
-            // Bounds-safe (gates field index against updateMaskArray.Length so Item /
-            // GameObject updates whose mask doesn't cover unit fields don't crash).
-            bool isUnitLike = objectType == ObjectType.Unit
-                              || objectType == ObjectType.Player
-                              || objectType == ObjectType.ActivePlayer;
-            if (isUnitLike && LegacyVersion.ExpansionVersion == 1)
-            {
-                int displayId = 0;
-                int UNIT_FIELD_DISPLAYID_idx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_DISPLAYID);
-                if (UNIT_FIELD_DISPLAYID_idx >= 0
-                    && UNIT_FIELD_DISPLAYID_idx < updateMaskArray.Length
-                    && updateMaskArray[UNIT_FIELD_DISPLAYID_idx])
-                    displayId = updates[UNIT_FIELD_DISPLAYID_idx].Int32Value;
-                else
-                    displayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
-
-                float cms = 0f;
-                uint modelId = 0;
-                if (displayId > 0)
-                {
-                    var info = GameData.GetDisplayInfo((uint)displayId);
-                    cms = info.DisplayScale;
-                    modelId = info.ModelId;
-                }
-                float modelScale = (modelId > 0) ? GameData.GetModelData(modelId).ModelScale : 0f;
-
-                // Per jim's PR #117 review: per-unit-create event, hot in populated areas
-                // (raids, cities, BGs). Gated behind DebugOutput so it doesn't spam JSONL
-                // in production bundles unless a tester is actively investigating scale.
-                if (Framework.Settings.DebugOutput)
-                {
-                    Log.Event("unit.scale.context", new
-                    {
-                        guid = guid.ToString(),
-                        entry = updateData.ObjectData.EntryID,
-                        object_type = objectType.ToString(),
-                        wire_scale = wireScale,
-                        display_id = displayId,
-                        creature_model_scale = cms,
-                        model_id = modelId,
-                        model_scale = modelScale,
-                        is_create = isCreate,
-                    });
-                }
-            }
+            // A unit's scale is translated for the modern client at the end of this method
+            // (TranslateUnitScale); other objects keep the 1.12 value.
+            updateData.ObjectData.Scale = updates[OBJECT_FIELD_SCALE_X].FloatValue;
         }
 
         // Item Fields
@@ -4185,21 +3962,7 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                                 is_player_target = guid == GetSession().GameState.CurrentPlayerGuid,
                             });
                         }
-                        if (aura.AuraData != null && ShouldDropModScaleAura(guid, (uint)aura.AuraData.SpellID))
-                        {
-                            Framework.Logging.Log.Event("aura.slot.dropped_mod_scale_npc", new
-                            {
-                                target_low = guid.GetCounter(),
-                                high_type = guid.GetHighType().ToString(),
-                                slot = i,
-                                spell_id = aura.AuraData.SpellID,
-                                source = "object_update",
-                            });
-                        }
-                        else
-                        {
-                            auraUpdate.Auras.Add(aura);
-                        }
+                        auraUpdate.Auras.Add(aura);
 
                         // MIRASU (stack-aura-decrement): remember what we just emitted so the
                         // next AURAAPPLICATIONS-quad-only update can detect a per-slot byte
@@ -5362,368 +5125,7 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
             }
         }
 
-        // JimsProxy (pet-scale-vanilla-parity): the local player's pet (warlock
-        // or hunter) renders at the wrong size in modern 1.14 Classic vs vanilla
-        // 1.12 reference. Modern Classic's per-display CreatureModelScale
-        // dropped the intrinsic M_native that vanilla M2 files baked in, so the
-        // proxy applies a per-family correction K via inverse-CMS bake-in:
-        //
-        //   emit (wire / CMS) × K
-        //   modern renders emit × CMS × ModelScale = wire × K × ModelScale
-        //   ≈ vanilla's wire × M_native when K is chosen per family.
-        //
-        // K resolution (see pet block below):
-        //   1. Primary — CreatureFamily DBC MaxScale (e.g. bat 0.7, boar 1.0,
-        //      wolf 1.0, imp 0.5). The vanilla server already lerps level
-        //      growth via wire SCALE_X, so we use the family-flat MaxScale.
-        //   2. Fallback when CreatureTemplate hasn't been received yet —
-        //      legacy K_hunter / K_warlock constants. Pet GUID is recorded in
-        //      PetScaleResolvePending so QueryHandler re-emits SCALE_X with
-        //      the correct K once the template arrives.
-        //
-        // Server-side combat reach and bounding radius are untouched, so range
-        // checks, melee hit detection, and ability targeting are unchanged.
-        // Only the visual scale forwarded to the client is modified; click
-        // hitbox grows with the visual.
-        //
-        // Detection: prefer CurrentPetGuid match (set when SMSG_PET_SPELLS_MESSAGE
-        // arrives, typically before the pet's first CREATE_OBJECT). Fallback
-        // to SUMMONEDBY in this update matching CurrentPlayerGuid so the first
-        // CREATE_OBJECT for a pet (which carries SUMMONEDBY) gets normalized
-        // even if CurrentPetGuid hasn't latched yet. Only fires when SCALE_X
-        // is present in this update (Scale != null) — a delta values update
-        // without SCALE_X leaves the already-normalized scale sticky on the
-        // client and avoids compounding multiplications across updates.
-        const float K_hunter  = 1.5f;   // fallback only — pre-family-table tuning
-        const float K_warlock = 0.75f;  // fallback only — pre-family-table tuning
-        if (LegacyVersion.ExpansionVersion == 1
-            && updateData.ObjectData.Scale != null
-            && (objectType == ObjectType.Unit || objectType == ObjectType.Player || objectType == ObjectType.ActivePlayer))
-        {
-            var localPlayerGuid = Session.GameState.CurrentPlayerGuid;
-            var currentPetGuid = Session.GameState.CurrentPetGuid;
-            bool isLocalPet = (currentPetGuid != default && guid == currentPetGuid)
-                              || (localPlayerGuid != default
-                                  && updateData.UnitData.SummonedBy != null
-                                  && (WowGuid128)updateData.UnitData.SummonedBy == localPlayerGuid);
-
-            // DisplayID for CMS lookup. Prefer current update (most up-to-date for
-            // shapeshift/morph cases); fall back to GameState cache for delta updates.
-            int displayId = 0;
-            int UNIT_FIELD_DISPLAYID_idx = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_DISPLAYID);
-            if (UNIT_FIELD_DISPLAYID_idx >= 0
-                && UNIT_FIELD_DISPLAYID_idx < updateMaskArray.Length
-                && updateMaskArray[UNIT_FIELD_DISPLAYID_idx])
-                displayId = updates[UNIT_FIELD_DISPLAYID_idx].Int32Value;
-            else
-                displayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_DISPLAYID);
-
-            float rawScale = (float)updateData.ObjectData.Scale;
-            float cms = 0f;
-            if (displayId > 0)
-                cms = GameData.GetDisplayInfo((uint)displayId).DisplayScale;
-
-            if (isLocalPet)
-            {
-                bool isWarlockPet = WarlockPetDisplayIds.Contains(displayId);
-
-                // JimsProxy (pet-scale-family-table): primary K comes from the
-                // Classic 1.14 CreatureFamily DBC, using each family's MaxScale
-                // value as a flat correction. We deliberately do NOT lerp by
-                // pet level — the vanilla server already applies the
-                // MinScale→MaxScale lerp via UNIT_FIELD_SCALE_X on the wire
-                // (verified empirically: Bruce L16 boar arrived with
-                // raw_scale=0.7 = the exact 0.6→1.0 lerp value for boar at L16).
-                // Applying the lerp a second time on the proxy would
-                // double-multiply and undersize every pet.
-                //
-                // MaxScale acts as the per-family M_native/ModelScale correction
-                // the modern client is missing — Blizzard's 1.14 Classic data
-                // dropped the per-model intrinsic scale that vanilla 1.12 baked
-                // into M2 files. Validated values: bat 0.7, boar 1.0, wolf 1.0,
-                // cat 1.1, voidwalker 0.8, imp 0.5, succubus 1.0.
-                //
-                // Family lookup chain:
-                //   1. petEntry = OBJECT_FIELD_ENTRY (creature_template ID).
-                //      For Pet-high-GUIDs, guid.GetEntry() returns the pet
-                //      INSTANCE number — different from the template ID.
-                //   2. GameData.GetCreatureTemplate(entry).Family — populated
-                //      by QueryHandler when the creature is queried (either by
-                //      the modern client or by the proxy itself, see below).
-                //   3. GameData.GetPetFamilyScale(family) → family.MaxScale.
-                //
-                // Fallback when CreatureTemplate isn't cached yet: legacy
-                // K_hunter=1.5 / K_warlock=0.75 constants, and the pet GUID is
-                // recorded in PetScaleResolvePending so the next
-                // SMSG_QUERY_CREATURE_RESPONSE for this entry can re-emit
-                // SCALE_X with the correct K.
-                int petEntry = updateData.ObjectData.EntryID != null
-                    ? (int)updateData.ObjectData.EntryID
-                    : Session.GameState.GetLegacyFieldValueInt32(guid, ObjectField.OBJECT_FIELD_ENTRY);
-                int familyId = 0;
-                float? familyTableK = null;
-                string? familyName = null;
-                if (petEntry > 0)
-                {
-                    var template = GameData.GetCreatureTemplate((uint)petEntry);
-                    if (template != null)
-                    {
-                        familyId = template.Family;
-                        if (familyId > 0 && GameData.CreatureFamilies.TryGetValue(familyId, out var fam))
-                        {
-                            familyTableK = GameData.GetPetFamilyScale(familyId);
-                            familyName = "family-" + familyId;
-                        }
-                    }
-                }
-
-                // Highest-priority K source: vanilla CreatureModelScale per DisplayID.
-                // CMS_v is the per-DisplayID correction the modern client is missing —
-                // see UpdateHandler comment at the non-pet NPC block for the math
-                // (emit = CMS_v² / CMS_m matches what the 1.12 client rendered).
-                // For pets specifically, per-DisplayID CMS_v is MORE accurate than
-                // per-family MaxScale because different display variants within the
-                // same family (e.g. multiple bat skins, multiple cat skins) have
-                // different CMS_v values. Falls back to Jim's family table when the
-                // DisplayID isn't in the vanilla DBC export (rare — covers post-vanilla
-                // additions, custom displays, etc.).
-                float? vanillaCmsK = (displayId > 0 && GameData.VanillaCreatureModelScales.TryGetValue((uint)displayId, out var vCms))
-                    ? vCms
-                    : (float?)null;
-                // Per-ModelId M_native compensation: multiply vanilla CMS_v by the
-                // model's 1.12-vs-1.14 intrinsic ratio when listed (see M2NativeRatio).
-                // Preserves per-DisplayID size relationships from vanilla DBC.
-                int modelIdForRatio = displayId > 0
-                    ? (int)GameData.GetDisplayInfo((uint)displayId).ModelId
-                    : 0;
-                float mRatio = 1f;
-                bool modelRatioApplied = modelIdForRatio > 0
-                                         && vanillaCmsK.HasValue
-                                         && M2NativeRatio.TryGetValue(modelIdForRatio, out mRatio);
-                float k = modelRatioApplied
-                    ? vanillaCmsK!.Value * mRatio
-                    : (vanillaCmsK ?? familyTableK ?? (isWarlockPet ? K_warlock : K_hunter));
-
-                // First-sight race: if CreatureTemplate isn't cached yet (creature
-                // query hasn't round-tripped), record the pet's data so the next
-                // SMSG_QUERY_CREATURE_RESPONSE can re-emit SCALE_X with the
-                // family-correct K. Otherwise the pet renders at K_hunter=1.5
-                // fallback for one update cycle and the user sees a "big pet"
-                // until they resummon.
-                if (familyTableK == null && petEntry > 0)
-                {
-                    Session.GameState.PetScaleResolvePending[guid] = new PendingPetScale(
-                        guid, (uint)petEntry, (uint)displayId, rawScale, cms, isWarlockPet);
-
-                    // The modern client caches creature templates in its WDB
-                    // folder and skips CMSG_QUERY_CREATURE on subsequent sessions —
-                    // which means SMSG_QUERY_CREATURE_RESPONSE never reaches the
-                    // proxy and PetScaleResolvePending never drains. Issue our
-                    // OWN CMSG_QUERY_CREATURE to the legacy server (the response
-                    // path is the same handler — cache + drain pending).
-                    // Tracked via PetScaleProxyQueriedEntries to avoid spamming
-                    // the server with repeated queries for the same entry.
-                    if (Session.GameState.PetScaleProxyQueriedEntries.Add((uint)petEntry))
-                    {
-                        WorldPacket queryPacket = new WorldPacket(Opcode.CMSG_QUERY_CREATURE);
-                        queryPacket.WriteUInt32((uint)petEntry);
-                        queryPacket.WriteGuid(new WowGuid64(HighGuidTypeLegacy.Creature, (uint)petEntry, 1));
-                        SendPacketToServer(queryPacket);
-                    }
-                }
-
-                // Server-pre-scaled summons: engineering trinket pets (Mechanical
-                // Battle Chicken display 6909, Mithril Dragonling 7908, etc.) have
-                // creature_template.display_scale set to CMS_v, so the legacy server
-                // sends wire == CMS_v. The 1.12 client renders wire × ModelScale; the
-                // 1.14 client *also* applies CreatureModelScale → wire × CMS × ModelScale
-                // = CMS_v² — visibly oversized (3×3 chicken). Mirror the NPC path's
-                // wire-pre-scaled strip: when wire ≈ CMS_v (and isn't the server-default
-                // 1.0), drop wire to 1.0 so the client lands at vanilla baseline.
-                // Real hunter/warlock pets are unaffected — their wire is the server-
-                // default 1.0, which the `!= 1.0` guard excludes.
-                // Gate strictly on wire > 1.0: the double-application bug only renders
-                // a creature OVERSIZED when the server pre-scales above 1.0 (chicken 3,
-                // dragonling 1.15). Small pets legitimately carry wire < 1.0 (voidwalker
-                // 0.8, tamed bats 0.43) and must keep the M2NativeRatio / family-table
-                // logic — stripping them to 1.0 wrongly inflates them.
-                float effectivePetWire = rawScale;
-                bool petWirePreScaled = vanillaCmsK.HasValue
-                    && rawScale > 1.01f
-                    && rawScale >= vanillaCmsK.Value - 0.01f
-                    && rawScale < vanillaCmsK.Value * 1.5f;
-                if (petWirePreScaled)
-                    effectivePetWire = 1.0f;
-
-                // Skip normalization if CMS data is missing/invalid — fall back to a flat
-                // K multiply so the pet still gets a size bump rather than passing through
-                // un-modified (and rendering small).
-                float emit = (cms > 0)
-                    ? (effectivePetWire / cms) * k
-                    : effectivePetWire * k;
-
-                updateData.ObjectData.Scale = emit;
-
-                Log.Event("unit.pet_scale.applied", new
-                {
-                    guid = guid.ToString(),
-                    display_id = displayId,
-                    creature_model_scale = cms,
-                    k = k,
-                    family = familyName ?? (isWarlockPet ? "warlock" : "hunter"),
-                    family_id = familyId,
-                    pet_entry = petEntry,
-                    k_source = modelRatioApplied ? "model-native-ratio"
-                               : vanillaCmsK.HasValue ? "vanilla-dbc"
-                               : familyTableK.HasValue ? "family-table"
-                               : (isWarlockPet ? "k-warlock-fallback" : "k-hunter-fallback"),
-                    raw_scale = rawScale,
-                    wire_pre_scaled = petWirePreScaled,
-                    effective_wire = effectivePetWire,
-                    emitted_scale = emit,
-                    matched_via = (currentPetGuid != default && guid == currentPetGuid) ? "current_pet_guid" : "summoned_by",
-                    cms_fallback = cms <= 0,
-                });
-            }
-            else if (objectType == ObjectType.Unit && cms > 0)
-            {
-                // Non-pet vanilla NPC scale: bridge Kronos (TC-1.12) wire convention to
-                // modern Classic 1.14 client rendering. Vanilla 1.12 server-side
-                // creature_template.scale equals CreatureModelScale per DisplayID, sent
-                // verbatim on the wire. The 1.12 client renders wire × CMS_v × ModelScale.
-                // Modern 1.14 client renders wire × CMS_m × ModelScale with its own (often
-                // different) CMS_m. Naïve forwarding produces CMS_v × CMS_m × MS — over-
-                // or undersized depending on the CMS_v/CMS_m ratio (most visibly: ogres
-                // and tigress at 1.5×–3× vanilla size before this fix).
-                //
-                // Correct emit = CMS_v² / CMS_m, factored as (wire/CMS_m) × CMS_v. When
-                // the modern client multiplies by its CMS_m at render, the result is
-                // CMS_v² × ModelScale = exactly what the 1.12 client rendered for the
-                // same DisplayID. Per-DisplayID, not per-ModelID — different visual
-                // variants of the same model can have different CMS_v values.
-                //
-                // CMS_v source: HermesProxy/CSV/CreatureDisplayInfoVanilla.csv (8,495
-                // entries extracted from 1.12.1.5875 CreatureDisplayInfo.dbc via Ladik's
-                // MPQ Editor + custom DBC parser). Missing entries fall back to K=1.0
-                // (assume no vanilla scale override, matches modern rendering).
-                //
-                // Players excluded (their wire_scale != CMS, so this math doesn't apply).
-                // Pets handled by the K_hunter/K_warlock + family-table + vanilla-CMS
-                // chain in the isLocalPet branch above.
-                const float K_npc_default = 1.0f;
-                float cmsVanilla = 0f;
-                bool hasVanillaCms = displayId > 0 && GameData.VanillaCreatureModelScales.TryGetValue((uint)displayId, out cmsVanilla);
-                float K_npc = hasVanillaCms ? cmsVanilla : K_npc_default;
-
-                // Twinstar pre-scales wire on creatures whose creature_template.scale
-                // column was set to CMS_v in their DB (vs unset = server default 1.0).
-                // For those, wire already encodes the vanilla factor; modern client's
-                // wire × CMS_m × ModelScale render then yields CMS_v² × ModelScale —
-                // ~2.2× too big for ogres at CMS_v=2.2, or ~half-size for Small Crag
-                // Boar at CMS_v=0.5. Strip the pre-scaling so the client lands at
-                // vanilla baseline.
-                //
-                // Tolerance is RATIO-based now (was absolute 0.01): Twinstar's data
-                // has a +10-20% bias on some entries (sibling creatures sharing a
-                // model where one has wire==CMS_v exact, another has wire ≈ CMS_v *
-                // 1.1-1.2). Examples in Wetlands: Mottled Raptor variants on model
-                // 137 (one entry exact, another at CMS_v * 1.175), Wendigo model 34
-                // (one exact, another at CMS_v * 1.109).
-                //
-                // Upper bound is split by CMS_v magnitude. For CMS_v < 1.0
-                // (visibly-small creatures: bats, crocs, wolves, crabs, scorpids),
-                // ratios can run much higher (Duskbat wire 0.40 / CMS_v 0.10 = 4.0,
-                // Loch Crocolisk 0.70 / 0.40 = 1.75) while still being the genuine
-                // vanilla-intended scale; without stripping, modern renders at
-                // wire × CMS_m which is too small to interact with (Loch Croc at
-                // 0.28, Lava Crab at 0.03). Cap at 5.0 to skip displays with
-                // CMS_v ≤ 0.01 (invisible spell-target objects like Andorhal Tower
-                // Marks of Detonation — wire 0.10 / CMS_v 0.01 = 10.0, intended
-                // invisible).
-                //
-                // For CMS_v >= 1.0 (boss-class creatures with intentionally large
-                // wire bias), keep the tight 1.5 bound so we don't shrink Gri'lek,
-                // Crowd Pummeler 9-60, Viscous Fallout etc. below their current
-                // bigger-than-CMS_v render.
-                float upperRatio = cmsVanilla < 1.0f ? 5.0f : 1.5f;
-                // Skip the strip for displays where vanilla server intent is
-                // deliberately a +bias over CMS_v (Cairne, Mr. Smite, Lady Onyxia,
-                // tauren chiefs, Silithid Flayers, Gnomeregan denizens, etc.).
-                // Without this exemption the heuristic shrinks them visibly below
-                // their vanilla render. List is sourced from the vmangos
-                // display_scale1 audit — see ScaleExemptDeliberateBias above.
-                bool isDeliberateBias = displayId > 0
-                    && ScaleExemptDeliberateBias.Contains(EncodeScaleBiasKey((uint)displayId, rawScale));
-                bool forceStrip = displayId > 0
-                    && ScaleForceStripBaseline.ContainsKey(displayId)
-                    && MathF.Abs(rawScale - 1.0f) > 0.01f;  // skip server-default wire
-                bool wirePreScaled = forceStrip || (hasVanillaCms
-                    && !isDeliberateBias
-                    && MathF.Abs(cmsVanilla - 1.0f) > 0.01f
-                    && MathF.Abs(rawScale - 1.0f) > 0.01f   // skip server-default wire
-                    && rawScale >= cmsVanilla - 0.01f       // FP epsilon: server-sent 1.7499995 still matches CMS_v 1.75
-                    && rawScale < cmsVanilla * upperRatio);
-                float stripTarget = 1.0f;
-                if (forceStrip && displayId > 0)
-                {
-                    if (ScaleForceStripBaseline.TryGetValue(displayId, out var baselineTarget))
-                        stripTarget = baselineTarget;
-                    if (ScaleForceStripEmitOverride.TryGetValue(EncodeScaleBiasKey((uint)displayId, rawScale), out var overrideTarget))
-                        stripTarget = overrideTarget;
-                }
-                float effectiveWire = wirePreScaled ? stripTarget : rawScale;
-                float npcEmit = (effectiveWire / cms) * K_npc;
-
-                // M2 mesh-adjust: per-ModelId compensation now handled via
-                // CreatureDisplayInfo CMS hotfix (CSV/Hotfix/CreatureDisplayInfo1.csv)
-                // so the modern client's intrinsic CMS already carries the K factor.
-                // NPCs render at wire × hotfix_CMS × ModelScale, matching the K-applied
-                // target without a proxy wire multiplier. Keeping the variable for the
-                // diagnostic event but not applying it here.
-                int modelIdForAdjust = displayId > 0 ? (int)GameData.GetDisplayInfo((uint)displayId).ModelId : 0;
-                float meshAdjust = 1.0f;
-                if (modelIdForAdjust > 0 && M2MeshAdjust.TryGetValue(modelIdForAdjust, out var adj))
-                    meshAdjust = adj;
-                updateData.ObjectData.Scale = npcEmit;
-
-                Log.Event("unit.npc_scale.applied", new
-                {
-                    guid = guid.ToString(),
-                    entry = updateData.ObjectData.EntryID,
-                    display_id = displayId,
-                    model_id = modelIdForAdjust,
-                    vanilla_cms = K_npc,
-                    modern_cms = cms,
-                    raw_scale = rawScale,
-                    effective_wire = effectiveWire,
-                    wire_pre_scaled = wirePreScaled,
-                    mesh_adjust = meshAdjust,
-                    emitted_scale = npcEmit,
-                    k_source = hasVanillaCms ? "vanilla_dbc" : "default",
-                });
-            }
-            else if (objectType == ObjectType.Player || objectType == ObjectType.ActivePlayer)
-            {
-                // K=0.75 for tauren is now baked into the CreatureDisplayInfo CMS hotfix
-                // (CSV/Hotfix/CreatureDisplayInfo1.csv) — id 59 CMS = 1.0125, id 60 CMS = 0.75.
-                // The 1.14 client renders all paths as wire × CMS × ModelScale, so the
-                // hotfix CMS alone yields the K-applied target without a proxy wire
-                // multiplier. Post-shift recompute uses the same CMS, so login and
-                // post-shift now match. Diagnostic event for visibility.
-                int modelIdForAdjust = displayId > 0 ? (int)GameData.GetDisplayInfo((uint)displayId).ModelId : 0;
-                if (modelIdForAdjust > 0 && M2MeshAdjust.TryGetValue(modelIdForAdjust, out var playerAdj))
-                {
-                    Log.Event("unit.player_scale.skipped", new
-                    {
-                        guid = guid.ToString(),
-                        display_id = displayId,
-                        model_id = modelIdForAdjust,
-                        raw_scale = rawScale,
-                        reason = "k_baked_in_cms_hotfix",
-                    });
-                }
-            }
-        }
+        TranslateUnitScale(updateMaskArray, updates, objectType, updateData, guid);
     }
 
 }

@@ -4385,19 +4385,6 @@ public partial class WorldClient
         aura.AuraData.Duration = durationFull;
         aura.AuraData.Remaining = durationLeft;
 
-        if (WorldClient.ShouldDropModScaleAura(guid, (uint)aura.AuraData.SpellID))
-        {
-            Framework.Logging.Log.Event("aura.slot.dropped_mod_scale_npc", new
-            {
-                target_low = guid.GetCounter(),
-                high_type = guid.GetHighType().ToString(),
-                slot = (int)slot,
-                spell_id = aura.AuraData.SpellID,
-                source = "extra_aura_info",
-            });
-            return;
-        }
-
         AuraUpdate update = new AuraUpdate(guid, false);
         update.Auras.Add(aura);
         SendPacketToClient(update);
@@ -4590,19 +4577,6 @@ public partial class WorldClient
                         duration_source = source.ToString(),
                     });
             }
-        }
-
-        if (WorldClient.ShouldDropModScaleAura(target, spellId))
-        {
-            Framework.Logging.Log.Event("aura.slot.dropped_mod_scale_npc", new
-            {
-                target_low = target.GetCounter(),
-                high_type = target.GetHighType().ToString(),
-                slot = (int)slot,
-                spell_id = spellId,
-                source = "refresh",
-            });
-            return;
         }
 
         AuraInfo aura = new AuraInfo();
