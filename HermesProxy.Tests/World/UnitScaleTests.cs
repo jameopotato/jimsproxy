@@ -213,6 +213,21 @@ public class UnitScaleTests
         Assert.Equal(1.15f, gnomeFactor, Eps);
     }
 
+    [Fact]
+    public void CreatureTemplateQuery_OncePerEntryUntilTheAnswerIsOverdue()
+    {
+        // One ask while an answer can still be on its way; a lost answer is asked again once
+        // UnitScaleQueryRetryMs has passed (Mirasu's PR #567 review). The answer removes the
+        // entry; a world port clears them all.
+        var asked = new Dictionary<uint, long>();
+        Assert.True(WorldClient.ShouldQueryCreatureTemplate(asked, 2773, 10_000));
+        asked[2773] = 10_000;
+        Assert.False(WorldClient.ShouldQueryCreatureTemplate(asked, 2773, 10_000 + 200));
+        Assert.False(WorldClient.ShouldQueryCreatureTemplate(asked, 2773, 10_000 + WorldClient.UnitScaleQueryRetryMs - 1));
+        Assert.True(WorldClient.ShouldQueryCreatureTemplate(asked, 2773, 10_000 + WorldClient.UnitScaleQueryRetryMs));
+        Assert.True(WorldClient.ShouldQueryCreatureTemplate(asked, 7442, 10_000 + 200)); // another entry
+    }
+
     private static int Idx<T>(T field) where T : Enum
     {
         int index = LegacyVersion.GetUpdateField(field);

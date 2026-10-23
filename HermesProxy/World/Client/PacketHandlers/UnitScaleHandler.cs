@@ -100,15 +100,17 @@ public partial class WorldClient
     }
 
     // A creature's family is in its query answer only, and the client keeps those answers
-    // across sessions and stops asking, so the proxy asks the server itself (once per entry
-    // per session). The answer, whoever asked, re-sends every waiting unit's scale
-    // (QueryHandler -> ResendUnitScalesForEntry).
+    // across sessions and stops asking, so the proxy asks the server itself. The answer,
+    // whoever asked, re-sends every waiting unit's scale (QueryHandler ->
+    // ResendUnitScalesForEntry).
     private void RequestCreatureTemplateForUnitScale(WowGuid128 guid, uint entry)
     {
         var state = GetSession().GameState;
         state.UnitScaleTemplatePending[guid] = entry;
-        if (!state.UnitScaleQueriedEntries.Add(entry))
+        long now = System.Environment.TickCount64;
+        if (!ShouldQueryCreatureTemplate(state.UnitScaleQueriedEntries, entry, now))
             return;
+        state.UnitScaleQueriedEntries[entry] = now;
 
         WorldPacket queryPacket = new WorldPacket(Opcode.CMSG_QUERY_CREATURE);
         queryPacket.WriteUInt32(entry);
@@ -116,9 +118,19 @@ public partial class WorldClient
         SendPacketToServer(queryPacket);
     }
 
+    // One ask per entry while an answer can still be on its way; an entry asked
+    // UnitScaleQueryRetryMs ago with no answer is asked again (a lost answer would otherwise
+    // leave every unit of it without its family for the session). HandleNewWorld clears the
+    // asks, since an answer can be lost across a world port.
+    internal const long UnitScaleQueryRetryMs = 5000;
+
+    internal static bool ShouldQueryCreatureTemplate(Dictionary<uint, long> askedAt, uint entry, long nowMs)
+        => !askedAt.TryGetValue(entry, out long asked) || nowMs - asked >= UnitScaleQueryRetryMs;
+
     private void ResendUnitScalesForEntry(uint entry)
     {
         var state = GetSession().GameState;
+        state.UnitScaleQueriedEntries.Remove(entry);
         var pending = state.UnitScaleTemplatePending;
         if (pending.Count == 0)
             return;

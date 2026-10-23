@@ -649,9 +649,10 @@ public sealed class GameSessionData
     public readonly object QuestQueryBucketLock = new();
     // JimsProxy (unit-scale): units sized before the proxy knew their creature's family
     // (unit -> entry), re-sent when the creature query answer arrives; and the entries the
-    // proxy has queried itself this session.
+    // proxy has asked about and not had an answer for yet (entry -> Environment.TickCount64
+    // of the ask), so a lost answer can be asked again.
     public Dictionary<WowGuid128, uint> UnitScaleTemplatePending = new();
-    public HashSet<uint> UnitScaleQueriedEntries = new();
+    public Dictionary<uint, long> UnitScaleQueriedEntries = new();
     // JimsProxy: per-(caster, spell) timestamp of the last forwarded SMSG_SPELL_FAILED_OTHER,
     // used to dedupe Kronos's auto-cast retry storm. Pet auto-cast can fire 5+/sec when the
     // target is out of range or being killed, each emitting a fresh SPELL_FAILED_OTHER. The

@@ -617,6 +617,10 @@ public partial class WorldClient
         // happened to carry the same MoveCounter value.
         GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
 
+        // JimsProxy (unit-scale): a creature query answer can be lost across the transfer;
+        // forget the unanswered asks so the next unit of such an entry asks again.
+        GetSession().GameState.UnitScaleQueriedEntries.Clear();
+
         NewWorld teleport = new NewWorld();
         var previousMapId = GetSession().GameState.CurrentMapId;
         GetSession().GameState.CurrentMapId = teleport.MapID = packet.ReadUInt32();

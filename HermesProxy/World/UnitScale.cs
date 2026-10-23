@@ -161,6 +161,8 @@ public static class UnitScale
                 s = familyScale;
                 familyApplied = true;
             }
+            // Inside the family block on purpose: the client applies TamedPetBaseScale only to a
+            // pet whose template has a family. (1.14.2: 1.0 on every model but 13195.)
             if (unit.IsPet && model.TamedPetBaseScale > 0f)
                 s *= model.TamedPetBaseScale;
         }
