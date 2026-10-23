@@ -427,102 +427,11 @@ public partial class WorldClient
         GameData.StoreCreatureTemplate(response.CreatureID, creature);
         SendPacketToClient(response);
 
-        // JimsProxy (pet-scale-resolve-race): drain any pet GUIDs that arrived
-        // with SCALE_X before this template's family was known. Recompute K
-        // from the now-resolved family and emit a SCALE_X-only values update so
-        // the first-sight "big pet" snaps to correct size without a resummon.
-        ResolvePendingPetScalesForEntry(response.CreatureID, creature.Family);
+        // JimsProxy (unit-scale): the template carries the CreatureFamily, which can change the
+        // client's display factor; re-send the scale of every unit of this entry sized before it.
+        ResendUnitScalesForEntry(response.CreatureID);
     }
 
-    private void ResolvePendingPetScalesForEntry(uint entry, int familyId)
-    {
-        var pending = GetSession().GameState.PetScaleResolvePending;
-        if (pending.Count == 0) return;
-
-        // Collect matches first; we mutate the dict while iterating.
-        var matches = new System.Collections.Generic.List<PendingPetScale>();
-        foreach (var kv in pending)
-        {
-            if (kv.Value.Entry == entry)
-                matches.Add(kv.Value);
-        }
-        if (matches.Count == 0) return;
-
-        // JimsProxy: K lookup chain matches UpdateHandler's isLocalPet branch —
-        // per-DisplayID vanilla CMS wins over family-table MaxScale, because
-        // CSV/CreatureDisplayInfoVanilla.csv tunes specific display variants
-        // (e.g. Imp displayId 4449 → 2.0) that family-table aggregates would
-        // otherwise overwrite. Previously this resolver used family-table K
-        // only — and re-emitted SCALE_X 200-300ms after summon with the
-        // family value, shrinking the imp back from 2.0 to 0.5 once the
-        // CMSG_QUERY_CREATURE response landed (user-visible "pet shrinks
-        // when buff happens" — actually template-query timing).
-        foreach (var p in matches)
-        {
-            float? vanillaCmsK = (p.DisplayId > 0 && GameData.VanillaCreatureModelScales.TryGetValue(p.DisplayId, out var vCms))
-                ? vCms
-                : (float?)null;
-            float? familyTableK = (familyId > 0)
-                ? GameData.GetPetFamilyScale(familyId)
-                : (float?)null;
-            // Mirror UpdateHandler's isLocalPet branch: per-ModelId M_native
-            // multiplier on vanilla CMS_v (see M2NativeRatio).
-            int modelIdForRatio = p.DisplayId > 0
-                ? (int)GameData.GetDisplayInfo(p.DisplayId).ModelId
-                : 0;
-            float mRatio = 1f;
-            bool modelRatioApplied = modelIdForRatio > 0
-                                     && vanillaCmsK.HasValue
-                                     && WorldClient.M2NativeRatio.TryGetValue(modelIdForRatio, out mRatio);
-            float k = modelRatioApplied
-                ? vanillaCmsK!.Value * mRatio
-                : (vanillaCmsK ?? familyTableK ?? (p.IsWarlockPet ? 0.75f : 1.5f));
-
-            // Server-pre-scaled summons (engineering trinket pets): strip the
-            // pre-baked wire scale, mirroring UpdateHandler's pet branch — without
-            // this, the creature-query resolver re-emits the oversized value
-            // 200-300ms after summon and overrides the corrected first emit.
-            // Gate on wire > 1.0 — see the matching comment in UpdateHandler's pet
-            // branch. Small pets (wire < 1.0) keep their M2NativeRatio/family logic.
-            float effectiveWire = p.RawScale;
-            bool wirePreScaled = vanillaCmsK.HasValue
-                && p.RawScale > 1.01f
-                && p.RawScale >= vanillaCmsK.Value - 0.01f
-                && p.RawScale < vanillaCmsK.Value * 1.5f;
-            if (wirePreScaled)
-                effectiveWire = 1.0f;
-
-            float emit = (p.Cms > 0)
-                ? (effectiveWire / p.Cms) * k
-                : effectiveWire * k;
-
-            // Synthesize a values-update carrying just OBJECT_FIELD_SCALE_X.
-            UpdateObject updateObject = new UpdateObject(GetSession().GameState);
-            ObjectUpdate update = new ObjectUpdate(p.Guid, UpdateTypeModern.Values, GetSession());
-            update.ObjectData.Scale = emit;
-            updateObject.ObjectUpdates.Add(update);
-            SendPacketToClient(updateObject);
-
-            Framework.Logging.Log.Event("unit.pet_scale.resolved_after_template", new
-            {
-                guid = p.Guid.ToString(),
-                entry = p.Entry,
-                display_id = p.DisplayId,
-                family_id = familyId,
-                k = k,
-                k_source = modelRatioApplied ? "model-native-ratio"
-                           : vanillaCmsK.HasValue ? "vanilla-dbc"
-                           : familyTableK.HasValue ? "family-table"
-                           : (p.IsWarlockPet ? "k-warlock-fallback" : "k-hunter-fallback"),
-                raw_scale = p.RawScale,
-                wire_pre_scaled = wirePreScaled,
-                effective_wire = effectiveWire,
-                emitted_scale = emit,
-            });
-
-            pending.Remove(p.Guid);
-        }
-    }
     [PacketHandler(Opcode.SMSG_QUERY_GAME_OBJECT_RESPONSE)]
     void HandleQueryGameObjectResposne(WorldPacket packet)
     {
