@@ -495,6 +495,10 @@ public partial class WorldClient
                     // JimsProxy (out-of-range-ghost): unit re-created → stop suppressing its movement.
                     GetSession().GameState.ClearRecentlyDestroyedObject(guid);
                     ReadCreateObjectBlock(packet, guid, updateData, auraUpdate, i);
+                    // JimsProxy (aura re-send after a loading screen): this create lists the
+                    // player's auras, so the loading screen it falls in needs no re-send.
+                    if (guid == GetSession().GameState.CurrentPlayerGuid)
+                        GetSession().GameState.SelfCreatedSinceLoadingScreenShown = true;
 
                     if (updateData.Guid == GetSession().GameState.CurrentPlayerGuid)
                         GetSession().GameState.CurrentPlayerStorage.CompletedQuests.WriteAllCompletedIntoArray(updateData.ActivePlayerData.QuestCompleted);
@@ -533,6 +537,10 @@ public partial class WorldClient
                     // JimsProxy (out-of-range-ghost): unit re-created → stop suppressing its movement.
                     GetSession().GameState.ClearRecentlyDestroyedObject(guid);
                     ReadCreateObjectBlock(packet, guid, updateData, auraUpdate, i);
+                    // JimsProxy (aura re-send after a loading screen): this create lists the
+                    // player's auras, so the loading screen it falls in needs no re-send.
+                    if (guid == GetSession().GameState.CurrentPlayerGuid)
+                        GetSession().GameState.SelfCreatedSinceLoadingScreenShown = true;
 
                     if (guid.IsItem() && updateData.ObjectData.EntryID != null &&
                        !GameData.ItemTemplates.ContainsKey((uint)updateData.ObjectData.EntryID))

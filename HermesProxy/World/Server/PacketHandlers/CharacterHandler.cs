@@ -117,6 +117,9 @@ public partial class WorldSocket
         if (loadingScreenNotify.MapID >= 0 && GetSession().GameState.CurrentMapId == null)
             GetSession().GameState.CurrentMapId = loadingScreenNotify.MapID;
 
+        if (loadingScreenNotify.Showing)
+            GetSession().GameState.SelfCreatedSinceLoadingScreenShown = false;
+
         //MIRASU: /reload on the 1.14.2 client fires CMSG_LOADING_SCREEN_NOTIFY(Showing=true)
         //MIRASU: then CMSG_LOADING_SCREEN_NOTIFY(Showing=false) with no client disconnect.
         //MIRASU: During the window the client tears down its UI aura cache and expects the
@@ -130,12 +133,31 @@ public partial class WorldSocket
         //MIRASU: SMSG_AURA_UPDATE(updateAll=true) for the current player by walking our
         //MIRASU: cached legacy update-fields for their own GUID. Mirrors the relog path
         //MIRASU: (UpdateHandler.cs aura loop around line 2088) including the NoCaster clamp.
+        //
+        // JimsProxy (an aura's looping animation stuck after a loading screen, 2026-10-21): a
+        // full list that re-lists an aura the client already shows, under a new CastID
+        // (ReadAuraSlot makes one per emission), leaves that aura's looping animation playing
+        // after the aura ends: the Skull of Impending Doom's pose stayed until the next map
+        // change after a relog, a BG leave and a /reload with the buff up, while a single add
+        // and removal ends it. Two kinds of loading screen:
+        //  - login and far teleport: the player's create inside the loading screen has just
+        //    listed the auras, so the re-send only repeated them. It is skipped.
+        //  - /reload (and any other loading screen with no create): the client still shows the
+        //    player's auras. An empty full list goes first, so the full list that follows lists
+        //    every aura on empty slots, as a login's create does.
         if (!loadingScreenNotify.Showing)
         {
             var state = GetSession().GameState;
             var playerGuid = state.CurrentPlayerGuid;
             var worldClient = GetSession().WorldClient;
-            if (playerGuid != default && worldClient != null)
+            bool skipAfterCreate = Framework.Settings.AuraResendAfterLoadFix && state.SelfCreatedSinceLoadingScreenShown;
+            if (skipAfterCreate && playerGuid != default)
+            {
+                // Fix-working breadcrumb, once per loading screen: DebugOutput only.
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("aura.loading_resend.skipped_after_create", new { player_low = playerGuid.GetCounter() });
+            }
+            else if (playerGuid != default && worldClient != null)
             {
                 var cachedFields = state.GetCachedObjectFieldsLegacy(playerGuid);
                 if (cachedFields != null)
@@ -170,6 +192,17 @@ public partial class WorldSocket
                             aura.Slot = i;
                             aura.AuraData = auraData;
                             auraUpdate.Auras.Add(aura);
+                        }
+                        if (Framework.Settings.AuraResendAfterLoadFix && auraUpdate.Auras.Count != 0)
+                        {
+                            worldClient.SendPacketToClient(new AuraUpdate(playerGuid, true));
+                            // Fix-working breadcrumb, once per /reload: DebugOutput only.
+                            if (Framework.Settings.DebugOutput)
+                                Log.Event("aura.loading_resend.cleared_first", new
+                                {
+                                    player_low = playerGuid.GetCounter(),
+                                    auras = auraUpdate.Auras.Count,
+                                });
                         }
                         worldClient.SendPacketToClient(auraUpdate);
                     }
