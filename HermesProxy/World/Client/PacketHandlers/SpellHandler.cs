@@ -3211,7 +3211,34 @@ public partial class WorldClient
             // Gated to vanilla only: TBC+ uses uint32 targetFlags and a different trailer
             // alignment, so the heuristic's invariants don't translate cleanly and could
             // mask unrelated parse drift instead of throwing.
+            // JimsProxy (a resisted or immune cast left open, 2026-10-18): first take the miss count
+            // whose entries and target section fit the packet exactly. With one miss Kronos sends the
+            // byte 2 and one entry; zeroing it (below) read that entry as the target section, the parse
+            // failed and the GO was dropped, so the cast never completed on the client and the caster
+            // stayed in the casting pose. The phantom check below runs only when no count fits.
+            int resolvedMisses = -1;
             if (missCount > 0 && LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+            {
+                byte[] missSection = packet.ReadBytes((uint)packet.BytesRemaining);
+                packet.Skip(-missSection.Length);
+                resolvedMisses = VanillaSpellGoMissCount.Resolve(missSection, missCount, flags);
+                // Fix-working breadcrumb (the phantom byte resolving to 0, a one-miss byte 2 to 1):
+                // DebugOutput only. A shape nothing fits still logs phantom_misscount_skipped below.
+                if (resolvedMisses >= 0 && resolvedMisses != missCount && Framework.Settings.DebugOutput)
+                {
+                    Log.Event("spell.spell_go.misscount_resolved", new
+                    {
+                        spell_id = dbdata.SpellID,
+                        misscount_byte = missCount,
+                        resolved = resolvedMisses,
+                        hit_count = hitCount,
+                        bytes_remaining = packet.BytesRemaining,
+                    });
+                }
+                if (resolvedMisses >= 0)
+                    missCount = (byte)resolvedMisses;
+            }
+            if (resolvedMisses < 0 && missCount > 0 && LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
             {
                 bool isPhantom = false;
                 string phantomReason = "";
