@@ -434,6 +434,12 @@ function addon:ZONE_CHANGED_NEW_AREA()
 end
 
 local proxyCastTimes = {}
+-- JimsPlus (channel bar after a missed channel): a channeled spell whose target resisted or was immune
+-- never starts its channel. The combat log still reports SPELL_CAST_SUCCESS for it, which starts the
+-- channel bar below, and the channel-end signals (JP_CH:X, the caster's channel aura fading) never come,
+-- so the bar ran its full duration. The miss and the success come from the same cast, in the same frame.
+local MISSED_CHANNEL_WINDOW = 0.25
+local missedChannels = {} -- [srcGUID] = { name = spellName, time = GetTime() }
 
 function addon:CHAT_MSG_SYSTEM(message)
     local prefix = message:sub(1, 6)
@@ -757,6 +763,15 @@ function addon:COMBAT_LOG_EVENT_UNFILTERED()
         -- Channeled spells are started on SPELL_CAST_SUCCESS instead of stopped.
         -- Duration comes from our spell-ID-keyed table (exact per-rank).
         if channelCast then
+            local missed = missedChannels[srcGUID]
+            if missed then
+                missedChannels[srcGUID] = nil
+                if missed.name == spellName and GetTime() - missed.time < MISSED_CHANNEL_WINDOW then
+                    -- the cast completed but its channel never started
+                    return self:DeleteCast(srcGUID, nil, nil, true)
+                end
+            end
+
             local cast = activeTimers[srcGUID]
             if cast and (spellName == ARCANE_MISSILES or spellName == ARCANE_MISSILE) then
                 -- Arcane Missiles triggers this event for every tick so ignore after first tick has been detected
@@ -833,6 +848,20 @@ function addon:COMBAT_LOG_EVENT_UNFILTERED()
             end
         end
     elseif eventType == "SPELL_MISSED" then
+        -- (Arcane Missiles' missiles are separate casts of the channel: a resisted missile is not a missed channel.)
+        if (channeledSpells[cleuSpellId] or channeledSpellsByName[spellName]) and spellName ~= ARCANE_MISSILE then
+            local channel = activeTimers[srcGUID]
+            if channel and channel.isChanneled and channel.spellName == spellName
+                and GetTime() - channel.timeStart < MISSED_CHANNEL_WINDOW then
+                -- the cast completed but its channel never started; a later tick that misses
+                -- comes well after the start and leaves a running channel alone
+                self:DeleteCast(srcGUID, nil, nil, true)
+            elseif not (channel and channel.isChanneled) then
+                -- the success may come right after the miss: remember it
+                missedChannels[srcGUID] = { name = spellName, time = GetTime() }
+            end
+        end
+
         -- TODO: magical vs physical interrupts
         -- Auto learn if a spell is uninterruptible for NPCs by checking if an interrupt was immuned
         if missType == "IMMUNE" and playerInterrupts[spellName] then
