@@ -142,6 +142,41 @@ public partial class WorldClient
     {
         MoveUpdate moveUpdate = new MoveUpdate();
         moveUpdate.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
+        // JimsProxy (stuck moving at the start or end of a mind control): the server relays a
+        // controlled unit's movement to every client in range. A packet its previous controller sent
+        // just before a hand-over arrives after it, and the client applies a relay to the unit it is
+        // moving like to any other unit: the relayed flags replace its own and its heartbeats then
+        // carry them with no key pressed, or a relayed stop cancels a key it has just pressed. At the
+        // end of a Mind Control the priest's last packets reach the freed victim (2026-10-18:
+        // CONTROL_UPDATE(player, On) at 18:27:01.156, the relayed forward at .203, forward heartbeats
+        // with no key from .688); at the start the victim's last packet reaches the priest after it
+        // took the unit over (SET_ACTIVE_MOVER(victim) at 18:52:02.469, the relayed forward+strafe at
+        // .484, the priest's client strafing the victim out of range). A movement relay for the
+        // unit a client moves itself is stale: the player's own GUID while the player has control,
+        // or the unit the client last named in CMSG_SET_ACTIVE_MOVER. The one such relay Kronos
+        // sends outside a hand-over is a MSG_MOVE_TELEPORT for the player's own unit at every world
+        // entry (login, far teleport, battleground exit), in the same burst as the control update,
+        // after the player's own create. It is dropped with the rest: in 16 stock-build entry pairs
+        // it carried the create's position, facing, time, fall block and transport exactly, plus a
+        // ROOT the server also sends as acked SMSG_MOVE_ROOT packets, so dropping it changes nothing
+        // (19 entries on the 2026-10-20 to 10-23 fix builds agree), while a copy applied late would
+        // snap the player back, re-root the client after the UNROOT, or free its pending
+        // acknowledgements (client read, 2026-10-26).
+        var relayState = GetSession().GameState;
+        bool relayIsSelf = moveUpdate.MoverGUID == relayState.CurrentPlayerGuid;
+        if (relayIsSelf ? relayState.LastObservedHasControl
+                        : moveUpdate.MoverGUID == relayState.ClientActiveMover)
+        {
+            // Fix-working breadcrumb: DebugOutput only.
+            if (Framework.Settings.DebugOutput)
+                Framework.Logging.Log.Event("movement.mover_relay_dropped", new
+                {
+                    opcode = packet.GetUniversalOpcode(false).ToString(),
+                    unit_low = moveUpdate.MoverGUID.GetCounter(),
+                    is_self = relayIsSelf,
+                });
+            return;
+        }
         // JimsProxy (out-of-range-ghost): drop a stray movement packet for a unit we just destroyed/out-of-ranged so it can't re-ghost the unit running-in-place on the modern client. Runs BEFORE the observed-bow move edge — a destroyed unit isn't rendered, so its stray move must neither reach the client nor count as a stop edge (a dead latched shooter is retracted by the death edge; an out-of-ranged one despawns and its latch ages out via the sweep).
         if (moveUpdate.MoverGUID != GetSession().GameState.CurrentPlayerGuid &&
             GetSession().GameState.WasObjectRecentlyDestroyed(moveUpdate.MoverGUID, out long ghostAgoMs))
