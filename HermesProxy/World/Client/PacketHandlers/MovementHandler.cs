@@ -355,7 +355,8 @@ public partial class WorldClient
             // JimsProxy (speed-stuck-after-fear-while-mounted): reassert cached speed, not 7.0f; see memory.
             MoveSetSpeed runFix = new MoveSetSpeed(Opcode.SMSG_MOVE_SET_RUN_SPEED);
             runFix.MoverGUID = control.Guid;
-            runFix.MoveCounter = 0;
+            // P1-2: own counter, so the ack stays in the proxy (the server never sent this change).
+            runFix.MoveCounter = SynthMoveCounters.RegainControlRunSpeed;
             runFix.Speed = GetSession().GameState.LastKnownPlayerRunSpeed;
             // step-2 hold: ride behind the held control-update in emission order.
             if (!heldPreCreate || !GetSession().GameState.PreCreateOpHold.TryCapture(runFix))
@@ -381,6 +382,9 @@ public partial class WorldClient
 
         MoveSetFlag unroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
         unroot.MoverGUID = guid;
+        // P1-2: own counter, so the FORCE_UNROOT ack stays in the proxy. The gravity and
+        // can-fly acks need none: 1.12 has no such acks, so they are already discarded.
+        unroot.MoveCounter = SynthMoveCounters.TaxiResumeDismountUnroot;
         SendPacketToClient(unroot);
     }
 
@@ -464,14 +468,8 @@ public partial class WorldClient
             teleport.Vehicle = new();
             teleport.Vehicle.VehicleSeatIndex = moveInfo.TransportSeat;
         }
-        // JimsProxy (zep-stuck-no-move 2026-05-14, belt-and-suspenders): a real
-        // teleport from the legacy server supersedes any pending synthetic
-        // transport-clear ack we were watching for. Clear the sentinel so a future
-        // legitimate ack carrying the same MoveCounter cannot be eaten.
         if (guid == GetSession().GameState.CurrentPlayerGuid)
         {
-            GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
-
             // JimsProxy (carried-root cure, same-map variant): hearth/tele/portal
             // within a map is a MoveTeleport, not a NEW_WORLD — a stranded root
             // crosses this loading screen too. Belief-only gate (the teleport's
@@ -491,9 +489,7 @@ public partial class WorldClient
 
             // JimsProxy (camp stun lock, step 2): a SERVER-originated self teleport
             // before the login's first self create block joins the pre-create hold
-            // (R56 op set). Our own transport-clear synth doesn't route through this
-            // handler and stays unheld — it is present on every healthy login and
-            // provably not part of the lock recipe.
+            // (R56 op set).
             if (GetSession().GameState.PreCreateOpHold.TryCapture(teleport))
                 return;
         }
@@ -651,13 +647,6 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_NEW_WORLD)]
     void HandleNewWorld(WorldPacket packet)
     {
-        // JimsProxy (zep-stuck-no-move 2026-05-14, belt-and-suspenders): clear any
-        // stale synthetic transport-clear ack sentinel. If the modern client failed
-        // to ack our previous synth MoveTeleport, the sentinel would otherwise
-        // linger forever and could eat a future legitimate teleport ack that
-        // happened to carry the same MoveCounter value.
-        GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
-
         NewWorld teleport = new NewWorld();
         var previousMapId = GetSession().GameState.CurrentMapId;
         GetSession().GameState.CurrentMapId = teleport.MapID = packet.ReadUInt32();
@@ -676,8 +665,7 @@ public partial class WorldClient
         // IsFirstEnterWorld deliberately stays TRUE — the client is still doing its
         // first world entry, and the login-initial handlers gated on it (the
         // SMSG_INITIALIZE_FACTIONS TimeSyncRequest synth the client needs to be
-        // able to move, SMSG_LOGIN_SET_TIME_SPEED) may run after the merge. The
-        // deferred transport synth likewise stays in Login mode. No
+        // able to move, SMSG_LOGIN_SET_TIME_SPEED) may run after the merge. No
         // IsWaitingForWorldPortAck: the client will never ack a transfer it never
         // saw.
         var evictionHold = GetSession().GameState.LoginEvictionHold;
@@ -789,22 +777,6 @@ public partial class WorldClient
             // unroot is synthesized at the player's first destination update.
             GetSession().GameState.WorldEntryPendingCarriedRootCheck = true;
 
-            // JimsProxy (zep-stuck-low-latency-race 2026-05-17): defer the
-            // transport-clear synth until the player's first post-NEW_WORLD
-            // UpdateObject lands. Firing inline here at NEW_WORLD time worked at
-            // ~150ms latency (synth happened to arrive at the modern client AFTER
-            // the destination COMPRESSED_UPDATE_OBJECT) but raced at ~35ms (synth
-            // arrived BEFORE the destination state, the server's subsequent
-            // player-update re-attached the transport flag, and the rapid
-            // clear→re-attach wedged the modern client into a no-MOVE_START_*
-            // state when the destination position was on a transport — Grom'gol
-            // zep tower platform, Ratchet boat deck). The deferred path in
-            // UpdateHandler.ReadMovementUpdateBlock inspects moveInfo.TransportGuid
-            // and only synths when the destination has the player OFF a transport,
-            // preserving the dc39c39 original use case (cross-continent land
-            // destinations) without breaking the on-transport destinations.
-            GetSession().GameState.PendingDeferredTransportSynth = DeferredTransportSynthMode.NewWorld;
-
             if (teleport.MapID > 1)
             {
                 UpdateLastInstance instance = new();
@@ -819,62 +791,6 @@ public partial class WorldClient
                 resume.Reason = 1;
                 SendPacketToClient(resume);
             }
-        }
-    }
-
-    // JimsProxy (zep-stuck-low-latency-race 2026-05-17): synthesizes a player-targeted
-    // SMSG_MOVE_TELEPORT with TransportGUID=default to force the modern client to clear
-    // any stale MOVEMENTFLAG_ONTRANSPORT carried across from the source map's transport.
-    // Fired from the deferred path in UpdateHandler.ReadMovementUpdateBlock only when the
-    // destination's player UpdateObject confirms the player is NOT on a transport (zep
-    // tower / boat deck) at the destination. The MoveCounter sentinel is dropped by the
-    // server-side HandleMoveTeleportAck so the legacy server never sees the spurious ack.
-    internal void FireDeferredTransportClearSynth(WowGuid128 playerGuid, Vector3 position, float orientation, string mode)
-    {
-        if (playerGuid.IsEmpty())
-            return;
-
-        const uint SyntheticTeleportAckSentinel = 0xFFFFFFFFu;
-        MoveTeleport transportClear = new MoveTeleport();
-        transportClear.MoverGUID = playerGuid;
-        transportClear.MoveCounter = SyntheticTeleportAckSentinel;
-        transportClear.Position = position;
-        transportClear.Orientation = orientation;
-        transportClear.PreloadWorld = 0;
-        transportClear.TransportGUID = default;
-        // Leave transportClear.Vehicle at its default null! sentinel — assigning
-        // null trips the non-nullable-ref-type check; the existing MoveTeleport
-        // path uses this same pattern for non-vehicle teleports.
-
-        GetSession().GameState.PendingSyntheticTransportClearAckCounter =
-            SyntheticTeleportAckSentinel;
-
-        Framework.Logging.Log.Event("movement.transport_clear.synthesized", new
-        {
-            map_id = GetSession().GameState.CurrentMapId,
-            player_low = playerGuid.GetCounter(),
-            position = $"{position.X:F2},{position.Y:F2},{position.Z:F2}",
-            deferred = true,
-            mode = mode,
-        });
-
-        try
-        {
-            SendPacketToClient(transportClear);
-            Framework.Logging.Log.Event("movement.transport_clear.send_completed", new
-            {
-                player_low = playerGuid.GetCounter(),
-                sentinel_counter = SyntheticTeleportAckSentinel,
-            });
-        }
-        catch (System.Exception ex)
-        {
-            Framework.Logging.Log.Event("movement.transport_clear.send_failed", new
-            {
-                player_low = playerGuid.GetCounter(),
-                exception_type = ex.GetType().Name,
-                exception_message = ex.Message,
-            });
         }
     }
 
@@ -1000,6 +916,18 @@ public partial class WorldClient
         speed.MoveInfo.ValidateMovementInfo();
         speed.Speed = packet.ReadFloat();
         SendPacketToClient(speed);
+
+        // JimsProxy (user report 2026-10-17: mind-controlled while mounted, Will of the Forsaken, a second at
+        // mount speed, then a disconnect): a speed change made while the player is charmed goes to the
+        // charmer as the forced form, and the player gets it only in this broadcast form, after control is
+        // back (2026-10-18 18:26:40, 0.2 s after the Will). Without it the cache the control-regain reassert
+        // reads keeps the mounted speed, and the next regain re-sends that to an unmounted player (with it,
+        // the 18:27:01 regain re-sent 7.00). Feed the cache from here too.
+        if (universalOpcode == Opcode.SMSG_MOVE_UPDATE_RUN_SPEED &&
+            speed.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            GetSession().GameState.LastKnownPlayerRunSpeed = speed.Speed;
+        }
 
         // Convenience in vanilla to use SwimSpeed as FlySpeed
         if (universalOpcode is Opcode.SMSG_MOVE_UPDATE_SWIM_SPEED
@@ -1657,6 +1585,8 @@ public partial class WorldClient
 
                     MoveSetFlag unroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
                     unroot.MoverGUID = playerGuid;
+                    // P1-2: own counter, so the FORCE_UNROOT ack stays in the proxy (see SendTaxiDismountRestore).
+                    unroot.MoveCounter = SynthMoveCounters.TaxiDismountUnroot;
                     capturedClient.SendPacketToClient(unroot);
 
                     System.Threading.Volatile.Write(ref capturedSession.GameState.IsInTaxiFlight, false);

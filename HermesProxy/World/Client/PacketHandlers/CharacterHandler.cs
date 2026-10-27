@@ -357,20 +357,6 @@ public partial class WorldClient
             map_id = verify.MapID,
         });
 
-        // JimsProxy (zep-stuck-login-turn-gate 2026-05-17): when the player logs
-        // in already on a transport (zep/boat in flight), the modern 1.14 client
-        // gates turn-input — CMSG_MOVE_SET_FACING / START_TURN_* never fire until
-        // the client receives a teleport-tier movement reset. World transfers
-        // (NEW_WORLD) provide that reset naturally via the map-load. Plain login
-        // doesn't. Arm the deferred-synth path with mode=Login so the synth
-        // fires AFTER the player's first UpdateObject lands (and so we have
-        // current transport state to attach to). The synth body uses
-        // TransportGUID=default; the server's natural player-update re-attaches
-        // the legitimate transport right after, but the brief off-transport
-        // pulse is what releases the client's turn-input gate.
-        GetSession().GameState.PendingDeferredTransportSynth =
-            DeferredTransportSynthMode.Login;
-
         LoadCUFProfiles cuf = new();
         cuf.Data = GetSession().AccountDataMgr.LoadCUFProfiles();
         SendPacketToClient(cuf);
