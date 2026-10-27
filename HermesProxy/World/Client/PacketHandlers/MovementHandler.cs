@@ -151,13 +151,18 @@ public partial class WorldClient
         // CONTROL_UPDATE(player, On) at 18:27:01.156, the relayed forward at .203, forward heartbeats
         // with no key from .688); at the start the victim's last packet reaches the priest after it
         // took the unit over (SET_ACTIVE_MOVER(victim) at 18:52:02.469, the relayed forward+strafe at
-        // .484, the priest's client strafing the victim out of range). The server relays nothing for
-        // the unit a client moves itself, so such a packet is stale: the player's own GUID while the
-        // player has control, or the unit the client last named in CMSG_SET_ACTIVE_MOVER.
+        // .484, the priest's client strafing the victim out of range). A movement relay for the
+        // unit a client moves itself is stale: the player's own GUID while the player has control,
+        // or the unit the client last named in CMSG_SET_ACTIVE_MOVER. MSG_MOVE_TELEPORT is left
+        // alone: Kronos relays one to the player for the player's own unit at every world entry
+        // (login, far teleport, battleground exit; 19 in the 2026-10-20 to 10-23 logs, in the same
+        // burst as the control update, after the player's own create), and a hand-over never hands
+        // the freed unit a stale teleport, so the teleport reaches the client as it always did.
         var relayState = GetSession().GameState;
         bool relayIsSelf = moveUpdate.MoverGUID == relayState.CurrentPlayerGuid;
-        if (relayIsSelf ? relayState.LastObservedHasControl
-                        : moveUpdate.MoverGUID == relayState.ClientActiveMover)
+        if (packet.GetUniversalOpcode(false) != Opcode.MSG_MOVE_TELEPORT &&
+            (relayIsSelf ? relayState.LastObservedHasControl
+                         : moveUpdate.MoverGUID == relayState.ClientActiveMover))
         {
             // Fix-working breadcrumb: DebugOutput only.
             if (Framework.Settings.DebugOutput)

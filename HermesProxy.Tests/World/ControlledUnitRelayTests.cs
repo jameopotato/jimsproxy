@@ -64,6 +64,14 @@ public class ControlledUnitRelayTests
         new MovementInfo { Flags = 0x1 }.WriteMovementInfoLegacy(w);
     });
 
+    // A relayed 1.12 MSG_MOVE_TELEPORT: the same shape, which Kronos sends to the player for the
+    // player's own unit at every world entry.
+    private static WorldPacket RelayedTeleport(WowGuid64 mover) => Legacy(Opcode.MSG_MOVE_TELEPORT, w =>
+    {
+        w.WritePackedGuid(mover);
+        new MovementInfo().WriteMovementInfoLegacy(w);
+    });
+
     private static WorldPacket PlayerControl(bool on) => Legacy(Opcode.SMSG_CONTROL_UPDATE, w =>
     {
         w.WritePackedGuid(LegacyPlayer);
@@ -152,6 +160,31 @@ public class ControlledUnitRelayTests
         h.Dispatch(RelayedForward(OtherPlayer));
 
         Assert.Equal(2, h.MoveUpdates);
+    }
+
+    // Kronos relays a MSG_MOVE_TELEPORT to the player for the player's own unit at every world entry
+    // (login, far teleport, battleground exit), after the player's own create. It is not a stale
+    // movement relay and reaches the client as it always did.
+    [Fact]
+    public void OwnTeleportRelay_WhileThePlayerHasControl_IsForwarded()
+    {
+        var h = new ClientHarness();
+        h.State.LastObservedHasControl = true;
+
+        h.Dispatch(RelayedTeleport(LegacyPlayer));
+
+        Assert.Equal(1, h.MoveUpdates);
+    }
+
+    [Fact]
+    public void TeleportRelayForTheUnitTheClientMoves_IsForwarded()
+    {
+        var h = new ClientHarness();
+        h.State.ClientActiveMover = OtherPlayer.To128(h.State);
+
+        h.Dispatch(RelayedTeleport(OtherPlayer));
+
+        Assert.Equal(1, h.MoveUpdates);
     }
 
     // A unit the client does not move is never affected, whoever the client moves.
