@@ -13,6 +13,14 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
+## 2026-10-15 — Reply to every NoData bnet request so the client's login token closes (PR #552)
+
+**Issue:** The bnet dispatcher sent nothing when a handler with no response parameter returned Ok. That is right for the one-way methods (ConnectionService.KeepAlive, RequestDisconnect) and wrong for methods whose response type is NoData, where the client waits for a reply: AuthenticationService.VerifyWebCredentials and PresenceService Subscribe, Unsubscribe, Update and BatchUnsubscribe returned Ok and sent nothing. The open VerifyWebCredentials token meant a client that stayed on the realm list after login, with no realm joined, hit its request timeout about 45 seconds after login and crashed; joining a realm inside that window hid it.
+
+**Change:** `BnetServer/Services/Services/Authentication.cs`, `Presence.cs`: the five handlers declare a `NoData response` parameter, so the dispatcher's reply path sends an empty Ok and closes the token (the same reply the reference emulator sends). `BnetServer/Services/BnetServices.ServiceManager.cs`: the silent branch documents the one-way rule. One-way methods are unchanged.
+
+**Verification:** `BnetServiceManagerResponseTests` (6): the five NoData cases fail on the unfixed handlers and pass with the fix, KeepAlive stays silent throughout, VerifyWebCredentials sends OnLogonComplete and then the Ok reply. Field (Kronos, 2026-10-15, same box and hour, auto-login, no realm joined): stock 5.2.2-beta.1 crashed the client 45 s after login on the realm list; this build kept it there past four minutes.
+
 ## 2026-10-13 — Party buff timers by provenance; known starts served across leave, return and relog (#513 part A, PR #547)
 
 **Issue:** The 1.12 server never tells the proxy how long another unit's buff has left. For a buff first seen already running the proxy filled Duration and Remaining with the spell's full CSV value, recorded that guess as the expiry and served it again later with the Duration flag set, so a 25-minute-old Fortitude showed 30:00 after a relog, a destroy and re-create, or an out-of-range trip (#513). Next to it: a seen recast re-sent the previous application's decayed Remaining instead of the full duration, stack and charge re-emits re-sent the last values undecayed, and the out-of-range leave kept the per-slot duration cache alive so it was read before the durable map.
