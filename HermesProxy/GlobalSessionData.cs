@@ -141,6 +141,10 @@ public sealed class GameSessionData
         get => _clientActiveMover?.Value ?? default;
         set => _clientActiveMover = new StrongBox<WowGuid128>(value);
     }
+
+    // JimsProxy (mount speed kept after Will of the Forsaken): orders a controlled unit's speed
+    // acknowledgement ahead of the client's release of that unit (see ControlReleaseAckOrder).
+    public readonly ControlReleaseAckOrder ReleaseAckOrder = new();
     // JimsProxy (feared-while-sitting, issue #479): the local player's stand state
     // (UNIT_FIELD_BYTES_1 byte 0) as last written by the legacy server, read from the
     // legacy field cache. Gate input for the synthesized stand-up on incoming fear.
