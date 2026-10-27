@@ -1552,6 +1552,11 @@ public sealed class GameSessionData
     // is merged against state the client no longer has, and the previous
     // buff bar lingers stale until reload.
     public HashSet<WowGuid128> NeedsFullAuraRefresh = [];
+    // JimsProxy (aura re-send after a loading screen): set when the session player's create is
+    // translated, cleared by CMSG_LOADING_SCREEN_NOTIFY(Showing = 1). Read at Showing = 0: true
+    // means the create inside this loading screen already gave the client the player's auras.
+    // Written on the server-packet thread, read and cleared on the client-packet thread.
+    public volatile bool SelfCreatedSinceLoadingScreenShown;
     // JimsProxy (synth-spell-start-for-autoshot): timestamp of the most recent
     // natural SMSG_SPELL_START forwarded for the local player's ranged auto
     // attack (Auto Shot 75 / Shoot 5019). The 1.12 server only emits SPELL_START
