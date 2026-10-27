@@ -3222,7 +3222,9 @@ public partial class WorldClient
                 byte[] missSection = packet.ReadBytes((uint)packet.BytesRemaining);
                 packet.Skip(-missSection.Length);
                 resolvedMisses = VanillaSpellGoMissCount.Resolve(missSection, missCount, flags);
-                if (resolvedMisses >= 0 && resolvedMisses != missCount)
+                // Fix-working breadcrumb (the phantom byte resolving to 0, a one-miss byte 2 to 1):
+                // DebugOutput only. A shape nothing fits still logs phantom_misscount_skipped below.
+                if (resolvedMisses >= 0 && resolvedMisses != missCount && Framework.Settings.DebugOutput)
                 {
                     Log.Event("spell.spell_go.misscount_resolved", new
                     {
