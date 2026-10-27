@@ -754,6 +754,54 @@ public sealed class GameSessionData
     public uint CurrentGuildNumAccounts;
     public WowGuid128 CurrentInteractedWithNPC;
     public WowGuid128 CurrentInteractedWithGO;
+
+    // JimsProxy: the last quest-giver greeting (SMSG_QUEST_GIVER_QUEST_LIST_MESSAGE) relayed to the
+    // client, kept for the current NPC interaction. After a turn-in reached through that greeting the
+    // 1.14 client leaves the reward page open unless the completion carries LaunchQuest, so the
+    // completion translator asks whether the greeting listed anything besides the completed quest
+    // (see WorldClient.HandleQuestGiverQuestComplete). The record is replaced as a whole: written from
+    // the WorldClient thread (list) and the WorldSocket thread (hello), read from the WorldClient thread.
+    private sealed record QuestGreeting(WowGuid128 Giver, uint[] QuestIds);
+    private volatile QuestGreeting? _questGreeting;
+
+    public void RecordQuestGreeting(WowGuid128 giver, IEnumerable<uint> questIds)
+    {
+        _questGreeting = new QuestGreeting(giver, questIds.ToArray());
+    }
+
+    // A forwarded CMSG_QUEST_GIVER_HELLO starts a new interaction; whatever greeting the server answers
+    // with is recorded again by the list handler.
+    public void ClearQuestGreeting()
+    {
+        _questGreeting = null;
+    }
+
+    public bool QuestGreetingHasOtherEntries(WowGuid128 giver, uint completedQuestId)
+    {
+        QuestGreeting? greeting = _questGreeting;
+        if (greeting == null || giver == default || greeting.Giver != giver)
+            return false;
+        foreach (uint questId in greeting.QuestIds)
+            if (questId != completedQuestId)
+                return true;
+        return false;
+    }
+
+    // Launch bits for SMSG_QUEST_GIVER_QUEST_COMPLETE, in the client's own priority order: a known
+    // follow-up quest keeps LaunchQuest (the next quest's details follow), a gossip NPC gets
+    // LaunchGossip (the gossip page follows), and a greeting that still lists other quests gets
+    // LaunchQuest so the client re-asks the NPC and the remaining list follows, as a native server
+    // does for every quest giver. Otherwise both bits stay clear and the client closes the page itself.
+    internal static (bool launchQuest, bool launchGossip) DecideQuestCompleteLaunch(bool hasFollowUpQuest, bool npcHasGossipFlag, bool greetingHasOtherEntries)
+    {
+        if (hasFollowUpQuest)
+            return (true, false);
+        if (npcHasGossipFlag)
+            return (false, true);
+        if (greetingHasOtherEntries)
+            return (true, false);
+        return (false, false);
+    }
     // JimsProxy: Auctionator-style Full Scan synthesis state. CMSG_AUCTION_REPLICATE_ITEMS
     // has no legacy 1.12 equivalent; the proxy walks pages internally via
     // CMSG_AUCTION_LIST_ITEMS at the canonical 6s cooldown and assembles rows

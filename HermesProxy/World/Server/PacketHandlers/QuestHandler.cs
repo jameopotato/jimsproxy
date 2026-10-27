@@ -152,6 +152,9 @@ public partial class WorldSocket
     {
         if (TryCoalesceQuestCmsg(Opcode.CMSG_QUEST_GIVER_HELLO, hello.QuestGiverGUID, 0))
             return;
+        // JimsProxy: a forwarded hello starts a new interaction; the greeting the legacy server
+        // answers with is recorded again (WorldClient.HandleQuestGiverQuestListMessage).
+        GetSession().GameState.ClearQuestGreeting();
         WorldPacket packet = new WorldPacket(Opcode.CMSG_QUEST_GIVER_HELLO);
         packet.WriteGuid(hello.QuestGiverGUID.To64());
         SendPacketToServer(packet);
