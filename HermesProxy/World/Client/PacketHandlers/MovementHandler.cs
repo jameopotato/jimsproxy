@@ -195,6 +195,7 @@ public partial class WorldClient
             IsAutoRepeatStoppingMove(packet.GetUniversalOpcode(false)))
         {
             RetractObservedShooterOnStop(moveUpdate.MoverGUID);
+            StopObservedLoopingEmoteOnMove(moveUpdate.MoverGUID, packet.GetUniversalOpcode(false));
         }
         moveUpdate.MoveInfo = new();
         moveUpdate.MoveInfo.ReadMovementInfoLegacy(packet, GetSession().GameState);
@@ -205,6 +206,32 @@ public partial class WorldClient
         moveUpdate.MoveInfo.Flags = (uint)(((MovementFlagWotLK)moveUpdate.MoveInfo.Flags).CastFlags<MovementFlagModern>());
         moveUpdate.MoveInfo.ValidateMovementInfo();
         SendPacketToClient(moveUpdate);
+    }
+
+    // JimsProxy (another player stuck dancing, 2026-10-17 live Stratholme): Kronos sends /dance as
+    // SMSG_EMOTE 10 only, with no stop when the dancer moves, and on the client another unit's dance
+    // keeps playing through its movement. A party member who danced at 22:50:14 kept dancing whenever
+    // idle on the owner's client until 23:16:21. On the same translational starts as the bow retract,
+    // the client gets SMSG_EMOTE 0 for the unit first, which ends the dance. The session player's own
+    // dance is ended the same way when the client sends its own move start (World/Server
+    // MovementHandler, LastLoopingEmoteId).
+    private void StopObservedLoopingEmoteOnMove(WowGuid128 mover, Opcode opcode)
+    {
+        var state = GetSession().GameState;
+        if (!Framework.Settings.ObservedDanceStopSynth || !state.ObservedLoopingEmotes.Remove(mover, out uint loopingEmoteId))
+            return;
+        EmoteMessage stopEmote = new EmoteMessage();
+        stopEmote.Guid = mover;
+        stopEmote.EmoteID = 0; // EMOTE_ONESHOT_NONE: ends the loop
+        SendPacketToClient(stopEmote);
+        // Fix-working breadcrumb: DebugOutput only.
+        if (Framework.Settings.DebugOutput)
+            Framework.Logging.Log.Event("emote.loop.broken_by_observed_move", new
+            {
+                unit_low = mover.GetCounter(),
+                last_emote_id = loopingEmoteId,
+                opcode = opcode.ToString(),
+            });
     }
 
     // JimsProxy (observed-bow retract): translational-start moves mean the mover left its firing stance (auto-shot requires standing still); turn/facing/heartbeat/stop are excluded so a shooter that only turns to track its target isn't falsely retracted.

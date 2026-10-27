@@ -163,6 +163,11 @@ public sealed class GameSessionData
     // loops indefinitely. Track the last looping emote so HandlePlayerMove can synthesize
     // a stop SMSG_EMOTE on the first movement-start packet.
     public uint LastLoopingEmoteId; // 0 means no active loop
+    // JimsProxy (another player stuck dancing): other players whose looping emote this client is
+    // still playing, with the emote id. Set by SMSG_EMOTE, cleared by the stop sent on their move start,
+    // by a server SMSG_EMOTE 0, and when they leave this client's view (the dance ends there too).
+    // Server-packet thread only.
+    public readonly Dictionary<WowGuid128, uint> ObservedLoopingEmotes = new();
     public long LastLoopingEmoteTickMs;
     // JimsProxy (#244 emote channel guard): the local player's active channel
     // window, tracked from MSG_CHANNEL_START / MSG_CHANNEL_UPDATE (vanilla
