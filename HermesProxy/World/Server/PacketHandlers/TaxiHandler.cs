@@ -43,6 +43,7 @@ public partial class WorldSocket
             packet.WriteGuid(taxi.FlightMaster.To64());
             packet.WriteUInt32(fromNode);
             packet.WriteUInt32(taxi.Node);
+            DismountBeforeTaxiActivation(taxi);
             SendPacketToServer(packet);
             Log.Event("taxi.activate_requested", new
             {
@@ -75,6 +76,7 @@ public partial class WorldSocket
             packet.WriteUInt32((uint)path.Count); // node count
             foreach (uint itr in path)
                 packet.WriteUInt32(itr);
+            DismountBeforeTaxiActivation(taxi);
             SendPacketToServer(packet);
             Log.Event("taxi.activate_requested", new
             {
@@ -86,6 +88,32 @@ public partial class WorldSocket
             });
         }
         GetSession().GameState.IsWaitingForTaxiStart = true;
+    }
+
+    // JimsProxy: the 1.14 client never dismounts for a flight. With its auto-dismount option
+    // on (the default) it sends the activation while mounted and expects the server to
+    // dismount it, as a modern server does on activation. The 1.12 server refuses a mounted
+    // player instead (SMSG_ACTIVATE_TAXI_REPLY 8, "already mounted") and leaves the taxi map
+    // open, so the player had to dismount by hand and click again (14 of 22 mounted
+    // activations in the captures, the only refused flights in the history). Called right
+    // before an activation is forwarded, on the same server connection, so the server reads
+    // the dismount before the activation; a click that forwards nothing (no route found)
+    // dismounts nobody, and unmounted players send nothing extra.
+    private void DismountBeforeTaxiActivation(ActivateTaxi taxi)
+    {
+        if (!LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180) || !IsPlayerMountedPerCache())
+            return;
+        List<uint> dismounted = CancelLegacyMountAuras();
+        // Fix-working breadcrumb: DebugOutput only (taxi.activate_requested already records every activation).
+        if (dismounted.Count > 0 && Framework.Settings.DebugOutput)
+        {
+            Log.Event("taxi.dismount_before_activate", new
+            {
+                flight_master = taxi.FlightMaster.ToString(),
+                to_node = taxi.Node,
+                mount_spell_ids = dismounted,
+            });
+        }
     }
 
     // JimsProxy (taxi-flight-robustness): vanilla 1.12 has no early-landing concept —
