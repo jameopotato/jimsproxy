@@ -37,6 +37,14 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 **Verification:** Lua 5.1 parse (luaparse) of the patched file and of beta's copy. Field (Kronos PTR, two boxes, 2026-10-18): before, at 21:54:49 the victim's target bar showed the priest channeling after an immune Mind Control; with this change the immune casts at 22:23:14, 22:33:50 and 22:34:40 closed the bar with the cast and showed no channel. Confirmed by the owner.
 
+## 2026-10-18 — JimsPlus: a landed Mind Control no longer shows as Failed
+
+**Issue:** When a priest's Mind Control landed, the JimsPlus cast bar for the priest could show "Failed" and vanish while the priest was channeling. JimsPlus fails a unit's cast when a crowd-control aura lands on it, and Mind Control is on that list. On a 1.12 server a landed Mind Control also puts a "Mind Control" aura on the priest itself, the channel's own aura, and the proxy sends it with no caster, so it read as a crowd control on the priest (2026-10-18, Kronos PTR: the GO at 22:22:21.779 started the channel bar, and the update 1 ms later carried the Mind Control aura on both the victim and the priest).
+
+**Change:** `Addons/JimsPlus/castbars/CastBars.lua` (SPELL_AURA_APPLIED): a crowd-control aura with the same name as the unit's current cast, applied by that unit or with no caster, is the cast's own aura and leaves the bar alone. A crowd control from another caster still fails the cast.
+
+**Verification:** Lua 5.1 parse (luaparse) of the patched file. Field (Kronos PTR, two boxes, 2026-10-18): before, the Mind Control that landed at 22:22:21 showed Failed on the victim's target bar while the priest channeled; with this change the ones that landed at 22:33:29, 22:34:10 and 22:34:52 showed the priest channeling until each ended. Confirmed by the owner.
+
 ## 2026-10-13 — Party buff timers by provenance; known starts served across leave, return and relog (#513 part A, PR #547)
 
 **Issue:** The 1.12 server never tells the proxy how long another unit's buff has left. For a buff first seen already running the proxy filled Duration and Remaining with the spell's full CSV value, recorded that guess as the expiry and served it again later with the Duration flag set, so a 25-minute-old Fortitude showed 30:00 after a relog, a destroy and re-create, or an out-of-range trip (#513). Next to it: a seen recast re-sent the previous application's decayed Remaining instead of the full duration, stack and charge re-emits re-sent the last values undecayed, and the out-of-range leave kept the per-slot duration cache alive so it was read before the durable map.
