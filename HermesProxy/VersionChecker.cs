@@ -899,7 +899,12 @@ public static class ModernVersion
         }
     }
 
-    public static uint GetGameObjectStateAnimId()
+    // The "no state animation" id a native server writes on every game object AND every
+    // unit/player create for this client build. It is the build's animation count, one past
+    // the last animation id; any other value (including an omitted field, which the client
+    // reads as 0 = Stand) plays as a looping state animation over the unit's normal idle.
+    // JimsProxy (#135): applied to units since the stealth-idle fix; was game objects only.
+    public static uint GetEmptyStateAnimId()
     {
         if (IsVersion(1, 14, 0) || IsVersion(2, 5, 2))
             return 1556;

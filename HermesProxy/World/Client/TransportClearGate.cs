@@ -6,7 +6,7 @@ namespace HermesProxy.World.Client;
 /// JimsProxy (#329/#331/#332 transport-clear wedge): pure decision for whether the deferred
 /// transport-clear synth should fire, extracted so the source/destination truth table is
 /// unit-testable (see <c>HermesProxy.Tests/World/TransportClearGateTests</c>) and decoupled from
-/// the <c>DiagLastObservedPlayerTransportGuid</c> field it happens to read at the call site.
+/// the <c>LastObservedPlayerTransportGuid</c> field it happens to read at the call site.
 ///
 /// The fabricated transport-clear (a MoveTeleport with TransportGUID=empty) is only legitimate
 /// when the player is leaving a transport whose attach the destination UpdateObject lost. Firing

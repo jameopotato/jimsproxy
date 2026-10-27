@@ -380,10 +380,13 @@ public sealed class GameSessionData
     // can feed malformed-packet kick counters on Kronos). 0 means none pending.
     public uint PendingSyntheticTransportClearAckCounter;
 
-    // JimsProxy (zep-relog-diag 2026-05-15): tracks the player's last-observed
-    // TransportGuid across UpdateObject reads so the diagnostic in
-    // UpdateHandler.ReadMovementUpdateBlock fires only on state transitions.
-    public WowGuid128? DiagLastObservedPlayerTransportGuid;
+    // JimsProxy (zep-relog-diag 2026-05-15, load-bearing since #404): the player's
+    // last-observed TransportGuid. Written from the player's own UpdateObject block
+    // (UpdateHandler.ReadMovementUpdateBlock, where it also gates the transport_state
+    // diagnostic to state transitions) and from every own movement packet
+    // (Server MovementHandler.HandlePlayerMove). Read by the TransportClearGate call site
+    // as the gate's source observation; null means never observed.
+    public WowGuid128? LastObservedPlayerTransportGuid;
 
     // JimsProxy (zep-stuck-low-latency-race 2026-05-17): deferred-synth mode.
     // HandleNewWorld / HandleLoginVerifyWorld set this and defer the transport-
@@ -550,6 +553,81 @@ public sealed class GameSessionData
     // hasn't seen refreshed — these snapshots get re-attached to forwarded updates.
     public Dictionary<WowGuid128, World.Server.Packets.PartyMemberPetStats> PartyPetStats = new();
     public Dictionary<WowGuid128, ushort> PartyMemberLevels = new();
+    // JimsProxy (#513 follow-up, out-of-view party buff lists): the 48 aura slots of each party
+    // member (and of each member's pet, keyed by the MEMBER guid) as last reported by the legacy
+    // server's slot-indexed party stats, primed from the unit's own aura fields when it leaves
+    // view. The 1.14 client replaces a member's list with every aura-bearing party state, so the
+    // proxy emits the complete list from here instead of the raw delta. Written and read on the
+    // WorldClient receive thread only. See World.Client.PartyAuraSlotTable.
+    public Dictionary<WowGuid128, uint[]> PartyMemberAuraSlots = new();
+    public Dictionary<WowGuid128, uint[]> PartyPetAuraSlots = new();
+
+    // JimsProxy (#513, rules 2 and 5): per member, when their last full party state arrived
+    // and which (modern) spell ids it listed, so a partial that merely restates that list
+    // right after it is not mistaken for a fresh application; and the last online status
+    // seen, so the offline edge can drop their recorded expiries.
+    public Dictionary<WowGuid128, (long Tick, HashSet<uint> Spells)> PartyMemberLastFullAuras = new();
+    public Dictionary<WowGuid128, bool> PartyMemberLastOnline = new();
+
+    public uint[] GetOrAddPartyAuraSlots(Dictionary<WowGuid128, uint[]> store, WowGuid128 key)
+    {
+        if (!store.TryGetValue(key, out var table))
+        {
+            table = World.Client.PartyAuraSlotTable.NewTable();
+            store[key] = table;
+        }
+        return table;
+    }
+
+    // True when the guid is a member of either current group (slot 1 is the battleground raid).
+    public bool IsGroupMemberGuid(WowGuid128 guid)
+    {
+        foreach (var group in CurrentGroups)
+        {
+            if (group == null)
+                continue;
+            foreach (var member in group.PlayerList)
+                if (member.GUID == guid)
+                    return true;
+        }
+        return false;
+    }
+
+    // The party member whose last known pet is this guid, or null.
+    public WowGuid128? GroupMemberOwningPet(WowGuid128 petGuid)
+    {
+        if (petGuid == default)
+            return null;
+        foreach (var kv in PartyPetStats)
+            if (kv.Value.NewPetGuid == petGuid)
+                return kv.Key;
+        return null;
+    }
+
+    // Drop the aura slot tables of anyone who is no longer in either group (called when a
+    // group list arrives or a group is destroyed), so a member who rejoins starts clean.
+    public void PrunePartyAuraSlots()
+    {
+        var stale = new List<WowGuid128>();
+        foreach (var key in PartyMemberAuraSlots.Keys)
+            if (!IsGroupMemberGuid(key))
+                stale.Add(key);
+        foreach (var key in stale)
+        {
+            PartyMemberAuraSlots.Remove(key);
+            PartyPetAuraSlots.Remove(key);
+            PartyMemberLastFullAuras.Remove(key);
+        }
+        var staleOnline = new List<WowGuid128>();
+        foreach (var key in PartyMemberLastOnline.Keys)
+            if (!IsGroupMemberGuid(key))
+                staleOnline.Add(key);
+        foreach (var key in staleOnline)
+        {
+            PartyMemberLastOnline.Remove(key);
+            PartyMemberOfflineSince.Remove(key);
+        }
+    }
     // Tracks quest ids the proxy has issued its own CMSG_QUERY_QUEST_INFO for.
     public HashSet<uint> ProxyIssuedQuestInfoQueries = new();
     // JimsProxy: client-originated CMSG_QUERY_QUEST_INFO gating. Questie's filter-toggle
@@ -701,6 +779,20 @@ public sealed class GameSessionData
     public long AuctionOwnerWalkLastFinalizedTickMs;
     public uint LastWhoRequestId;
     public WowGuid128 CurrentPetGuid;
+    // JimsProxy pet-bar lock (opt-in, JimsPlus): when true, the proxy keeps the pet's command
+    // and stance buttons in place on every forwarded SMSG_PET_SPELLS and refuses a client write
+    // that would displace one. Default false = the proxy does nothing to any pet bar, so a
+    // player who hasn't turned the lock on in JimsPlus is unaffected. Set per session over the
+    // JP "P\tLOCK\t<0|1>" sideband; JimsPlus re-asserts it on every login.
+    public bool PetControlLockEnabled;
+    // The last SMSG_PET_SPELLS as forwarded to the client (control slots enforced when the lock
+    // is on), its ability buttons kept current from every forwarded castable or empty
+    // CMSG_PET_SET_ACTION write; null
+    // while there is no pet. Written on the legacy read path, read on the modern one; both under
+    // PetBarLock. Kept even when the lock is off, so a one-shot "/jp petreset" can still repaint.
+    public PetSpells? LastPetSpells;
+    public long LastPetSpellsTick;
+    public readonly Lock PetBarLock = new();
     public WowGuid128 CurrentSelection;
     public WowGuid64 CurrentAttackTarget;        // active CMSG_ATTACK_SWING victim, cleared on ATTACK_STOP/CANCEL_COMBAT
     public bool WaitingForAttackStart;           // true between CMSG_ATTACK_SWING and SMSG_ATTACK_START
@@ -1347,12 +1439,23 @@ public sealed class GameSessionData
     // been sent to the client — the proxy-layer equivalent of the servers' own
     // SendEnchantmentDurations-after-add-to-map ordering.
     public List<(WowGuid128 ItemGuid, uint ModernSlot, uint DurationSeconds)>? PendingEnchantTimeReemits;
+    // JimsProxy (item-time-at-login, #539): the same rule for SMSG_ITEM_TIME_UPDATE. The
+    // server sends one per timed item at login; Kronos front-loads them before the item
+    // creates and the client discards a time update for a guid it has not constructed.
+    // Seconds plus receipt tick per item guid, stashed when the push arrives pre-create,
+    // consumed when the item's create is translated and re-emitted after that create has
+    // been sent (PendingItemTimeReemits). A bank item's entry waits until the bank is
+    // opened. Not carried across sessions: each login gets fresh pushes.
+    public Dictionary<WowGuid128, (uint Seconds, int Tick)> PendingItemTimeUpdates = [];
+    public List<(WowGuid128 ItemGuid, uint DurationSeconds)>? PendingItemTimeReemits;
     public Dictionary<WowGuid128, Dictionary<byte, WowGuid128>> UnitAuraCaster = [];
-    // Wall-clock aura expiry per (unit, spell). Unlike the per-slot caches above this
-    // survives unit destroys AND relogs (carried over in CreateNewGameSessionData), so a
-    // buff re-seen on a group member resumes its real remaining time instead of
-    // restarting at full duration (PallyPower blessing timers after relog/stealth).
-    public Dictionary<(WowGuid128, int), long> UnitAuraExpiryTick = [];
+    // Wall-clock aura expiry per (unit, spell), with how the proxy learned it (#513). Unlike
+    // the per-slot caches above this survives unit destroys AND relogs (carried over in
+    // CreateNewGameSessionData), so a buff re-seen on a group member resumes its real
+    // remaining time instead of restarting at full duration (PallyPower blessing timers
+    // after relog/stealth). Only KNOWN values are recorded here; a guessed remaining time is
+    // never written (see World.Client.AuraTimerProvenance). Keys use the modern spell id.
+    public Dictionary<(WowGuid128, int), World.Client.AuraExpiryRecord> UnitAuraExpiry = [];
 
     // MIRASU (stack-aura-decrement): last AuraDataInfo emitted for each (unit, slot).
     // Used to detect AURAAPPLICATIONS-quad-only updates where a single slot's app
@@ -1576,7 +1679,7 @@ public sealed class GameSessionData
         self.IgnoredPlayers = previous.IgnoredPlayers;
         // Buff expiries are wall-clock facts about other units — a /camp doesn't
         // change when the rogue's blessing runs out.
-        self.UnitAuraExpiryTick = previous.UnitAuraExpiryTick;
+        self.UnitAuraExpiry = previous.UnitAuraExpiry;
     }
 
     /// <summary>
@@ -1957,6 +2060,15 @@ public sealed class GameSessionData
             return GameData.IsAllianceRace(cache.RaceId);
         return false;
     }
+    // JimsProxy (#504): map id of the last battleground-map fallback logged, so the event fires once
+    // per map instead of on every call (this method runs on chat, party and threat paths).
+    private uint _inBattlegroundFallbackLoggedMap;
+    // JimsProxy (#504): the battleground map whose queue slot just ENDED while the character was
+    // still standing on it. Between that status and the teleport out, the server restores the home
+    // group (its group list arrives on the battleground map), so the map fallback must not count
+    // that window as "in the battleground" or a home raid would be filed in the battleground slot.
+    private uint _battlegroundExitedMapId;
+
     public bool IsInBattleground()
     {
         if (CurrentMapId == null)
@@ -1968,23 +2080,57 @@ public sealed class GameSessionData
             return false;
         }
 
-        // Only if we are properly queued for the BG.
-        foreach (var queue in BattleFieldQueueTypes)
+        bool inBattleground = DecideInBattleground(CurrentMapId, bgId, BattleFieldQueueTypes.Values,
+            LegacyVersion.RemovedInVersion(Enums.ClientVersionBuild.V2_0_1_6180), _battlegroundExitedMapId, out bool usedFallback);
+
+        // Fix-working breadcrumb (the fallback deciding is the #504 fix in use): DebugOutput only (review of #546).
+        if (usedFallback && Framework.Settings.DebugOutput && _inBattlegroundFallbackLoggedMap != CurrentMapId)
         {
-            if (LegacyVersion.RemovedInVersion(Enums.ClientVersionBuild.V2_0_1_6180))
+            _inBattlegroundFallbackLoggedMap = (uint)CurrentMapId;
+            Log.Event("battleground.in_bg.map_fallback", new
             {
-                if (queue.Value == CurrentMapId)
-                    return true;
-            }
-            else
+                map_id = CurrentMapId,
+                bg_id = bgId,
+                queue_entries = BattleFieldQueueTypes.Count,
+            });
+        }
+        return inBattleground;
+    }
+
+    // JimsProxy (#504): a stored queue entry for the current battleground decides as before (vanilla
+    // stores the map id, TBC+ the battleground id). With none, a battleground map still counts
+    // (after a disconnect and rejoin the queue-slot table is not carried over and the server does
+    // not re-send the status, so battleground chat went out as party chat and the raid was filed
+    // in group slot 0), EXCEPT on the map whose slot just ended (the exit window, see
+    // MarkBattlegroundExited). Pure, so the decision table is unit-tested.
+    internal static bool DecideInBattleground(uint? currentMapId, uint bgId, Dictionary<uint, uint>.ValueCollection? queueValues, bool legacyIsVanilla, uint exitedMapId, out bool usedFallback)
+    {
+        usedFallback = false;
+        if (currentMapId == null || bgId == 0)
+            return false;
+
+        if (queueValues != null)
+        {
+            foreach (var value in queueValues)
             {
-                if (queue.Value == bgId)
+                if (legacyIsVanilla ? value == currentMapId : value == bgId)
                     return true;
             }
         }
 
-        return false;
+        if (exitedMapId != 0 && exitedMapId == currentMapId)
+            return false;
+
+        usedFallback = true;
+        return true;
     }
+
+    // JimsProxy (#504): called by the status handler when a slot ends while the character still
+    // stands on that battleground map (the exit window), and cleared again when any status names
+    // a map (a new queue or a re-entry).
+    public void MarkBattlegroundExited(uint mapId) => _battlegroundExitedMapId = mapId;
+    public void ClearBattlegroundExited() => _battlegroundExitedMapId = 0;
+    public bool HasBattleFieldQueueType(uint queueSlot) => BattleFieldQueueTypes.ContainsKey(queueSlot);
     public long GetBattleFieldQueueTime(uint queueSlot)
     {
         if (BattleFieldQueueTimes.TryGetValue(queueSlot, out var time))
@@ -2119,6 +2265,37 @@ public sealed class GameSessionData
         PendingEnchantTimeReemits = null;
         return reemits;
     }
+    // JimsProxy (item-time-at-login, #539): see PendingItemTimeUpdates. A zero push is the
+    // server's own expiry signal and the item is about to be removed, so it is not stashed.
+    public void StorePendingItemTimeUpdate(WowGuid128 itemGuid, uint durationSeconds, int nowTick)
+    {
+        if (durationSeconds == 0)
+            return;
+        PendingItemTimeUpdates[itemGuid] = (durationSeconds, nowTick);
+    }
+    // The stashed seconds decayed by the time spent in the stash, or null when nothing was
+    // stashed or the remainder truncates to zero (the server's expiry is due within the second).
+    public uint? ConsumePendingItemTimeUpdate(WowGuid128 itemGuid, int nowTick)
+    {
+        if (!PendingItemTimeUpdates.Remove(itemGuid, out var push))
+            return null;
+        int elapsed = unchecked(nowTick - push.Tick);
+        if (elapsed < 0)
+            elapsed = 0;
+        long remainingSeconds = push.Seconds - elapsed / 1000;
+        return remainingSeconds > 0 ? (uint)remainingSeconds : null;
+    }
+    public void ArmItemTimeReemit(WowGuid128 itemGuid, uint durationSeconds)
+    {
+        PendingItemTimeReemits ??= [];
+        PendingItemTimeReemits.Add((itemGuid, durationSeconds));
+    }
+    public List<(WowGuid128 ItemGuid, uint DurationSeconds)>? TakeItemTimeReemits()
+    {
+        var reemits = PendingItemTimeReemits;
+        PendingItemTimeReemits = null;
+        return reemits;
+    }
     public void StoreAuraCaster(WowGuid128 target, byte slot, WowGuid128 caster)
     {
         ref var dict = ref CollectionsMarshal.GetValueRefOrAddDefault(UnitAuraCaster, target, out _);
@@ -2145,44 +2322,133 @@ public sealed class GameSessionData
         UnitAuraDurationPushTime.Remove(guid);
         UnitAuraCaster.Remove(guid);
         UnitAuraLastEmitted.Remove(guid);
-        // UnitAuraExpiryTick deliberately survives — it restores remaining buff time
+        // UnitAuraExpiry deliberately survives: it restores remaining buff time
         // when the unit re-enters view.
         return evicted;
     }
 
-    public void RecordAuraExpiry(WowGuid128 guid, int spellId, int remainingMs)
+    // JimsProxy (#513, rule 6): the duration tables only (the out-of-range leave). The slot
+    // casters and the last-emitted entries stay, so the unit's debuffs keep their caster.
+    public void EvictUnitAuraDurations(WowGuid128 guid)
     {
-        if (remainingMs <= 0)
+        UnitAuraDurationUpdateTime.Remove(guid);
+        UnitAuraDurationLeft.Remove(guid);
+        UnitAuraDurationFull.Remove(guid);
+        UnitAuraDurationPushTime.Remove(guid);
+    }
+
+    // JimsProxy (#513, rule 4): a listing that names EVERY aura on a unit (a create, a full party
+    // state) makes any record of a spell it does not carry stale: the buff ended while the unit was
+    // out of view. Drop those records. Returns the number dropped.
+    public int DropAuraExpiriesForUnitExcept(WowGuid128 guid, HashSet<int> keepSpellIds)
+    {
+        List<(WowGuid128, int)> keys = [];
+        foreach (var kvp in UnitAuraExpiry)
+            if (kvp.Key.Item1 == guid && !keepSpellIds.Contains(kvp.Key.Item2))
+                keys.Add(kvp.Key);
+        foreach (var key in keys)
+            UnitAuraExpiry.Remove(key);
+        return keys.Count;
+    }
+
+    // JimsProxy (#513): record a KNOWN expiry only. The caller names the start class and the
+    // duration source that made the value known; a guess must never reach this map.
+    public void RecordAuraExpiry(WowGuid128 guid, int spellId, int remainingMs,
+        World.Client.AuraStartClass startClass, World.Client.AuraDurationSource source, int fullMs, int boundMs = 0,
+        WowGuid128 caster = default)
+    {
+        if (remainingMs <= 0 || startClass == World.Client.AuraStartClass.Unknown)
             return;
-        if (UnitAuraExpiryTick.Count > 4096)
+        if (UnitAuraExpiry.Count > 4096)
         {
             long now = Environment.TickCount64;
             List<(WowGuid128, int)> expired = [];
-            foreach (var kvp in UnitAuraExpiryTick)
-                if (kvp.Value <= now)
+            foreach (var kvp in UnitAuraExpiry)
+                if (kvp.Value.ExpiryTick <= now && !PartyMemberOfflineSince.ContainsKey(kvp.Key.Item1))
                     expired.Add(kvp.Key);
             foreach (var key in expired)
-                UnitAuraExpiryTick.Remove(key);
+                UnitAuraExpiry.Remove(key);
         }
-        UnitAuraExpiryTick[(guid, spellId)] = Environment.TickCount64 + remainingMs;
+        if (fullMs < remainingMs)
+            fullMs = remainingMs;
+        // Keep a caster already on record when the new write does not know one (a restore
+        // re-records the decayed value; the stats classes never see the caster).
+        if (caster == default && UnitAuraExpiry.TryGetValue((guid, spellId), out var previous))
+            caster = previous.Caster;
+        UnitAuraExpiry[(guid, spellId)] = new World.Client.AuraExpiryRecord(
+            Environment.TickCount64 + remainingMs, startClass, source, fullMs, boundMs, caster);
     }
 
-    public int? TryGetAuraRemainingMs(WowGuid128 guid, int spellId)
+    // JimsProxy (#513, rule 5 as verified in the field 2026-10-12): the server PAUSES a party
+    // member's buffs while they are offline (their own Fortitude came back 7.0 s longer than
+    // wall clock after a 7.1 s logout). So the offline edge marks the member, and the return
+    // edge (their online status, or their create, whichever the proxy sees first) shifts every
+    // record of theirs by the offline interval instead of dropping it.
+    public Dictionary<WowGuid128, long> PartyMemberOfflineSince = new();
+
+    public void MarkPartyMemberOffline(WowGuid128 guid)
     {
-        if (!UnitAuraExpiryTick.TryGetValue((guid, spellId), out var expiry))
+        if (!PartyMemberOfflineSince.ContainsKey(guid))
+            PartyMemberOfflineSince[guid] = Environment.TickCount64;
+    }
+
+    // Returns the offline interval applied, or null when the member was not marked.
+    public (long OfflineMs, int Shifted)? ShiftAuraExpiriesIfReturning(WowGuid128 guid)
+    {
+        if (!PartyMemberOfflineSince.Remove(guid, out long since))
             return null;
-        long remaining = expiry - Environment.TickCount64;
-        if (remaining <= 0)
+        long offlineMs = Environment.TickCount64 - since;
+        if (offlineMs < 0)
+            offlineMs = 0;
+        return (offlineMs, ShiftAuraExpiriesForUnit(guid, offlineMs));
+    }
+
+    public int ShiftAuraExpiriesForUnit(WowGuid128 guid, long deltaMs)
+    {
+        if (deltaMs <= 0)
+            return 0;
+        List<(WowGuid128, int)> keys = [];
+        foreach (var kvp in UnitAuraExpiry)
+            if (kvp.Key.Item1 == guid)
+                keys.Add(kvp.Key);
+        foreach (var key in keys)
         {
-            UnitAuraExpiryTick.Remove((guid, spellId));
+            var record = UnitAuraExpiry[key];
+            UnitAuraExpiry[key] = record with { ExpiryTick = record.ExpiryTick + deltaMs };
+        }
+        return keys.Count;
+    }
+
+    // The recorded entry, or null when there is none or it has run out (then it is dropped).
+    public World.Client.AuraExpiryRecord? TryGetAuraExpiry(WowGuid128 guid, int spellId)
+    {
+        if (!UnitAuraExpiry.TryGetValue((guid, spellId), out var record))
+            return null;
+        if (record.ExpiryTick - Environment.TickCount64 <= 0)
+        {
+            UnitAuraExpiry.Remove((guid, spellId));
             return null;
         }
-        return (int)Math.Min(remaining, int.MaxValue);
+        return record;
     }
 
     public void ClearAuraExpiry(WowGuid128 guid, int spellId)
     {
-        UnitAuraExpiryTick.Remove((guid, spellId));
+        UnitAuraExpiry.Remove((guid, spellId));
+    }
+
+    // JimsProxy (#513, rule 5): a party member's offline edge drops everything recorded for
+    // that member. The server may pause their buffs while they are away, so any wall-clock
+    // value would run short on their return. Returns the number of entries dropped.
+    public int DropAuraExpiriesForUnit(WowGuid128 guid)
+    {
+        List<(WowGuid128, int)> keys = [];
+        foreach (var kvp in UnitAuraExpiry)
+            if (kvp.Key.Item1 == guid)
+                keys.Add(kvp.Key);
+        foreach (var key in keys)
+            UnitAuraExpiry.Remove(key);
+        return keys.Count;
     }
     // A single values update can move an aura to a lower free slot (set at B, clear at
     // old A, B < A). The clear must not delete the expiry the set just recorded.

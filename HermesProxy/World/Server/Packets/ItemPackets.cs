@@ -942,3 +942,19 @@ internal static class ItemPacketHelpers
         return true;
     }
 }
+
+// JimsProxy (2026-10-06): modern SMSG_ITEM_TIME_UPDATE. The same two fields as 1.12, with the
+// guid packed. Realm connection, as native (TrinityCore Opcodes.cpp).
+public class ItemTimeUpdate : ServerPacket
+{
+    public ItemTimeUpdate() : base(Opcode.SMSG_ITEM_TIME_UPDATE) { }
+
+    public override void Write()
+    {
+        _worldPacket.WritePackedGuid128(ItemGuid);
+        _worldPacket.WriteUInt32(DurationLeft);
+    }
+
+    public WowGuid128 ItemGuid;
+    public uint DurationLeft;
+}

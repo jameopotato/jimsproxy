@@ -232,6 +232,11 @@ public partial class WorldClient
         // overwrite the old slot data before the addon's first read.
         GetSession().GameState.EvictUnitAuraState(guid);
 
+        // JimsProxy (#513 follow-up): a party member (or party pet) leaving view keeps its
+        // last in-view aura slots in the out-of-view table, so the first party-stats delta
+        // after this patches a complete list. Must run before the field cache is dropped.
+        PrimePartyAuraSlotsOnLeaveView(guid);
+
         lock (GetSession().GameState.ObjectCacheLock)
         {
             GetSession().GameState.ObjectCacheLegacy.Remove(guid);
@@ -685,6 +690,28 @@ public partial class WorldClient
             }
         }
 
+        // JimsProxy (item-time-at-login, #539): the same for timed items whose server push
+        // beat the item's create; the countdown the tooltip shows reads this packet only.
+        var itemTimeReemits = GetSession().GameState.TakeItemTimeReemits();
+        if (itemTimeReemits != null)
+        {
+            foreach (var (itemGuid, durationSeconds) in itemTimeReemits)
+            {
+                ItemTimeUpdate itemTime = new ItemTimeUpdate();
+                itemTime.ItemGuid = itemGuid;
+                itemTime.DurationLeft = durationSeconds;
+                SendPacketToClient(itemTime);
+                if (Settings.DebugOutput)
+                {
+                    Log.Event("item.time.reemitted_post_create", new
+                    {
+                        item_guid = itemGuid.ToString(),
+                        duration_seconds = durationSeconds,
+                    });
+                }
+            }
+        }
+
         // JimsProxy (camp stun lock, step 2): this update carried the login's first
         // self create block (marked in DetectStuckLogoutStunAtSelfCreate) — release
         // any control ops held from before it, in arrival order, now that the create
@@ -759,6 +786,39 @@ public partial class WorldClient
         }
     }
 
+    // JimsProxy (#513 follow-up, out-of-view party buff lists): snapshot a party member's (or a
+    // party pet's) UNIT_FIELD_AURA slots from the legacy field cache into the out-of-view table
+    // the party-stats handlers patch. Without it, the first slot-indexed delta after the unit
+    // leaves view would be emitted as a one-entry list and the 1.14 client, which replaces the
+    // member's list with every aura-bearing state, would show only that one buff. Receive-thread
+    // only, like the tables themselves.
+    void PrimePartyAuraSlotsOnLeaveView(WowGuid128 guid)
+    {
+        var gameState = GetSession().GameState;
+        Dictionary<WowGuid128, uint[]> store;
+        WowGuid128 key;
+        if (gameState.IsGroupMemberGuid(guid))
+        {
+            store = gameState.PartyMemberAuraSlots;
+            key = guid;
+        }
+        else if (gameState.GroupMemberOwningPet(guid) is WowGuid128 owner)
+        {
+            store = gameState.PartyPetAuraSlots;
+            key = owner;
+        }
+        else
+            return;
+
+        var fields = gameState.GetCachedObjectFieldsLegacy(guid);
+        if (fields == null)
+            return;
+        int auraFieldBase = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
+        if (auraFieldBase < 0)
+            return;
+        PartyAuraSlotTable.PrimeFromUnitFields(gameState.GetOrAddPartyAuraSlots(store, key), fields, auraFieldBase);
+    }
+
     public void ReadFarObjectsBlock(WorldPacket packet, UpdateObject updateObject, object index)
     {
         var objCount = packet.ReadInt32();
@@ -772,6 +832,17 @@ public partial class WorldClient
             if (guid == GetSession().GameState.CurrentPlayerGuid)
                 continue;
             PrintString($"Guid = {objCount}", index, j);
+
+            // JimsProxy (#513, rule 6): the out-of-range leave evicts the per-slot DURATION
+            // state as the destroy path does, so the class-tagged expiry map is the only timer
+            // carrier across either leave and every cold emit consults it. Before this, the
+            // per-slot cache survived this path and was read before the map. The slot casters
+            // are kept: a unit that walks out and back must still show the local player's own
+            // debuffs as theirs.
+            GetSession().GameState.EvictUnitAuraDurations(guid);
+            // JimsProxy (#513 follow-up): same priming as the destroy path (the out-of-range
+            // list is the other way a party member leaves view). Before the cache is dropped.
+            PrimePartyAuraSlotsOnLeaveView(guid);
 
             lock (GetSession().GameState.ObjectCacheLock)
             {
@@ -1359,7 +1430,7 @@ public partial class WorldClient
             // hook for triaging zep / boat transport bugs from JSONL bundles.
             if (guid == GetSession().GameState.CurrentPlayerGuid)
             {
-                var prevTransport = GetSession().GameState.DiagLastObservedPlayerTransportGuid;
+                var prevTransport = GetSession().GameState.LastObservedPlayerTransportGuid;
                 if (prevTransport == null || prevTransport.Value != moveInfo.TransportGuid)
                 {
                     Framework.Logging.Log.Event("movement.player_update.transport_state", new
@@ -1375,7 +1446,7 @@ public partial class WorldClient
                         map_id = GetSession().GameState.CurrentMapId,
                     });
 
-                    GetSession().GameState.DiagLastObservedPlayerTransportGuid = moveInfo.TransportGuid;
+                    GetSession().GameState.LastObservedPlayerTransportGuid = moveInfo.TransportGuid;
                 }
 
                 // JimsProxy (zep-stuck-low-latency-race 2026-05-17): deferred
@@ -1967,13 +2038,10 @@ public partial class WorldClient
 
         if (GameData.SpellEffectPoints.TryGetValue(spellId, out var basePoints))
             data.Points = basePoints;
-        int? talentDuration = GameData.TryGetTalentDuration(spellId, GetSession().GameState.CurrentPlayerKnownSpells);
-        int duration = talentDuration ?? GameData.GetAuraSpellDuration(spellId);
-        if (duration > 0)
-        {
-            data.Duration = duration;
-            data.Remaining = duration;
-        }
+        // JimsProxy (#513): no duration pre-fill here. Whether a remaining time goes on the
+        // wire is decided by provenance in the emit paths (see AuraTimerProvenance). A full
+        // duration written here for a buff first seen already running was a guess presented
+        // as known, and it was then recorded and served again as if it were.
         return data;
     }
 
@@ -2117,6 +2185,7 @@ public partial class WorldClient
     private void AfterStoreObjectUpdateHook(WowGuid128 guid, ObjectType objectType, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, AuraUpdate auraUpdate, PowerUpdate? powerUpdate, bool isCreate, ObjectUpdate updateData, BitArray changedValuesMask)
     {
         DetectStuckLogoutStunAtSelfCreate(guid, updates, isCreate, updateData);
+        ArmHeldCooldownsAtSelfCreate(guid, updates, isCreate);
         SynthStandOnFearCcOnset(guid, updates);
 
         // JimsProxy (fishing recast wedge): remember our newest bobber so a recast's
@@ -2289,6 +2358,39 @@ public partial class WorldClient
     //              (Settings.StuckLogoutStunClientStrip) so turn/cast input isn't locked
     //              client-side even if the server ignores the cancel. The server still rejects
     //              real casts until ITS state clears; the strip only restores input.
+    // JimsProxy (stealth cooldown after a stealthed login): a native server lists a held
+    // cooldown (Stealth, Prowl, Shadowmeld: the cooldown starts when the aura ends) in the login
+    // spell history, OnHold set, so the client has an entry for the cooldown event that follows
+    // the cancel. The 1.12 login list carries only running cooldowns, so after the local
+    // player's create at login send one held-cooldown packet for such auras it carries; the
+    // client takes the spell's own duration and shows nothing until the server's cooldown
+    // event starts it. Pre-existing on every build before this; field-found 2026-10-12.
+    private void ArmHeldCooldownsAtSelfCreate(WowGuid128 guid, Dictionary<int, UpdateField> updates, bool isCreate)
+    {
+        if (!isCreate || guid != GetSession().GameState.CurrentPlayerGuid)
+            return;
+        if (!LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+            return;
+        int UNIT_FIELD_AURA = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_AURA);
+        if (UNIT_FIELD_AURA < 0)
+            return;
+
+        List<uint> auraSpellIds = new();
+        for (int i = 0; i < VanillaAuraSlotCount; i++)
+        {
+            if (updates.TryGetValue(UNIT_FIELD_AURA + i, out var slot) && slot.UInt32Value != 0)
+                auraSpellIds.Add(slot.UInt32Value);
+        }
+        var held = OnHoldCooldownsAtLogin.Select(auraSpellIds, GameData.CooldownStartsOnAuraRemoval);
+        if (held.Count == 0)
+            return;
+
+        SendPacketToClient(OnHoldCooldownsAtLogin.BuildPacket(guid, held));
+        // Fix-working breadcrumb (once per stealthed login): DebugOutput only (review of #551).
+        if (Framework.Settings.DebugOutput)
+            Log.Event("cooldown.held_armed_at_login", new { spell_ids = held });
+    }
+
     private void DetectStuckLogoutStunAtSelfCreate(WowGuid128 guid, Dictionary<int, UpdateField> updates, bool isCreate, ObjectUpdate updateData)
     {
         if (!isCreate || GetSession().GameState.StuckStunLoginCheckDone)
@@ -2706,6 +2808,10 @@ public partial class WorldClient
                         foreach (var (legacySlot, durationMs) in pendingEnchants)
                             GetSession().GameState.ArmEnchantTimeReemit(guid, TranslateEnchantmentSlotToModern(legacySlot), durationMs);
                     }
+                    // JimsProxy (item-time-at-login, #539): a stashed pre-create
+                    // SMSG_ITEM_TIME_UPDATE gets the same treatment as the enchant time.
+                    if (GetSession().GameState.ConsumePendingItemTimeUpdate(guid, Environment.TickCount) is uint itemTimeSeconds)
+                        GetSession().GameState.ArmItemTimeReemit(guid, itemTimeSeconds);
                 }
 
                 uint?[] gems = new uint?[ItemConst.MaxGemSockets];
@@ -3724,6 +3830,24 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
             if (UNIT_FIELD_AURA > 0 && UNIT_FIELD_AURAFLAGS > 0 && UNIT_FIELD_AURALEVELS > 0 && UNIT_FIELD_AURAAPPLICATIONS > 0)
             {
                 int aurasCount = LegacyVersion.GetAuraSlotsCount();
+                // JimsProxy (#513, rule 4): the spells a create lists, so records of spells it
+                // does not list (buffs that ended while the unit was out of view) can be dropped.
+                HashSet<int>? createAuraSpellIds = isCreate ? new HashSet<int>() : null;
+                // JimsProxy (#513, rule 5): a party member coming back from a relog may be created
+                // before their online status arrives; shift their records by the offline interval
+                // before any slot below reads them.
+                if (isCreate && GetSession().GameState.ShiftAuraExpiriesIfReturning(guid) is var (offlineMs, shifted))
+                {
+                    // Fix-working breadcrumb: DebugOutput only (review of #547).
+                    if (Framework.Settings.DebugOutput)
+                        Framework.Logging.Log.Event("party.aura.offline_shift", new
+                        {
+                            member_low = guid.GetCounter(),
+                            offline_ms = offlineMs,
+                            shifted,
+                            source = "create",
+                        });
+                }
                 for (byte i = 0; i < aurasCount; i++)
                 {
                     // Process slot i when EITHER:
@@ -3800,8 +3924,30 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                         }
                         if (aura.AuraData != null)
                         {
-                            int durationLeft;
-                            int durationFull;
+                            // JimsProxy (#513): decide the timer by provenance. A KNOWN remaining
+                            // time carries the Duration flag with both values, is recorded in the
+                            // expiry map and seeds the per-slot cache; an UNKNOWN one carries no
+                            // flag and no values and records nothing. The same rule covers the
+                            // stack/charge re-emits (clones), which used to re-send the previous
+                            // values undecayed. See AuraTimerProvenance.
+                            uint auraSpellId = (uint)aura.AuraData.SpellID;
+                            bool isSelf = guid == GetSession().GameState.CurrentPlayerGuid;
+                            var prevEmitted = GetSession().GameState.GetLastEmittedAura(guid, i);
+                            bool slotOccupantChanged = prevEmitted == null || prevEmitted.SpellID != aura.AuraData.SpellID;
+                            // A create, and a values update promoted to a full aura refresh after
+                            // an out-of-range leave, list auras that may have been running for any
+                            // length of time: not applications.
+                            bool listsRunningAuras = isCreate || auraUpdate.UpdateAll;
+                            // A new spell in a slot of a unit already in view is a fresh application.
+                            bool freshApplication = !isSelf && !listsRunningAuras && !appsOnlyChanged && slotOccupantChanged;
+                            var timerClass = AuraStartClass.Unknown;
+                            var timerSource = AuraDurationSource.None;
+                            int durationLeft = 0;
+                            int durationFull = 0;
+                            int boundMs = 0;
+                            WowGuid128 castUnit = default;
+                            if (isCreate)
+                                createAuraSpellIds?.Add((int)auraSpellId);
 
                             // JimsProxy (Rupture-DoT-Lingering-Icon): for vanilla CP-scaling
                             // finishers, the snapshot must win over the cache. Each Rupture
@@ -3814,6 +3960,9 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                                 aura.AuraData.SpellID, guid);
                             if (finisherMs is int snapMs && snapMs > 0)
                             {
+                                // The local player's own finisher: start and duration both known.
+                                timerClass = AuraStartClass.ObservedGo;
+                                timerSource = AuraDurationSource.Local;
                                 durationFull = snapMs;
                                 durationLeft = snapMs;
                                 GetSession().GameState.StoreAuraDurationFull(guid, i, snapMs);
@@ -3836,7 +3985,6 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                                 // later). Only push-path stores arm this window, so stale-Y durations
                                 // (stored at Y's cast/emit, always older than a second at swap time)
                                 // are still wiped.
-                                var prevEmitted = GetSession().GameState.GetLastEmittedAura(guid, i);
                                 if (prevEmitted != null && prevEmitted.SpellID != aura.AuraData.SpellID)
                                 {
                                     if (GetSession().GameState.HasFreshAuraDurationPush(guid, i, Environment.TickCount))
@@ -3853,64 +4001,146 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                                     {
                                         GetSession().GameState.ClearAuraDuration(guid, i);
                                     }
+                                    // The previous occupant's caster must not be read as this spell's.
+                                    GetSession().GameState.ClearAuraCaster(guid, i);
                                 }
-                                GetSession().GameState.GetAuraDuration(guid, i, out durationLeft, out durationFull);
-                                // JimsProxy (Cheap-Shot-aura-duration 2026-05-07): mirror the
-                                // SpellHandler refresh path's CSV fallback. On a cold cache (fresh
-                                // enemy debuff via OBJECT_UPDATE before any SMSG_AURA_UPDATE fires)
-                                // GetAuraDuration returns 0 for both values, leaving the modern
-                                // client with no duration → UnitAura returns 0/0 → stun-watch
-                                // addons (TidyPlates, CCC, ElvUI) show no countdown. Spell 1833
-                                // (Cheap Shot, flat 4 s) is the primary case; any other spell with
-                                // an AuraDurations CSV row also benefits.
-                                if (durationFull <= 0)
+                                GetSession().GameState.GetAuraDuration(guid, i, out int cachedLeft, out int cachedFull);
+                                if (cachedLeft > 0 && cachedFull > 0)
                                 {
-                                    uint auraSpellId = (uint)aura.AuraData.SpellID;
-                                    int? talentDur = GameData.TryGetTalentDuration(auraSpellId, GetSession().GameState.CurrentPlayerKnownSpells);
-                                    durationFull = talentDur ?? GameData.GetAuraSpellDuration(auraSpellId);
+                                    // A warm per-slot cache is written only by known paths: the
+                                    // server's duration pushes for the local player, a seen recast,
+                                    // a fresh in-view application, or an earlier known emit.
+                                    var cachedRecord = GetSession().GameState.TryGetAuraExpiry(guid, (int)auraSpellId);
+                                    timerClass = isSelf ? AuraStartClass.Self
+                                        : cachedRecord?.StartClass ?? AuraStartClass.Restored;
+                                    timerSource = cachedRecord?.Source
+                                        ?? (isSelf ? AuraDurationSource.Local : AuraDurationSource.Fixed);
+                                    boundMs = cachedRecord?.BoundMs ?? 0;
+                                    durationLeft = Math.Min(cachedLeft, cachedFull);
+                                    durationFull = cachedFull;
                                 }
-                                // Cold per-slot cache on a re-seen unit (relog, stealth
-                                // destroy/recreate) — resume the wall-clock remaining time
-                                // instead of restarting the timer at full duration.
-                                if (durationLeft <= 0 && isCreate &&
-                                    GetSession().GameState.TryGetAuraRemainingMs(guid, (int)aura.AuraData.SpellID) is int persistedMs)
+                                else if (freshApplication)
                                 {
-                                    durationLeft = persistedMs;
-                                    if (durationFull < persistedMs)
-                                        durationFull = persistedMs;
-                                    GetSession().GameState.StoreAuraDurationFull(guid, i, durationFull);
-                                    GetSession().GameState.StoreAuraDurationLeft(guid, i, persistedMs, Environment.TickCount);
-                                    Framework.Logging.Log.Event("aura.duration.restored_from_expiry", new
+                                    // OBSERVED_SLOT: a new spell in a slot of a unit already in view
+                                    // is a fresh application, so the full duration runs from now
+                                    // when it is knowable: fixed by the spell id, or talent-modified
+                                    // by a cast the proxy saw the local player (or their pet) make
+                                    // (rule 3: a talent-modified spell or a finisher from another
+                                    // caster is not knowable). A create is not an application: the
+                                    // buff may have been running for any length of time. Decided
+                                    // BEFORE the expiry map is consulted: an older record of this
+                                    // spell on the unit is stale by definition here.
+                                    castUnit = GetSession().GameState.GetAuraCaster(guid, i, aura.AuraData.SpellID);
+                                    bool localPlayerCast = castUnit != default &&
+                                        (castUnit == GetSession().GameState.CurrentPlayerGuid || castUnit == GetSession().GameState.CurrentPetGuid);
+                                    bool talentSpell = GameData.TalentDurationModifiers.ContainsKey(auraSpellId);
+                                    bool finisher = GameData.IsComboPointFinisher(auraSpellId);
+                                    int fixedMs = GameData.GetAuraSpellDuration(auraSpellId);
+                                    timerSource = AuraTimerProvenance.DurationSourceFor(fixedMs > 0, localPlayerCast, talentSpell, finisher);
+                                    int fullMs = timerSource switch
                                     {
-                                        target_low = guid.GetCounter(),
-                                        slot = i,
-                                        spell_id = aura.AuraData.SpellID,
-                                        remaining_ms = persistedMs,
-                                    });
+                                        AuraDurationSource.Fixed => fixedMs,
+                                        AuraDurationSource.Local => GameData.TryGetTalentDuration(auraSpellId, GetSession().GameState.CurrentPlayerKnownSpells) ?? fixedMs,
+                                        _ => 0,
+                                    };
+                                    if (fullMs > 0)
+                                    {
+                                        timerClass = AuraStartClass.ObservedSlot;
+                                        durationFull = fullMs;
+                                        durationLeft = fullMs;
+                                        GetSession().GameState.StoreAuraDurationFull(guid, i, fullMs);
+                                        GetSession().GameState.StoreAuraDurationLeft(guid, i, fullMs, Environment.TickCount);
+                                    }
+                                    else
+                                    {
+                                        GetSession().GameState.ClearAuraExpiry(guid, (int)auraSpellId);
+                                    }
+                                }
+                                else if (GetSession().GameState.TryGetAuraExpiry(guid, (int)auraSpellId) is AuraExpiryRecord known)
+                                {
+                                    // Cold slot with a recorded start (a re-create after a leave or
+                                    // a relog, or a slot the cache lost): serve the decayed value on
+                                    // any emit, or drop the entry when it has run out while the
+                                    // spell is still in the slot (rule 1: a same-caster refresh the
+                                    // proxy did not see).
+                                    int? toServe = AuraTimerProvenance.RemainingToServe(known, Environment.TickCount64);
+                                    if (toServe is int remaining)
+                                    {
+                                        timerClass = known.StartClass;
+                                        timerSource = known.Source;
+                                        boundMs = known.BoundMs;
+                                        durationFull = known.FullMs;
+                                        durationLeft = remaining;
+                                        GetSession().GameState.StoreAuraDurationFull(guid, i, durationFull);
+                                        GetSession().GameState.StoreAuraDurationLeft(guid, i, remaining, Environment.TickCount);
+                                        // The record also carries who applied it: a re-created member
+                                        // keeps the viewer's own buffs listed on the raid frame.
+                                        if (known.Caster != default && GetSession().GameState.GetAuraCaster(guid, i) == default)
+                                            GetSession().GameState.StoreAuraCaster(guid, i, known.Caster);
+                                        Framework.Logging.Log.Event("aura.duration.restored_from_expiry", new
+                                        {
+                                            target_low = guid.GetCounter(),
+                                            slot = i,
+                                            spell_id = aura.AuraData.SpellID,
+                                            remaining_ms = remaining,
+                                            start_class = known.StartClass.ToString(),
+                                            is_create = isCreate,
+                                        });
+                                    }
+                                    else
+                                    {
+                                        GetSession().GameState.ClearAuraExpiry(guid, (int)auraSpellId);
+                                        Framework.Logging.Log.Event("aura.duration.expired_but_present", new
+                                        {
+                                            target_low = guid.GetCounter(),
+                                            slot = i,
+                                            spell_id = aura.AuraData.SpellID,
+                                            start_class = known.StartClass.ToString(),
+                                        });
+                                    }
                                 }
                             }
 
-                            if (durationLeft > 0 && durationFull > 0)
+                            if (castUnit == default)
+                                castUnit = GetSession().GameState.GetAuraCaster(guid, i, aura.AuraData.SpellID);
+                            bool timerKnown = durationLeft > 0 &&
+                                AuraTimerProvenance.IsKnown(timerClass, timerSource, durationFull, boundMs);
+                            if (timerKnown)
                             {
                                 aura.AuraData.Flags |= AuraFlagsModern.Duration;
                                 aura.AuraData.Duration = durationFull;
                                 aura.AuraData.Remaining = durationLeft;
+                                GetSession().GameState.RecordAuraExpiry(guid, (int)auraSpellId, durationLeft,
+                                    timerClass, timerSource, durationFull, boundMs, castUnit);
                             }
-                            if (!appsOnlyChanged && aura.AuraData.Remaining is int remainingMs && remainingMs > 0)
-                                GetSession().GameState.RecordAuraExpiry(guid, (int)aura.AuraData.SpellID, remainingMs);
-                            Framework.Logging.Log.Event("aura.slot.set", new
+                            else
                             {
-                                target_low = guid.GetCounter(),
-                                slot = i,
-                                spell_id = aura.AuraData.SpellID,
-                                slot_field_value = _slotSpellId,
-                                duration_full = durationFull,
-                                duration_left = durationLeft,
-                                mask_aura = _maskAura,
-                                mask_levels = _maskLevels,
-                                mask_apps = _maskApps,
-                                is_player_target = guid == GetSession().GameState.CurrentPlayerGuid,
-                            });
+                                // Unknown: no flag, no values, nothing recorded. A 1.12 client
+                                // showed no timer here either; addons run their own estimate.
+                                aura.AuraData.Flags &= ~AuraFlagsModern.Duration;
+                                aura.AuraData.Duration = null;
+                                aura.AuraData.Remaining = null;
+                                durationFull = 0;
+                                durationLeft = 0;
+                            }
+                            // Per emitted slot on every unit update: DebugOutput only (review of #547; was always-on).
+                            if (Framework.Settings.DebugOutput)
+                                Framework.Logging.Log.Event("aura.slot.set", new
+                                {
+                                    target_low = guid.GetCounter(),
+                                    slot = i,
+                                    spell_id = aura.AuraData.SpellID,
+                                    slot_field_value = _slotSpellId,
+                                    duration_full = durationFull,
+                                    duration_left = durationLeft,
+                                    timer_class = timerClass.ToString(),
+                                    timer_source = timerSource.ToString(),
+                                    timer_on_wire = timerKnown,
+                                    mask_aura = _maskAura,
+                                    mask_levels = _maskLevels,
+                                    mask_apps = _maskApps,
+                                    is_player_target = guid == GetSession().GameState.CurrentPlayerGuid,
+                                });
                             //MIRASU: Set NoCaster flag when caster lookup fails, or the 1.14.2 client's
                             //MIRASU: UI buff-bar treats the aura as malformed-for-display (icon hidden)
                             //MIRASU: even though the effect engine still applies stat mods from the spell
@@ -3927,7 +4157,6 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                             //MIRASU: The WotLK branch in VersionChecker.ConvertAuraFlags already sets
                             //MIRASU: NoCaster from a wire bit; 1.12's AuraFlagsVanilla has no such bit,
                             //MIRASU: so we infer it here from the caster-lookup result.
-                            var castUnit = GetSession().GameState.GetAuraCaster(guid, i, aura.AuraData.SpellID);
                             aura.AuraData.CastUnit = castUnit;
                             if (castUnit == default)
                                 aura.AuraData.Flags |= AuraFlagsModern.NoCaster;
@@ -3990,6 +4219,12 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                         }
                     }
                 }
+                // Only group members and the local player can carry a record of a buff that ended
+                // out of view; a mob's records expire on their own, so the whole-map scan is not
+                // paid on every unit create (review of #547).
+                if (createAuraSpellIds != null &&
+                    (guid == GetSession().GameState.CurrentPlayerGuid || GetSession().GameState.IsGroupMemberGuid(guid)))
+                    GetSession().GameState.DropAuraExpiriesForUnitExcept(guid, createAuraSpellIds);
             }
         }
 

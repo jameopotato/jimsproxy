@@ -548,7 +548,7 @@ public partial class WorldSocket
     // JimsProxy sideband: addon-driven commands the 1.14 modern client wire
     // protocol no longer carries. Body grammar:
     //   "1" / "0"          — handshake on/off (legacy castbar/HC interop)
-    //   "<cmd>\t<args>..." — structured command, e.g. "Z\tStormwind City"
+    //   "<cmd>\t<args>..." — structured command, e.g. "Z\tStormwind City", "P\tLOCK\t1"
     private void HandleJimsPlusSideband(string body)
     {
         if (string.IsNullOrEmpty(body)) return;
@@ -572,6 +572,35 @@ public partial class WorldSocket
         {
             case "Z":
                 HandleZoneSideband(args);
+                break;
+            case "P":
+                HandlePetSideband(args);
+                break;
+        }
+    }
+
+    // Pet sideband (JimsPlus pet-bar lock, opt-in): "LOCK\t1"/"LOCK\t0" turns the command/stance
+    // lock on or off for this session; "RESET" repaints the current pet's bar once. See
+    // SetPetControlLock / ResetPetBarNow in PetHandler.cs. Receive-only: nothing here is
+    // forwarded to the server as chat, and only JimsPlus emits it.
+    private void HandlePetSideband(string args)
+    {
+        if (args == null) return;
+
+        int tab = args.IndexOf('\t');
+        string verb = (tab >= 0 ? args.Substring(0, tab) : args).Trim().ToUpperInvariant();
+        string rest = tab >= 0 ? args.Substring(tab + 1).Trim() : string.Empty;
+
+        switch (verb)
+        {
+            case "LOCK":
+                SetPetControlLock(rest == "1");
+                break;
+            case "RESET":
+                ResetPetBarNow();
+                break;
+            default:
+                Log.Event("chat.pet_sideband.unknown", new { args });
                 break;
         }
     }

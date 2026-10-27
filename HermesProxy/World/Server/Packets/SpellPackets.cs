@@ -2435,3 +2435,73 @@ public struct SpellModifierData
     public int ModifierValue;
     public byte ClassIndex;
 }
+
+// JimsProxy (2026-10-06): three modern combat-log packets translated from their 1.12 forms.
+// Layouts from WowPacketParser V6_0_2 CombatLogHandler (shared by the 1.14 and 2.5 tables);
+// connections as native (TrinityCore Opcodes.cpp).
+public class SpellLogMissEntry
+{
+    public WowGuid128 Victim;
+    public SpellMissInfo MissReason;
+}
+
+public class SpellMissLog : ServerPacket
+{
+    public SpellMissLog() : base(Opcode.SMSG_SPELL_MISS_LOG, ConnectionType.Instance) { }
+
+    public override void Write()
+    {
+        _worldPacket.WriteUInt32(SpellID);
+        _worldPacket.WritePackedGuid128(Caster);
+        _worldPacket.WriteInt32(Entries.Count);
+        foreach (SpellLogMissEntry entry in Entries)
+        {
+            _worldPacket.WritePackedGuid128(entry.Victim);
+            _worldPacket.WriteUInt8((byte)entry.MissReason);
+            _worldPacket.WriteBit(false); // no hit-roll debug block
+            _worldPacket.FlushBits();
+        }
+    }
+
+    public uint SpellID;
+    public WowGuid128 Caster;
+    public List<SpellLogMissEntry> Entries = new();
+}
+
+public class ProcResist : ServerPacket
+{
+    public ProcResist() : base(Opcode.SMSG_PROC_RESIST) { } // Realm, as native
+
+    public override void Write()
+    {
+        _worldPacket.WritePackedGuid128(Caster);
+        _worldPacket.WritePackedGuid128(Target);
+        _worldPacket.WriteUInt32(SpellID);
+        _worldPacket.WriteBit(false); // no Rolled
+        _worldPacket.WriteBit(false); // no Needed
+        _worldPacket.FlushBits();
+    }
+
+    public WowGuid128 Caster;
+    public WowGuid128 Target;
+    public uint SpellID;
+}
+
+public class SpellOrDamageImmune : ServerPacket
+{
+    public SpellOrDamageImmune() : base(Opcode.SMSG_SPELL_OR_DAMAGE_IMMUNE, ConnectionType.Instance) { }
+
+    public override void Write()
+    {
+        _worldPacket.WritePackedGuid128(CasterGUID);
+        _worldPacket.WritePackedGuid128(VictimGUID);
+        _worldPacket.WriteUInt32(SpellID);
+        _worldPacket.WriteBit(IsPeriodic);
+        _worldPacket.FlushBits();
+    }
+
+    public WowGuid128 CasterGUID;
+    public WowGuid128 VictimGUID;
+    public uint SpellID;
+    public bool IsPeriodic;
+}

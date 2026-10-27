@@ -57,3 +57,16 @@ public enum PetNameInvalidReason
     RussianSilentCharacterAtBeginningOrEnd = 15,
     DeclensionDoesntMatchBaseName = 16
 }
+
+// JimsProxy: pet action-bar slot types. Every SMSG_PET_SPELLS button and every
+// CMSG_PET_SET_ACTION value is packed as (action | type << 24); the layout and
+// the values are the same on 1.12 and 1.14 (TrinityCore ActiveStates).
+public enum ActiveStates : byte
+{
+    Decide   = 0x00,  // custom: the client decides on use
+    Passive  = 0x01,  // passive ability, or an empty slot (action 0)
+    Reaction = 0x06,  // Aggressive / Defensive / Passive stance (ReactStates)
+    Command  = 0x07,  // Attack / Follow / Stay (CommandStates)
+    Disabled = 0x81,  // castable, autocast off
+    Enabled  = 0xC1   // castable, autocast on
+}
