@@ -22,6 +22,8 @@ public class ControlReleaseAckOrderTests
     private const Opcode RunAck = Opcode.CMSG_MOVE_FORCE_RUN_SPEED_CHANGE_ACK;
     private const Opcode RunBackAck = Opcode.CMSG_MOVE_FORCE_RUN_BACK_SPEED_CHANGE_ACK;
 
+    // The gate never reads the opcode; the names only have to exist in the 1.12 table the constructor
+    // maps through (MSG_MOVE_HEARTBEAT and MSG_MOVE_FALL_LAND, not their CMSG forms).
     private static WorldPacket C2S(Opcode opcode) => new(opcode);
 
     // The priest's client has taken the victim over (CMSG_SET_ACTIVE_MOVER(victim)).
@@ -52,13 +54,13 @@ public class ControlReleaseAckOrderTests
         Assert.False(gate.OnClientMoverChange(Priest));
         var moverPriest = C2S(Opcode.CMSG_SET_ACTIVE_MOVER); Send(moverPriest);
         var splineDone = C2S(Opcode.CMSG_MOVE_SPLINE_DONE); Send(splineDone);
-        var fallLand = C2S(Opcode.CMSG_MOVE_FALL_LAND); Send(fallLand);
+        var fallLand = C2S(Opcode.MSG_MOVE_FALL_LAND); Send(fallLand);
         Assert.Empty(sent);
 
         Assert.True(gate.OnAck(Victim, RunAck, 0, out var release));
         Assert.Equal(new[] { moverNone, farSight, moverPriest, splineDone, fallLand }, release);
 
-        var later = C2S(Opcode.CMSG_MOVE_HEARTBEAT);
+        var later = C2S(Opcode.MSG_MOVE_HEARTBEAT);
         Assert.False(gate.TryHold(later, out _));
     }
 
@@ -144,13 +146,13 @@ public class ControlReleaseAckOrderTests
         gate.ExpectAck(Victim, RunAck, 0);
         Assert.True(gate.OnClientMoverChange(default));
 
-        var packets = Enumerable.Range(0, ControlReleaseAckOrder.MaxHeld).Select(_ => C2S(Opcode.CMSG_MOVE_HEARTBEAT)).ToList();
+        var packets = Enumerable.Range(0, ControlReleaseAckOrder.MaxHeld).Select(_ => C2S(Opcode.MSG_MOVE_HEARTBEAT)).ToList();
         List<WorldPacket>? overflow = null;
         foreach (var p in packets)
             Assert.True(gate.TryHold(p, out overflow));
 
         Assert.Equal(packets, overflow);
-        Assert.False(gate.TryHold(C2S(Opcode.CMSG_MOVE_HEARTBEAT), out _));
+        Assert.False(gate.TryHold(C2S(Opcode.MSG_MOVE_HEARTBEAT), out _));
         Assert.False(gate.OnAck(Victim, RunAck, 0, out _));
     }
 
@@ -165,7 +167,7 @@ public class ControlReleaseAckOrderTests
         Assert.True(gate.TryHold(mover, out _));
 
         Assert.Equal(new[] { mover }, gate.Reset());
-        Assert.False(gate.TryHold(C2S(Opcode.CMSG_MOVE_HEARTBEAT), out _));
+        Assert.False(gate.TryHold(C2S(Opcode.MSG_MOVE_HEARTBEAT), out _));
         Assert.False(gate.OnAck(Victim, RunAck, 0, out _));
     }
 
