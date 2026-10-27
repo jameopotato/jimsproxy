@@ -64,8 +64,8 @@ public class ControlledUnitRelayTests
         new MovementInfo { Flags = 0x1 }.WriteMovementInfoLegacy(w);
     });
 
-    // A relayed 1.12 MSG_MOVE_TELEPORT: the same shape, which Kronos sends to the player for the
-    // player's own unit at every world entry.
+    // A relayed 1.12 MSG_MOVE_TELEPORT: the same shape. Kronos sends one to the player for the
+    // player's own unit at every world entry; it duplicates the create and the acked root packets.
     private static WorldPacket RelayedTeleport(WowGuid64 mover) => Legacy(Opcode.MSG_MOVE_TELEPORT, w =>
     {
         w.WritePackedGuid(mover);
@@ -163,24 +163,37 @@ public class ControlledUnitRelayTests
     }
 
     // Kronos relays a MSG_MOVE_TELEPORT to the player for the player's own unit at every world entry
-    // (login, far teleport, battleground exit), after the player's own create. It is not a stale
-    // movement relay and reaches the client as it always did.
+    // (login, far teleport, battleground exit), after the player's own create. It carries nothing the
+    // create and the acked root packets do not, and a copy applied late would re-root the client or
+    // free its pending acknowledgements, so it is dropped with every other relay for the mover.
     [Fact]
-    public void OwnTeleportRelay_WhileThePlayerHasControl_IsForwarded()
+    public void OwnTeleportRelay_WhileThePlayerHasControl_IsDropped()
     {
         var h = new ClientHarness();
         h.State.LastObservedHasControl = true;
 
         h.Dispatch(RelayedTeleport(LegacyPlayer));
 
-        Assert.Equal(1, h.MoveUpdates);
+        Assert.Equal(0, h.MoveUpdates);
     }
 
     [Fact]
-    public void TeleportRelayForTheUnitTheClientMoves_IsForwarded()
+    public void TeleportRelayForTheUnitTheClientMoves_IsDropped()
     {
         var h = new ClientHarness();
         h.State.ClientActiveMover = OtherPlayer.To128(h.State);
+
+        h.Dispatch(RelayedTeleport(OtherPlayer));
+
+        Assert.Equal(0, h.MoveUpdates);
+    }
+
+    // The same teleport for a unit this client does not move is how the client sees that unit placed.
+    [Fact]
+    public void TeleportRelayForAnotherUnit_IsForwarded()
+    {
+        var h = new ClientHarness();
+        h.State.LastObservedHasControl = true;
 
         h.Dispatch(RelayedTeleport(OtherPlayer));
 
