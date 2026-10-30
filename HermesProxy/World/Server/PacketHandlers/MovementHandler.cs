@@ -60,6 +60,8 @@ public partial class WorldSocket
         // P1-2: the transport-clear synth and its gate are deleted; the stamp now keeps the
         // transitions of the movement.player_update.transport_state diagnostic true.
         GetSession().GameState.LastObservedPlayerTransportGuid = movement.MoveInfo.TransportGuid;
+        // JimsProxy (addon say/yell carrier): the listener position for carried say/yell messages.
+        GetSession().GameState.SetOwnPosition(movement.MoveInfo.Position);
 
         // JimsProxy (charge strafe-latch cure 2026-08-28, re-anchored 2026-08-29):
         // fire the cure the moment the orphan is observed — the armed pend's real
@@ -352,6 +354,11 @@ public partial class WorldSocket
 
         WorldPacket packet = new WorldPacket(Opcode.MSG_MOVE_WORLDPORT_ACK);
         SendPacketToServer(packet);
+
+        // JimsProxy (addon say/yell carrier): membership in a custom channel survives a world
+        // port on a stock core (field, 2026-10-29), but a join costs one packet and an already-
+        // member answer the notify filter drops, so re-join after every arrival to be sure.
+        GetSession().WorldClient?.SendChatJoinChannel(0, AddonSayYellCarrier.ChannelName, "");
     }
 
     // JimsProxy (P1-2, check D-01): an acknowledgement carrying one of the counters the proxy

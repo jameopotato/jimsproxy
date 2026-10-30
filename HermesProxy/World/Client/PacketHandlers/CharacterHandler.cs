@@ -260,6 +260,7 @@ public partial class WorldClient
         verify.Pos.Y = packet.ReadFloat();
         verify.Pos.Z = packet.ReadFloat();
         verify.Pos.Orientation = packet.ReadFloat();
+        GetSession().GameState.SetOwnPosition(new Vector3(verify.Pos.X, verify.Pos.Y, verify.Pos.Z));
 
         // JimsProxy (camp stun lock, step 2): arm the pre-create self-op hold for
         // this login — self control ops (root/unroot/control-update/teleport) that
@@ -313,6 +314,12 @@ public partial class WorldClient
         });
 
         GetSession().GameState.IsInWorld = true;
+
+        // JimsProxy (addon say/yell carrier): join the proxy-only channel at every login (and
+        // again after each world port, Server MovementHandler.HandleWorldPortResponse). An
+        // existing membership is answered with PlayerAlreadyMember, which the notify filter
+        // keeps from the client.
+        SendChatJoinChannel(0, AddonSayYellCarrier.ChannelName, "");
 
         // JimsProxy (worldentry root-ceremony breadcrumb 2026-08-03): logins get the
         // same arrival ROOT/UNROOT ceremony as world transfers (wire-verified, incl.

@@ -296,6 +296,31 @@ public partial class WorldSocket
         if (worldClient == null)
             return;
 
+        // JimsProxy (addon say/yell carrier): a say or yell addon message forwarded as 1.12 chat
+        // makes every 1.12 client in range play the shout or talk animation on this player (see
+        // World/AddonSayYellCarrier.cs). Send it on the proxy-only channel with the type and this
+        // player's position; the receiving proxies re-deliver it as say or yell within range.
+        if (AddonSayYellCarrier.IsCarrierType(packet.Params.Type))
+        {
+            var state = GetSession().GameState;
+            bool yell = packet.Params.Type == ChatMessageTypeModern.Yell;
+            string carried = AddonSayYellCarrier.Encode(yell, state.CurrentMapId ?? 0, state.OwnPosition.X, state.OwnPosition.Y, prefix, body);
+            if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
+                worldClient.SendMessageChatWotLK(ChatMessageTypeWotLK.Channel, language, carried, AddonSayYellCarrier.ChannelName, "");
+            else
+                worldClient.SendMessageChatVanilla(ChatMessageTypeVanilla.Channel, language, carried, AddonSayYellCarrier.ChannelName, "");
+            // Per addon message: DebugOutput only.
+            if (Framework.Settings.DebugOutput)
+                Log.Event("addon.say_yell.carried", new
+                {
+                    type = yell ? "YELL" : "SAY",
+                    prefix,
+                    length = carried.Length,
+                    has_position = state.HasOwnPosition,
+                });
+            return;
+        }
+
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
         {
             ChatMessageTypeWotLK chatMsg = packet.Params.Type.CastEnum<ChatMessageTypeWotLK>();
