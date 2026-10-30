@@ -13,7 +13,7 @@ A fork of [WowLegacyCore/HermesProxy](https://github.com/WowLegacyCore/HermesPro
 
 ---
 
-## 2026-10-29 — Carry say and yell addon messages on a proxy-only channel (1.12 players saw proxied players shouting)
+## 2026-10-29 — Carry say and yell addon messages on a proxy-only channel (1.12 players saw proxied players shouting, PR #569)
 
 **Issue:** Several players on native 1.12 clients reported players on the proxy "constantly in the shouting animation". Since Classic 1.13.3 an addon can send its hidden messages to SAY and YELL; Nova World Buffs shares its timers by addon yell 30 s after login, on every zone change, on taking and leaving a flight, every ten minutes and at each buff drop. The proxy forwarded these as 1.12 say and yell chat in the addon language. The 1.12 client plays the shout animation on every yell and the talk animation on every say it receives, before it looks at the language, and shows no text for an addon-language message, so every 1.12 player in range saw the sender shout with nothing said. The modern client never animates an addon message, so proxied players saw nothing on each other. Unchanged since before v5.2.1; not a regression of the October releases.
 
