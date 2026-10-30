@@ -25,6 +25,13 @@ public partial class WorldClient
 
         string channelName = packet.ReadCString();
 
+        // JimsProxy (addon say/yell carrier): the proxy-only channel is never shown to the client.
+        if (AddonSayYellCarrier.IsCarrierChannel(channelName))
+        {
+            OnAddonCarrierChannelNotify(type);
+            return;
+        }
+
         switch (type)
         {
             case ChatNotify.PlayerAlreadyMember:
@@ -209,11 +216,24 @@ public partial class WorldClient
                 break;
         }
 
+        bool carrierChannel = chatType == ChatMessageTypeVanilla.Channel && AddonSayYellCarrier.IsCarrierChannel(channelName);
         uint textLength = packet.ReadUInt32();
         // Addon bodies are binary (DEFLATE etc.); read 1:1 (Latin1) so bytes >= 0x80 survive.
-        string text = packet.ReadString(textLength, language == (uint)Language.Addon ? Encoding.Latin1 : null);
+        string text = packet.ReadString(textLength, language == (uint)Language.Addon || carrierChannel ? Encoding.Latin1 : null);
         var chatTag = (ChatTag)packet.ReadUInt8();
         var chatFlags = chatTag.CastEnum<ChatFlags>();
+
+        // JimsProxy (addon say/yell carrier): a message on the proxy-only channel is another
+        // proxied player's say or yell addon message; within listen range it goes on as that
+        // message, through the same path as a real one. Anything else on the channel is dropped.
+        if (carrierChannel)
+        {
+            if (!TryUnwrapAddonCarrier(sender, ref text, out bool carriedYell))
+                return;
+            chatType = carriedYell ? ChatMessageTypeVanilla.Yell : ChatMessageTypeVanilla.Say;
+            language = (uint)Language.Addon;
+            channelName = "";
+        }
 
         if (Session.GameState.IgnoredPlayers.Contains(sender) && !chatFlags.HasFlag(ChatFlags.GM) && chatType != ChatMessageTypeVanilla.Ignored)
         {
@@ -357,6 +377,59 @@ public partial class WorldClient
         }
     }
 
+    // JimsProxy (addon say/yell carrier): decode a carrier-channel message and decide whether this
+    // player would have heard the say or yell. On success `text` is the addon message as a 1.12
+    // say or yell would carry it ("prefix\tbody").
+    private bool TryUnwrapAddonCarrier(WowGuid128 sender, ref string text, out bool yell)
+    {
+        yell = false;
+        if (!AddonSayYellCarrier.TryDecode(text, out var message))
+            return false;
+
+        var state = GetSession().GameState;
+        bool inRange = AddonSayYellCarrier.InRange(message, state.CurrentMapId, state.HasOwnPosition, state.OwnPosition.X, state.OwnPosition.Y);
+        // Per carried message: DebugOutput only.
+        if (Framework.Settings.DebugOutput)
+            Log.Event("addon.say_yell.received", new
+            {
+                sender_low = sender.GetCounter(),
+                type = message.Yell ? "YELL" : "SAY",
+                prefix = message.Prefix,
+                in_range = inRange,
+            });
+        if (!inRange)
+            return false;
+
+        yell = message.Yell;
+        text = message.Prefix + '\t' + message.Body;
+        return true;
+    }
+
+    // JimsProxy (addon say/yell carrier): the carrier channel's notifications never reach the
+    // client. A refusal means no proxied player hears this player's say or yell addon messages
+    // (an edge nobody can reproduce on request, so it is logged always).
+    private void OnAddonCarrierChannelNotify(ChatNotify type)
+    {
+        switch (type)
+        {
+            case ChatNotify.YouJoined:
+            case ChatNotify.PlayerAlreadyMember:
+                if (Framework.Settings.DebugOutput)
+                    Log.Event("addon.say_yell.channel_joined", new { notify = type.ToString() });
+                break;
+            case ChatNotify.InvalidName:
+            case ChatNotify.WrongPassword:
+            case ChatNotify.WrongFaction:
+            case ChatNotify.Banned:
+            case ChatNotify.Muted:
+            case ChatNotify.NotMember:
+            case ChatNotify.NotModerated:
+            case ChatNotify.Throttled:
+                Log.Event("addon.say_yell.channel_refused", new { notify = type.ToString() });
+                break;
+        }
+    }
+
     [PacketHandler(Opcode.SMSG_CHAT, ClientVersionBuild.V2_0_1_6180)]
     [PacketHandler(Opcode.SMSG_GM_MESSAGECHAT, ClientVersionBuild.V2_0_1_6180)]
     void HandleServerChatMessageWotLK(WorldPacket packet)
@@ -454,10 +527,21 @@ public partial class WorldClient
                 break;
         }
 
+        bool carrierChannel = chatType == ChatMessageTypeWotLK.Channel && AddonSayYellCarrier.IsCarrierChannel(channelName);
         uint textLength = packet.ReadUInt32();
         // Addon bodies are binary (DEFLATE etc.); read 1:1 (Latin1) so bytes >= 0x80 survive.
-        string text = packet.ReadString(textLength, language == (uint)Language.Addon ? Encoding.Latin1 : null);
+        string text = packet.ReadString(textLength, language == (uint)Language.Addon || carrierChannel ? Encoding.Latin1 : null);
         var chatFlags = (ChatFlags)packet.ReadUInt8();
+
+        // JimsProxy (addon say/yell carrier): see HandleServerChatMessageVanilla.
+        if (carrierChannel)
+        {
+            if (!TryUnwrapAddonCarrier(sender, ref text, out bool carriedYell))
+                return;
+            chatType = carriedYell ? ChatMessageTypeWotLK.Yell : ChatMessageTypeWotLK.Say;
+            language = (uint)Language.Addon;
+            channelName = "";
+        }
 
         if (LegacyVersion.InVersion(ClientVersionBuild.V2_0_1_6180, ClientVersionBuild.V3_0_2_9056) &&
             packet.GetUniversalOpcode(false) == Opcode.SMSG_GM_MESSAGECHAT)

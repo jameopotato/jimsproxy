@@ -497,6 +497,7 @@ public partial class WorldClient
         }
         if (guid == GetSession().GameState.CurrentPlayerGuid)
         {
+            GetSession().GameState.SetOwnPosition(moveInfo.Position);
             // JimsProxy (carried-root cure, same-map variant): hearth/tele/portal
             // within a map is a MoveTeleport, not a NEW_WORLD — a stranded root
             // crosses this loading screen too. Belief-only gate (the teleport's
@@ -678,6 +679,7 @@ public partial class WorldClient
         var previousMapId = GetSession().GameState.CurrentMapId;
         GetSession().GameState.CurrentMapId = teleport.MapID = packet.ReadUInt32();
         teleport.Position = packet.ReadVector3();
+        GetSession().GameState.SetOwnPosition(teleport.Position);
         teleport.Orientation = packet.ReadFloat();
         teleport.Reason = 4;
 

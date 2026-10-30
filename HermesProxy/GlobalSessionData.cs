@@ -402,6 +402,16 @@ public sealed class GameSessionData
     // World/Client/PreCreateOpHold.cs. Same lifetime rules as LoginEvictionHold.
     public readonly PreCreateOpHold PreCreateOpHold = new();
     public uint? CurrentMapId;
+    // JimsProxy (addon say/yell carrier): the session player's last known position, from its
+    // own movement packets, the login position and teleports; the listener side of the
+    // carrier's range check (AddonSayYellCarrier.InRange).
+    public Vector3 OwnPosition;
+    public bool HasOwnPosition;
+    public void SetOwnPosition(Vector3 position)
+    {
+        OwnPosition = position;
+        HasOwnPosition = true;
+    }
     public uint CurrentZoneId;
     public uint CurrentTaxiNode;
     public List<byte> UsableTaxiNodes = [];
