@@ -94,6 +94,11 @@ public static partial class GameData
     // SMSG_SPELL_START forwarded so the modern client can initialize the channel bar.
     // Sourced from SpellMisc DBC (Attributes_1 & 0x44), same data as JimsPlus castbars.
     public static FrozenSet<uint> ChanneledSpells = FrozenSet<uint>.Empty;
+    // JimsProxy (observer self-channel visual): vanilla 1.12 self-channeled spells, Spell.dbc
+    // AttributesEx & 0x40 (Evocation, Hellfire, Tranquility, First Aid). Kronos sends another
+    // unit's channel of one with no channel object; a native server lists the caster as its own
+    // channel object, and without one the client shows no channel visual on the caster.
+    public static FrozenSet<uint> SelfChanneledSpells = FrozenSet<uint>.Empty;
     // JimsProxy (strafe cancel-gap): vanilla 1.12 spells whose in-progress cast the server
     // cancels when the caster moves — Spell.dbc InterruptFlags & SPELL_INTERRUPT_FLAG_MOVEMENT
     // (0x01, cmangos-classic SpellDefines.h; checked in Spell::update). Gates the strafe
@@ -448,6 +453,11 @@ public static partial class GameData
     public static bool IsChanneledSpell(uint spellId)
     {
         return ChanneledSpells.Contains(spellId);
+    }
+
+    public static bool IsSelfChanneledSpell(uint spellId)
+    {
+        return SelfChanneledSpells.Contains(spellId);
     }
 
     /// <summary>
@@ -1042,6 +1052,7 @@ public static partial class GameData
             LoadOffGcdSpells,
             LoadSpell1sGcd,
             LoadChanneledSpells,
+            LoadSelfChanneledSpells,
             LoadMovementInterruptSpells,
             LoadAuraSpells,
             LoadAuraDurations,
@@ -2345,6 +2356,29 @@ public static partial class GameData
             set.Add(spellId);
         }
         ChanneledSpells = set.ToFrozenSet();
+    }
+
+    public static void LoadSelfChanneledSpells()
+    {
+        if (LegacyVersion.ExpansionVersion > 1)
+            return;
+
+        var path = Path.Combine("CSV", $"SpellSelfChanneled{LegacyVersion.ExpansionVersion}.csv");
+        if (!File.Exists(path))
+        {
+            Log.Print(LogType.Storage, $"WARNING: {path} not found — other units' self-channeled " +
+                                       "spells (Evocation, Hellfire) will show no channel visual.");
+            return;
+        }
+
+        using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+        var set = new HashSet<uint>(EstimateRowCount(path, 8));
+        foreach (var row in reader)
+        {
+            uint spellId = uint.Parse(row[0].Span);
+            set.Add(spellId);
+        }
+        SelfChanneledSpells = set.ToFrozenSet();
     }
 
     // JimsProxy (strafe cancel-gap): 1.12 Spell.dbc rows with the movement interrupt bit,
