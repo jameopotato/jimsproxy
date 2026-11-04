@@ -847,6 +847,7 @@ public partial class WorldClient
 
         SendItemUpdatesIfNeeded(item);
         GameData.StoreItemTemplate((uint)entry.Key, item);
+        ResendSynthesizedPlayerStatsForItemTemplate((uint)entry.Key);
     }
 
     // JimsProxy (Kronos Chronoboon): true when no alias is presented for this GUID yet, or the presented

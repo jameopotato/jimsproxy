@@ -117,6 +117,12 @@ public static partial class GameData
     // MOD_DAMAGE_DONE (13) for completeness — the server normally pushes MOD_DAMAGE_DONE_POS but
     // certain Kronos paths drop fields that are zero, so synthesizing fills any gaps.
     public static FrozenDictionary<uint, SpellAuraEffect[]> SpellAuraEffects = FrozenDictionary<uint, SpellAuraEffect[]>.Empty;
+    // JimsProxy: item set bonuses by ItemSet id (vanilla ItemSet.dbc SpellID/Threshold columns plus the
+    // set's RequiredSkill/RequiredSkillRank). The legacy server applies a set bonus as a passive aura
+    // that never gets a visible aura slot, and no item template lists it, so the synthesized
+    // character-sheet stats (hit, spell hit, spell crit, +healing/+damage) could not see any set bonus
+    // without this table. See GetActiveItemSetBonusSpells.
+    public static FrozenDictionary<uint, ItemSetBonus[]> ItemSetBonuses = FrozenDictionary<uint, ItemSetBonus[]>.Empty;
     public static FrozenDictionary<uint, TaxiPath> TaxiPaths = FrozenDictionary<uint, TaxiPath>.Empty;
     public static int[,] TaxiNodesGraph = new int[250, 250];
     public static FrozenDictionary<uint /*questId*/, uint /*questBit*/> QuestBits = FrozenDictionary<uint, uint>.Empty;
@@ -1045,6 +1051,7 @@ public static partial class GameData
             LoadDispellSpells,
             LoadSpellEffectPoints,
             LoadSpellAuraEffects,
+            LoadItemSetBonuses,
             LoadStackableAuras,
             LoadMountAuras,
             LoadMeleeSpells,
@@ -1896,7 +1903,8 @@ public static partial class GameData
     //   bit 4 = Frost,    bit 5 = Shadow, bit 6 = Arcane.
     // Modern client's ModDamageDonePos[] is indexed identically (0=Physical, 6=Arcane).
     public static (int? healingDone, int?[] damageDone) ComputeEquipmentSpellStats(
-        int[] equippedItemIds, uint[] activeAuraSpellIds)
+        int[] equippedItemIds, uint[] activeAuraSpellIds,
+        System.Collections.Generic.IReadOnlyList<uint>? setBonusSpellIds = null)
     {
         var damage = new int[7];
         int healing = 0;
@@ -1936,6 +1944,18 @@ public static partial class GameData
             if (spellId == 0)
                 continue;
             AccumulateSpellAuras(spellId, damage, ref healing, ref anyHealing, ref anyDamage);
+        }
+
+        // Set bonuses: the legacy server applies them as passive auras with no visible slot and no
+        // item template lists them, so they come from ItemSet data (GetActiveItemSetBonusSpells).
+        // A set spell that did reach an aura slot is already counted above.
+        if (setBonusSpellIds != null)
+        {
+            foreach (var spellId in setBonusSpellIds)
+            {
+                if (Array.IndexOf(activeAuraSpellIds, spellId) < 0)
+                    AccumulateSpellAuras(spellId, damage, ref healing, ref anyHealing, ref anyDamage);
+            }
         }
 
         var resultDamage = new int?[7];
@@ -1997,7 +2017,8 @@ public static partial class GameData
     // Instability, druid Vengeance, etc.).
     public static float[] ComputeSpellCritChance(byte playerClass, byte playerLevel,
         int playerIntellect, int[] equippedItemIds, uint[] activeAuraSpellIds,
-        System.Collections.Generic.HashSet<uint> knownSpellIds)
+        System.Collections.Generic.HashSet<uint> knownSpellIds,
+        System.Collections.Generic.IReadOnlyList<uint>? setBonusSpellIds = null)
     {
         var crit = new float[7];
 
@@ -2041,6 +2062,18 @@ public static partial class GameData
                 AccumulateCritAuras(sid, crit);
         }
 
+        // Set bonuses: the legacy server applies them as passive auras with no visible slot and no
+        // item template lists them, so they come from ItemSet data (GetActiveItemSetBonusSpells).
+        // A set spell that did reach an aura slot is already counted above.
+        if (setBonusSpellIds != null)
+        {
+            foreach (var sid in setBonusSpellIds)
+            {
+                if (Array.IndexOf(activeAuraSpellIds, sid) < 0)
+                    AccumulateCritAuras(sid, crit);
+            }
+        }
+
         return crit;
     }
 
@@ -2071,15 +2104,94 @@ public static partial class GameData
         }
     }
 
+    // JimsProxy: CSV/ItemSetSpells1.csv is the 1.12.1 client's ItemSet.dbc (patch-2.MPQ) flattened to
+    // one row per set spell: ItemSetId,SpellId,Threshold,RequiredSkill,RequiredSkillRank. 471 rows over
+    // 172 sets; identical to the 1.14.2 client's ItemSetSpell table.
+    public static void LoadItemSetBonuses()
+    {
+        if (LegacyVersion.ExpansionVersion != 1)
+            return;
+
+        var path = Path.Combine("CSV", $"ItemSetSpells{LegacyVersion.ExpansionVersion}.csv");
+        if (!File.Exists(path))
+            return;
+
+        using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+
+        var bySet = new Dictionary<uint, List<ItemSetBonus>>();
+        foreach (var row in reader)
+        {
+            uint setId = uint.Parse(row[0].Span);
+            uint spellId = uint.Parse(row[1].Span);
+            int threshold = int.Parse(row[2].Span);
+            uint requiredSkill = uint.Parse(row[3].Span);
+            uint requiredSkillRank = uint.Parse(row[4].Span);
+
+            if (!bySet.TryGetValue(setId, out var list))
+            {
+                list = new List<ItemSetBonus>(4);
+                bySet[setId] = list;
+            }
+            list.Add(new ItemSetBonus(spellId, threshold, requiredSkill, requiredSkillRank));
+        }
+
+        ItemSetBonuses = bySet.ToFrozenDictionary(kv => kv.Key, kv => kv.Value.ToArray());
+    }
+
+    // JimsProxy: the set-bonus spells the legacy server has applied to the active player, derived
+    // from the equipped items' ItemSet ids (a field of the legacy item template). Mirrors
+    // mangos-classic AddItemsSetItem: count the equipped pieces per set, apply every set spell whose
+    // threshold the count reaches, and skip a set whose RequiredSkill the player does not have at
+    // RequiredSkillRank (Bloodvine Garb needs Tailoring 300, Primal Batskin and Blood Tiger Harness
+    // Leatherworking 300, The Darksoul Blacksmithing 300). A piece whose template is not cached yet
+    // counts as absent, as everywhere else in the synthesis; the template's arrival re-emits.
+    public static List<uint> GetActiveItemSetBonusSpells(int[] equippedItemIds, Func<uint, ushort>? skillRankLookup)
+    {
+        var result = new List<uint>();
+        if (ItemSetBonuses.Count == 0)
+            return result;
+
+        Dictionary<uint, int>? piecesPerSet = null;
+        for (int slot = 0; slot < equippedItemIds.Length; slot++)
+        {
+            int itemId = equippedItemIds[slot];
+            if (itemId <= 0) continue;
+            ItemTemplate? tmpl = GetItemTemplate((uint)itemId);
+            if (tmpl == null || tmpl.ItemSet == 0) continue;
+            piecesPerSet ??= new Dictionary<uint, int>();
+            piecesPerSet[tmpl.ItemSet] = piecesPerSet.GetValueOrDefault(tmpl.ItemSet) + 1;
+        }
+        if (piecesPerSet == null)
+            return result;
+
+        foreach (var (setId, count) in piecesPerSet)
+        {
+            if (!ItemSetBonuses.TryGetValue(setId, out var bonuses))
+                continue;
+            foreach (var bonus in bonuses)
+            {
+                if (bonus.Threshold > count)
+                    continue;
+                if (bonus.RequiredSkill != 0
+                    && (skillRankLookup == null || skillRankLookup(bonus.RequiredSkill) < bonus.RequiredSkillRank))
+                    continue;
+                result.Add(bonus.SpellId);
+            }
+        }
+        return result;
+    }
+
     // JimsProxy: synthesize the melee/ranged Hit Chance modifier for the active player.
     // Vanilla 1.12 has no UiHitModifier-equivalent field, so the modern client's Ranged
     // (and Melee) "Hit Chance" row stays at 0% unless we compute it. Mirrors mangos-classic
     // Player::ApplyAura(SPELL_AURA_MOD_HIT_CHANCE) — sums aura 54 effects from equipped item
-    // ON_EQUIP triggered spells, active aura slots, and known-spell talents (e.g. Warrior /
-    // Druid Precision). Aura 54's BasePoints stores rank-1 (so a +1% trinket has BP=0); the
+    // ON_EQUIP triggered spells, active aura slots, known-spell talents (e.g. Warrior /
+    // Druid Precision) and the equipped sets' bonus spells (Devilsaur Armor 2-piece 15465,
+    // Black Dragon Mail 2-piece 15464). Aura 54's BasePoints stores rank-1 (so a +1% trinket has BP=0); the
     // CSV loader has already +1'd these to actual percentages, so we just sum directly.
     public static float ComputeMeleeRangedHitModifier(int[] equippedItemIds,
-        uint[] activeAuraSpellIds, System.Collections.Generic.HashSet<uint> knownSpellIds)
+        uint[] activeAuraSpellIds, System.Collections.Generic.HashSet<uint> knownSpellIds,
+        System.Collections.Generic.IReadOnlyList<uint>? setBonusSpellIds = null)
     {
         float hit = 0f;
 
@@ -2107,6 +2219,18 @@ public static partial class GameData
         {
             foreach (var sid in knownSpellIds)
                 hit += AccumulateHitAura(sid);
+        }
+
+        // Set bonuses: the legacy server applies them as passive auras with no visible slot and no
+        // item template lists them, so they come from ItemSet data (GetActiveItemSetBonusSpells).
+        // A set spell that did reach an aura slot is already counted above.
+        if (setBonusSpellIds != null)
+        {
+            foreach (var sid in setBonusSpellIds)
+            {
+                if (Array.IndexOf(activeAuraSpellIds, sid) < 0)
+                    hit += AccumulateHitAura(sid);
+            }
         }
 
         return hit;
@@ -2137,7 +2261,8 @@ public static partial class GameData
     // Precision et al) is intentionally NOT included — the modern client computes those
     // SPELLMOD contributions itself; including them here would double-count.
     public static float ComputeSpellHitModifier(int[] equippedItemIds,
-        uint[] activeAuraSpellIds, System.Collections.Generic.HashSet<uint> knownSpellIds)
+        uint[] activeAuraSpellIds, System.Collections.Generic.HashSet<uint> knownSpellIds,
+        System.Collections.Generic.IReadOnlyList<uint>? setBonusSpellIds = null)
     {
         float hit = 0f;
 
@@ -2165,6 +2290,18 @@ public static partial class GameData
         {
             foreach (var sid in knownSpellIds)
                 hit += AccumulateSpellHitAura(sid);
+        }
+
+        // Set bonuses: the legacy server applies them as passive auras with no visible slot and no
+        // item template lists them, so they come from ItemSet data (GetActiveItemSetBonusSpells).
+        // A set spell that did reach an aura slot is already counted above.
+        if (setBonusSpellIds != null)
+        {
+            foreach (var sid in setBonusSpellIds)
+            {
+                if (Array.IndexOf(activeAuraSpellIds, sid) < 0)
+                    hit += AccumulateSpellHitAura(sid);
+            }
         }
 
         return hit;
@@ -5583,6 +5720,9 @@ public static partial class GameData
     // SpellAuraEffects1 CSV (vanilla DBC dump). Used to synthesize per-school spell damage
     // and total spell healing from equipment-triggered passive auras. Aura type values match
     // the standard SPELL_AURA_* enum (e.g. 13 = MOD_DAMAGE_DONE, 135 = MOD_HEALING_DONE).
+    // JimsProxy: one set spell of an item set (see ItemSetBonuses / LoadItemSetBonuses).
+    public readonly record struct ItemSetBonus(uint SpellId, int Threshold, uint RequiredSkill, uint RequiredSkillRank);
+
     public readonly struct SpellAuraEffect
     {
         public readonly byte EffectIndex;  // 0..2
