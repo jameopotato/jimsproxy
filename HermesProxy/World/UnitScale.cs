@@ -89,6 +89,11 @@ public static class UnitScale
 
     public static void LoadClientData(string directory, int expansion)
     {
+        // Later legacy servers send a modern scale already, and the tables exist for the 1.14
+        // client only: nothing to load, and no errors to log, on a 2.5.x or WotLK setup.
+        if (LegacyVersion.ExpansionVersion != 1)
+            return;
+
         string displaysPath = Path.Combine(directory, $"UnitScaleDisplays{expansion}.csv");
         string racesPath = Path.Combine(directory, $"UnitScaleDisplayRaces{expansion}.csv");
         string raceModelsPath = Path.Combine(directory, $"UnitScaleRaceModels{expansion}.csv");
@@ -133,6 +138,14 @@ public static class UnitScale
         {
             foreach (var row in reader)
                 models[ParseUInt(row[0].Span)] = new ModelRow(ParseFloat(row[1].Span), ParseFloat(row[2].Span));
+        }
+
+        // A header-only table would keep the translation on with a term missing (an empty
+        // race table drops the race model scale from every humanoid NPC): treat it as missing.
+        if (displays.Count == 0 || races.Count == 0 || raceModels.Count == 0 || models.Count == 0)
+        {
+            Log.Print(LogType.Error, $"EMPTY CSV: one of the UnitScale*{expansion}.csv tables in {directory} has no rows; unit sizes are not translated. Reinstall the proxy or re-extract hermes-bundle.zip to restore the data files");
+            return;
         }
 
         s_displayRaces = races.ToFrozenDictionary();

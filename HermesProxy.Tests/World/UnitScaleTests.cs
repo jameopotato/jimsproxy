@@ -26,6 +26,7 @@ internal static class UnitScaleTestData
             GameData.LoadCreatureDisplayInfo();
             GameData.LoadCreatureModelCollisionHeights(Path.Combine("CSV", "CreatureModelCollisionHeightsModern1.csv"));
             GameData.LoadCreatureFamilies();
+            GameData.LoadVanillaCreatureModelScales();
             GameData.LoadCreatureDisplayInfoHotfixes(Path.Combine("CSV", "Hotfix", "CreatureDisplayInfo1.csv"));
             GameData.LoadCreatureDisplayInfoExtraHotfixes(Path.Combine("CSV", "Hotfix", "CreatureDisplayInfoExtra1.csv"));
             UnitScale.LoadClientData("CSV", 1);

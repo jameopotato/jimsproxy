@@ -38,6 +38,11 @@ public partial class WorldClient
         if (!IsTranslatedUnit(unit))
             return;
 
+        // The session's pet (by the May block's own test) keeps the May pet path, which reads
+        // ObjectData.Scale as the server's value: a mind-controlled humanoid, a humanoid guardian.
+        if (IsLocalPet(guid, updateData))
+            return;
+
         var factor = UnitScale.ComputeFactor(unit);
         float clientScale = UnitScale.ToClientObjectScale(serverScale, factor.Value);
         updateData.ObjectData.Scale = clientScale;
@@ -111,6 +116,18 @@ public partial class WorldClient
         }
 
         return model.Height * drawnScale;
+    }
+
+    // The May block's test for the session's pet (UpdateHandler, the pet-scale branch).
+    private bool IsLocalPet(WowGuid128 guid, ObjectUpdate updateData)
+    {
+        var state = GetSession().GameState;
+        var currentPetGuid = state.CurrentPetGuid;
+        var localPlayerGuid = state.CurrentPlayerGuid;
+        return (currentPetGuid != default && guid == currentPetGuid)
+               || (localPlayerGuid != default
+                   && updateData.UnitData.SummonedBy != null
+                   && (WowGuid128)updateData.UnitData.SummonedBy == localPlayerGuid);
     }
 
     private static bool IsUnitObjectType(ObjectType objectType)
