@@ -3566,6 +3566,22 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                 {
                     var channelSpells = GetSession().GameState.UnitChannelSpells;
                     int oldSpellId = channelSpells.GetValueOrDefault(guid, 0);
+
+                    // JimsProxy (observer self-channel visual): Kronos leaves the channel object at 0
+                    // when a unit channels on itself (Evocation, Hellfire, Tranquility, a bandage on
+                    // itself), so this client got the channel spell with no channel object and drew no
+                    // channel visual on the caster. A native server lists the caster as its own channel
+                    // object for a self-channeled spell; do the same, and clear it when that channel
+                    // ends. An object the server sent, or one set by an earlier update, is kept.
+                    if (updateData.UnitData.ChannelObject == null &&
+                        GetGuidValue64(updates, UnitField.UNIT_FIELD_CHANNEL_OBJECT).IsEmpty())
+                    {
+                        if (spellId != 0 && GameData.IsSelfChanneledSpell((uint)spellId))
+                            updateData.UnitData.ChannelObject = guid;
+                        else if (oldSpellId != 0 && GameData.IsSelfChanneledSpell((uint)oldSpellId))
+                            updateData.UnitData.ChannelObject = WowGuid128.Empty;
+                    }
+
                     if (spellId != oldSpellId)
                     {
                         string guidStr = guid.ToClientGuidString();
@@ -4743,58 +4759,9 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                 && guid == GetSession().GameState.CurrentPlayerGuid
                 && !guid.IsEmpty())
             {
-                var (healingDone, damageDone) = GameData.ComputeEquipmentSpellStats(
-                    GetSession().GameState.CurrentEquippedItemIds,
-                    GetSession().GameState.CurrentPlayerAuraSpellIds);
-
-                if (healingDone.HasValue)
-                    updateData.ActivePlayerData.ModHealingDonePos = healingDone;
-
-                for (int i = 0; i < 7; i++)
-                {
-                    if (updateData.ActivePlayerData.ModDamageDonePos[i] == null && damageDone[i].HasValue)
-                        updateData.ActivePlayerData.ModDamageDonePos[i] = damageDone[i];
-                }
-
-                // JimsProxy (vanilla synthesized spell crit): vanilla 1.12 has no
-                // PLAYER_SPELL_CRIT_PERCENTAGE1 field. Compute base + INT/rate + aura
-                // contributions per school and override the modern client's per-school
-                // crit array. Done unconditionally for the active player (overwriting any
-                // value the legacy server might have pushed via a lookup that returns
-                // null on vanilla — safe because the field doesn't exist there).
-                float[] critByschool = GameData.ComputeSpellCritChance(
-                    GetSession().GameState.CurrentPlayerClass,
-                    GetSession().GameState.CurrentPlayerLevel,
-                    GetSession().GameState.CurrentPlayerIntellect,
-                    GetSession().GameState.CurrentEquippedItemIds,
-                    GetSession().GameState.CurrentPlayerAuraSpellIds,
-                    GetSession().GameState.CurrentPlayerKnownSpells);
-                for (int i = 0; i < 7; i++)
-                    updateData.ActivePlayerData.SpellCritPercentage[i] = critByschool[i];
-
-                // JimsProxy: synthesize melee/ranged Hit Chance. Vanilla 1.12 has no
-                // UiHitModifier-equivalent field — Kronos can't push a value the modern
-                // client recognises — so the Ranged/Melee "Hit Chance" row reads 0% until
-                // we compute it from aura type 54 contributions on equipment, active
-                // auras, and talent passives.
-                float hitMod = GameData.ComputeMeleeRangedHitModifier(
-                    GetSession().GameState.CurrentEquippedItemIds,
-                    GetSession().GameState.CurrentPlayerAuraSpellIds,
-                    GetSession().GameState.CurrentPlayerKnownSpells);
-                updateData.ActivePlayerData.UiHitModifier = hitMod;
-
-                float spellHitMod = GameData.ComputeSpellHitModifier(
-                    GetSession().GameState.CurrentEquippedItemIds,
-                    GetSession().GameState.CurrentPlayerAuraSpellIds,
-                    GetSession().GameState.CurrentPlayerKnownSpells);
-                // Modern Classic Era 1.14 interprets UiSpellHitModifier as a *rating* and
-                // applies the Classic-Era rating-to-% conversion at L60: 7.0 spell-hit
-                // rating per 1% (empirically verified — sending field=40 displayed 5.7%,
-                // 40/5.7 ≈ 7.0). Pre-scale so the displayed value matches what we
-                // synthesize. UiHitModifier (melee/ranged) does NOT have this conversion
-                // and stays a flat %.
-                const float SPELL_HIT_RATING_PER_PCT_L60 = 7.0f;
-                updateData.ActivePlayerData.UiSpellHitModifier = spellHitMod * SPELL_HIT_RATING_PER_PCT_L60;
+                // The computation lives in SynthesizeVanillaPlayerStats (SynthesizedPlayerStats.cs) so
+                // the item-template arrival path can re-emit the same fields.
+                SynthesizeVanillaPlayerStats(updateData.ActivePlayerData, fillDamageGaps: true);
             }
             int PLAYER_FIELD_MOD_TARGET_RESISTANCE = LegacyVersion.GetUpdateField(PlayerField.PLAYER_FIELD_MOD_TARGET_RESISTANCE);
             if (PLAYER_FIELD_MOD_TARGET_RESISTANCE >= 0 && updateMaskArray[PLAYER_FIELD_MOD_TARGET_RESISTANCE])

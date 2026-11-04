@@ -1,6 +1,6 @@
 """
 extract-gcd-csv.py -- regenerate HermesProxy/CSV/SpellOffGcd1.csv, Spell1sGcd1.csv,
-and SpellChanneled1.csv from a vanilla 1.12 client's Spell.dbc.
+SpellChanneled1.csv and SpellSelfChanneled1.csv from a vanilla 1.12 client's Spell.dbc.
 
 These CSVs drive the GCD hold-and-fire and channeled-spell logic in jimsproxy:
   - SpellOffGcd1.csv      : spells that bypass the GCD hold entirely (off-GCD, issue #43)
@@ -8,6 +8,11 @@ These CSVs drive the GCD hold-and-fire and channeled-spell logic in jimsproxy:
                             instead of the default 1500ms (issue #43)
   - SpellChanneled1.csv   : channeled spells (AttributesEx & 0x44) whose SPELL_START must
                             be forwarded to the client for channel bar timing (issue #91)
+  - SpellSelfChanneled1.csv : self-channeled spells (AttributesEx & 0x40, e.g. Evocation,
+                            Hellfire, Tranquility, First Aid). Another unit channeling one with
+                            no channel object gets itself as the channel object, as a native
+                            server sends it. Not limited by the castable filters below: any
+                            unit, NPCs included, can be seen channeling one.
 
 HOW TO RUN
 
@@ -119,6 +124,7 @@ def parse(blob: bytes):
     off_gcd: list[int] = []
     one_s_gcd: list[int] = []
     channeled: list[int] = []
+    self_channeled: list[int] = []
     filtered = {'passive': 0, 'hidden': 0, 'no_effect': 0, 'no_name': 0, 'zero_id': 0}
 
     for i in range(record_count):
@@ -132,6 +138,8 @@ def parse(blob: bytes):
         rec_time = struct.unpack_from('<i', blob, base + IDX_START_RECOVERY_TIME * 4)[0]
 
         if sid == 0: filtered['zero_id'] += 1; continue
+        if attrs_ex & ATTR_EX_CHANNELED_2:
+            self_channeled.append(sid)
         if attrs & ATTR_PASSIVE: filtered['passive'] += 1; continue
         if attrs & ATTR_HIDDEN_CLIENTSIDE: filtered['hidden'] += 1; continue
         if all(e == 0 for e in effects): filtered['no_effect'] += 1; continue
@@ -144,7 +152,7 @@ def parse(blob: bytes):
         if attrs_ex & (ATTR_EX_CHANNELED_1 | ATTR_EX_CHANNELED_2):
             channeled.append(sid)
 
-    return off_gcd, one_s_gcd, channeled, filtered, record_count
+    return off_gcd, one_s_gcd, channeled, self_channeled, filtered, record_count
 
 
 def write_csv(path: str, ids: list[int]) -> None:
@@ -163,7 +171,7 @@ def main():
     args = parser.parse_args()
 
     blob = load_spell_dbc(args.client, args.dbc)
-    off_gcd, one_s_gcd, channeled, filtered, total = parse(blob)
+    off_gcd, one_s_gcd, channeled, self_channeled, filtered, total = parse(blob)
 
     print(f"Total records:          {total:,}", file=sys.stderr)
     for k, v in filtered.items():
@@ -171,17 +179,21 @@ def main():
     print(f"Off-GCD (castable):     {len(off_gcd):,}", file=sys.stderr)
     print(f"1s-GCD (castable):      {len(one_s_gcd):,}", file=sys.stderr)
     print(f"Channeled (castable):   {len(channeled):,}", file=sys.stderr)
+    print(f"Self-channeled (all):   {len(self_channeled):,}", file=sys.stderr)
 
     os.makedirs(args.out_dir, exist_ok=True)
     off_gcd_path = os.path.join(args.out_dir, 'SpellOffGcd1.csv')
     one_s_gcd_path = os.path.join(args.out_dir, 'Spell1sGcd1.csv')
     channeled_path = os.path.join(args.out_dir, 'SpellChanneled1.csv')
+    self_channeled_path = os.path.join(args.out_dir, 'SpellSelfChanneled1.csv')
     write_csv(off_gcd_path, off_gcd)
     write_csv(one_s_gcd_path, one_s_gcd)
     write_csv(channeled_path, channeled)
+    write_csv(self_channeled_path, self_channeled)
     print(f"Wrote {off_gcd_path}", file=sys.stderr)
     print(f"Wrote {one_s_gcd_path}", file=sys.stderr)
     print(f"Wrote {channeled_path}", file=sys.stderr)
+    print(f"Wrote {self_channeled_path}", file=sys.stderr)
 
 
 if __name__ == '__main__':
