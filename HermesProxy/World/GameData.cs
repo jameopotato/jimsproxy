@@ -1043,6 +1043,7 @@ public static partial class GameData
             LoadCreatureModelCollisionHeights,
             LoadCreatureFamilies,
             LoadVanillaCreatureModelScales,
+            UnitScale.LoadClientData,
             LoadTalentSpellRanks,
             LoadSpellRankChain,
             LoadTransports,
@@ -5398,6 +5399,8 @@ public static partial class GameData
         // math that must agree with what is on screen — the synthesized player collision
         // height — has to read the same values, not the stock CreatureDisplayInfo.csv ones.
         var displayScales = new Dictionary<uint, float>();
+        // JimsProxy (unit-scale): the same rows, whole, for the unit scale factor (UnitScale.cs).
+        var displayRows = new Dictionary<uint, UnitScale.DisplayRow>();
         uint counter = 0;
         foreach (var row in reader)
         {
@@ -5432,6 +5435,7 @@ public static partial class GameData
             int textureVariationFileDataId3 = row[26].Parse<int>();
 
             displayScales[id] = creatureModelScale;
+            displayRows[id] = new UnitScale.DisplayRow(modelId, creatureModelScale, (uint)Math.Max(extendedDisplayInfoId, 0), playerOverrideScale);
 
             HotfixRecord record = new HotfixRecord();
             record.TableHash = DB2Hash.CreatureDisplayInfo;
@@ -5470,12 +5474,19 @@ public static partial class GameData
         }
 
         HotfixCreatureDisplayScales = displayScales.ToFrozenDictionary();
+        UnitScale.SetDisplayHotfixes(displayRows);
     }
     public static void LoadCreatureDisplayInfoExtraHotfixes()
     {
-        var path = Path.Combine("CSV", "Hotfix", $"CreatureDisplayInfoExtra{ModernVersion.ExpansionVersion}.csv");
+        LoadCreatureDisplayInfoExtraHotfixes(Path.Combine("CSV", "Hotfix", $"CreatureDisplayInfoExtra{ModernVersion.ExpansionVersion}.csv"));
+    }
 
+    public static void LoadCreatureDisplayInfoExtraHotfixes(string path)
+    {
         using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+        // JimsProxy (unit-scale): a pushed Extra row replaces the client's, and its race picks
+        // the race model scale in the unit scale factor (UnitScale.cs).
+        var displayRaces = new Dictionary<uint, UnitScale.DisplayRace>();
         uint counter = 0;
         foreach (var row in reader)
         {
@@ -5484,6 +5495,7 @@ public static partial class GameData
             uint id = row[0].Parse<uint>();
             sbyte displayRaceId = row[1].Parse<sbyte>();
             sbyte displaySexId = row[2].Parse<sbyte>();
+            displayRaces[id] = new UnitScale.DisplayRace(displayRaceId, displaySexId);
             sbyte displayClassId = row[3].Parse<sbyte>();
             sbyte skinId = row[4].Parse<sbyte>();
             sbyte faceId = row[5].Parse<sbyte>();
@@ -5520,6 +5532,8 @@ public static partial class GameData
             record.HotfixContent.WriteUInt8(customDisplayOption3);
             Hotfixes.Add(record.HotfixId, record);
         }
+
+        UnitScale.SetDisplayRaceHotfixes(displayRaces);
     }
     public static void LoadCreatureDisplayInfoOptionHotfixes()
     {
