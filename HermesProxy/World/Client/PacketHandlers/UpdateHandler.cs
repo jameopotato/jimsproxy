@@ -3566,6 +3566,22 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                 {
                     var channelSpells = GetSession().GameState.UnitChannelSpells;
                     int oldSpellId = channelSpells.GetValueOrDefault(guid, 0);
+
+                    // JimsProxy (observer self-channel visual): Kronos leaves the channel object at 0
+                    // when a unit channels on itself (Evocation, Hellfire, Tranquility, a bandage on
+                    // itself), so this client got the channel spell with no channel object and drew no
+                    // channel visual on the caster. A native server lists the caster as its own channel
+                    // object for a self-channeled spell; do the same, and clear it when that channel
+                    // ends. An object the server sent, or one set by an earlier update, is kept.
+                    if (updateData.UnitData.ChannelObject == null &&
+                        GetGuidValue64(updates, UnitField.UNIT_FIELD_CHANNEL_OBJECT).IsEmpty())
+                    {
+                        if (spellId != 0 && GameData.IsSelfChanneledSpell((uint)spellId))
+                            updateData.UnitData.ChannelObject = guid;
+                        else if (oldSpellId != 0 && GameData.IsSelfChanneledSpell((uint)oldSpellId))
+                            updateData.UnitData.ChannelObject = WowGuid128.Empty;
+                    }
+
                     if (spellId != oldSpellId)
                     {
                         string guidStr = guid.ToClientGuidString();

@@ -23,7 +23,7 @@ JimsProxy --set ServerAddress=logon.example.com --set ServerPort=3724
 JimsProxy --config MyOtherServer.config
 ```
 
-**In file** marks the 19 keys present in the shipped file; the other 21 take their built-in
+**In file** marks the 19 keys present in the shipped file; the other 22 take their built-in
 default unless added. **Default** is the effective out-of-the-box value.
 
 ---
@@ -80,6 +80,7 @@ A second instance on the same machine needs its own port set, for example
 |---|---|:---:|---|
 | `ThreatEngine` | `false` | ✅ | Synthesizes threat for threat-meter addons; vanilla servers send none. Inactive in battlegrounds. |
 | `EnablePallyPowerInterop` | `true` | ❌ | Translates PallyPower blessing assignments between 1.12 and 1.14 players (`PLPWR` prefix only). |
+| `AddonSayYellCarrier` | `true` | ❌ | Carries say and yell addon messages between proxied players on a proxy-only channel, so 1.12 players nearby no longer see the shout animation on every addon yell (Nova World Buffs). `false` forwards them as 1.12 say and yell chat again. |
 | `ClientTcpNoDelay` | `true` | ❌ | `TCP_NODELAY` on the client socket. `false` restores Nagle batching, which tested worse for cast responsiveness. |
 
 ## Reliability
