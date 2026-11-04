@@ -2225,11 +2225,15 @@ public partial class WorldClient
         if (objectType == ObjectType.Player || objectType == ObjectType.ActivePlayer)
         {
             int UNIT_FIELD_NATIVEDISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_NATIVEDISPLAYID);
+            int UNIT_FIELD_DISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_DISPLAYID);
             int UNIT_FIELD_MOUNTDISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_MOUNTDISPLAYID);
             int OBJECT_FIELD_SCALE_X = LegacyVersion.GetUpdateField(ObjectField.OBJECT_FIELD_SCALE_X);
-            if (UNIT_FIELD_NATIVEDISPLAYID >= 0 && UNIT_FIELD_MOUNTDISPLAYID >= 0 && OBJECT_FIELD_SCALE_X >= 0)
+            if (UNIT_FIELD_NATIVEDISPLAYID >= 0 && UNIT_FIELD_DISPLAYID >= 0 && UNIT_FIELD_MOUNTDISPLAYID >= 0 && OBJECT_FIELD_SCALE_X >= 0)
             {
-                if (!changedValuesMask.Get(UNIT_FIELD_NATIVEDISPLAYID) && !changedValuesMask.Get(UNIT_FIELD_MOUNTDISPLAYID) && !changedValuesMask.Get(OBJECT_FIELD_SCALE_X))
+                // JimsProxy (unit-scale): the drawn model (DISPLAYID: a form or a costume) changes
+                // the height and the translated scale, so it re-sends the packet too.
+                if (!changedValuesMask.Get(UNIT_FIELD_NATIVEDISPLAYID) && !changedValuesMask.Get(UNIT_FIELD_DISPLAYID)
+                    && !changedValuesMask.Get(UNIT_FIELD_MOUNTDISPLAYID) && !changedValuesMask.Get(OBJECT_FIELD_SCALE_X))
                     return; // No need for an update
 
                 // Reads UNIT_FIELD_DISPLAYID (the currently rendered, form-aware model), not
@@ -2241,7 +2245,14 @@ public partial class WorldClient
                 if (rawScaleX == 0.0f)
                     return;
 
-                float scaledHeight = ComputeVisualCollisionHeight(currentDisplayId, mountDisplayId, rawScaleX);
+                // JimsProxy (unit-scale): this packet's Scale lands in the same client slot as
+                // ObjectData.Scale (the last one to arrive wins), so for a translated unit it must
+                // carry the translated value, or a mount or dismount would snap the unit back to the
+                // doubled size until its next scale update. Untranslated units keep the #359 formula.
+                float clientScale = ComputeClientUnitScale(objectType, updates, out float displayFactor);
+                float scaledHeight = clientScale != rawScaleX || displayFactor != 1.0f
+                    ? ComputeTranslatedCollisionHeight(currentDisplayId, mountDisplayId, clientScale, displayFactor)
+                    : ComputeVisualCollisionHeight(currentDisplayId, mountDisplayId, rawScaleX);
                 if (scaledHeight == 0)
                     scaledHeight = mountDisplayId != 0 ? PlayerHeight.Mounted : PlayerHeight.Normal;
 
@@ -2253,7 +2264,7 @@ public partial class WorldClient
                 {
                     MoverGUID = guid,
                     Height = scaledHeight,
-                    Scale = rawScaleX,
+                    Scale = clientScale,
                     Reason = reason,
                     MountDisplayID = (uint) mountDisplayId,
                 };
@@ -2266,6 +2277,7 @@ public partial class WorldClient
                         display_id = currentDisplayId,
                         mount_display_id = mountDisplayId,
                         raw_scale = rawScaleX,
+                        client_scale = clientScale,
                         height = scaledHeight,
                         reason = reason.ToString(),
                     });
@@ -5329,6 +5341,11 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
             }
         }
 
+        // JimsProxy (unit-scale, v1): players and humanoid NPCs get SCALE_X / the client's own
+        // display factor (UnitScaleHandler.cs). Runs first: the May block below keeps sizing pets
+        // (its pet branch wins for a pet) and every other creature, and skips humanoid displays.
+        TranslateUnitScale(updateMaskArray, updates, objectType, updateData, guid);
+
         // JimsProxy (pet-scale-vanilla-parity): the local player's pet (warlock
         // or hunter) renders at the wrong size in modern 1.14 Classic vs vanilla
         // 1.12 reference. Modern Classic's per-display CreatureModelScale
@@ -5552,8 +5569,12 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                     cms_fallback = cms <= 0,
                 });
             }
-            else if (objectType == ObjectType.Unit && cms > 0)
+            else if (objectType == ObjectType.Unit && cms > 0
+                     && !(UnitScale.TranslationEnabled && displayId > 0 && UnitScale.IsCharacterModelDisplay((uint)displayId)))
             {
+                // JimsProxy (unit-scale, v1): a humanoid display (a race's character model) is
+                // sized by TranslateUnitScale above while the tables are loaded; this branch keeps
+                // every other creature as before.
                 // Non-pet vanilla NPC scale: bridge Kronos (TC-1.12) wire convention to
                 // modern Classic 1.14 client rendering. Vanilla 1.12 server-side
                 // creature_template.scale equals CreatureModelScale per DisplayID, sent
@@ -5668,27 +5689,6 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                     emitted_scale = npcEmit,
                     k_source = hasVanillaCms ? "vanilla_dbc" : "default",
                 });
-            }
-            else if (objectType == ObjectType.Player || objectType == ObjectType.ActivePlayer)
-            {
-                // K=0.75 for tauren is now baked into the CreatureDisplayInfo CMS hotfix
-                // (CSV/Hotfix/CreatureDisplayInfo1.csv) — id 59 CMS = 1.0125, id 60 CMS = 0.75.
-                // The 1.14 client renders all paths as wire × CMS × ModelScale, so the
-                // hotfix CMS alone yields the K-applied target without a proxy wire
-                // multiplier. Post-shift recompute uses the same CMS, so login and
-                // post-shift now match. Diagnostic event for visibility.
-                int modelIdForAdjust = displayId > 0 ? (int)GameData.GetDisplayInfo((uint)displayId).ModelId : 0;
-                if (modelIdForAdjust > 0 && M2MeshAdjust.TryGetValue(modelIdForAdjust, out var playerAdj))
-                {
-                    Log.Event("unit.player_scale.skipped", new
-                    {
-                        guid = guid.ToString(),
-                        display_id = displayId,
-                        model_id = modelIdForAdjust,
-                        raw_scale = rawScale,
-                        reason = "k_baked_in_cms_hotfix",
-                    });
-                }
             }
         }
     }
