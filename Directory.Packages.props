@@ -10,6 +10,7 @@
   </ItemGroup>
   <ItemGroup>
     <!-- Framework project packages -->
+    <PackageVersion Include="BouncyCastle.Cryptography" Version="2.4.0" />
     <PackageVersion Include="Google.Protobuf" Version="3.33.4" />
     <PackageVersion Include="Microsoft.CSharp" Version="4.7.0" />
     <PackageVersion Include="Sep" Version="0.12.2" />

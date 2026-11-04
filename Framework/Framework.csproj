@@ -12,6 +12,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="BouncyCastle.Cryptography" />
     <PackageReference Include="Google.Protobuf" />
     <PackageReference Include="System.Configuration.ConfigurationManager" />
   </ItemGroup>

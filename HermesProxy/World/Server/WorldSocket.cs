@@ -666,7 +666,7 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
 
             PacketHeader header = new();
             header.Size = packetSize;
-            _worldCrypt.Encrypt(ref data, ref header.Tag);
+            _worldCrypt.Encrypt(data, header.Tag);
 
             ByteBuffer byteBuffer = new();
             header.Write(byteBuffer);
