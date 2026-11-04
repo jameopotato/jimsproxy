@@ -228,7 +228,7 @@ public partial class WorldClient
         // message, through the same path as a real one. Anything else on the channel is dropped.
         if (carrierChannel)
         {
-            if (!TryUnwrapAddonCarrier(sender, ref text, out bool carriedYell))
+            if (!TryUnwrapAddonCarrier(sender, language, ref text, out bool carriedYell))
                 return;
             chatType = carriedYell ? ChatMessageTypeVanilla.Yell : ChatMessageTypeVanilla.Say;
             language = (uint)Language.Addon;
@@ -380,9 +380,24 @@ public partial class WorldClient
     // JimsProxy (addon say/yell carrier): decode a carrier-channel message and decide whether this
     // player would have heard the say or yell. On success `text` is the addon message as a 1.12
     // say or yell would carry it ("prefix\tbody").
-    private bool TryUnwrapAddonCarrier(WowGuid128 sender, ref string text, out bool yell)
+    private bool TryUnwrapAddonCarrier(WowGuid128 sender, uint language, ref string text, out bool yell)
     {
         yell = false;
+        // A proxy sends the carrier in the addon language and the server relays it as such
+        // (Kronos, 2026-10-29). A 1.12 client cannot send the addon language, so anything else
+        // on the channel did not come from a proxy: dropped, with a DebugOutput breadcrumb.
+        if (language != (uint)Language.Addon)
+        {
+            if (Framework.Settings.DebugOutput)
+                Log.Event("addon.say_yell.received", new
+                {
+                    sender_low = sender.GetCounter(),
+                    dropped = "language",
+                    language,
+                    length = text.Length,
+                });
+            return false;
+        }
         if (!AddonSayYellCarrier.TryDecode(text, out var message))
             return false;
 
@@ -423,7 +438,7 @@ public partial class WorldClient
             case ChatNotify.Banned:
             case ChatNotify.Muted:
             case ChatNotify.NotMember:
-            case ChatNotify.NotModerated:
+            case ChatNotify.NotModerator:
             case ChatNotify.Throttled:
                 Log.Event("addon.say_yell.channel_refused", new { notify = type.ToString() });
                 break;
@@ -536,7 +551,7 @@ public partial class WorldClient
         // JimsProxy (addon say/yell carrier): see HandleServerChatMessageVanilla.
         if (carrierChannel)
         {
-            if (!TryUnwrapAddonCarrier(sender, ref text, out bool carriedYell))
+            if (!TryUnwrapAddonCarrier(sender, language, ref text, out bool carriedYell))
                 return;
             chatType = carriedYell ? ChatMessageTypeWotLK.Yell : ChatMessageTypeWotLK.Say;
             language = (uint)Language.Addon;

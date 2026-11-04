@@ -300,7 +300,8 @@ public partial class WorldSocket
         // makes every 1.12 client in range play the shout or talk animation on this player (see
         // World/AddonSayYellCarrier.cs). Send it on the proxy-only channel with the type and this
         // player's position; the receiving proxies re-deliver it as say or yell within range.
-        if (AddonSayYellCarrier.IsCarrierType(packet.Params.Type))
+        // AddonSayYellCarrier=false in HermesProxy.config restores the forward as 1.12 chat.
+        if (Framework.Settings.AddonSayYellCarrier && AddonSayYellCarrier.IsCarrierType(packet.Params.Type))
         {
             var state = GetSession().GameState;
             bool yell = packet.Params.Type == ChatMessageTypeModern.Yell;

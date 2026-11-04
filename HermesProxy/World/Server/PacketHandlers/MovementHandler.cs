@@ -358,7 +358,8 @@ public partial class WorldSocket
         // JimsProxy (addon say/yell carrier): membership in a custom channel survives a world
         // port on a stock core (field, 2026-10-29), but a join costs one packet and an already-
         // member answer the notify filter drops, so re-join after every arrival to be sure.
-        GetSession().WorldClient?.SendChatJoinChannel(0, AddonSayYellCarrier.ChannelName, "");
+        if (Framework.Settings.AddonSayYellCarrier)
+            GetSession().WorldClient?.SendChatJoinChannel(0, AddonSayYellCarrier.ChannelName, "");
     }
 
     // JimsProxy (P1-2, check D-01): an acknowledgement carrying one of the counters the proxy

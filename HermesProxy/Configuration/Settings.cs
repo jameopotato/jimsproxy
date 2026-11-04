@@ -156,6 +156,13 @@ public static class Settings
     // prefix-gated to "PLPWR" — no other addon traffic is touched. Disable if
     // a future PallyPower protocol bump invalidates the assumption.
     public static bool EnablePallyPowerInterop;
+    // JimsProxy (addon say/yell carrier): carry say and yell addon messages between proxied
+    // players on a proxy-only channel instead of forwarding them as 1.12 say or yell chat,
+    // which makes every 1.12 client nearby play the shout or talk animation (see
+    // World/AddonSayYellCarrier.cs). Set false to restore the forward as 1.12 chat (the
+    // channel is not joined either). Default-init true so paths that bypass
+    // LoadAndVerifyFrom (tests) get the fix.
+    public static bool AddonSayYellCarrier = true;
     // JimsProxy (low-latency-mode): forward every CMSG_CAST_SPELL immediately
     // without holding. Eliminates hold-queue race conditions that cause stuck
     // spells for players with <40ms RTT. Most players should leave this OFF.
@@ -341,6 +348,7 @@ public static class Settings
         AuraResendAfterLoadFix = config.GetBoolean("AuraResendAfterLoadFix", true);
         AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);
+        AddonSayYellCarrier = config.GetBoolean("AddonSayYellCarrier", true);
         ClientTcpNoDelay = config.GetBoolean("ClientTcpNoDelay", true);
         LowLatencyMode = config.GetBoolean("LowLatencyMode", false);
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);

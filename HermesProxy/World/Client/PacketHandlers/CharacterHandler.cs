@@ -319,7 +319,8 @@ public partial class WorldClient
         // again after each world port, Server MovementHandler.HandleWorldPortResponse). An
         // existing membership is answered with PlayerAlreadyMember, which the notify filter
         // keeps from the client.
-        SendChatJoinChannel(0, AddonSayYellCarrier.ChannelName, "");
+        if (Framework.Settings.AddonSayYellCarrier)
+            SendChatJoinChannel(0, AddonSayYellCarrier.ChannelName, "");
 
         // JimsProxy (worldentry root-ceremony breadcrumb 2026-08-03): logins get the
         // same arrival ROOT/UNROOT ceremony as world transfers (wire-verified, incl.
