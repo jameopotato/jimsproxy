@@ -2076,7 +2076,7 @@ public partial class WorldClient
         // so the pet-instant-buff suppression below is unaffected.
         if (!casterIsLocalPlayer && !casterIsLocalPet)
         {
-            GetSession().HealCommBridge.OnRealSpellStartFromOther(spell.Cast.CasterUnit, (uint)spell.Cast.SpellID);
+            GetSession().HealCommBridge.OnRealSpellStartFromOther(spell.Cast.CasterUnit, (uint)spell.Cast.SpellID, spell.Cast.CastTime);
         }
 
         // JimsProxy (pet-instant-buff-double-sound): suppress SMSG_SPELL_START for pet
