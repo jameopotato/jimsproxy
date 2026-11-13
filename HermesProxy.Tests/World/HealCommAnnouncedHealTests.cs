@@ -152,6 +152,17 @@ public class HealCommAnnouncedHealTests
             w.WritePackedGuid(LegacyTarget);
         });
 
+    // 1.12 SMSG_SPELL_FAILURE as Kronos broadcasts it to observers: the caster's full guid, the
+    // spell and a reason byte (always 0). An interrupt sends an observer this and then
+    // SMSG_SPELL_FAILED_OTHER.
+    private static WorldPacket SpellFailurePacket(WowGuid64 caster, uint spellId) =>
+        Legacy(Opcode.SMSG_SPELL_FAILURE, w =>
+        {
+            w.WriteGuid(caster);
+            w.WriteUInt32(spellId);
+            w.WriteUInt8(0);
+        });
+
     // 1.12 SMSG_SPELL_FAILED_OTHER: the caster's full guid and the spell.
     private static WorldPacket SpellFailedOtherPacket(WowGuid64 caster, uint spellId) =>
         Legacy(Opcode.SMSG_SPELL_FAILED_OTHER, w =>
@@ -183,7 +194,8 @@ public class HealCommAnnouncedHealTests
     }
 
     // The server says the cast failed (the healer moved, was interrupted): the prediction ends
-    // there, as an interrupt, whatever the healer's addon goes on to send.
+    // there, as an interrupt, whatever the healer's addon goes on to send. An observer gets two
+    // packets for one interrupt; the heal ends once.
     [Fact]
     public void RealCastFails_EndsTheAdoptedHealAsInterrupted()
     {
@@ -192,9 +204,32 @@ public class HealCommAnnouncedHealTests
         h.Announce(HealAnnouncement);
         h.ClearSent();
 
+        h.Dispatch(SpellFailurePacket(LegacyHealer, FlashHealRank7));
         h.Dispatch(SpellFailedOtherPacket(LegacyHealer, FlashHealRank7));
 
         Assert.Equal(new[] { $"S::{FlashHealRank7}:1:" }, h.Lhc40Stops);
+    }
+
+    // A 1.12 failure names only caster and spell, and the server also sends one as the late echo
+    // of an EARLIER cast of the same spell, after the next cast has begun (44 logged casts of one
+    // healer, about 80 ms in). The proxy pairs it to the earlier cast; the live heal's prediction
+    // must stay, and end when that heal lands.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void FailureOfAnEarlierCastOfTheSameSpell_DoesNotEndTheLiveHeal(bool failureOpcode)
+    {
+        var h = new ClientHarness();
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, CastTimeMs)); // recast before its end was reported
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, CastTimeMs));
+        h.Announce(HealAnnouncement);
+        h.ClearSent();
+
+        h.Dispatch(failureOpcode ? SpellFailurePacket(LegacyHealer, FlashHealRank7) : SpellFailedOtherPacket(LegacyHealer, FlashHealRank7));
+        Assert.Empty(h.Lhc40Stops);
+
+        h.Dispatch(SpellGoPacket(LegacyHealer, FlashHealRank7));
+        Assert.Equal(new[] { $"S::{FlashHealRank7}:0:" }, h.Lhc40Stops);
     }
 
     // An instant used mid-cast (a trinket, Inner Focus) completes without ending the heal.
@@ -245,6 +280,22 @@ public class HealCommAnnouncedHealTests
 
         Assert.Single(h.Sent.OfType<SpellFailedOther>());
         Assert.Equal(new[] { $"S::{FlashHealRank1}:0:" }, h.Lhc40Stops);
+    }
+
+    // The same healer's failure, with no cast start to pair it to, cannot be told from the echo of
+    // an earlier cast: the synthesized cast is left to the healer's own stop.
+    [Fact]
+    public void RealFailureWithNoCastStart_DoesNotEndASynthesizedCast()
+    {
+        var h = new ClientHarness(Class.Priest);
+        h.Announce(HealAnnouncement);
+        h.ClearSent();
+
+        h.Dispatch(SpellFailedOtherPacket(LegacyHealer, FlashHealRank7));
+
+        Assert.Empty(h.Lhc40Stops);
+        h.Announce("Healstop");
+        Assert.Equal(new[] { $"S::{FlashHealRank1}:1:" }, h.Lhc40Stops);
     }
 
     // ---- A healer out of range: which spell -----------------------------------------------------

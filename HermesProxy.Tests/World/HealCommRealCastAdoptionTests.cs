@@ -259,8 +259,8 @@ public class HealCommRealCastAdoptionTests
         var h = new ClientHarness();
         var creature = WowGuid128.Create(HighGuidType703.Creature, 0, 1234, 99);
 
-        h.Bridge.OnRealSpellStartFromOther(h.Healer, LesserHealingWave, 0);
-        h.Bridge.OnRealSpellStartFromOther(creature, LesserHealingWave, CastTimeMs);
+        h.Bridge.OnRealSpellStartFromOther(h.Healer, LesserHealingWave, 0, default);
+        h.Bridge.OnRealSpellStartFromOther(creature, LesserHealingWave, CastTimeMs, default);
 
         Assert.Equal(0, h.Bridge.RealCastCountForTest);
     }
@@ -270,11 +270,11 @@ public class HealCommRealCastAdoptionTests
     {
         var h = new ClientHarness();
         for (uint i = 0; i < 200; i++)
-            h.Bridge.OnRealSpellStartFromOther(new WowGuid64(HighGuidTypeLegacy.Player, 10_000 + i).To128(h.State), FlashHeal, CastTimeMs);
+            h.Bridge.OnRealSpellStartFromOther(new WowGuid64(HighGuidTypeLegacy.Player, 10_000 + i).To128(h.State), FlashHeal, CastTimeMs, default);
         Assert.Equal(200, h.Bridge.RealCastCountForTest); // all still casting: none dropped
 
         h.NowMs += 60_000;
-        h.Bridge.OnRealSpellStartFromOther(h.Healer, FlashHeal, CastTimeMs);
+        h.Bridge.OnRealSpellStartFromOther(h.Healer, FlashHeal, CastTimeMs, default);
 
         Assert.Equal(1, h.Bridge.RealCastCountForTest);
     }

@@ -1116,11 +1116,6 @@ public partial class WorldClient
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
             reason = (byte)LegacyVersion.ConvertSpellCastResult(packet.ReadUInt8());
 
-        // JimsProxy (announced heals): another player's cast failed. If the bridge is tracking
-        // a heal of theirs, it ends here. Ahead of the dedup below, which can return early.
-        if (casterUnit != GetSession().GameState.CurrentPlayerGuid && casterUnit != GetSession().GameState.CurrentPetGuid)
-            GetSession().HealCommBridge.OnRealSpellEndFromOther(casterUnit, spellId, completed: false);
-
         // JimsProxy: dedup the auto-cast retry storm. Kronos pet auto-cast fires
         // SMSG_SPELL_FAILED_OTHER 5+/sec while a target is out of range / dying;
         // forwarding each one chains CancelSpellVisuals into a stuck cast sound on
@@ -1202,6 +1197,12 @@ public partial class WorldClient
             {
                 castId = trackedCastId;
                 pairedLiveObservedCast = pairedLive;
+                // JimsProxy (announced heals): the cast this failure was paired to has ended. If
+                // it is the heal the HealComm bridge is tracking for this caster, the heal ends
+                // here. By cast id: a 1.12 failure names only caster and spell, and the same
+                // packets also report an earlier cast of that spell (44 logged casts of one
+                // healer had such an echo about 80 ms after the next cast began).
+                GetSession().HealCommBridge.OnRealSpellEndFromOther(casterUnit, spellId, trackedCastId, completed: false);
             }
             // JimsProxy: pet AUTO-CAST failure — pull the unique CastID stored at
             // SPELL_START in PetAutoCastActiveCastIds. Without this lookup, the
@@ -1434,12 +1435,6 @@ public partial class WorldClient
             // stashed form-exit START for this spell before the failure reaches the client.
             CancelFormExitDeferredCast(spellId, "spell_failure");
         }
-        // JimsProxy (announced heals): the same end, for the failure Kronos broadcasts to
-        // observers under this opcode (see the non-local branch below).
-        else if (!casterIsLocalPet)
-        {
-            GetSession().HealCommBridge.OnRealSpellEndFromOther(casterUnit, spellId, completed: false);
-        }
 
         // Ranged auto-attack exception (mirrors the SPELL_START allowlist in
         // HandleSpellStart): for Auto Shot (75) / Shoot (5019), the modern
@@ -1619,7 +1614,12 @@ public partial class WorldClient
             var activeKey = (casterUnit, spellId);
             foundActiveCastId = GetSession().GameState.TryPairObservedTerminatorCastId(casterUnit, spellId, out var trackedCastId, out failurePairedLiveCast);
             if (foundActiveCastId)
+            {
                 castId = trackedCastId;
+                // JimsProxy (announced heals): see HandleSpellFailedOther. Kronos sends an
+                // observer both packets for one interrupt; this one arrives first.
+                GetSession().HealCommBridge.OnRealSpellEndFromOther(casterUnit, spellId, trackedCastId, completed: false);
+            }
             // JimsProxy: pet AUTO-CAST failure path — same rationale as
             // HandleSpellFailedOther. Without this lookup the synthesized dismiss
             // packets target the deterministic seed and the client ignores them.
@@ -2087,7 +2087,7 @@ public partial class WorldClient
         // so the pet-instant-buff suppression below is unaffected.
         if (!casterIsLocalPlayer && !casterIsLocalPet)
         {
-            GetSession().HealCommBridge.OnRealSpellStartFromOther(spell.Cast.CasterUnit, (uint)spell.Cast.SpellID, spell.Cast.CastTime);
+            GetSession().HealCommBridge.OnRealSpellStartFromOther(spell.Cast.CasterUnit, (uint)spell.Cast.SpellID, spell.Cast.CastTime, spell.Cast.CastID);
         }
 
         // JimsProxy (pet-instant-buff-double-sound): suppress SMSG_SPELL_START for pet
@@ -2386,7 +2386,7 @@ public partial class WorldClient
         // tracking a heal of theirs, this is where it landed.
         else if (GetSession().GameState.CurrentPetGuid != spell.Cast.CasterUnit)
         {
-            GetSession().HealCommBridge.OnRealSpellEndFromOther(spell.Cast.CasterUnit, (uint)spell.Cast.SpellID, completed: true);
+            GetSession().HealCommBridge.OnRealSpellEndFromOther(spell.Cast.CasterUnit, (uint)spell.Cast.SpellID, spell.Cast.CastID, completed: true);
         }
 
         // JimsProxy (fifo-terminator-symmetry): a FIFO entry with NO started pending cast but a

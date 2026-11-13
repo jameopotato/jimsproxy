@@ -168,6 +168,7 @@ public sealed class HealCommBridge
     private sealed class SynthCast
     {
         public uint SpellId;
+        // The synthesized cast's id; for an adopted cast, the id of the server's own cast.
         public WowGuid128 CastId;
         public uint SpellVisualId;
         public DateTime ExpectedEndUtc;
@@ -192,15 +193,20 @@ public sealed class HealCommBridge
     private readonly struct RealCast
     {
         public readonly uint SpellId;
+        // The id the proxy gave this cast when it forwarded the start. The server's later
+        // packets about the cast are paired to it (GameSessionData.TryPairObserved*), which is
+        // how its end is told apart from the end of another cast of the same spell.
+        public readonly WowGuid128 CastId;
         // While the cast runs, when it is expected to end; once Ended, when it did.
         public readonly long EndMs;
         // The server has since sent this cast's SMSG_SPELL_GO or failure: the client saw it
         // start and end, so a late announcement of it has nothing left to describe.
         public readonly bool Ended;
 
-        public RealCast(uint spellId, long endMs, bool ended = false)
+        public RealCast(uint spellId, WowGuid128 castId, long endMs, bool ended = false)
         {
             SpellId = spellId;
+            CastId = castId;
             EndMs = endMs;
             Ended = ended;
         }
@@ -647,6 +653,7 @@ public sealed class HealCommBridge
     private RealCastMatch MatchRealCast(WowGuid128 senderGuid, int castTimeMs, out uint spellId)
     {
         long nowMs = ClockMsForTest();
+        WowGuid128 realCastId;
         lock (_realCastsLock)
         {
             if (!_realCastsByCaster.TryGetValue(senderGuid, out var real) ||
@@ -656,6 +663,7 @@ public sealed class HealCommBridge
                 return RealCastMatch.None;
             }
             spellId = real.SpellId;
+            realCastId = real.CastId;
             if (real.Ended)
                 return RealCastMatch.Ended;
         }
@@ -667,6 +675,7 @@ public sealed class HealCommBridge
         var tracked = new SynthCast
         {
             SpellId = spellId,
+            CastId = realCastId,
             SentSpellStart = false,
             ExpectedEndUtc = DateTime.UtcNow.AddMilliseconds(castTimeMs),
         };
@@ -950,7 +959,7 @@ public sealed class HealCommBridge
     // That is the rare order (the healer came into range mid-cast). The usual one
     // is the reverse — real start first, announcement after — so a player's
     // cast-time cast is also remembered here for MatchRealCast.
-    public void OnRealSpellStartFromOther(WowGuid128 casterGuid, uint spellId, uint castTimeMs)
+    public void OnRealSpellStartFromOther(WowGuid128 casterGuid, uint spellId, uint castTimeMs, WowGuid128 castId)
     {
         if (_synthCastsByCaster.ContainsKey(casterGuid))
             DismissSynth(casterGuid, "real_spell_start_arrived");
@@ -973,19 +982,32 @@ public sealed class HealCommBridge
                     _realCastsByCaster.Remove(expired);
                 _realCastSweepScratch.Clear();
             }
-            _realCastsByCaster[casterGuid] = new RealCast(spellId, nowMs + castTimeMs);
+            _realCastsByCaster[casterGuid] = new RealCast(spellId, castId, nowMs + castTimeMs);
         }
     }
 
     // JimsProxy (announced heals): the server's own SMSG_SPELL_GO (`completed`) or failure for
-    // another player's cast. For a healer in range this is the end of the heal, and it is what
-    // the proxy goes by: the heal's prediction is taken down here instead of waiting for the
-    // healer's addon to say so. The addon's word arrives a round trip later, in a spelling the
-    // bridge may not know, or never (HealComm-1.0 sends no stop for a completed heal), and
-    // until then LibHealComm-4.0 kept showing a heal that had landed or been cancelled.
-    // The server occasionally reports a failure for a cast it then fires (27 of 1,271 logged
-    // heal failures, a median 93 ms apart); those lose their prediction that much early.
-    public void OnRealSpellEndFromOther(WowGuid128 casterGuid, uint spellId, bool completed)
+    // another player's cast, with the cast id the proxy paired that packet to. For a healer in
+    // range this is the end of the heal, and it is what the proxy goes by: the heal's
+    // prediction is taken down here instead of waiting for the healer's addon to say so. The
+    // addon's word arrives a round trip later, in a spelling the bridge may not know, or never
+    // (HealComm-1.0 sends no stop for a completed heal), and until then LibHealComm-4.0 kept
+    // showing a heal that had landed or been cancelled.
+    //
+    // The cast id matters. A 1.12 failure names only the caster and the spell, and the server
+    // sends the same packets for two other things besides "this cast was interrupted":
+    //  - the late echo of an earlier cast of the same spell. The proxy pairs that to the earlier
+    //    cast, so its id is not the tracked heal's and nothing ends. (46 of 10,660 logged heal
+    //    casts, 44 of them one healer's, about 80 ms into the next cast. Going by caster and
+    //    spell alone would have taken those predictions down for the whole cast.)
+    //  - a second cast request refused while the first is still casting. That one does pair to
+    //    the live cast and cannot be told from an interrupt when it arrives: 26 of the 1,271
+    //    failures paired to a live heal were followed by the heal firing. 23 came within 270 ms
+    //    of the cast's end (the next heal pressed early) and cost that much prediction; 3 came
+    //    in the first 250 ms of the cast and cost the rest of it. Not believing a failure that
+    //    early or that late would misread more casts than it saves: 42 real cancels fall in
+    //    the first 250 ms and 208 in the last 300.
+    public void OnRealSpellEndFromOther(WowGuid128 casterGuid, uint spellId, WowGuid128 castId, bool completed)
     {
         if (!casterGuid.IsPlayer())
             return;
@@ -996,21 +1018,26 @@ public sealed class HealCommBridge
             // Remembered as ended, so an announcement still on its way is not taken for a
             // cast the client is showing (nor, with nothing remembered, for a healer out of
             // range, which would synthesize a cast that is already over).
-            if (_realCastsByCaster.TryGetValue(casterGuid, out var real) && !real.Ended && real.SpellId == spellId)
-                _realCastsByCaster[casterGuid] = new RealCast(spellId, nowMs, ended: true);
+            if (_realCastsByCaster.TryGetValue(casterGuid, out var real) && !real.Ended && real.CastId == castId)
+                _realCastsByCaster[casterGuid] = new RealCast(real.SpellId, castId, nowMs, ended: true);
         }
 
         if (!_synthCastsByCaster.TryGetValue(casterGuid, out var tracked))
             return;
-        // An adopted cast is tracked under the spell being cast. A synthesized one is not (its
-        // spell may be a stand-in), and reaching here means the healer came into range after
-        // it started: any heal of theirs ending is that heal. Anything else (an instant used
-        // mid-cast, a trinket) ends nothing.
-        bool isTrackedHeal = tracked.SentSpellStart
-            ? DirectHealSpellIds.Contains(spellId) || GroupHealSpellIds.Contains(spellId)
-            : tracked.SpellId == spellId;
-        if (isTrackedHeal)
-            DismissSynth(casterGuid, completed ? "real_cast_completed" : "interrupted");
+        if (!tracked.SentSpellStart)
+        {
+            // An adopted cast: it ends when the server's cast it stands for does.
+            if (tracked.CastId == castId)
+                DismissSynth(casterGuid, completed ? "real_cast_completed" : "interrupted");
+        }
+        // A synthesized cast, and the healer has come into range since it started: the server
+        // sent no start for that heal, so there is no cast id to go by. A heal of theirs
+        // completing is that heal. A failure is left to the healer's own stop: it cannot be
+        // told from the echo of an earlier cast.
+        else if (completed && (DirectHealSpellIds.Contains(spellId) || GroupHealSpellIds.Contains(spellId)))
+        {
+            DismissSynth(casterGuid, "real_cast_completed");
+        }
     }
 
     internal int RealCastCountForTest
