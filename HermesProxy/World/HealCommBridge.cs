@@ -60,20 +60,14 @@ public sealed class HealCommBridge
     private const uint SpellRejuvenation = 774;
     private const uint SpellRegrowth = 8936;
     private const uint SpellPrayerOfHealing = 596;
-    private const uint SpellHeal = 2054;              // Priest, named plain "Heal"
+    // Priest, named plain "Heal": stands in for a heal that cannot be identified. JimsPlus is
+    // told separately that the spell is not known.
+    private const uint SpellHeal = 2054;
     private const uint SpellFlashHeal = 2061;         // Priest
     private const uint SpellHealingTouch = 5185;      // Druid
     private const uint SpellHolyLight = 635;          // Paladin
     private const uint SpellFlashOfLight = 19750;     // Paladin
     private const uint SpellHealingWave = 331;        // Shaman
-
-    // JimsProxy (announced heals): the spell a synthesized cast carries when the heal cannot be
-    // identified and Settings.HealCommUnknownHealSpell is on (it is off by default; see
-    // UnknownHealSpell). It exists only in the proxy's hotfix tables (CSV/Hotfix/Spell*.csv, name
-    // "Unknown Heal"), so every cast bar and combat log line on the client says what we know: a
-    // heal, of unknown kind. Above every 1.12 and 1.14.2 spell id and inside the 23 bits a cast
-    // id keeps for the spell.
-    public const uint UnknownHealSpellId = 1999001;
 
     // Direct heals by spell id (every rank). A proxied healer's side appends the spell it is
     // casting to its HC-1.0 announcement (see TranslateDirectHealOutbound); an appended id is
@@ -166,6 +160,13 @@ public sealed class HealCommBridge
     // Tracked per-caster (not per-spell) because HC-1.0 Healstop carries no
     // spell ID — at most one synth cast per caster at a time, matching how
     // vanilla HealComm-1.0 itself models a caster's pending cast.
+    //
+    // JimsProxy (announced heals), read from the 1.14.2 client: the incoming-heal entry is
+    // recorded only when the caster's unit object exists on the client, and so is the combat
+    // log line. A synthesized cast for a healer with no unit there (the usual out-of-range
+    // case) is therefore dropped whole; that healer's heal reaches only LibHealComm-4.0 (the
+    // LHC40 message) and JimsPlus (the JP_HC sideband). The synthesized cast does its job for
+    // a healer who is in view but whose cast start the server did not send.
     private sealed class SynthCast
     {
         public uint SpellId;
@@ -203,15 +204,51 @@ public sealed class HealCommBridge
         // The server has since sent this cast's SMSG_SPELL_GO or failure: the client saw it
         // start and end, so a late announcement of it has nothing left to describe.
         public readonly bool Ended;
+        // As forwarded in the cast start, for sending that start again (AttachNativeAmount).
+        public readonly uint SpellVisualId;
+        public readonly uint CastFlags;
+        public readonly uint CastFlagsEx;
 
-        public RealCast(uint spellId, WowGuid128 castId, long endMs, bool ended = false)
+        public RealCast(uint spellId, WowGuid128 castId, long endMs, uint spellVisualId, uint castFlags, uint castFlagsEx, bool ended = false)
         {
             SpellId = spellId;
             CastId = castId;
             EndMs = endMs;
+            SpellVisualId = spellVisualId;
+            CastFlags = castFlags;
+            CastFlagsEx = castFlagsEx;
             Ended = ended;
         }
+
+        public RealCast AsEnded(long endedMs) => new(SpellId, CastId, endedMs, SpellVisualId, CastFlags, CastFlagsEx, ended: true);
     }
+
+    // JimsProxy (announced heals): an incoming-heal entry this bridge put on the client for a
+    // cast the SERVER started (see AttachNativeAmount). The client removes it when it processes
+    // that cast's SMSG_SPELL_GO or failure and at no other time: not when the cast's time is up,
+    // not on the caster's next cast, not when the caster leaves view. Left alone in those cases
+    // it would stay on the target's frame until the target itself left view, so every entry is
+    // kept here until the server's end packet for the cast has been forwarded or the bridge has
+    // ended it itself.
+    private sealed class NativeAmount
+    {
+        public WowGuid128 Caster;
+        public WowGuid128 CastId;
+        public uint SpellId;
+        public uint SpellVisualId;
+        public DateTime DeadlineUtc;
+    }
+
+    private readonly ConcurrentDictionary<WowGuid128, NativeAmount> _nativeAmounts = new();
+
+    // How long past a cast's expected end the bridge waits for the server's end packet before
+    // ending the client's entry itself. Generous on purpose: the failure it sends also ends the
+    // caster's cast on the client, and an observer is not told about pushback, so a cast can
+    // legitimately run past the end the bridge expects.
+    internal TimeSpan NativeAmountCleanupGrace = TimeSpan.FromSeconds(2);
+
+    // Test seam for Settings.HealCommNativeAmountInRange (a static, shared by every test class).
+    internal bool? NativeAmountInRangeForTest;
 
     private enum RealCastMatch
     {
@@ -534,11 +571,16 @@ public sealed class HealCommBridge
         var targetGuid = _session.GameState.GetPlayerGuidByName(targetName);
         if (targetGuid.IsEmpty()) return null;
 
-        switch (MatchRealCast(senderGuid, castTimeMs, out uint spellId))
+        var match = MatchRealCast(senderGuid, castTimeMs, out var real);
+        uint spellId = real.SpellId;
+        switch (match)
         {
             case RealCastMatch.Ended:
                 // The client saw this cast start and end before its announcement arrived.
                 return null;
+            case RealCastMatch.Adopted:
+                AttachNativeAmount(senderGuid, real, targetGuid, (uint)Math.Max(0, amount));
+                break;
             case RealCastMatch.None:
                 // A healer out of range. The spell is the one its own side named, else the
                 // one its class and cast time leave no doubt about, else unknown.
@@ -549,8 +591,7 @@ public sealed class HealCommBridge
                     if (spellId == 0)
                     {
                         certain = false;
-                        // The hotfix rows exist for the 1.14 client only.
-                        spellId = UnknownHealSpell(Framework.Settings.HealCommUnknownHealSpell && ModernVersion.ExpansionVersion == 1);
+                        spellId = SpellHeal;
                     }
                 }
                 SynthesizeRemoteHealCast(senderGuid, targetGuid, spellId, castTimeMs, (uint)Math.Max(0, amount), certain, targetName);
@@ -586,10 +627,15 @@ public sealed class HealCommBridge
         // SMSG_SPELL_START Target.Unit is single — modern Prayer of Healing
         // AoE cast bar renders on caster regardless of target field. Per-
         // target prediction picks the first resolvable target as the anchor.
-        switch (MatchRealCast(senderGuid, castTimeMs, out uint spellId))
+        var match = MatchRealCast(senderGuid, castTimeMs, out var real);
+        uint spellId = real.SpellId;
+        switch (match)
         {
             case RealCastMatch.Ended:
                 return null;
+            case RealCastMatch.Adopted:
+                AttachNativeAmount(senderGuid, real, firstTarget, (uint)Math.Max(0, amount));
+                break;
             case RealCastMatch.None:
                 // The group form is only ever Prayer of Healing (HealComm-1.0 sends it for
                 // nothing else, pfUI never sends it), so the spell is known; the rank is not.
@@ -658,23 +704,21 @@ public sealed class HealCommBridge
     // for the end). An announcement that arrives after that cast has already ended describes
     // nothing the client still shows, and is dropped: the caller neither synthesizes nor
     // forwards it.
-    private RealCastMatch MatchRealCast(WowGuid128 senderGuid, int castTimeMs, out uint spellId)
+    private RealCastMatch MatchRealCast(WowGuid128 senderGuid, int castTimeMs, out RealCast real)
     {
         long nowMs = ClockMsForTest();
-        WowGuid128 realCastId;
         lock (_realCastsLock)
         {
-            if (!_realCastsByCaster.TryGetValue(senderGuid, out var real) ||
+            if (!_realCastsByCaster.TryGetValue(senderGuid, out real) ||
                 nowMs > real.EndMs + RealCastAnnounceGraceMs)
             {
-                spellId = 0;
+                real = default;
                 return RealCastMatch.None;
             }
-            spellId = real.SpellId;
-            realCastId = real.CastId;
             if (real.Ended)
                 return RealCastMatch.Ended;
         }
+        uint spellId = real.SpellId;
 
         // A repeated announcement of the same cast (HC-1.0 sends on RAID and BATTLEGROUND)
         // replaces its own entry, as a repeated synthesis did.
@@ -683,7 +727,7 @@ public sealed class HealCommBridge
         var tracked = new SynthCast
         {
             SpellId = spellId,
-            CastId = realCastId,
+            CastId = real.CastId,
             SentSpellStart = false,
             ExpectedEndUtc = DateTime.UtcNow.AddMilliseconds(castTimeMs),
         };
@@ -738,10 +782,139 @@ public sealed class HealCommBridge
         };
     }
 
-    // The spell that stands in for a heal that could not be identified: the priest spell named
-    // plain "Heal", or with Settings.HealCommUnknownHealSpell on, "Unknown Heal" from the hotfix
-    // tables. Either way JimsPlus is told the spell is not known.
-    internal static uint UnknownHealSpell(bool hotfixSpell) => hotfixSpell ? UnknownHealSpellId : SpellHeal;
+    // JimsProxy (announced heals), opt-in (Settings.HealCommNativeAmountInRange): put the
+    // announced amount on a cast the server started, so the client's own incoming-heal number
+    // (UnitGetIncomingHeals) has it for a healer in range.
+    //
+    // The client takes that number only from a cast-start packet, and the server's own start
+    // went out before the healer's addon announced the amount. Read from the 1.14.2 client:
+    // a second SMSG_SPELL_START with the same cast id runs the whole start again on the existing
+    // cast and records the prediction on it. For another unit's cast that costs one thing, a
+    // second "begins to cast" combat log line: the client keeps no cast bar and fires no cast
+    // event for other units on this setup, and the running visual is neither restarted nor
+    // stopped as long as the visual id is the one already sent. So the packet repeats the real
+    // start (same cast id, spell and visual) with the time left as its cast time, the announced
+    // target, and the heal-prediction block. JimsPlus is told first (JP_HC:R), so its own bar
+    // does not start over on the repeated log line.
+    //
+    // The server's own SMSG_SPELL_GO or failure for the cast then removes the entry on the
+    // client, the proxy forwards those already, and nothing else does: see NativeAmount for
+    // what the bridge has to do about the rest.
+    private void AttachNativeAmount(WowGuid128 casterGuid, RealCast real, WowGuid128 targetGuid, uint amount)
+    {
+        if (!(NativeAmountInRangeForTest ?? Framework.Settings.HealCommNativeAmountInRange))
+            return;
+        var worldClient = _session.WorldClient;
+        if (worldClient == null) return;
+
+        long remainingMs = Math.Max(1, real.EndMs - ClockMsForTest());
+
+        if (_session.GameState.IsJimsPlusSidebandActive())
+            SendSideband($"JP_HC:R:{casterGuid.ToClientGuidString()}");
+
+        var repeat = new SpellStart();
+        repeat.Cast.CasterGUID = casterGuid;
+        repeat.Cast.CasterUnit = casterGuid;
+        repeat.Cast.CastID = real.CastId;
+        repeat.Cast.SpellID = (int)real.SpellId;
+        repeat.Cast.SpellXSpellVisualID = real.SpellVisualId;
+        repeat.Cast.CastFlags = real.CastFlags | (uint)CastFlag.HealPrediction;
+        repeat.Cast.CastFlagsEx = real.CastFlagsEx;
+        repeat.Cast.CastTime = (uint)remainingMs;
+        repeat.Cast.Target.Flags = SpellCastTargetFlags.Unit;
+        repeat.Cast.Target.Unit = targetGuid;
+        repeat.Cast.Predict.Points = amount;
+        repeat.Cast.Predict.Type = 0;
+        repeat.Cast.Predict.BeaconGUID = WowGuid128.Empty;
+        worldClient.SendPacketToClient(repeat);
+
+        // One record per cast: a repeated announcement of the same cast (another target, the
+        // same message on a second channel) adds to the same cast on the client.
+        var entry = new NativeAmount
+        {
+            Caster = casterGuid,
+            CastId = real.CastId,
+            SpellId = real.SpellId,
+            SpellVisualId = real.SpellVisualId,
+            DeadlineUtc = DateTime.UtcNow.AddMilliseconds(remainingMs) + NativeAmountCleanupGrace,
+        };
+        _nativeAmounts[real.CastId] = entry;
+        ScheduleNativeAmountCleanup(entry);
+    }
+
+    // The server's end packet for the cast never came (or was paired to another cast): end the
+    // client's entry once the cast is well past its expected end.
+    private void ScheduleNativeAmountCleanup(NativeAmount entry)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (true)
+                {
+                    TimeSpan wait = entry.DeadlineUtc - DateTime.UtcNow;
+                    if (wait > TimeSpan.Zero)
+                        await Task.Delay(wait).ConfigureAwait(false);
+                    if (!_nativeAmounts.TryGetValue(entry.CastId, out var current) || !ReferenceEquals(current, entry))
+                        return;
+                    if (entry.DeadlineUtc > DateTime.UtcNow)
+                        continue; // pushed back while waiting
+                    EndNativeAmount(entry);
+                    return;
+                }
+            }
+            catch { }
+        });
+    }
+
+    // Ends the client's incoming-heal entry for a cast the server started, when the server's
+    // own end packet will not do it. The client acts on this only while the caster's unit exists.
+    private void EndNativeAmount(NativeAmount entry)
+    {
+        if (_nativeAmounts.TryRemove(new KeyValuePair<WowGuid128, NativeAmount>(entry.CastId, entry)))
+            SendCastEnd(entry.Caster, entry.CastId, entry.SpellId, entry.SpellVisualId);
+    }
+
+    // SMSG_SPELL_FAILED_OTHER for a cast the bridge put on the client or added a prediction to.
+    // For another unit the client fires no event and plays nothing for it; it ends that cast's
+    // visual and removes its incoming-heal entries, provided the reason is not zero (which
+    // reason is otherwise immaterial for another unit) and the caster's unit exists.
+    private void SendCastEnd(WowGuid128 casterGuid, WowGuid128 castId, uint spellId, uint spellVisualId)
+    {
+        var worldClient = _session.WorldClient;
+        if (worldClient == null) return;
+
+        var failed = new SpellFailedOther();
+        failed.CasterUnit = casterGuid;
+        failed.CastID = castId;
+        failed.SpellID = spellId;
+        failed.SpellXSpellVisualID = spellVisualId;
+        failed.Reason = 27;
+        worldClient.SendPacketToClient(failed);
+    }
+
+    // JimsProxy (announced heals): the caster's unit is about to leave the client (destroyed or
+    // out of range). Called before that reaches the client, because a failure can remove an
+    // incoming-heal entry only while the caster's unit exists, and nothing removes it after.
+    public void OnUnitLeavingView(WowGuid128 guid)
+    {
+        if (!guid.IsPlayer())
+            return;
+
+        if (!_nativeAmounts.IsEmpty)
+        {
+            foreach (var entry in _nativeAmounts.Values)
+            {
+                if (entry.Caster == guid)
+                    EndNativeAmount(entry);
+            }
+        }
+
+        // A synthesized cast keeps being tracked: the heal goes on, and LibHealComm-4.0 and
+        // JimsPlus need no unit. Only the client's own entry has to go.
+        if (_synthCastsByCaster.TryGetValue(guid, out var synth) && synth.SentSpellStart)
+            SendCastEnd(guid, synth.CastId, synth.SpellId, synth.SpellVisualId);
+    }
 
     private Class GetSenderClass(WowGuid128 senderGuid)
     {
@@ -879,6 +1052,8 @@ public sealed class HealCommBridge
             SendSideband($"JP_HC:D:{senderGuid.ToClientGuidString()}:{delayMs}");
 
         synth.ExpectedEndUtc = synth.ExpectedEndUtc.AddMilliseconds(delayMs);
+        if (!synth.SentSpellStart && _nativeAmounts.TryGetValue(synth.CastId, out var native))
+            native.DeadlineUtc = native.DeadlineUtc.AddMilliseconds(delayMs);
     }
 
     private void DismissSynth(WowGuid128 senderGuid, string reasonTag)
@@ -887,22 +1062,12 @@ public sealed class HealCommBridge
         var worldClient = _session.WorldClient;
         if (worldClient == null) return;
 
-        // Native dismiss: SpellFailedOther clears UnitGetIncomingHeals and the
-        // cast bar on observers' frames. Reason 27 is INTERRUPTED — generic
-        // enough that the client just clears state without surfacing a
-        // player-facing error (errors only render for local-player SpellFailure).
-        // Only for a cast we synthesized: an adopted real cast ends on the client
-        // through the server's own SPELL_GO or failure.
+        // Native dismiss: SpellFailedOther removes the cast's incoming-heal entry
+        // (UnitGetIncomingHeals) on the client. Only for a cast we synthesized: an
+        // adopted real cast ends on the client through the server's own SPELL_GO or
+        // failure, and so does an amount attached to it (see NativeAmount).
         if (synth.SentSpellStart)
-        {
-            var failed = new SpellFailedOther();
-            failed.CasterUnit = senderGuid;
-            failed.CastID = synth.CastId;
-            failed.SpellID = synth.SpellId;
-            failed.SpellXSpellVisualID = synth.SpellVisualId;
-            failed.Reason = 27;
-            worldClient.SendPacketToClient(failed);
-        }
+            SendCastEnd(senderGuid, synth.CastId, synth.SpellId, synth.SpellVisualId);
 
         // The JimsPlus bar for a synthesized cast ends the same way. 1: stopped early by the
         // healer. 2: the server's own cast start for this healer follows, which replaces the
@@ -920,10 +1085,11 @@ public sealed class HealCommBridge
         // LHC40 S: addon msg, the bar stays visible forever even after we've
         // cleared the native pending heal. Synthesize an inbound CHAT_MSG_ADDON
         // here so LHC4 fires HealComm_HealStopped → Luna's element updates.
-        // Interrupt-visual flag: only "interrupted" (real Healstop mid-cast)
-        // gets the X mark; superseded / natural_completion_timeout are clean
-        // completions and shouldn't show interrupt UI.
-        bool isInterruptVisual = reasonTag == "interrupted";
+        // Interrupt-visual flag: only "interrupted" (real Healstop mid-cast) and
+        // "real_cast_failed" (the server's failure for the cast) get the X mark;
+        // superseded / natural_completion_timeout are clean completions and
+        // shouldn't show interrupt UI.
+        bool isInterruptVisual = reasonTag is "interrupted" or "real_cast_failed";
         EmitLhc40StopToClient(senderGuid, synth.SpellId, isInterruptVisual);
     }
 
@@ -946,7 +1112,7 @@ public sealed class HealCommBridge
         if (worldClient == null) return;
 
         string body = $"S::{spellId}:{(isInterrupted ? 1 : 0)}:";
-        var chatType = IsInRaid() ? ChatMessageTypeModern.Raid : ChatMessageTypeModern.Party;
+        var chatType = GroupAddonChatType();
 
         // ChatPkt resolves senderName from senderGuid internally (line 385 in
         // ChatPackets.cs), so we can pass empty senderName.
@@ -967,10 +1133,23 @@ public sealed class HealCommBridge
     // That is the rare order (the healer came into range mid-cast). The usual one
     // is the reverse — real start first, announcement after — so a player's
     // cast-time cast is also remembered here for MatchRealCast.
-    public void OnRealSpellStartFromOther(WowGuid128 casterGuid, uint spellId, uint castTimeMs, WowGuid128 castId)
+    public void OnRealSpellStartFromOther(WowGuid128 casterGuid, uint spellId, uint castTimeMs, WowGuid128 castId,
+        uint spellVisualId = 0, uint castFlags = 0, uint castFlagsEx = 0)
     {
         if (_synthCastsByCaster.ContainsKey(casterGuid))
             DismissSynth(casterGuid, "real_spell_start_arrived");
+
+        // One cast at a time: an amount still attached to an earlier cast of this caster is
+        // left over (that cast's end was not reported, or its failure has yet to arrive as an
+        // echo), and the client does not remove it for a new start.
+        if (!_nativeAmounts.IsEmpty)
+        {
+            foreach (var entry in _nativeAmounts.Values)
+            {
+                if (entry.Caster == casterGuid && entry.CastId != castId)
+                    EndNativeAmount(entry);
+            }
+        }
 
         // Instants are never announced as a heal, and only players run HealComm.
         if (castTimeMs == 0 || !casterGuid.IsPlayer())
@@ -990,7 +1169,7 @@ public sealed class HealCommBridge
                     _realCastsByCaster.Remove(expired);
                 _realCastSweepScratch.Clear();
             }
-            _realCastsByCaster[casterGuid] = new RealCast(spellId, castId, nowMs + castTimeMs);
+            _realCastsByCaster[casterGuid] = new RealCast(spellId, castId, nowMs + castTimeMs, spellVisualId, castFlags, castFlagsEx);
         }
     }
 
@@ -1027,8 +1206,11 @@ public sealed class HealCommBridge
             // cast the client is showing (nor, with nothing remembered, for a healer out of
             // range, which would synthesize a cast that is already over).
             if (_realCastsByCaster.TryGetValue(casterGuid, out var real) && !real.Ended && real.CastId == castId)
-                _realCastsByCaster[casterGuid] = new RealCast(real.SpellId, castId, nowMs, ended: true);
+                _realCastsByCaster[casterGuid] = real.AsEnded(nowMs);
         }
+
+        // The packet being forwarded removes the client's incoming-heal entry for this cast.
+        _nativeAmounts.TryRemove(castId, out _);
 
         if (!_synthCastsByCaster.TryGetValue(casterGuid, out var tracked))
             return;
@@ -1036,7 +1218,7 @@ public sealed class HealCommBridge
         {
             // An adopted cast: it ends when the server's cast it stands for does.
             if (tracked.CastId == castId)
-                DismissSynth(casterGuid, completed ? "real_cast_completed" : "interrupted");
+                DismissSynth(casterGuid, completed ? "real_cast_completed" : "real_cast_failed");
         }
         // A synthesized cast, and the healer has come into range since it started: the server
         // sent no start for that heal, so there is no cast id to go by. A heal of theirs
@@ -1189,6 +1371,24 @@ public sealed class HealCommBridge
     // effect was the bridge sent emit on Party channel during raids (server
     // rejects "no party") and broke heal-prediction inside the headline use
     // case.
+    // The chat type of an addon message the bridge makes for the client. LibHealComm-4.0 drops
+    // a message whose channel is not the one it is sending on itself, and the 1.14.2 client
+    // names the channel from the chat type: party and raid by their own types, "INSTANCE_CHAT"
+    // only for the battleground types (0x3E, 0x3F). In a battleground the library is on
+    // INSTANCE_CHAT, so a stop sent as party or raid chat was dropped there, and a direct heal
+    // it has recorded never expires on its own.
+    private ChatMessageTypeModern GroupAddonChatType()
+    {
+        return GroupAddonChatType(_session.GameState.IsInBattleground(), IsInRaid());
+    }
+
+    internal static ChatMessageTypeModern GroupAddonChatType(bool inBattleground, bool inRaid)
+    {
+        if (inBattleground)
+            return ChatMessageTypeModern.Battleground;
+        return inRaid ? ChatMessageTypeModern.Raid : ChatMessageTypeModern.Party;
+    }
+
     private bool IsInRaid()
     {
         var groups = _session.GameState.CurrentGroups;

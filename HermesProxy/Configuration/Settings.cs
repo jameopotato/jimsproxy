@@ -264,14 +264,13 @@ public static class Settings
     // legacy CMSG_CANCEL_CAST for started cast-time casts on strafe starts, gated on the 1.12
     // movement-interrupt flag (SpellMovementInterrupt CSV). Kill switch — leave ON.
     public static bool StrafeCancelPreempt;
-    // JimsProxy (announced heals): a heal announced by an out-of-range healer's addon that the
-    // HealComm bridge cannot identify is cast as the priest spell named plain "Heal", a spell
-    // every client has (JimsPlus is told the spell is not known and labels its bar "Unknown
-    // Heal"). When set it is cast as "Unknown Heal" instead, a spell that exists only in the
-    // proxy's hotfix tables (HealCommBridge.UnknownHealSpellId), so the client's own bars and
-    // combat log say so too. Default OFF, opt-in: what the 1.14 client does with a cast of a
-    // spell it has no data of its own for has not been tried in game.
-    public static bool HealCommUnknownHealSpell;
+    // JimsProxy (announced heals): when set, a heal announced by the addon of a healer in range
+    // also reaches the client's own incoming-heal number (UnitGetIncomingHeals): the bridge
+    // sends the server's cast start again with the announced amount attached (see
+    // HealCommBridge.AttachNativeAmount). Without it only LibHealComm-4.0 addons show that
+    // heal. The cost is a second "begins to cast" combat log line for the cast. Default OFF,
+    // opt-in until tried in game.
+    public static bool HealCommNativeAmountInRange;
     // JimsProxy (announced heals): when set, our own HC-1.0 heal announcement carries the spell
     // being cast as a fifth field ("Heal/<target>/<amount>/<castMs>/<spellId>/"), so a proxied
     // receiver out of range of this healer shows the real spell. HealComm-1.0, pfUI and
@@ -379,7 +378,7 @@ public static class Settings
             : RttPrefireMode.Off;
         FormExitStartDeferMs = Math.Clamp(config.GetInt("FormExitStartDeferMs", 100), 0, 300);
         StrafeCancelPreempt = config.GetBoolean("StrafeCancelPreempt", true);
-        HealCommUnknownHealSpell = config.GetBoolean("HealCommUnknownHealSpell", false);
+        HealCommNativeAmountInRange = config.GetBoolean("HealCommNativeAmountInRange", false);
         HealCommAnnounceSpellId = config.GetBoolean("HealCommAnnounceSpellId", false);
         SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 400), 0, 1300);
         ThreatEngine = config.GetBoolean("ThreatEngine", false);

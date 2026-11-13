@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
@@ -18,12 +17,12 @@ namespace HermesProxy.Tests.World;
 // announces ("Heal/<target>/<amount>/<castMs>/").
 //  - A healer in range: the server's own cast packets are the truth. The heal's prediction ends
 //    when the server says the cast completed or failed, and an announcement that arrives after
-//    that is dropped.
+//    that is dropped. Opted in, the announced amount is also attached to the server's cast for
+//    the client's own incoming-heal number, by sending that cast's start a second time.
 //  - A healer out of range: the spell is the one the healer's own proxy named (a fifth field), or
 //    the one class and cast time leave no doubt about, or a stand-in. JimsPlus is told the target
-//    and whether the spell is known. Two parts are opt-in and off by default until tried in game:
-//    the stand-in being the hotfix-only spell "Unknown Heal" (otherwise the priest spell named
-//    plain "Heal"), and our own announcement carrying the fifth field.
+//    and whether the spell is known. The stand-in is the priest spell named plain "Heal". Our
+//    own announcement carries the fifth field only when opted in.
 //  - pfUI's "HealStop" stops a heal; a pushed-back heal keeps its prediction until its new end.
 // Server packets go through the real handlers; announcements through the bridge's inbound entry
 // point, as the chat handler calls it.
@@ -284,6 +283,170 @@ public class HealCommAnnouncedHealTests
         Assert.Equal(new[] { $"S::{FlashHealRank1}:0:" }, h.Lhc40Stops);
     }
 
+    // ---- A healer in range: the client's own incoming-heal number (opt-in) -----------------------
+
+    // The client takes that number only from a cast-start packet, and the server's start went
+    // out before the amount was announced. Read from the 1.14.2 client: a second start with the
+    // same cast id records the prediction on the running cast and, for another unit, costs only a
+    // second combat log line, provided it repeats the visual already sent.
+    [Fact]
+    public void AdoptedHeal_SendsTheCastStartAgainWithTheAmount_WhenOptedIn()
+    {
+        var h = new ClientHarness { Bridge = { NativeAmountInRangeForTest = true } };
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, CastTimeMs));
+        var first = Assert.Single(h.SpellStarts);
+        h.NowMs += 180; // the healer's round trip
+        h.ClearSent();
+
+        h.Announce(HealAnnouncement);
+
+        var repeat = Assert.Single(h.SpellStarts);
+        Assert.Equal(first.Cast.CastID, repeat.Cast.CastID);
+        Assert.Equal(first.Cast.SpellID, repeat.Cast.SpellID);
+        Assert.Equal(first.Cast.SpellXSpellVisualID, repeat.Cast.SpellXSpellVisualID);
+        Assert.Equal(h.Healer, repeat.Cast.CasterUnit);
+        Assert.Equal(first.Cast.CastFlags | (uint)CastFlag.HealPrediction, repeat.Cast.CastFlags);
+        Assert.Equal(CastTimeMs - 180, repeat.Cast.CastTime); // the time left, so the cast still ends on time
+        Assert.Equal(LegacyTarget.To128(h.State), repeat.Cast.Target.Unit);
+        Assert.Equal(900u, repeat.Cast.Predict.Points);
+    }
+
+    // JimsPlus is told before the repeat, so the second combat log line does not restart its bar.
+    [Fact]
+    public void RepeatedCastStart_IsAnnouncedToJimsPlusFirst()
+    {
+        var h = new ClientHarness { Bridge = { NativeAmountInRangeForTest = true } };
+        h.EnableSideband();
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, CastTimeMs));
+        h.ClearSent();
+
+        h.Announce(HealAnnouncement);
+
+        Assert.Equal(new[] { $"JP_HC:R:{h.Healer.ToClientGuidString()}" }, h.Sideband);
+        var sent = h.Sent;
+        Assert.True(sent.FindIndex(p => p is ChatPkt c && c.ChatText.StartsWith("JP_HC:R:")) < sent.FindIndex(p => p is SpellStart));
+    }
+
+    // The server's own finish removes the entry on the client: the bridge sends nothing more for
+    // it, then or later.
+    [Fact]
+    public void ServerEndOfTheCast_NeedsNoEndFromTheBridge()
+    {
+        var h = new ClientHarness { Bridge = { NativeAmountInRangeForTest = true } };
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, CastTimeMs));
+        h.Announce(HealAnnouncement);
+        h.ClearSent();
+
+        h.Dispatch(SpellGoPacket(LegacyHealer, FlashHealRank7));
+        h.Bridge.OnUnitLeavingView(h.Healer);
+
+        Assert.Empty(h.Sent.OfType<SpellFailedOther>());
+    }
+
+    // The client removes the entry only on the cast's finish or failure, and a failure only
+    // while the caster's unit exists. A healer who leaves view mid-cast gets the failure first.
+    [Fact]
+    public void HealerLeavingViewMidCast_EndsTheAttachedAmount()
+    {
+        var h = new ClientHarness { Bridge = { NativeAmountInRangeForTest = true } };
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, CastTimeMs));
+        var castId = Assert.Single(h.SpellStarts).Cast.CastID;
+        h.Announce(HealAnnouncement);
+        h.ClearSent();
+
+        h.Bridge.OnUnitLeavingView(h.Healer);
+
+        var failed = Assert.Single(h.Sent.OfType<SpellFailedOther>());
+        Assert.Equal(castId, failed.CastID);
+        Assert.Equal(h.Healer, failed.CasterUnit);
+        Assert.NotEqual(0, failed.Reason); // reason 0 skips the client's prediction cleanup
+    }
+
+    // The same through the real handler: the failure goes out ahead of the update that takes the
+    // unit off the client.
+    [Fact]
+    public void HealerDestroyedMidCast_GetsTheFailureBeforeTheDestroy()
+    {
+        var h = new ClientHarness { Bridge = { NativeAmountInRangeForTest = true } };
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, CastTimeMs));
+        h.Announce(HealAnnouncement);
+        h.ClearSent();
+
+        h.Dispatch(Legacy(Opcode.SMSG_DESTROY_OBJECT, w => w.WriteGuid(LegacyHealer)));
+
+        var sent = h.Sent;
+        int failure = sent.FindIndex(p => p is SpellFailedOther);
+        int destroy = sent.FindIndex(p => p is UpdateObject u && u.DestroyedGuids.Contains(h.Healer));
+        Assert.True(failure >= 0 && destroy >= 0 && failure < destroy);
+    }
+
+    // No finish and no failure from the server (the packet was missed, or paired to another cast):
+    // the bridge ends the entry itself, well after the cast should have ended.
+    [Fact]
+    public async Task NoEndFromTheServer_EndsTheAttachedAmountAfterAGrace()
+    {
+        var h = new ClientHarness { Bridge = { NativeAmountInRangeForTest = true, NativeAmountCleanupGrace = TimeSpan.FromMilliseconds(150) } };
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, 200));
+        var castId = Assert.Single(h.SpellStarts).Cast.CastID;
+        h.Announce("Heal/Target/900/200/");
+        h.ClearSent();
+
+        await Task.Delay(200, TestContext.Current.CancellationToken); // the cast's expected end
+        Assert.Empty(h.Sent.OfType<SpellFailedOther>());
+
+        await Task.Delay(600, TestContext.Current.CancellationToken);
+        Assert.Equal(castId, Assert.Single(h.Sent.OfType<SpellFailedOther>()).CastID);
+    }
+
+    // The healer's addon saying stop ends the prediction LibHealComm-4.0 shows. The client's own
+    // entry belongs to the server's cast and waits for the server's word (a failure sent for a
+    // cast that is still running would end it on the client).
+    [Fact]
+    public void HealersOwnStop_DoesNotEndTheAttachedAmount()
+    {
+        var h = new ClientHarness { Bridge = { NativeAmountInRangeForTest = true } };
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, CastTimeMs));
+        h.Announce(HealAnnouncement);
+        h.ClearSent();
+
+        h.Announce("Healstop");
+
+        Assert.Equal(new[] { $"S::{FlashHealRank7}:1:" }, h.Lhc40Stops);
+        Assert.Empty(h.Sent.OfType<SpellFailedOther>());
+    }
+
+    // A new cast by the same healer while an amount is still attached to the earlier one (its end
+    // was never reported): the client does not remove an entry for a new start, so the bridge does.
+    [Fact]
+    public void NewCastStart_EndsAnAmountLeftOnTheEarlierCast()
+    {
+        var h = new ClientHarness { Bridge = { NativeAmountInRangeForTest = true } };
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, CastTimeMs));
+        var firstCastId = Assert.Single(h.SpellStarts).Cast.CastID;
+        h.Announce(HealAnnouncement);
+        h.ClearSent();
+
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, CastTimeMs));
+
+        Assert.Equal(firstCastId, Assert.Single(h.Sent.OfType<SpellFailedOther>()).CastID);
+    }
+
+    // ---- The stop's channel ----------------------------------------------------------------------
+
+    // LibHealComm-4.0 drops a message that is not on the channel it sends on itself, and the client
+    // names the channel from the chat type. In a battleground the library is on INSTANCE_CHAT, which
+    // the 1.14.2 client gives only to the battleground chat types; a stop sent as party or raid
+    // chat was dropped there, and the heal it should have ended never expires on its own.
+    [Theory]
+    [InlineData(true, false, ChatMessageTypeModern.Battleground)]
+    [InlineData(true, true, ChatMessageTypeModern.Battleground)]
+    [InlineData(false, true, ChatMessageTypeModern.Raid)]
+    [InlineData(false, false, ChatMessageTypeModern.Party)]
+    public void GroupAddonChatType_FollowsTheChannelLibHealCommIsOn(bool inBattleground, bool inRaid, ChatMessageTypeModern expected)
+    {
+        Assert.Equal(expected, HealCommBridge.GroupAddonChatType(inBattleground, inRaid));
+    }
+
     // The same healer's failure, with no cast start to pair it to, cannot be told from the echo of
     // an earlier cast: the synthesized cast is left to the healer's own stop.
     [Fact]
@@ -369,32 +532,6 @@ public class HealCommAnnouncedHealTests
         h.Announce("Heal/Target/1400/2500/");
 
         Assert.Equal((int)PriestHeal, Assert.Single(h.SpellStarts).Cast.SpellID);
-    }
-
-    // The stand-in is the hotfix-only spell "Unknown Heal" only when opted in
-    // (Settings.HealCommUnknownHealSpell): what the client does with a spell it has no data of its
-    // own for has not been tried in game.
-    [Fact]
-    public void UnknownHealSpell_IsTheHotfixSpellOnlyWhenOptedIn()
-    {
-        Assert.False(global::Framework.Settings.HealCommUnknownHealSpell);
-        Assert.Equal(PriestHeal, HealCommBridge.UnknownHealSpell(hotfixSpell: false));
-        Assert.Equal(HealCommBridge.UnknownHealSpellId, HealCommBridge.UnknownHealSpell(hotfixSpell: true));
-    }
-
-    // "Unknown Heal" exists only in the hotfix tables: every table that defines a spell to the
-    // client must have its row, under the id the bridge casts.
-    [Theory]
-    [InlineData("SpellName1.csv", "\"1999001\",\"Unknown Heal\"")]
-    [InlineData("Spell1.csv", "\"1999001\",")]
-    [InlineData("SpellMisc1.csv", ",1999001")]
-    [InlineData("SpellEffect1.csv", ",1999001")]
-    [InlineData("SpellLevels1.csv", ",1999001")]
-    public void UnknownHealSpell_IsDefinedInTheHotfixTables(string file, string rowPart)
-    {
-        Assert.Equal(1999001u, HealCommBridge.UnknownHealSpellId);
-        string[] rows = File.ReadAllLines(Path.Combine(AppContext.BaseDirectory, "CSV", "Hotfix", file));
-        Assert.Single(rows, row => file.StartsWith("SpellName") || file == "Spell1.csv" ? row.StartsWith(rowPart) : row.EndsWith(rowPart));
     }
 
     // ---- The spell a proxied healer's side names ------------------------------------------------

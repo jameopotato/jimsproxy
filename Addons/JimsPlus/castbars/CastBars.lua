@@ -450,6 +450,11 @@ local UNKNOWN_HEAL_ICON = 134400 -- question mark
 local HEAL_TARGET_SEPARATOR = " \194\187 "
 local PROXY_HEAL_START_WINDOW = 0.3
 local proxyHealStarts = {} -- [casterGUID] = GetTime() of the last JP_HC start
+-- A JP_HC:R names a caster whose cast start the proxy is about to send a second time (to attach a
+-- heal amount to the cast). The combat log reports that as a new cast start; it must not restart
+-- the bar of the cast it repeats.
+local PROXY_REPEAT_START_WINDOW = 1
+local proxyRepeatStarts = {} -- [casterGUID] = GetTime() of the last JP_HC:R
 
 function addon:CHAT_MSG_SYSTEM(message)
     local prefix = message:sub(1, 6)
@@ -487,6 +492,8 @@ function addon:CHAT_MSG_SYSTEM(message)
         --   JP_HC:S:<casterGUID>:<spellID>:<castMs>:<certain>:<targetName>   start
         --   JP_HC:D:<casterGUID>:<delayMs>                                    pushed back
         --   JP_HC:X:<casterGUID>:<how>     end; 0 ran its course, 1 stopped early, 2 replaced
+        --   JP_HC:R:<casterGUID>           the next cast start logged for this caster repeats
+        --                                  the cast already running (a healer in view)
         local sig = message:sub(7, 7)
         local guidStr, a, b, c, d = strsplit(":", message:sub(9))
         if not guidStr or guidStr == "" or guidStr == self.PLAYER_GUID then return end
@@ -501,6 +508,8 @@ function addon:CHAT_MSG_SYSTEM(message)
             proxyHealStarts[guidStr] = GetTime()
             self:StoreCast(guidStr, spellName, spellId, icon, castTime, true, nil, displayName)
             activeTimers[guidStr].isProxyHeal = true
+        elseif sig == "R" then
+            proxyRepeatStarts[guidStr] = GetTime()
         else
             local cast = activeTimers[guidStr]
             if not cast or not cast.isProxyHeal then return end
@@ -749,6 +758,18 @@ function addon:COMBAT_LOG_EVENT_UNFILTERED()
         if proxyHealStart and GetTime() - proxyHealStart < PROXY_HEAL_START_WINDOW then
             local active = activeTimers[srcGUID]
             if active and active.isProxyHeal then return end
+        end
+
+        -- JimsPlus (announced heals): the proxy sent this caster's cast start a second time to
+        -- attach the heal amount (JP_HC:R). This line is the cast already on the bar.
+        local repeatStart = proxyRepeatStarts[srcGUID]
+        if repeatStart then
+            proxyRepeatStarts[srcGUID] = nil
+            local active = activeTimers[srcGUID]
+            if GetTime() - repeatStart < PROXY_REPEAT_START_WINDOW and active
+                and not active.isChanneled and active.spellName == spellName then
+                return
+            end
         end
 
         -- is player or player pet or mind controlled

@@ -118,7 +118,7 @@ Off by default and not in the shipped file. For testing at a developer's request
 | `RttPrefire` | Only with `LowLatencyMode`. `off` (default) forwards everything; `timer` holds a press in the last 400 ms of the cooldown and releases it at the estimated expiry. Other modes are developer-only. |
 | `IdentityPinnedCastIds` | Only with `LowLatencyMode`. Deterministic cast start/finish pairing. |
 | `RefireSpellGo` | Re-sends an instant cast's completion about 8 ms later to close casts the client dropped (stuck pose, looping sound, lit button). |
-| `HealCommUnknownHealSpell` | An out-of-range group member's heal that cannot be identified is cast as "Unknown Heal", a spell the proxy defines through hotfix data, instead of the priest spell "Heal". JimsPlus labels its bar "Unknown Heal" either way. |
+| `HealCommNativeAmountInRange` | A heal announced by the addon of a healer in range also reaches the client's built-in incoming-heal number (frames that do not use LibHealComm-4.0), by sending the cast's start again with the amount. Adds a second "begins to cast" combat log line per such heal. |
 | `HealCommAnnounceSpellId` | Adds the spell being cast to this player's heal announcement as a fifth field, so a proxied group member out of range shows the real spell. HealComm-1.0 and pfUI ignore the field; a 1.12 addon that does not would stop showing this player's heals. |
 
 ---
