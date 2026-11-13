@@ -99,7 +99,6 @@ behaviour listed, for isolating regressions.
 | Key | Behaviour when `false` |
 |---|---|
 | `StrafeCancelPreempt` | Strafe-cancelling a cast registers after about 700 ms instead of 190 ms. |
-| `HealCommUnknownHealSpell` | An out-of-range group member's heal that cannot be identified shows as the priest spell "Heal" instead of "Unknown Heal". |
 | `SynthStandOnFear` | A character feared while seated stays seated; fear-break trinkets fail. |
 | `WorldEntryCarriedRootCure` | Movement lock after a loading screen while the server considers the character rooted (#328). |
 | `LoginEvictionMerge` | Loading screen stalls when the server evicts the character from a full instance at login. |
@@ -119,6 +118,8 @@ Off by default and not in the shipped file. For testing at a developer's request
 | `RttPrefire` | Only with `LowLatencyMode`. `off` (default) forwards everything; `timer` holds a press in the last 400 ms of the cooldown and releases it at the estimated expiry. Other modes are developer-only. |
 | `IdentityPinnedCastIds` | Only with `LowLatencyMode`. Deterministic cast start/finish pairing. |
 | `RefireSpellGo` | Re-sends an instant cast's completion about 8 ms later to close casts the client dropped (stuck pose, looping sound, lit button). |
+| `HealCommUnknownHealSpell` | An out-of-range group member's heal that cannot be identified is cast as "Unknown Heal", a spell the proxy defines through hotfix data, instead of the priest spell "Heal". JimsPlus labels its bar "Unknown Heal" either way. |
+| `HealCommAnnounceSpellId` | Adds the spell being cast to this player's heal announcement as a fifth field, so a proxied group member out of range shows the real spell. HealComm-1.0 and pfUI ignore the field; a 1.12 addon that does not would stop showing this player's heals. |
 
 ---
 

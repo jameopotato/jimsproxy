@@ -68,7 +68,8 @@ public sealed class HealCommBridge
     private const uint SpellHealingWave = 331;        // Shaman
 
     // JimsProxy (announced heals): the spell a synthesized cast carries when the heal cannot be
-    // identified. It exists only in the proxy's hotfix tables (CSV/Hotfix/Spell*.csv, name
+    // identified and Settings.HealCommUnknownHealSpell is on (it is off by default; see
+    // UnknownHealSpell). It exists only in the proxy's hotfix tables (CSV/Hotfix/Spell*.csv, name
     // "Unknown Heal"), so every cast bar and combat log line on the client says what we know: a
     // heal, of unknown kind. Above every 1.12 and 1.14.2 spell id and inside the 23 bits a cast
     // id keeps for the spell.
@@ -321,17 +322,24 @@ public sealed class HealCommBridge
             return sb.ToString();
         }
 
-        // Single-target direct heal → Heal/{targetName}/{amount}/{castMs}/
-        //
-        // JimsProxy (announced heals): the spell being cast rides along as a fifth field. Our own
-        // side is the one place the spell of this heal is known for certain, and HC-1.0 has no
-        // field for it, so a proxied receiver out of range of this healer would otherwise have to
-        // guess. 1.12 receivers read fields two to four by position and ignore the rest
-        // (HealComm-1.0 startHeal(result[2], result[3], result[4]); pfUI msgobj[2..4]). The group
-        // form above cannot carry it: its trailing fields are target names.
-        if (DirectHealSpellIds.Contains(spellId))
-            return $"Heal/{targetNames[0]}/{amount}/{castMs}/{spellId}/";
-        return $"Heal/{targetNames[0]}/{amount}/{castMs}/";
+        return FormatDirectHeal(targetNames[0], amount, castMs, spellId, Framework.Settings.HealCommAnnounceSpellId);
+    }
+
+    // Single-target direct heal → Heal/{targetName}/{amount}/{castMs}/
+    //
+    // JimsProxy (announced heals): with `withSpell` (Settings.HealCommAnnounceSpellId, off by
+    // default) the spell being cast rides along as a fifth field. Our own side is the one place
+    // the spell of this heal is known for certain, and HC-1.0 has no field for it, so a proxied
+    // receiver out of range of this healer otherwise has to work it out. The 1.12 receivers read
+    // so far take fields two to four by position and ignore the rest (HealComm-1.0
+    // startHeal(result[2], result[3], result[4]); pfUI msgobj[2..4]); one that does not would
+    // lose this healer's heals, which is why it is opt-in. The group form cannot carry it: its
+    // trailing fields are target names.
+    internal static string FormatDirectHeal(string targetName, int amount, int castMs, uint spellId, bool withSpell)
+    {
+        if (withSpell && DirectHealSpellIds.Contains(spellId))
+            return $"Heal/{targetName}/{amount}/{castMs}/{spellId}/";
+        return $"Heal/{targetName}/{amount}/{castMs}/";
     }
 
     private static string? TranslateStopOutbound(string[] parts)
@@ -730,9 +738,9 @@ public sealed class HealCommBridge
         };
     }
 
-    // The spell that stands in for a heal that could not be identified: "Unknown Heal" from the
-    // hotfix tables, or with the kill switch off (Settings.HealCommUnknownHealSpell) the priest
-    // spell named plain "Heal".
+    // The spell that stands in for a heal that could not be identified: the priest spell named
+    // plain "Heal", or with Settings.HealCommUnknownHealSpell on, "Unknown Heal" from the hotfix
+    // tables. Either way JimsPlus is told the spell is not known.
     internal static uint UnknownHealSpell(bool hotfixSpell) => hotfixSpell ? UnknownHealSpellId : SpellHeal;
 
     private Class GetSenderClass(WowGuid128 senderGuid)

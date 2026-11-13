@@ -27,7 +27,8 @@ public class HealCommRealCastAdoptionTests
 {
     private const uint LesserHealingWave = 8004;
     private const uint FlashHeal = 2061;
-    private const uint UnknownHeal = HealCommBridge.UnknownHealSpellId;
+    // The stand-in for a heal that cannot be identified: by default the priest spell named plain "Heal".
+    private const uint UnknownHeal = 2054;
     private const uint CastTimeMs = 1500;
 
     private static readonly WowGuid64 LegacyPlayer = new(HighGuidTypeLegacy.Player, 57);
@@ -62,7 +63,7 @@ public class HealCommRealCastAdoptionTests
             Healer = LegacyHealer.To128(State);
             // The healer is known by name only (a party list entry carries no class), the case
             // that used to guess Greater Heal whatever the healer's class. With no real cast to
-            // go by, such a heal is now cast as Unknown Heal.
+            // go by, such a heal is now cast as the stand-in for an unknown heal.
             State.UpdatePlayerCache(Healer, new PlayerCache { Name = "Healer" });
             State.UpdatePlayerCache(LegacyTarget.To128(State), new PlayerCache { Name = "Target" });
         }

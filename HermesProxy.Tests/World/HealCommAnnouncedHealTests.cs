@@ -20,8 +20,10 @@ namespace HermesProxy.Tests.World;
 //    when the server says the cast completed or failed, and an announcement that arrives after
 //    that is dropped.
 //  - A healer out of range: the spell is the one the healer's own proxy named (a fifth field), or
-//    the one class and cast time leave no doubt about, or "Unknown Heal". JimsPlus is told the
-//    target and whether the spell is known.
+//    the one class and cast time leave no doubt about, or a stand-in. JimsPlus is told the target
+//    and whether the spell is known. Two parts are opt-in and off by default until tried in game:
+//    the stand-in being the hotfix-only spell "Unknown Heal" (otherwise the priest spell named
+//    plain "Heal"), and our own announcement carrying the fifth field.
 //  - pfUI's "HealStop" stops a heal; a pushed-back heal keeps its prediction until its new end.
 // Server packets go through the real handlers; announcements through the bridge's inbound entry
 // point, as the chat handler calls it.
@@ -343,36 +345,41 @@ public class HealCommAnnouncedHealTests
         Assert.StartsWith($"D:1.5:{FlashOfLightRank1}:900:", body);
     }
 
-    // The reported case: a healer whose class is not on record. It used to be cast as Greater Heal.
+    // The reported case: a healer whose class is not on record. It used to be cast as Greater
+    // Heal. It is now cast as the stand-in for an unknown heal, by default the priest spell named
+    // plain "Heal", with the announced cast time and amount.
     [Fact]
-    public void HealFromAHealerOfUnknownClass_IsCastAsUnknownHeal()
+    public void HealFromAHealerOfUnknownClass_IsCastAsTheUnknownStandIn()
     {
         var h = new ClientHarness(Class.None);
 
         var (_, body) = h.Announce(HealAnnouncement);
 
         var start = Assert.Single(h.SpellStarts);
-        Assert.Equal((int)HealCommBridge.UnknownHealSpellId, start.Cast.SpellID);
+        Assert.Equal((int)PriestHeal, start.Cast.SpellID);
         Assert.Equal((uint)CastFlag.HealPrediction, start.Cast.CastFlags);
-        Assert.StartsWith($"D:1.5:{HealCommBridge.UnknownHealSpellId}:900:", body);
+        Assert.StartsWith($"D:1.5:{PriestHeal}:900:", body);
     }
 
     [Fact]
-    public void HealThatFitsSeveralSpells_IsCastAsUnknownHeal()
+    public void HealThatFitsSeveralSpells_IsCastAsTheUnknownStandIn()
     {
         var h = new ClientHarness(Class.Priest);
 
         h.Announce("Heal/Target/1400/2500/");
 
-        Assert.Equal((int)HealCommBridge.UnknownHealSpellId, Assert.Single(h.SpellStarts).Cast.SpellID);
+        Assert.Equal((int)PriestHeal, Assert.Single(h.SpellStarts).Cast.SpellID);
     }
 
-    // The kill switch for a client that does not take the hotfix spell.
+    // The stand-in is the hotfix-only spell "Unknown Heal" only when opted in
+    // (Settings.HealCommUnknownHealSpell): what the client does with a spell it has no data of its
+    // own for has not been tried in game.
     [Fact]
-    public void UnknownHealSpell_FallsBackToThePriestSpellNamedHeal()
+    public void UnknownHealSpell_IsTheHotfixSpellOnlyWhenOptedIn()
     {
-        Assert.Equal(HealCommBridge.UnknownHealSpellId, HealCommBridge.UnknownHealSpell(hotfixSpell: true));
+        Assert.False(global::Framework.Settings.HealCommUnknownHealSpell);
         Assert.Equal(PriestHeal, HealCommBridge.UnknownHealSpell(hotfixSpell: false));
+        Assert.Equal(HealCommBridge.UnknownHealSpellId, HealCommBridge.UnknownHealSpell(hotfixSpell: true));
     }
 
     // "Unknown Heal" exists only in the hotfix tables: every table that defines a spell to the
@@ -392,32 +399,31 @@ public class HealCommAnnouncedHealTests
 
     // ---- The spell a proxied healer's side names ------------------------------------------------
 
-    // Our own client's LibHealComm-4.0 message names the spell; HC-1.0 has no field for it, so it
-    // rides as a fifth one, which 1.12 receivers do not read.
+    // By default our own announcement goes out in the plain 1.12 form: every 1.12 player in the
+    // group receives it, and only three of their addons' parsers have been read.
     [Fact]
-    public void OutboundDirectHeal_CarriesTheSpellAsAFifthField()
+    public void OutboundDirectHeal_GoesOutInThePlainFormByDefault()
     {
         var h = new ClientHarness();
         string prefix = HealCommBridge.LhcPrefix;
         string body = $"D:1.500:{FlashHealRank7}:1100:1-0000004D";
 
+        Assert.False(global::Framework.Settings.HealCommAnnounceSpellId);
         Assert.True(h.Bridge.TryTranslateOutboundAddon(ref prefix, ref body));
 
         Assert.Equal(HealCommBridge.HcPrefix, prefix);
-        Assert.Equal($"Heal/Target/1100/1500/{FlashHealRank7}/", body);
+        Assert.Equal("Heal/Target/1100/1500/", body);
     }
 
-    // Only a direct heal is named; anything else goes out in the plain 1.12 form.
-    [Fact]
-    public void OutboundHealOfAnotherSpell_KeepsThePlainForm()
+    // Opted in (Settings.HealCommAnnounceSpellId), the spell our own client's LibHealComm-4.0
+    // message names rides as a fifth field. Only a direct heal is named.
+    [Theory]
+    [InlineData(FlashHealRank7, true, "Heal/Target/1100/1500/10917/")]
+    [InlineData(FlashHealRank7, false, "Heal/Target/1100/1500/")]
+    [InlineData(Fireball, true, "Heal/Target/1100/1500/")]
+    public void FormatDirectHeal_CarriesTheSpellAsAFifthFieldOnlyWhenOptedIn(uint spellId, bool withSpell, string expected)
     {
-        var h = new ClientHarness();
-        string prefix = HealCommBridge.LhcPrefix;
-        string body = $"D:1.500:{Fireball}:1100:1-0000004D";
-
-        Assert.True(h.Bridge.TryTranslateOutboundAddon(ref prefix, ref body));
-
-        Assert.Equal("Heal/Target/1100/1500/", body);
+        Assert.Equal(expected, HealCommBridge.FormatDirectHeal("Target", 1100, 1500, spellId, withSpell));
     }
 
     // The receiving side: the healer's own proxy saw the cast, so this is the spell, rank
@@ -470,7 +476,7 @@ public class HealCommAnnouncedHealTests
     public async Task PushedBackHeal_KeepsItsPredictionUntilItsNewEnd()
     {
         var h = new ClientHarness(Class.Paladin);
-        h.Announce("Heal/Target/900/100/"); // a cast time no paladin heal has: Unknown Heal
+        h.Announce("Heal/Target/900/100/"); // a cast time no paladin heal has: the unknown stand-in
         h.Announce("Healdelay/700/"); // now ends 800 ms after the start, not 100
         h.ClearSent();
 
@@ -478,7 +484,7 @@ public class HealCommAnnouncedHealTests
         Assert.Empty(h.Lhc40Stops);
 
         await Task.Delay(900, TestContext.Current.CancellationToken);
-        Assert.Equal(new[] { $"S::{HealCommBridge.UnknownHealSpellId}:0:" }, h.Lhc40Stops);
+        Assert.Equal(new[] { $"S::{PriestHeal}:0:" }, h.Lhc40Stops);
     }
 
     // ---- What JimsPlus is told -------------------------------------------------------------------
@@ -505,7 +511,8 @@ public class HealCommAnnouncedHealTests
 
         h.Announce(HealAnnouncement);
 
-        Assert.Equal(new[] { $"JP_HC:S:{h.Healer.ToClientGuidString()}:{HealCommBridge.UnknownHealSpellId}:1500:0:Target" }, h.Sideband);
+        // certain = 0: JimsPlus labels the bar "Unknown Heal" whatever spell stands in on the wire
+        Assert.Equal(new[] { $"JP_HC:S:{h.Healer.ToClientGuidString()}:{PriestHeal}:1500:0:Target" }, h.Sideband);
     }
 
     [Fact]

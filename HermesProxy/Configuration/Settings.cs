@@ -265,11 +265,21 @@ public static class Settings
     // movement-interrupt flag (SpellMovementInterrupt CSV). Kill switch — leave ON.
     public static bool StrafeCancelPreempt;
     // JimsProxy (announced heals): a heal announced by an out-of-range healer's addon that the
-    // HealComm bridge cannot identify is cast as "Unknown Heal", a spell that exists only in
-    // the proxy's hotfix tables (HealCommBridge.UnknownHealSpellId). When false it is cast as
-    // the priest spell named plain "Heal" instead, a spell every client has. Kill switch for
-    // a client that does not take the hotfix; leave ON.
-    public static bool HealCommUnknownHealSpell = true;
+    // HealComm bridge cannot identify is cast as the priest spell named plain "Heal", a spell
+    // every client has (JimsPlus is told the spell is not known and labels its bar "Unknown
+    // Heal"). When set it is cast as "Unknown Heal" instead, a spell that exists only in the
+    // proxy's hotfix tables (HealCommBridge.UnknownHealSpellId), so the client's own bars and
+    // combat log say so too. Default OFF, opt-in: what the 1.14 client does with a cast of a
+    // spell it has no data of its own for has not been tried in game.
+    public static bool HealCommUnknownHealSpell;
+    // JimsProxy (announced heals): when set, our own HC-1.0 heal announcement carries the spell
+    // being cast as a fifth field ("Heal/<target>/<amount>/<castMs>/<spellId>/"), so a proxied
+    // receiver out of range of this healer shows the real spell. HealComm-1.0, pfUI and
+    // LibHermesHealComm read fields two to four by position and ignore the rest. Default OFF,
+    // opt-in: every 1.12 player in the group receives the message, and an addon with a stricter
+    // parser than those three would stop showing this healer's heals. A received fifth field is
+    // read either way.
+    public static bool HealCommAnnounceSpellId;
     // JimsProxy (#313): width (ms) of the spell-queue hold window. A press arriving in the
     // last SpellQueueWindowMs of an active GCD or cast bar is held and fired at expiry; earlier
     // presses are forwarded and the server arbitrates (NOT_READY / SpellInProgress). Mirrors the
@@ -369,7 +379,8 @@ public static class Settings
             : RttPrefireMode.Off;
         FormExitStartDeferMs = Math.Clamp(config.GetInt("FormExitStartDeferMs", 100), 0, 300);
         StrafeCancelPreempt = config.GetBoolean("StrafeCancelPreempt", true);
-        HealCommUnknownHealSpell = config.GetBoolean("HealCommUnknownHealSpell", true);
+        HealCommUnknownHealSpell = config.GetBoolean("HealCommUnknownHealSpell", false);
+        HealCommAnnounceSpellId = config.GetBoolean("HealCommAnnounceSpellId", false);
         SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 400), 0, 1300);
         ThreatEngine = config.GetBoolean("ThreatEngine", false);
         var serverTypeStr = config.GetString("ServerType", "Kronos");
