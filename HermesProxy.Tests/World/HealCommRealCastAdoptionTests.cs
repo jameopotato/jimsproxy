@@ -20,14 +20,14 @@ namespace HermesProxy.Tests.World;
 // bridge synthesized a second SMSG_SPELL_START for it under a spell guessed from the class:
 // Greater Heal for a priest or an unknown class. Now an announcement for a cast the client is
 // already showing synthesizes nothing; a healer out of range (no real start) still gets the
-// synthesized cast.
+// synthesized cast (which spell it carries: HealCommAnnouncedHealTests).
 // The real start goes through the real SMSG_SPELL_START handler; the announcement through the
 // bridge's inbound entry point, as the chat handler calls it.
 public class HealCommRealCastAdoptionTests
 {
     private const uint LesserHealingWave = 8004;
     private const uint FlashHeal = 2061;
-    private const uint GreaterHealRank1 = 2060;
+    private const uint UnknownHeal = HealCommBridge.UnknownHealSpellId;
     private const uint CastTimeMs = 1500;
 
     private static readonly WowGuid64 LegacyPlayer = new(HighGuidTypeLegacy.Player, 57);
@@ -61,7 +61,8 @@ public class HealCommRealCastAdoptionTests
 
             Healer = LegacyHealer.To128(State);
             // The healer is known by name only (a party list entry carries no class), the case
-            // that guesses Greater Heal whatever the healer's class.
+            // that used to guess Greater Heal whatever the healer's class. With no real cast to
+            // go by, such a heal is now cast as Unknown Heal.
             State.UpdatePlayerCache(Healer, new PlayerCache { Name = "Healer" });
             State.UpdatePlayerCache(LegacyTarget.To128(State), new PlayerCache { Name = "Target" });
         }
@@ -161,12 +162,12 @@ public class HealCommRealCastAdoptionTests
 
         var start = Assert.Single(h.SpellStarts);
         Assert.Equal(h.Healer, start.Cast.CasterUnit);
-        Assert.Equal((int)GreaterHealRank1, start.Cast.SpellID);
+        Assert.Equal((int)UnknownHeal, start.Cast.SpellID);
         Assert.Equal(CastTimeMs, start.Cast.CastTime);
         Assert.Equal((uint)CastFlag.HealPrediction, start.Cast.CastFlags);
         Assert.Equal(900u, start.Cast.Predict.Points);
         Assert.Equal(HealCommBridge.LhcPrefix, prefix);
-        Assert.StartsWith($"D:1.5:{GreaterHealRank1}:900:", body);
+        Assert.StartsWith($"D:1.5:{UnknownHeal}:900:", body);
     }
 
     // The announcement trails the cast, so it can land just after a short cast completed; an
@@ -229,8 +230,8 @@ public class HealCommRealCastAdoptionTests
         h.Announce("Healstop");
 
         var failed = Assert.Single(h.Sent.OfType<SpellFailedOther>());
-        Assert.Equal(GreaterHealRank1, failed.SpellID);
-        Assert.Equal(new[] { $"S::{GreaterHealRank1}:1:" }, h.Lhc40Stops);
+        Assert.Equal(UnknownHeal, failed.SpellID);
+        Assert.Equal(new[] { $"S::{UnknownHeal}:1:" }, h.Lhc40Stops);
     }
 
     // The fallback end-of-cast timer of one adopted cast must not end the next one. (Adopted

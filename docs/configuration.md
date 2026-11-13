@@ -99,6 +99,7 @@ behaviour listed, for isolating regressions.
 | Key | Behaviour when `false` |
 |---|---|
 | `StrafeCancelPreempt` | Strafe-cancelling a cast registers after about 700 ms instead of 190 ms. |
+| `HealCommUnknownHealSpell` | An out-of-range group member's heal that cannot be identified shows as the priest spell "Heal" instead of "Unknown Heal". |
 | `SynthStandOnFear` | A character feared while seated stays seated; fear-break trinkets fail. |
 | `WorldEntryCarriedRootCure` | Movement lock after a loading screen while the server considers the character rooted (#328). |
 | `LoginEvictionMerge` | Loading screen stalls when the server evicts the character from a full instance at login. |

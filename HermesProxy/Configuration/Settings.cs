@@ -264,6 +264,12 @@ public static class Settings
     // legacy CMSG_CANCEL_CAST for started cast-time casts on strafe starts, gated on the 1.12
     // movement-interrupt flag (SpellMovementInterrupt CSV). Kill switch — leave ON.
     public static bool StrafeCancelPreempt;
+    // JimsProxy (announced heals): a heal announced by an out-of-range healer's addon that the
+    // HealComm bridge cannot identify is cast as "Unknown Heal", a spell that exists only in
+    // the proxy's hotfix tables (HealCommBridge.UnknownHealSpellId). When false it is cast as
+    // the priest spell named plain "Heal" instead, a spell every client has. Kill switch for
+    // a client that does not take the hotfix; leave ON.
+    public static bool HealCommUnknownHealSpell = true;
     // JimsProxy (#313): width (ms) of the spell-queue hold window. A press arriving in the
     // last SpellQueueWindowMs of an active GCD or cast bar is held and fired at expiry; earlier
     // presses are forwarded and the server arbitrates (NOT_READY / SpellInProgress). Mirrors the
@@ -363,6 +369,7 @@ public static class Settings
             : RttPrefireMode.Off;
         FormExitStartDeferMs = Math.Clamp(config.GetInt("FormExitStartDeferMs", 100), 0, 300);
         StrafeCancelPreempt = config.GetBoolean("StrafeCancelPreempt", true);
+        HealCommUnknownHealSpell = config.GetBoolean("HealCommUnknownHealSpell", true);
         SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 400), 0, 1300);
         ThreatEngine = config.GetBoolean("ThreatEngine", false);
         var serverTypeStr = config.GetString("ServerType", "Kronos");

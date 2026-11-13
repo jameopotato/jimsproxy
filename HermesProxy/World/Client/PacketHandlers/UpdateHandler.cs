@@ -3055,7 +3055,25 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                 if (objectType == ObjectType.Unit)
                     GetSession().GameState.StoreCreatureClass(guid.GetEntry(), (Class)updateData.UnitData.ClassId);
                 else
+                {
                     updateData.PlayerData.ArenaFaction = (byte)(GameData.IsAllianceRace((Race)updateData.UnitData.RaceId) ? 1 : 0);
+
+                    // JimsProxy (class on sight): remember a player's race, class and sex from
+                    // seeing them. Until now the player cache learned these only from a name query
+                    // (also who, guild and arena rosters), and the client asks for a name only when
+                    // it does not already hold it from an earlier login. A group list carries no
+                    // class either, so a party member could stand in view all session with no
+                    // class on record: the HealComm bridge then took a shaman for a priest.
+                    if (guid.IsPlayer() && rawClassId >= (byte)Class.Warrior && rawClassId <= (byte)Class.Druid)
+                    {
+                        GetSession().GameState.UpdatePlayerCache(guid, new PlayerCache
+                        {
+                            RaceId = (Race)updateData.UnitData.RaceId,
+                            ClassId = (Class)rawClassId,
+                            SexId = updateData.UnitData.SexId <= (byte)Gender.Female ? (Gender)updateData.UnitData.SexId : Gender.None,
+                        });
+                    }
+                }
             }
 
             int UNIT_FIELD_POWER1 = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_POWER1);

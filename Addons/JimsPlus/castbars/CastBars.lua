@@ -180,7 +180,8 @@ function addon:StopAllCasts(unitGUID, noFadeOut)
 end
 
 -- Store or refresh new cast data for unit, and start castbar(s)
-function addon:StoreCast(unitGUID, spellName, spellID, iconTexturePath, castTime, isPlayer, isChanneled)
+-- displayName (optional): the bar text when it says more than the spell name (see JP_HC below).
+function addon:StoreCast(unitGUID, spellName, spellID, iconTexturePath, castTime, isPlayer, isChanneled, displayName)
     local currTime = GetTime()
 
     if not activeTimers[unitGUID] then
@@ -198,6 +199,8 @@ function addon:StoreCast(unitGUID, spellName, spellID, iconTexturePath, castTime
     end
 
     cast.spellName = spellName
+    cast.displayName = displayName
+    cast.isProxyHeal = nil
     cast.spellID = spellID
     cast.icon = iconTexturePath
     cast.isChanneled = isChanneled
@@ -440,6 +443,13 @@ local proxyCastTimes = {}
 -- so the bar ran its full duration. The miss and the success come from the same cast, in the same frame.
 local MISSED_CHANNEL_WINDOW = 0.25
 local missedChannels = {} -- [srcGUID] = { name = spellName, time = GetTime() }
+-- JimsPlus (announced heals): see JP_HC in CHAT_MSG_SYSTEM.
+local UNKNOWN_HEAL = "Unknown Heal"
+local UNKNOWN_HEAL_ICON = 134400 -- question mark
+-- "Flash of Light » Tankname". The guillemet (U+00BB) is in every client font; an arrow is not.
+local HEAL_TARGET_SEPARATOR = " \194\187 "
+local PROXY_HEAL_START_WINDOW = 0.3
+local proxyHealStarts = {} -- [casterGUID] = GetTime() of the last JP_HC start
 
 function addon:CHAT_MSG_SYSTEM(message)
     local prefix = message:sub(1, 6)
@@ -465,6 +475,50 @@ function addon:CHAT_MSG_SYSTEM(message)
             if guidStr and guidStr ~= "" and guidStr ~= self.PLAYER_GUID then
                 local cast = activeTimers[guidStr]
                 if cast and cast.isChanneled then
+                    self:DeleteCast(guidStr, nil, nil, true)
+                end
+            end
+        end
+    elseif prefix == "JP_HC:" then
+        -- JimsPlus (announced heals): a group member out of range is casting a heal. The server
+        -- sends nothing about that cast; the healer's addon announced it, and the proxy passes
+        -- on what the announcement says: the exact cast time, who is being healed, and the
+        -- spell when it is known (certain = 1). When it is not, the bar says so.
+        --   JP_HC:S:<casterGUID>:<spellID>:<castMs>:<certain>:<targetName>   start
+        --   JP_HC:D:<casterGUID>:<delayMs>                                    pushed back
+        --   JP_HC:X:<casterGUID>:<how>     end; 0 ran its course, 1 stopped early, 2 replaced
+        local sig = message:sub(7, 7)
+        local guidStr, a, b, c, d = strsplit(":", message:sub(9))
+        if not guidStr or guidStr == "" or guidStr == self.PLAYER_GUID then return end
+        if sig == "S" then
+            local spellId, castTime = tonumber(a), tonumber(b)
+            if not spellId or not castTime then return end
+            local spellName, _, icon = GetSpellInfo(spellId)
+            if c ~= "1" or not spellName then
+                spellName, icon = UNKNOWN_HEAL, UNKNOWN_HEAL_ICON
+            end
+            local displayName = (d and d ~= "") and (spellName .. HEAL_TARGET_SEPARATOR .. d) or nil
+            proxyHealStarts[guidStr] = GetTime()
+            self:StoreCast(guidStr, spellName, spellId, icon, castTime, true, nil, displayName)
+            activeTimers[guidStr].isProxyHeal = true
+        else
+            local cast = activeTimers[guidStr]
+            if not cast or not cast.isProxyHeal then return end
+            if sig == "D" then
+                local delay = tonumber(a)
+                if delay then
+                    cast.maxValue = cast.maxValue + delay / 1000
+                    cast.endTime = cast.endTime + delay / 1000
+                end
+            elseif sig == "X" then
+                proxyHealStarts[guidStr] = nil
+                if a == "1" then
+                    cast.isFailed = true
+                    self:DeleteCast(guidStr)
+                elseif a == "2" then
+                    -- the server's own cast start for this healer follows and takes the bar
+                    self:DeleteCast(guidStr, nil, nil, nil, true)
+                else
                     self:DeleteCast(guidStr, nil, nil, true)
                 end
             end
@@ -687,6 +741,15 @@ function addon:COMBAT_LOG_EVENT_UNFILTERED()
 
         local castTime, icon = GetSpellCastInfo(spellID)
         if not castTime then return end
+
+        -- JimsPlus (announced heals): this is the combat log's line for a cast the proxy has just
+        -- described in full (JP_HC). Starting the bar again from here would lose the target and
+        -- the exact cast time.
+        local proxyHealStart = proxyHealStarts[srcGUID]
+        if proxyHealStart and GetTime() - proxyHealStart < PROXY_HEAL_START_WINDOW then
+            local active = activeTimers[srcGUID]
+            if active and active.isProxyHeal then return end
+        end
 
         -- is player or player pet or mind controlled
         local isSrcPlayer = bit_band(srcFlags, COMBATLOG_OBJECT_CONTROL_PLAYER) > 0
