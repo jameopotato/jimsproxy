@@ -4,7 +4,7 @@
 ## SavedVariables: JimsPlusDB, JimsPlusCastbarsDB
 ## SavedVariablesPerCharacter: JimsPlusCastbarsCharDB, JimsPlusCharDB
 ## Author: JimsProxy Team (CastBars based on ClassicCastbars by Wardz; ApiCompat based on HermesCompat by techgeekpr)
-## Version: 1.2.5
+## Version: 1.2.6
 
 Core.lua
 Options.lua

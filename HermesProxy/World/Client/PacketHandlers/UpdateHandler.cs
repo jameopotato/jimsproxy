@@ -261,6 +261,9 @@ public partial class WorldClient
 
         // JimsProxy (out-of-range-ghost): suppress any stray trailing movement the legacy server broadcasts for this guid after the destroy, until a CreateObject re-creates it.
         GetSession().GameState.MarkObjectRecentlyDestroyed(guid);
+        // JimsProxy (another player stuck dancing): a unit that left this client's view no longer dances
+        // there, so no stop is owed for it any more.
+        GetSession().GameState.ObservedLoopingEmotes.Remove(guid);
 
         // MIRASU (onyxia-landed-still-hovering): forget hover state on destroy — a missed UNSET_HOVER while out of range must not poison the stable guid; re-approach re-seeds if still airborne.
         SetHoverState(guid, false, "destroyed", synthesize: false);
@@ -294,6 +297,37 @@ public partial class WorldClient
 
     // MIRASU (mc-rune-dousing): rune entries whose boss life state flipped mid-packet; flushed after the containing update packet is sent so the resync can't outrun a same-packet rune create.
     private readonly List<uint> _pendingMcRuneResyncs = new();
+
+    // JimsProxy (#417 symptom 2): mounts held back from an update so the client can get a mount display
+    // of 0 for that player first (MountCacheResetTracker); sent after the containing update packet, each
+    // as its own packet, so the 0 is applied before the mount and after everything the server sent first.
+    private readonly List<(WowGuid128 Guid, int MountDisplayId)> _pendingMountCacheResets = new();
+
+    private void FlushPendingMountCacheResets()
+    {
+        if (_pendingMountCacheResets.Count == 0)
+            return;
+        var state = GetSession().GameState;
+        foreach (var (guid, mountDisplayId) in _pendingMountCacheResets)
+        {
+            foreach (int value in new[] { 0, mountDisplayId })
+            {
+                UpdateObject updateObject = new UpdateObject(state);
+                ObjectUpdate update = new ObjectUpdate(guid, UpdateTypeModern.Values, GetSession());
+                update.UnitData.MountDisplayID = value;
+                updateObject.ObjectUpdates.Add(update);
+                SendPacketToClient(updateObject);
+            }
+            // Fix-working breadcrumb: DebugOutput only.
+            if (Framework.Settings.DebugOutput)
+                Log.Event("unit.mount.cache_reset", new
+                {
+                    guid_low = guid.GetCounter(),
+                    mount_display_id = mountDisplayId,
+                });
+        }
+        _pendingMountCacheResets.Clear();
+    }
 
     // MIRASU (mc-rune-dousing): douseable = not yet doused (no legacy InUse) and paired boss not currently known alive; never-seen bosses count as dead, matching what a 1.12 client could attempt.
     private bool IsMcRuneDouseable(uint runeEntry, GameObjectFlagsLegacy legacyFlags)
@@ -495,6 +529,10 @@ public partial class WorldClient
                     // JimsProxy (out-of-range-ghost): unit re-created → stop suppressing its movement.
                     GetSession().GameState.ClearRecentlyDestroyedObject(guid);
                     ReadCreateObjectBlock(packet, guid, updateData, auraUpdate, i);
+                    // JimsProxy (aura re-send after a loading screen): this create lists the
+                    // player's auras, so the loading screen it falls in needs no re-send.
+                    if (guid == GetSession().GameState.CurrentPlayerGuid)
+                        GetSession().GameState.SelfCreatedSinceLoadingScreenShown = true;
 
                     if (updateData.Guid == GetSession().GameState.CurrentPlayerGuid)
                         GetSession().GameState.CurrentPlayerStorage.CompletedQuests.WriteAllCompletedIntoArray(updateData.ActivePlayerData.QuestCompleted);
@@ -533,6 +571,10 @@ public partial class WorldClient
                     // JimsProxy (out-of-range-ghost): unit re-created → stop suppressing its movement.
                     GetSession().GameState.ClearRecentlyDestroyedObject(guid);
                     ReadCreateObjectBlock(packet, guid, updateData, auraUpdate, i);
+                    // JimsProxy (aura re-send after a loading screen): this create lists the
+                    // player's auras, so the loading screen it falls in needs no re-send.
+                    if (guid == GetSession().GameState.CurrentPlayerGuid)
+                        GetSession().GameState.SelfCreatedSinceLoadingScreenShown = true;
 
                     if (guid.IsItem() && updateData.ObjectData.EntryID != null &&
                        !GameData.ItemTemplates.ContainsKey((uint)updateData.ObjectData.EntryID))
@@ -734,6 +776,8 @@ public partial class WorldClient
         // MIRASU (mc-rune-dousing): after the packet's own updates are out, push rune targetability for any boss life-state edges seen in it, and hide respawned circles around doused runes.
         FlushPendingMcRuneResyncs();
         SuppressMcCirclesOnDousedRunes();
+        // JimsProxy (#417 symptom 2): after the packet's own updates, the held-back mounts, each preceded by a 0.
+        FlushPendingMountCacheResets();
 
         // JimsProxy (Kronos Chronoboon): repaint the remaining on-use sweep AFTER the aliased create is
         // forwarded — the fresh alias replaced the item the client bound its login cooldown to.
@@ -896,6 +940,9 @@ public partial class WorldClient
             GetSession().ThreatTracker.OnUnitDestroyed(guid);
             // JimsProxy (out-of-range-ghost): suppress stray trailing movement for this guid until it is re-created on re-approach.
             GetSession().GameState.MarkObjectRecentlyDestroyed(guid);
+            // JimsProxy (another player stuck dancing): a unit that left this client's view no longer
+            // dances there, so no stop is owed for it any more.
+            GetSession().GameState.ObservedLoopingEmotes.Remove(guid);
 
             // MIRASU (onyxia-landed-still-hovering): out-of-range is a visibility loss like destroy — forget hover state so a missed UNSET_HOVER can't poison the guid.
             SetHoverState(guid, false, "out_of_range", synthesize: false);
@@ -1449,60 +1496,6 @@ public partial class WorldClient
                     GetSession().GameState.LastObservedPlayerTransportGuid = moveInfo.TransportGuid;
                 }
 
-                // JimsProxy (zep-stuck-low-latency-race 2026-05-17): deferred
-                // transport-clear synth dispatcher. Both arming paths SKIP the
-                // synth when the player's destination UpdateObject confirms
-                // they are legitimately on a transport (zep tower / boat deck /
-                // mid-flight zep). Reasons differ but the action is the same:
-                //
-                //   - NewWorld + on transport: the natural NEW_WORLD load
-                //     already unlocked the client's movement state on map
-                //     load; firing the synth would risk re-wedging.
-                //   - Login + on transport: SMSG_MOVE_TELEPORT with
-                //     TransportGUID=empty would dump the player off the
-                //     transport into mid-air / ocean (validated 2026-05-17,
-                //     log jimsproxy-20260517-102517.jsonl — tester fell into
-                //     ocean at Silithus). MoveTeleport semantics don't allow
-                //     a no-op "state-refresh" with TransportGUID preserved;
-                //     the client treats any MoveTeleport as a real teleport.
-                //     Accept the temporary turn-input gate; the next natural
-                //     world transition (zep docking) releases it.
-                //
-                // Synth fires only when destination is NOT on a transport —
-                // the dc39c39 stale-flag-clear use case (player rode through
-                // a portal mid-zep, or the legacy server's UpdateObject lost
-                // the transport attach by destination). Same payload for
-                // both NewWorld and Login paths in this branch.
-                var pendingMode = GetSession().GameState.PendingDeferredTransportSynth;
-                if (pendingMode != DeferredTransportSynthMode.None)
-                {
-                    GetSession().GameState.PendingDeferredTransportSynth = DeferredTransportSynthMode.None;
-                    // JimsProxy (#329/#331/#332 transport-clear wedge): fire the fabricated
-                    // transport-clear ONLY when the player carried a transport at the SOURCE
-                    // (or the source was unobserved -> fail-safe fire). Firing it when the player
-                    // was observed OFF a transport at the source is the wedge: a mage-teleport /
-                    // cross-continent / BG-exit transition gets a spurious MoveTeleport
-                    // (TransportGUID=empty) that leaves the client (esp. at EU latency) unable to
-                    // walk until /reload. prevTransport = the source state captured above (this
-                    // player UpdateObject's prior observation); moveInfo.TransportGuid = destination.
-                    if (TransportClearGate.ShouldFire(prevTransport, moveInfo.TransportGuid))
-                    {
-                        FireDeferredTransportClearSynth(guid, moveInfo.Position, moveInfo.Orientation, pendingMode.ToString());
-                    }
-                    else
-                    {
-                        Framework.Logging.Log.Event("movement.transport_clear.deferred_skipped", new
-                        {
-                            map_id = GetSession().GameState.CurrentMapId,
-                            player_low = guid.GetCounter(),
-                            source_transport_guid = prevTransport?.ToString() ?? "<unobserved>",
-                            destination_transport_guid = moveInfo.TransportGuid.ToString(),
-                            mode = pendingMode.ToString(),
-                            reason = moveInfo.TransportGuid.IsEmpty() ? "source_off_transport" : "destination_on_transport",
-                        });
-                    }
-                }
-
                 // JimsProxy (carried-root cure 2026-08-03, THE FIX for the BG-exit
                 // movement lockup): a spam-clicked Leave departs while the BG-end
                 // root is being removed; the server's unroot fires between maps and
@@ -1537,20 +1530,11 @@ public partial class WorldClient
 
             moveInfo.WalkSpeed = packet.ReadFloat();
             moveInfo.RunSpeed = packet.ReadFloat();
-            // JimsProxy (speed-stuck-{fear,bg-end}-while-mounted): seed cache + fire BG-end reassert if armed.
+            // JimsProxy (speed-stuck-{fear,bg-end}-while-mounted): seed the cache the regain-control restore reads.
+            // P1-2: the post-teleport run-speed reassert that also fired here is deleted. It copied this same
+            // run speed, which the create already carries to the client, and it left ahead of that create.
             if (guid == GetSession().GameState.CurrentPlayerGuid && moveInfo.RunSpeed > 0)
-            {
                 GetSession().GameState.LastKnownPlayerRunSpeed = moveInfo.RunSpeed;
-                if (GetSession().GameState.PendingPostTeleportRunSpeedReassert)
-                {
-                    GetSession().GameState.PendingPostTeleportRunSpeedReassert = false;
-                    MoveSetSpeed reassert = new MoveSetSpeed(Opcode.SMSG_MOVE_SET_RUN_SPEED);
-                    reassert.MoverGUID = guid;
-                    reassert.MoveCounter = 0;
-                    reassert.Speed = moveInfo.RunSpeed;
-                    SendPacketToClient(reassert);
-                }
-            }
             moveInfo.RunBackSpeed = packet.ReadFloat();
             moveInfo.SwimSpeed = packet.ReadFloat();
             moveInfo.SwimBackSpeed = packet.ReadFloat();
@@ -2241,11 +2225,15 @@ public partial class WorldClient
         if (objectType == ObjectType.Player || objectType == ObjectType.ActivePlayer)
         {
             int UNIT_FIELD_NATIVEDISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_NATIVEDISPLAYID);
+            int UNIT_FIELD_DISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_DISPLAYID);
             int UNIT_FIELD_MOUNTDISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_MOUNTDISPLAYID);
             int OBJECT_FIELD_SCALE_X = LegacyVersion.GetUpdateField(ObjectField.OBJECT_FIELD_SCALE_X);
-            if (UNIT_FIELD_NATIVEDISPLAYID >= 0 && UNIT_FIELD_MOUNTDISPLAYID >= 0 && OBJECT_FIELD_SCALE_X >= 0)
+            if (UNIT_FIELD_NATIVEDISPLAYID >= 0 && UNIT_FIELD_DISPLAYID >= 0 && UNIT_FIELD_MOUNTDISPLAYID >= 0 && OBJECT_FIELD_SCALE_X >= 0)
             {
-                if (!changedValuesMask.Get(UNIT_FIELD_NATIVEDISPLAYID) && !changedValuesMask.Get(UNIT_FIELD_MOUNTDISPLAYID) && !changedValuesMask.Get(OBJECT_FIELD_SCALE_X))
+                // JimsProxy (unit-scale): the drawn model (DISPLAYID: a form or a costume) changes
+                // the height and the translated scale, so it re-sends the packet too.
+                if (!changedValuesMask.Get(UNIT_FIELD_NATIVEDISPLAYID) && !changedValuesMask.Get(UNIT_FIELD_DISPLAYID)
+                    && !changedValuesMask.Get(UNIT_FIELD_MOUNTDISPLAYID) && !changedValuesMask.Get(OBJECT_FIELD_SCALE_X))
                     return; // No need for an update
 
                 // Reads UNIT_FIELD_DISPLAYID (the currently rendered, form-aware model), not
@@ -2257,7 +2245,14 @@ public partial class WorldClient
                 if (rawScaleX == 0.0f)
                     return;
 
-                float scaledHeight = ComputeVisualCollisionHeight(currentDisplayId, mountDisplayId, rawScaleX);
+                // JimsProxy (unit-scale): this packet's Scale lands in the same client slot as
+                // ObjectData.Scale (the last one to arrive wins), so for a translated unit it must
+                // carry the translated value, or a mount or dismount would snap the unit back to the
+                // doubled size until its next scale update. Untranslated units keep the #359 formula.
+                float clientScale = ComputeClientUnitScale(objectType, updates, out float displayFactor);
+                float scaledHeight = clientScale != rawScaleX || displayFactor != 1.0f
+                    ? ComputeTranslatedCollisionHeight(currentDisplayId, mountDisplayId, clientScale, displayFactor)
+                    : ComputeVisualCollisionHeight(currentDisplayId, mountDisplayId, rawScaleX);
                 if (scaledHeight == 0)
                     scaledHeight = mountDisplayId != 0 ? PlayerHeight.Mounted : PlayerHeight.Normal;
 
@@ -2269,7 +2264,7 @@ public partial class WorldClient
                 {
                     MoverGUID = guid,
                     Height = scaledHeight,
-                    Scale = rawScaleX,
+                    Scale = clientScale,
                     Reason = reason,
                     MountDisplayID = (uint) mountDisplayId,
                 };
@@ -2282,6 +2277,7 @@ public partial class WorldClient
                         display_id = currentDisplayId,
                         mount_display_id = mountDisplayId,
                         raw_scale = rawScaleX,
+                        client_scale = clientScale,
                         height = scaledHeight,
                         reason = reason.ToString(),
                     });
@@ -3367,6 +3363,17 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                 updateData.UnitData.NativeDisplayID = updates[UNIT_FIELD_NATIVEDISPLAYID].Int32Value;
             }
             int UNIT_FIELD_MOUNTDISPLAYID = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_MOUNTDISPLAYID);
+            // JimsProxy (#417 symptom 2): for another player, the same mount again after the player came
+            // back into view unmounted is held back from this update and sent after it, preceded by a 0
+            // (MountCacheResetTracker). Every update, mounted or not, is tracked, creates included.
+            bool holdMountForCacheReset = false;
+            if (UNIT_FIELD_MOUNTDISPLAYID >= 0 && Framework.Settings.MountCacheResetSynth &&
+                objectType == ObjectType.Player && guid != Session.GameState.CurrentPlayerGuid)
+            {
+                bool mountInBlock = updateMaskArray[UNIT_FIELD_MOUNTDISPLAYID];
+                int mountValue = mountInBlock ? updates[UNIT_FIELD_MOUNTDISPLAYID].Int32Value : 0;
+                holdMountForCacheReset = Session.GameState.MountCacheResets.OnUpdate(guid, isCreate, mountInBlock, mountValue);
+            }
             if (UNIT_FIELD_MOUNTDISPLAYID >= 0 && updateMaskArray[UNIT_FIELD_MOUNTDISPLAYID])
             {
                 // JimsProxy (mount-and-quest-diagnostics): log mount display transitions so
@@ -3379,6 +3386,11 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                 int oldMountDisplayId = Session.GameState.GetLegacyFieldValueInt32(guid, UnitField.UNIT_FIELD_MOUNTDISPLAYID);
                 int newMountDisplayId = updates[UNIT_FIELD_MOUNTDISPLAYID].Int32Value;
                 updateData.UnitData.MountDisplayID = newMountDisplayId;
+                if (holdMountForCacheReset)
+                {
+                    updateData.UnitData.MountDisplayID = null;
+                    _pendingMountCacheResets.Add((guid, newMountDisplayId));
+                }
 
                 if (oldMountDisplayId != newMountDisplayId)
                 {
@@ -3566,6 +3578,22 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                 {
                     var channelSpells = GetSession().GameState.UnitChannelSpells;
                     int oldSpellId = channelSpells.GetValueOrDefault(guid, 0);
+
+                    // JimsProxy (observer self-channel visual): Kronos leaves the channel object at 0
+                    // when a unit channels on itself (Evocation, Hellfire, Tranquility, a bandage on
+                    // itself), so this client got the channel spell with no channel object and drew no
+                    // channel visual on the caster. A native server lists the caster as its own channel
+                    // object for a self-channeled spell; do the same, and clear it when that channel
+                    // ends. An object the server sent, or one set by an earlier update, is kept.
+                    if (updateData.UnitData.ChannelObject == null &&
+                        GetGuidValue64(updates, UnitField.UNIT_FIELD_CHANNEL_OBJECT).IsEmpty())
+                    {
+                        if (spellId != 0 && GameData.IsSelfChanneledSpell((uint)spellId))
+                            updateData.UnitData.ChannelObject = guid;
+                        else if (oldSpellId != 0 && GameData.IsSelfChanneledSpell((uint)oldSpellId))
+                            updateData.UnitData.ChannelObject = WowGuid128.Empty;
+                    }
+
                     if (spellId != oldSpellId)
                     {
                         string guidStr = guid.ToClientGuidString();
@@ -4743,58 +4771,9 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                 && guid == GetSession().GameState.CurrentPlayerGuid
                 && !guid.IsEmpty())
             {
-                var (healingDone, damageDone) = GameData.ComputeEquipmentSpellStats(
-                    GetSession().GameState.CurrentEquippedItemIds,
-                    GetSession().GameState.CurrentPlayerAuraSpellIds);
-
-                if (healingDone.HasValue)
-                    updateData.ActivePlayerData.ModHealingDonePos = healingDone;
-
-                for (int i = 0; i < 7; i++)
-                {
-                    if (updateData.ActivePlayerData.ModDamageDonePos[i] == null && damageDone[i].HasValue)
-                        updateData.ActivePlayerData.ModDamageDonePos[i] = damageDone[i];
-                }
-
-                // JimsProxy (vanilla synthesized spell crit): vanilla 1.12 has no
-                // PLAYER_SPELL_CRIT_PERCENTAGE1 field. Compute base + INT/rate + aura
-                // contributions per school and override the modern client's per-school
-                // crit array. Done unconditionally for the active player (overwriting any
-                // value the legacy server might have pushed via a lookup that returns
-                // null on vanilla — safe because the field doesn't exist there).
-                float[] critByschool = GameData.ComputeSpellCritChance(
-                    GetSession().GameState.CurrentPlayerClass,
-                    GetSession().GameState.CurrentPlayerLevel,
-                    GetSession().GameState.CurrentPlayerIntellect,
-                    GetSession().GameState.CurrentEquippedItemIds,
-                    GetSession().GameState.CurrentPlayerAuraSpellIds,
-                    GetSession().GameState.CurrentPlayerKnownSpells);
-                for (int i = 0; i < 7; i++)
-                    updateData.ActivePlayerData.SpellCritPercentage[i] = critByschool[i];
-
-                // JimsProxy: synthesize melee/ranged Hit Chance. Vanilla 1.12 has no
-                // UiHitModifier-equivalent field — Kronos can't push a value the modern
-                // client recognises — so the Ranged/Melee "Hit Chance" row reads 0% until
-                // we compute it from aura type 54 contributions on equipment, active
-                // auras, and talent passives.
-                float hitMod = GameData.ComputeMeleeRangedHitModifier(
-                    GetSession().GameState.CurrentEquippedItemIds,
-                    GetSession().GameState.CurrentPlayerAuraSpellIds,
-                    GetSession().GameState.CurrentPlayerKnownSpells);
-                updateData.ActivePlayerData.UiHitModifier = hitMod;
-
-                float spellHitMod = GameData.ComputeSpellHitModifier(
-                    GetSession().GameState.CurrentEquippedItemIds,
-                    GetSession().GameState.CurrentPlayerAuraSpellIds,
-                    GetSession().GameState.CurrentPlayerKnownSpells);
-                // Modern Classic Era 1.14 interprets UiSpellHitModifier as a *rating* and
-                // applies the Classic-Era rating-to-% conversion at L60: 7.0 spell-hit
-                // rating per 1% (empirically verified — sending field=40 displayed 5.7%,
-                // 40/5.7 ≈ 7.0). Pre-scale so the displayed value matches what we
-                // synthesize. UiHitModifier (melee/ranged) does NOT have this conversion
-                // and stays a flat %.
-                const float SPELL_HIT_RATING_PER_PCT_L60 = 7.0f;
-                updateData.ActivePlayerData.UiSpellHitModifier = spellHitMod * SPELL_HIT_RATING_PER_PCT_L60;
+                // The computation lives in SynthesizeVanillaPlayerStats (SynthesizedPlayerStats.cs) so
+                // the item-template arrival path can re-emit the same fields.
+                SynthesizeVanillaPlayerStats(updateData.ActivePlayerData, fillDamageGaps: true);
             }
             int PLAYER_FIELD_MOD_TARGET_RESISTANCE = LegacyVersion.GetUpdateField(PlayerField.PLAYER_FIELD_MOD_TARGET_RESISTANCE);
             if (PLAYER_FIELD_MOD_TARGET_RESISTANCE >= 0 && updateMaskArray[PLAYER_FIELD_MOD_TARGET_RESISTANCE])
@@ -5362,6 +5341,11 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
             }
         }
 
+        // JimsProxy (unit-scale, v1): players and humanoid NPCs get SCALE_X / the client's own
+        // display factor (UnitScaleHandler.cs). Runs first: the May block below keeps sizing pets
+        // (its pet branch wins for a pet) and every other creature, and skips humanoid displays.
+        TranslateUnitScale(updateMaskArray, updates, objectType, updateData, guid);
+
         // JimsProxy (pet-scale-vanilla-parity): the local player's pet (warlock
         // or hunter) renders at the wrong size in modern 1.14 Classic vs vanilla
         // 1.12 reference. Modern Classic's per-display CreatureModelScale
@@ -5585,8 +5569,12 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                     cms_fallback = cms <= 0,
                 });
             }
-            else if (objectType == ObjectType.Unit && cms > 0)
+            else if (objectType == ObjectType.Unit && cms > 0
+                     && !(UnitScale.TranslationEnabled && displayId > 0 && UnitScale.IsCharacterModelDisplay((uint)displayId)))
             {
+                // JimsProxy (unit-scale, v1): a humanoid display (a race's character model) is
+                // sized by TranslateUnitScale above while the tables are loaded; this branch keeps
+                // every other creature as before.
                 // Non-pet vanilla NPC scale: bridge Kronos (TC-1.12) wire convention to
                 // modern Classic 1.14 client rendering. Vanilla 1.12 server-side
                 // creature_template.scale equals CreatureModelScale per DisplayID, sent
@@ -5701,27 +5689,6 @@ WowGuid128 charmedBy = GetGuidValue(updates, UnitField.UNIT_FIELD_CHARMEDBY).To1
                     emitted_scale = npcEmit,
                     k_source = hasVanillaCms ? "vanilla_dbc" : "default",
                 });
-            }
-            else if (objectType == ObjectType.Player || objectType == ObjectType.ActivePlayer)
-            {
-                // K=0.75 for tauren is now baked into the CreatureDisplayInfo CMS hotfix
-                // (CSV/Hotfix/CreatureDisplayInfo1.csv) — id 59 CMS = 1.0125, id 60 CMS = 0.75.
-                // The 1.14 client renders all paths as wire × CMS × ModelScale, so the
-                // hotfix CMS alone yields the K-applied target without a proxy wire
-                // multiplier. Post-shift recompute uses the same CMS, so login and
-                // post-shift now match. Diagnostic event for visibility.
-                int modelIdForAdjust = displayId > 0 ? (int)GameData.GetDisplayInfo((uint)displayId).ModelId : 0;
-                if (modelIdForAdjust > 0 && M2MeshAdjust.TryGetValue(modelIdForAdjust, out var playerAdj))
-                {
-                    Log.Event("unit.player_scale.skipped", new
-                    {
-                        guid = guid.ToString(),
-                        display_id = displayId,
-                        model_id = modelIdForAdjust,
-                        raw_scale = rawScale,
-                        reason = "k_baked_in_cms_hotfix",
-                    });
-                }
             }
         }
     }

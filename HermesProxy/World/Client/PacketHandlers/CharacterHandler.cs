@@ -260,6 +260,7 @@ public partial class WorldClient
         verify.Pos.Y = packet.ReadFloat();
         verify.Pos.Z = packet.ReadFloat();
         verify.Pos.Orientation = packet.ReadFloat();
+        GetSession().GameState.SetOwnPosition(new Vector3(verify.Pos.X, verify.Pos.Y, verify.Pos.Z));
 
         // JimsProxy (camp stun lock, step 2): arm the pre-create self-op hold for
         // this login — self control ops (root/unroot/control-update/teleport) that
@@ -314,6 +315,13 @@ public partial class WorldClient
 
         GetSession().GameState.IsInWorld = true;
 
+        // JimsProxy (addon say/yell carrier): join the proxy-only channel at every login (and
+        // again after each world port, Server MovementHandler.HandleWorldPortResponse). An
+        // existing membership is answered with PlayerAlreadyMember, which the notify filter
+        // keeps from the client.
+        if (Framework.Settings.AddonSayYellCarrier)
+            SendChatJoinChannel(0, AddonSayYellCarrier.ChannelName, "");
+
         // JimsProxy (worldentry root-ceremony breadcrumb 2026-08-03): logins get the
         // same arrival ROOT/UNROOT ceremony as world transfers (wire-verified, incl.
         // the stuck-stun golden capture where the broken login shows the missing
@@ -356,20 +364,6 @@ public partial class WorldClient
             player_guid_low = GetSession().GameState.CurrentPlayerGuid.GetCounter(),
             map_id = verify.MapID,
         });
-
-        // JimsProxy (zep-stuck-login-turn-gate 2026-05-17): when the player logs
-        // in already on a transport (zep/boat in flight), the modern 1.14 client
-        // gates turn-input — CMSG_MOVE_SET_FACING / START_TURN_* never fire until
-        // the client receives a teleport-tier movement reset. World transfers
-        // (NEW_WORLD) provide that reset naturally via the map-load. Plain login
-        // doesn't. Arm the deferred-synth path with mode=Login so the synth
-        // fires AFTER the player's first UpdateObject lands (and so we have
-        // current transport state to attach to). The synth body uses
-        // TransportGUID=default; the server's natural player-update re-attaches
-        // the legitimate transport right after, but the brief off-transport
-        // pulse is what releases the client's turn-input gate.
-        GetSession().GameState.PendingDeferredTransportSynth =
-            DeferredTransportSynthMode.Login;
 
         LoadCUFProfiles cuf = new();
         cuf.Data = GetSession().AccountDataMgr.LoadCUFProfiles();

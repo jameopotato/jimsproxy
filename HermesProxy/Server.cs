@@ -11,8 +11,6 @@ using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Reflection;
-using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -101,18 +99,6 @@ partial class Server
         Log.DebugLogEnabled = Settings.DebugOutput;
         Log.Print(LogType.Debug, "Debug logging enabled");
         Log.SpanStatsEnabled = Settings.SpanStatsLog;
-
-        if (!AesGcm.IsSupported)
-        {
-            Log.Print(LogType.Error, "AesGcm is not supported on your platform");
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-            {
-                Log.Print(LogType.Error, "Since you are on MacOS, you can install openssl@3 via homebrew");
-                Log.Print(LogType.Error, "Run this:      brew install openssl@3");
-                Log.Print(LogType.Error, "Start Hermes:  DYLD_LIBRARY_PATH=/opt/homebrew/opt/openssl@3/lib ./HermesProxy");
-            }
-            return;
-        }
 
         Log.Print(LogType.Server, $"Modern (Client) Build: {Settings.ClientBuild}");
         Log.Print(LogType.Server, $"Legacy (Server) Build: {Settings.ServerBuild}");

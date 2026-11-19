@@ -104,8 +104,8 @@ public class WorldEntryCeremonyTests
     }
 
     // The cure unroot's sentinel counter must be disjoint from the legacy server's
-    // constant 0 and from the 0xFFFFFFFF transport-clear teleport sentinel, so the
-    // ack swallow can never eat a legitimate ack.
+    // constant 0 and from 0xFFFFFFFF (the old sentinel of the transport-clear teleport,
+    // deleted in P1-2), so the ack swallow can never eat a legitimate ack.
     [Fact]
     public void SynthCounter_DisjointFromLegacyValues()
     {

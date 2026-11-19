@@ -125,6 +125,24 @@ public static class Settings
     // kill switch. Default-init true so paths that bypass LoadAndVerifyFrom (tests) get
     // the fix.
     public static bool SynthStandOnFear = true;
+    // JimsProxy (#417 symptom 2, another player's mount not shown after a portal): give the client a
+    // mount display of 0 for another player right before the same mount again, after that player came
+    // back into view unmounted (see MountCacheResetTracker). A synthesized update on a core path, so it
+    // has a kill switch. Default-init true so paths that bypass LoadAndVerifyFrom (tests) get the fix.
+    public static bool MountCacheResetSynth = true;
+
+    // JimsProxy (another player stuck dancing): when another player who danced starts moving, give
+    // this client SMSG_EMOTE 0 for that player so the dance loop ends, as the session player's own
+    // dance already does on a move start. A synthesized packet on the movement-relay path, so it has
+    // a kill switch. Default-init true so paths that bypass LoadAndVerifyFrom (tests) get the fix.
+    public static bool ObservedDanceStopSynth = true;
+
+    // JimsProxy (an aura's looping animation stuck after a loading screen): the loading-screen
+    // aura re-send is skipped when the session player's create came inside that loading screen
+    // (login, far teleport), and after any other loading screen (/reload) an empty full aura
+    // list goes first. A synthesized packet on the world-entry path, so it has a kill switch.
+    // Default-init true so paths that bypass LoadAndVerifyFrom (tests) get the fix.
+    public static bool AuraResendAfterLoadFix = true;
     // JimsProxy (clean handshake teardown): bound the realmd auth handshake. If realmd accepts
     // the TCP connection but never sends LOGON_CHALLENGE (half-accepting login server, load-shed,
     // firewall), the login thread would otherwise block forever ("stuck on Connecting..."). On
@@ -138,6 +156,13 @@ public static class Settings
     // prefix-gated to "PLPWR" — no other addon traffic is touched. Disable if
     // a future PallyPower protocol bump invalidates the assumption.
     public static bool EnablePallyPowerInterop;
+    // JimsProxy (addon say/yell carrier): carry say and yell addon messages between proxied
+    // players on a proxy-only channel instead of forwarding them as 1.12 say or yell chat,
+    // which makes every 1.12 client nearby play the shout or talk animation (see
+    // World/AddonSayYellCarrier.cs). Set false to restore the forward as 1.12 chat (the
+    // channel is not joined either). Default-init true so paths that bypass
+    // LoadAndVerifyFrom (tests) get the fix.
+    public static bool AddonSayYellCarrier = true;
     // JimsProxy (low-latency-mode): forward every CMSG_CAST_SPELL immediately
     // without holding. Eliminates hold-queue race conditions that cause stuck
     // spells for players with <40ms RTT. Most players should leave this OFF.
@@ -316,8 +341,14 @@ public static class Settings
         ChargePendLatchCure = config.GetBoolean("ChargePendLatchCure", true);
         Charm382StripPetInCombat = config.GetBoolean("Charm382StripPetInCombat", true);
         SynthStandOnFear = config.GetBoolean("SynthStandOnFear", true);
+        MountCacheResetSynth = config.GetBoolean("MountCacheResetSynth", true);
+
+        ObservedDanceStopSynth = config.GetBoolean("ObservedDanceStopSynth", true);
+
+        AuraResendAfterLoadFix = config.GetBoolean("AuraResendAfterLoadFix", true);
         AuthHandshakeTimeoutMs = Math.Clamp(config.GetInt("AuthHandshakeTimeoutMs", 15000), 1000, 60000);
         EnablePallyPowerInterop = config.GetBoolean("EnablePallyPowerInterop", true);
+        AddonSayYellCarrier = config.GetBoolean("AddonSayYellCarrier", true);
         ClientTcpNoDelay = config.GetBoolean("ClientTcpNoDelay", true);
         LowLatencyMode = config.GetBoolean("LowLatencyMode", false);
         SuppressSpellCastErrors = config.GetBoolean("SuppressSpellCastErrors", false);

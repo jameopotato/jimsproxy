@@ -57,18 +57,6 @@ public sealed class TradeSession
     public uint ServerStateIndex = 1; // incremented by any trade action
 }
 
-// JimsProxy (zep-stuck-low-latency-race 2026-05-17): which deferred-synth path
-// armed the PendingDeferredTransportSynth flag. NewWorld defers + conditionally
-// skips when destination has player on transport (natural NEW_WORLD load already
-// unlocks the client). Login always fires the synth because there's no loading
-// screen at login to unlock the modern client's turn-input gate.
-public enum DeferredTransportSynthMode
-{
-    None = 0,
-    NewWorld = 1,
-    Login = 2,
-}
-
 // JimsProxy (empty-victim wedge): what an SMSG_ATTACK_STOP naming the local player did to the
 // auto-attack handshake state. Returned by GameSessionData.ApplyLocalPlayerAttackStop so the
 // socket layer only has to decide whether to forward a CMSG_ATTACK_STOP.
@@ -131,6 +119,24 @@ public sealed class GameSessionData
     // by hardcoding 7.0f. Default true: a player who has never been CC'd is
     // always in control, so the natural login state is "has control already."
     public bool LastObservedHasControl = true;
+    // JimsProxy (stuck moving at the start of a mind control): the unit this client moves, from its
+    // last CMSG_SET_ACTIVE_MOVER (every mover switch the client makes sends one, GUID 0 included). The
+    // client socket's thread writes it and the server thread reads it, so the 16-byte GUID sits in an
+    // immutable box swapped by reference.
+    private volatile StrongBox<WowGuid128>? _clientActiveMover;
+    public WowGuid128 ClientActiveMover
+    {
+        get => _clientActiveMover?.Value ?? default;
+        set => _clientActiveMover = new StrongBox<WowGuid128>(value);
+    }
+
+    // JimsProxy (mount speed kept after Will of the Forsaken): orders a controlled unit's speed
+    // acknowledgement ahead of the client's release of that unit (see ControlReleaseAckOrder).
+    public readonly ControlReleaseAckOrder ReleaseAckOrder = new();
+
+    // JimsProxy (#417 symptom 2): what this client was last given as each other player's mount
+    // display, and which players need a 0 before the same mount again (MountCacheResetTracker).
+    public readonly MountCacheResetTracker MountCacheResets = new();
     // JimsProxy (feared-while-sitting, issue #479): the local player's stand state
     // (UNIT_FIELD_BYTES_1 byte 0) as last written by the legacy server, read from the
     // legacy field cache. Gate input for the synthesized stand-up on incoming fear.
@@ -142,8 +148,6 @@ public sealed class GameSessionData
     public uint LastLocalFearConfuseFlags;
     // JimsProxy (speed-stuck-after-fear-while-mounted): cached for reassert; see memory.
     public float LastKnownPlayerRunSpeed = 7.0f;
-    // JimsProxy (speed-stuck-after-bg-end-while-mounted): deferred reassert flag; see memory.
-    public bool PendingPostTeleportRunSpeedReassert;
     // JimsProxy (taxi-flight-robustness): when set, signals a pending taxi-dismount Task
     // scheduled to fire at TaxiDismountFiresAtTickMs. The CTS is cancelled+disposed on
     // (a) clean session disconnect, (b) early landing CMSG, (c) a fresh taxi spline
@@ -159,6 +163,11 @@ public sealed class GameSessionData
     // loops indefinitely. Track the last looping emote so HandlePlayerMove can synthesize
     // a stop SMSG_EMOTE on the first movement-start packet.
     public uint LastLoopingEmoteId; // 0 means no active loop
+    // JimsProxy (another player stuck dancing): other players whose looping emote this client is
+    // still playing, with the emote id. Set by SMSG_EMOTE, cleared by the stop sent on their move start,
+    // by a server SMSG_EMOTE 0, and when they leave this client's view (the dance ends there too).
+    // Server-packet thread only.
+    public readonly Dictionary<WowGuid128, uint> ObservedLoopingEmotes = new();
     public long LastLoopingEmoteTickMs;
     // JimsProxy (#244 emote channel guard): the local player's active channel
     // window, tracked from MSG_CHANNEL_START / MSG_CHANNEL_UPDATE (vanilla
@@ -371,47 +380,13 @@ public sealed class GameSessionData
     // free the player early.
     public long ChargePendLatchArmedAtMs;
     public uint ChargePendLatchArmedFlags;           // the arming packet's modern movement flags, for the cure breadcrumb
-    // JimsProxy (zep-stuck-no-move 2026-05-14): set to a sentinel MoveCounter when
-    // HandleNewWorld emits a synthesized SMSG_MOVE_TELEPORT to clear the modern
-    // client's stale MOVEMENTFLAG_ONTRANSPORT after a cross-continent transport
-    // (zep/boat) zone change. The legacy server never sent that teleport, so the
-    // matching CMSG_MOVE_TELEPORT_ACK must be dropped before reaching the legacy
-    // server (per project_kronos_three_delayed_kick_sources, a spurious teleport-ack
-    // can feed malformed-packet kick counters on Kronos). 0 means none pending.
-    public uint PendingSyntheticTransportClearAckCounter;
-
-    // JimsProxy (zep-relog-diag 2026-05-15, load-bearing since #404): the player's
-    // last-observed TransportGuid. Written from the player's own UpdateObject block
-    // (UpdateHandler.ReadMovementUpdateBlock, where it also gates the transport_state
-    // diagnostic to state transitions) and from every own movement packet
-    // (Server MovementHandler.HandlePlayerMove). Read by the TransportClearGate call site
-    // as the gate's source observation; null means never observed.
+    // JimsProxy (zep-relog-diag 2026-05-15): the player's last-observed TransportGuid.
+    // Written from the player's own UpdateObject block (UpdateHandler.ReadMovementUpdateBlock,
+    // where it gates the transport_state diagnostic to state transitions) and from every own
+    // movement packet (Server MovementHandler.HandlePlayerMove); null means never observed.
+    // From #404 until P1-2 it was also the source observation of the transport-clear synth's
+    // gate; that synth is deleted, and the diagnostic is its only reader now.
     public WowGuid128? LastObservedPlayerTransportGuid;
-
-    // JimsProxy (zep-stuck-low-latency-race 2026-05-17): deferred-synth mode.
-    // HandleNewWorld / HandleLoginVerifyWorld set this and defer the transport-
-    // clear MoveTeleport synth until the player's first post-NEW_WORLD (or
-    // post-login) UpdateObject is processed in UpdateHandler. Two reasons to
-    // defer:
-    //   1. NewWorld path — at low latency (~35ms) the inline synth fired
-    //      BEFORE the destination map's COMPRESSED_UPDATE_OBJECT arrived; the
-    //      server's subsequent natural player-update re-attached
-    //      MOVEMENTFLAG_ONTRANSPORT (player landed on destination zep tower /
-    //      boat deck), and the rapid clear→re-attach wedged the modern client.
-    //      Deferred path skips the synth entirely when the destination's
-    //      player UpdateObject confirms the player is on a destination
-    //      transport (no synth needed — the natural NEW_WORLD flow already
-    //      unlocks the client's movement state on map load).
-    //   2. Login path — when the client logs in already on a transport, the
-    //      modern client gates turn-input (CMSG_MOVE_SET_FACING / START_TURN_*)
-    //      and never sends them until something resets its movement state.
-    //      There's no loading screen at login, so the natural NEW_WORLD reset
-    //      doesn't fire. Synthesizing the transport-clear MoveTeleport gives
-    //      the gate the kick it needs to release. Login path ALWAYS synths
-    //      regardless of transport state.
-    // Cleared by the deferred path in UpdateHandler.ReadMovementUpdateBlock
-    // once it fires or skips.
-    public DeferredTransportSynthMode PendingDeferredTransportSynth;
 
     public bool IsFirstEnterWorld;
     public bool IsConnectedToInstance;
@@ -427,6 +402,16 @@ public sealed class GameSessionData
     // World/Client/PreCreateOpHold.cs. Same lifetime rules as LoginEvictionHold.
     public readonly PreCreateOpHold PreCreateOpHold = new();
     public uint? CurrentMapId;
+    // JimsProxy (addon say/yell carrier): the session player's last known position, from its
+    // own movement packets, the login position and teleports; the listener side of the
+    // carrier's range check (AddonSayYellCarrier.InRange).
+    public Vector3 OwnPosition;
+    public bool HasOwnPosition;
+    public void SetOwnPosition(Vector3 position)
+    {
+        OwnPosition = position;
+        HasOwnPosition = true;
+    }
     public uint CurrentZoneId;
     public uint CurrentTaxiNode;
     public List<byte> UsableTaxiNodes = [];
@@ -754,6 +739,66 @@ public sealed class GameSessionData
     public uint CurrentGuildNumAccounts;
     public WowGuid128 CurrentInteractedWithNPC;
     public WowGuid128 CurrentInteractedWithGO;
+
+    // JimsProxy: the last quest-giver greeting (SMSG_QUEST_GIVER_QUEST_LIST_MESSAGE) relayed to the
+    // client, kept for the current NPC interaction. After a turn-in reached through that greeting the
+    // 1.14 client leaves the reward page open unless the completion carries LaunchQuest, so the
+    // completion translator asks whether the greeting listed anything besides the completed quest
+    // (see WorldClient.HandleQuestGiverQuestComplete). The record is replaced as a whole: written from
+    // the WorldClient thread (list) and the WorldSocket thread (hello), read from the WorldClient thread.
+    private sealed record QuestGreeting(WowGuid128 Giver, uint[] QuestIds);
+    private volatile QuestGreeting? _questGreeting;
+
+    public void RecordQuestGreeting(WowGuid128 giver, IEnumerable<uint> questIds)
+    {
+        _questGreeting = new QuestGreeting(giver, questIds.ToArray());
+    }
+
+    // A forwarded CMSG_QUEST_GIVER_HELLO starts a new interaction; whatever greeting the server answers
+    // with is recorded again by the list handler.
+    public void ClearQuestGreeting()
+    {
+        _questGreeting = null;
+    }
+
+    public bool QuestGreetingHasOtherEntries(WowGuid128 giver, uint completedQuestId)
+    {
+        QuestGreeting? greeting = _questGreeting;
+        if (greeting == null || giver == default || greeting.Giver != giver)
+            return false;
+        foreach (uint questId in greeting.QuestIds)
+            if (questId != completedQuestId)
+                return true;
+        return false;
+    }
+
+    // Launch bits for SMSG_QUEST_GIVER_QUEST_COMPLETE, in the client's own priority order: a known
+    // follow-up quest keeps LaunchQuest (the next quest's details follow), a gossip NPC gets
+    // LaunchGossip (the gossip page follows), and a greeting that still lists other quests gets
+    // LaunchQuest so the client re-asks the NPC and the remaining list follows, as a native server
+    // does for every quest giver. Otherwise both bits stay clear and the client closes the page itself.
+    internal static (bool launchQuest, bool launchGossip) DecideQuestCompleteLaunch(bool hasFollowUpQuest, bool npcHasGossipFlag, bool greetingHasOtherEntries)
+    {
+        if (hasFollowUpQuest)
+            return (true, false);
+        if (npcHasGossipFlag)
+            return (false, true);
+        if (greetingHasOtherEntries)
+            return (true, false);
+        return (false, false);
+    }
+
+    // JimsProxy: the mount auras among a unit's aura-slot spell IDs, in slot order. Used by the
+    // 1.12 mount cancel (WorldSocket.CancelLegacyMountAuras) for CMSG_CANCEL_MOUNT_AURA and for
+    // the dismount before a taxi activation.
+    internal static List<uint> MountAurasAmong(IEnumerable<uint> auraSpellIds, Func<uint, bool> isMountAura)
+    {
+        List<uint> result = new();
+        foreach (uint spellId in auraSpellIds)
+            if (isMountAura(spellId))
+                result.Add(spellId);
+        return result;
+    }
     // JimsProxy: Auctionator-style Full Scan synthesis state. CMSG_AUCTION_REPLICATE_ITEMS
     // has no legacy 1.12 equivalent; the proxy walks pages internally via
     // CMSG_AUCTION_LIST_ITEMS at the canonical 6s cooldown and assembles rows
@@ -1517,6 +1562,11 @@ public sealed class GameSessionData
     // is merged against state the client no longer has, and the previous
     // buff bar lingers stale until reload.
     public HashSet<WowGuid128> NeedsFullAuraRefresh = [];
+    // JimsProxy (aura re-send after a loading screen): set when the session player's create is
+    // translated, cleared by CMSG_LOADING_SCREEN_NOTIFY(Showing = 1). Read at Showing = 0: true
+    // means the create inside this loading screen already gave the client the player's auras.
+    // Written on the server-packet thread, read and cleared on the client-packet thread.
+    public volatile bool SelfCreatedSinceLoadingScreenShown;
     // JimsProxy (synth-spell-start-for-autoshot): timestamp of the most recent
     // natural SMSG_SPELL_START forwarded for the local player's ranged auto
     // attack (Auto Shot 75 / Shoot 5019). The 1.12 server only emits SPELL_START

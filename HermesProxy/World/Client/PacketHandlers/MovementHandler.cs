@@ -142,6 +142,41 @@ public partial class WorldClient
     {
         MoveUpdate moveUpdate = new MoveUpdate();
         moveUpdate.MoverGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
+        // JimsProxy (stuck moving at the start or end of a mind control): the server relays a
+        // controlled unit's movement to every client in range. A packet its previous controller sent
+        // just before a hand-over arrives after it, and the client applies a relay to the unit it is
+        // moving like to any other unit: the relayed flags replace its own and its heartbeats then
+        // carry them with no key pressed, or a relayed stop cancels a key it has just pressed. At the
+        // end of a Mind Control the priest's last packets reach the freed victim (2026-10-18:
+        // CONTROL_UPDATE(player, On) at 18:27:01.156, the relayed forward at .203, forward heartbeats
+        // with no key from .688); at the start the victim's last packet reaches the priest after it
+        // took the unit over (SET_ACTIVE_MOVER(victim) at 18:52:02.469, the relayed forward+strafe at
+        // .484, the priest's client strafing the victim out of range). A movement relay for the
+        // unit a client moves itself is stale: the player's own GUID while the player has control,
+        // or the unit the client last named in CMSG_SET_ACTIVE_MOVER. The one such relay Kronos
+        // sends outside a hand-over is a MSG_MOVE_TELEPORT for the player's own unit at every world
+        // entry (login, far teleport, battleground exit), in the same burst as the control update,
+        // after the player's own create. It is dropped with the rest: in 16 stock-build entry pairs
+        // it carried the create's position, facing, time, fall block and transport exactly, plus a
+        // ROOT the server also sends as acked SMSG_MOVE_ROOT packets, so dropping it changes nothing
+        // (19 entries on the 2026-10-20 to 10-23 fix builds agree), while a copy applied late would
+        // snap the player back, re-root the client after the UNROOT, or free its pending
+        // acknowledgements (client read, 2026-10-26).
+        var relayState = GetSession().GameState;
+        bool relayIsSelf = moveUpdate.MoverGUID == relayState.CurrentPlayerGuid;
+        if (relayIsSelf ? relayState.LastObservedHasControl
+                        : moveUpdate.MoverGUID == relayState.ClientActiveMover)
+        {
+            // Fix-working breadcrumb: DebugOutput only.
+            if (Framework.Settings.DebugOutput)
+                Framework.Logging.Log.Event("movement.mover_relay_dropped", new
+                {
+                    opcode = packet.GetUniversalOpcode(false).ToString(),
+                    unit_low = moveUpdate.MoverGUID.GetCounter(),
+                    is_self = relayIsSelf,
+                });
+            return;
+        }
         // JimsProxy (out-of-range-ghost): drop a stray movement packet for a unit we just destroyed/out-of-ranged so it can't re-ghost the unit running-in-place on the modern client. Runs BEFORE the observed-bow move edge — a destroyed unit isn't rendered, so its stray move must neither reach the client nor count as a stop edge (a dead latched shooter is retracted by the death edge; an out-of-ranged one despawns and its latch ages out via the sweep).
         if (moveUpdate.MoverGUID != GetSession().GameState.CurrentPlayerGuid &&
             GetSession().GameState.WasObjectRecentlyDestroyed(moveUpdate.MoverGUID, out long ghostAgoMs))
@@ -160,6 +195,7 @@ public partial class WorldClient
             IsAutoRepeatStoppingMove(packet.GetUniversalOpcode(false)))
         {
             RetractObservedShooterOnStop(moveUpdate.MoverGUID);
+            StopObservedLoopingEmoteOnMove(moveUpdate.MoverGUID, packet.GetUniversalOpcode(false));
         }
         moveUpdate.MoveInfo = new();
         moveUpdate.MoveInfo.ReadMovementInfoLegacy(packet, GetSession().GameState);
@@ -170,6 +206,32 @@ public partial class WorldClient
         moveUpdate.MoveInfo.Flags = (uint)(((MovementFlagWotLK)moveUpdate.MoveInfo.Flags).CastFlags<MovementFlagModern>());
         moveUpdate.MoveInfo.ValidateMovementInfo();
         SendPacketToClient(moveUpdate);
+    }
+
+    // JimsProxy (another player stuck dancing, 2026-10-17 live Stratholme): Kronos sends /dance as
+    // SMSG_EMOTE 10 only, with no stop when the dancer moves, and on the client another unit's dance
+    // keeps playing through its movement. A party member who danced at 22:50:14 kept dancing whenever
+    // idle on the owner's client until 23:16:21. On the same translational starts as the bow retract,
+    // the client gets SMSG_EMOTE 0 for the unit first, which ends the dance. The session player's own
+    // dance is ended the same way when the client sends its own move start (World/Server
+    // MovementHandler, LastLoopingEmoteId).
+    private void StopObservedLoopingEmoteOnMove(WowGuid128 mover, Opcode opcode)
+    {
+        var state = GetSession().GameState;
+        if (!Framework.Settings.ObservedDanceStopSynth || !state.ObservedLoopingEmotes.Remove(mover, out uint loopingEmoteId))
+            return;
+        EmoteMessage stopEmote = new EmoteMessage();
+        stopEmote.Guid = mover;
+        stopEmote.EmoteID = 0; // EMOTE_ONESHOT_NONE: ends the loop
+        SendPacketToClient(stopEmote);
+        // Fix-working breadcrumb: DebugOutput only.
+        if (Framework.Settings.DebugOutput)
+            Framework.Logging.Log.Event("emote.loop.broken_by_observed_move", new
+            {
+                unit_low = mover.GetCounter(),
+                last_emote_id = loopingEmoteId,
+                opcode = opcode.ToString(),
+            });
     }
 
     // JimsProxy (observed-bow retract): translational-start moves mean the mover left its firing stance (auto-shot requires standing still); turn/facing/heartbeat/stop are excluded so a shooter that only turns to track its target isn't falsely retracted.
@@ -320,7 +382,8 @@ public partial class WorldClient
             // JimsProxy (speed-stuck-after-fear-while-mounted): reassert cached speed, not 7.0f; see memory.
             MoveSetSpeed runFix = new MoveSetSpeed(Opcode.SMSG_MOVE_SET_RUN_SPEED);
             runFix.MoverGUID = control.Guid;
-            runFix.MoveCounter = 0;
+            // P1-2: own counter, so the ack stays in the proxy (the server never sent this change).
+            runFix.MoveCounter = SynthMoveCounters.RegainControlRunSpeed;
             runFix.Speed = GetSession().GameState.LastKnownPlayerRunSpeed;
             // step-2 hold: ride behind the held control-update in emission order.
             if (!heldPreCreate || !GetSession().GameState.PreCreateOpHold.TryCapture(runFix))
@@ -346,6 +409,9 @@ public partial class WorldClient
 
         MoveSetFlag unroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
         unroot.MoverGUID = guid;
+        // P1-2: own counter, so the FORCE_UNROOT ack stays in the proxy. The gravity and
+        // can-fly acks need none: 1.12 has no such acks, so they are already discarded.
+        unroot.MoveCounter = SynthMoveCounters.TaxiResumeDismountUnroot;
         SendPacketToClient(unroot);
     }
 
@@ -429,14 +495,9 @@ public partial class WorldClient
             teleport.Vehicle = new();
             teleport.Vehicle.VehicleSeatIndex = moveInfo.TransportSeat;
         }
-        // JimsProxy (zep-stuck-no-move 2026-05-14, belt-and-suspenders): a real
-        // teleport from the legacy server supersedes any pending synthetic
-        // transport-clear ack we were watching for. Clear the sentinel so a future
-        // legitimate ack carrying the same MoveCounter cannot be eaten.
         if (guid == GetSession().GameState.CurrentPlayerGuid)
         {
-            GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
-
+            GetSession().GameState.SetOwnPosition(moveInfo.Position);
             // JimsProxy (carried-root cure, same-map variant): hearth/tele/portal
             // within a map is a MoveTeleport, not a NEW_WORLD — a stranded root
             // crosses this loading screen too. Belief-only gate (the teleport's
@@ -456,9 +517,7 @@ public partial class WorldClient
 
             // JimsProxy (camp stun lock, step 2): a SERVER-originated self teleport
             // before the login's first self create block joins the pre-create hold
-            // (R56 op set). Our own transport-clear synth doesn't route through this
-            // handler and stays unheld — it is present on every healthy login and
-            // provably not part of the lock recipe.
+            // (R56 op set).
             if (GetSession().GameState.PreCreateOpHold.TryCapture(teleport))
                 return;
         }
@@ -522,6 +581,12 @@ public partial class WorldClient
         }
 
         GetSession().GameState.IsWaitingForNewWorld = true;
+
+        // JimsProxy (mount speed kept after Will of the Forsaken): the suspend pauses the client's
+        // movement, so no awaited speed acknowledgement can come; let a hold in progress go.
+        if (GetSession().GameState.ReleaseAckOrder.Reset() is { } heldAtTransfer)
+            foreach (var held in heldAtTransfer)
+                SendPacketToServer(held);
 
         SuspendToken suspend = new();
         suspend.SequenceIndex = 3;
@@ -610,17 +675,11 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_NEW_WORLD)]
     void HandleNewWorld(WorldPacket packet)
     {
-        // JimsProxy (zep-stuck-no-move 2026-05-14, belt-and-suspenders): clear any
-        // stale synthetic transport-clear ack sentinel. If the modern client failed
-        // to ack our previous synth MoveTeleport, the sentinel would otherwise
-        // linger forever and could eat a future legitimate teleport ack that
-        // happened to carry the same MoveCounter value.
-        GetSession().GameState.PendingSyntheticTransportClearAckCounter = 0;
-
         NewWorld teleport = new NewWorld();
         var previousMapId = GetSession().GameState.CurrentMapId;
         GetSession().GameState.CurrentMapId = teleport.MapID = packet.ReadUInt32();
         teleport.Position = packet.ReadVector3();
+        GetSession().GameState.SetOwnPosition(teleport.Position);
         teleport.Orientation = packet.ReadFloat();
         teleport.Reason = 4;
 
@@ -635,8 +694,7 @@ public partial class WorldClient
         // IsFirstEnterWorld deliberately stays TRUE — the client is still doing its
         // first world entry, and the login-initial handlers gated on it (the
         // SMSG_INITIALIZE_FACTIONS TimeSyncRequest synth the client needs to be
-        // able to move, SMSG_LOGIN_SET_TIME_SPEED) may run after the merge. The
-        // deferred transport synth likewise stays in Login mode. No
+        // able to move, SMSG_LOGIN_SET_TIME_SPEED) may run after the merge. No
         // IsWaitingForWorldPortAck: the client will never ack a transfer it never
         // saw.
         var evictionHold = GetSession().GameState.LoginEvictionHold;
@@ -748,22 +806,6 @@ public partial class WorldClient
             // unroot is synthesized at the player's first destination update.
             GetSession().GameState.WorldEntryPendingCarriedRootCheck = true;
 
-            // JimsProxy (zep-stuck-low-latency-race 2026-05-17): defer the
-            // transport-clear synth until the player's first post-NEW_WORLD
-            // UpdateObject lands. Firing inline here at NEW_WORLD time worked at
-            // ~150ms latency (synth happened to arrive at the modern client AFTER
-            // the destination COMPRESSED_UPDATE_OBJECT) but raced at ~35ms (synth
-            // arrived BEFORE the destination state, the server's subsequent
-            // player-update re-attached the transport flag, and the rapid
-            // clear→re-attach wedged the modern client into a no-MOVE_START_*
-            // state when the destination position was on a transport — Grom'gol
-            // zep tower platform, Ratchet boat deck). The deferred path in
-            // UpdateHandler.ReadMovementUpdateBlock inspects moveInfo.TransportGuid
-            // and only synths when the destination has the player OFF a transport,
-            // preserving the dc39c39 original use case (cross-continent land
-            // destinations) without breaking the on-transport destinations.
-            GetSession().GameState.PendingDeferredTransportSynth = DeferredTransportSynthMode.NewWorld;
-
             if (teleport.MapID > 1)
             {
                 UpdateLastInstance instance = new();
@@ -778,62 +820,6 @@ public partial class WorldClient
                 resume.Reason = 1;
                 SendPacketToClient(resume);
             }
-        }
-    }
-
-    // JimsProxy (zep-stuck-low-latency-race 2026-05-17): synthesizes a player-targeted
-    // SMSG_MOVE_TELEPORT with TransportGUID=default to force the modern client to clear
-    // any stale MOVEMENTFLAG_ONTRANSPORT carried across from the source map's transport.
-    // Fired from the deferred path in UpdateHandler.ReadMovementUpdateBlock only when the
-    // destination's player UpdateObject confirms the player is NOT on a transport (zep
-    // tower / boat deck) at the destination. The MoveCounter sentinel is dropped by the
-    // server-side HandleMoveTeleportAck so the legacy server never sees the spurious ack.
-    internal void FireDeferredTransportClearSynth(WowGuid128 playerGuid, Vector3 position, float orientation, string mode)
-    {
-        if (playerGuid.IsEmpty())
-            return;
-
-        const uint SyntheticTeleportAckSentinel = 0xFFFFFFFFu;
-        MoveTeleport transportClear = new MoveTeleport();
-        transportClear.MoverGUID = playerGuid;
-        transportClear.MoveCounter = SyntheticTeleportAckSentinel;
-        transportClear.Position = position;
-        transportClear.Orientation = orientation;
-        transportClear.PreloadWorld = 0;
-        transportClear.TransportGUID = default;
-        // Leave transportClear.Vehicle at its default null! sentinel — assigning
-        // null trips the non-nullable-ref-type check; the existing MoveTeleport
-        // path uses this same pattern for non-vehicle teleports.
-
-        GetSession().GameState.PendingSyntheticTransportClearAckCounter =
-            SyntheticTeleportAckSentinel;
-
-        Framework.Logging.Log.Event("movement.transport_clear.synthesized", new
-        {
-            map_id = GetSession().GameState.CurrentMapId,
-            player_low = playerGuid.GetCounter(),
-            position = $"{position.X:F2},{position.Y:F2},{position.Z:F2}",
-            deferred = true,
-            mode = mode,
-        });
-
-        try
-        {
-            SendPacketToClient(transportClear);
-            Framework.Logging.Log.Event("movement.transport_clear.send_completed", new
-            {
-                player_low = playerGuid.GetCounter(),
-                sentinel_counter = SyntheticTeleportAckSentinel,
-            });
-        }
-        catch (System.Exception ex)
-        {
-            Framework.Logging.Log.Event("movement.transport_clear.send_failed", new
-            {
-                player_low = playerGuid.GetCounter(),
-                exception_type = ex.GetType().Name,
-                exception_message = ex.Message,
-            });
         }
     }
 
@@ -889,6 +875,13 @@ public partial class WorldClient
         }
 
         speed.Speed = packet.ReadFloat();
+        // JimsProxy (mount speed kept after Will of the Forsaken): a speed change for a unit the
+        // client controls other than the player (a Mind Control victim) must be acknowledged to the
+        // server before the client's release of that unit; remember it before the client can answer
+        // (ControlReleaseAckOrder). The player's own acknowledgements are accepted whenever they come.
+        if (speed.MoverGUID != GetSession().GameState.CurrentPlayerGuid &&
+            ForceSpeedAckOpcode(universalOpcode) is var ackOpcode && ackOpcode != Opcode.MSG_NULL_ACTION)
+            GetSession().GameState.ReleaseAckOrder.ExpectAck(speed.MoverGUID, ackOpcode, speed.MoveCounter);
         SendPacketToClient(speed);
 
         // JimsProxy (speed-stuck-after-fear-while-mounted): cache for CC-end reassert.
@@ -911,6 +904,21 @@ public partial class WorldClient
             SendPacketToClient(flySpeed);
         }
     }
+
+    // The client's acknowledgement for each forced speed change it is sent.
+    internal static Opcode ForceSpeedAckOpcode(Opcode setSpeed) => setSpeed switch
+    {
+        Opcode.SMSG_MOVE_SET_WALK_SPEED => Opcode.CMSG_MOVE_FORCE_WALK_SPEED_CHANGE_ACK,
+        Opcode.SMSG_MOVE_SET_RUN_SPEED => Opcode.CMSG_MOVE_FORCE_RUN_SPEED_CHANGE_ACK,
+        Opcode.SMSG_MOVE_SET_RUN_BACK_SPEED => Opcode.CMSG_MOVE_FORCE_RUN_BACK_SPEED_CHANGE_ACK,
+        Opcode.SMSG_MOVE_SET_SWIM_SPEED => Opcode.CMSG_MOVE_FORCE_SWIM_SPEED_CHANGE_ACK,
+        Opcode.SMSG_MOVE_SET_SWIM_BACK_SPEED => Opcode.CMSG_MOVE_FORCE_SWIM_BACK_SPEED_CHANGE_ACK,
+        Opcode.SMSG_MOVE_SET_TURN_RATE => Opcode.CMSG_MOVE_FORCE_TURN_RATE_CHANGE_ACK,
+        Opcode.SMSG_MOVE_SET_FLIGHT_SPEED => Opcode.CMSG_MOVE_FORCE_FLIGHT_SPEED_CHANGE_ACK,
+        Opcode.SMSG_MOVE_SET_FLIGHT_BACK_SPEED => Opcode.CMSG_MOVE_FORCE_FLIGHT_BACK_SPEED_CHANGE_ACK,
+        Opcode.SMSG_MOVE_SET_PITCH_RATE => Opcode.CMSG_MOVE_FORCE_PITCH_RATE_CHANGE_ACK,
+        _ => Opcode.MSG_NULL_ACTION,
+    };
 
     // for other players
     [PacketHandler(Opcode.MSG_MOVE_SET_FLIGHT_BACK_SPEED)]
@@ -937,6 +945,18 @@ public partial class WorldClient
         speed.MoveInfo.ValidateMovementInfo();
         speed.Speed = packet.ReadFloat();
         SendPacketToClient(speed);
+
+        // JimsProxy (user report 2026-10-17: mind-controlled while mounted, Will of the Forsaken, a second at
+        // mount speed, then a disconnect): a speed change made while the player is charmed goes to the
+        // charmer as the forced form, and the player gets it only in this broadcast form, after control is
+        // back (2026-10-18 18:26:40, 0.2 s after the Will). Without it the cache the control-regain reassert
+        // reads keeps the mounted speed, and the next regain re-sends that to an unmounted player (with it,
+        // the 18:27:01 regain re-sent 7.00). Feed the cache from here too.
+        if (universalOpcode == Opcode.SMSG_MOVE_UPDATE_RUN_SPEED &&
+            speed.MoverGUID == GetSession().GameState.CurrentPlayerGuid)
+        {
+            GetSession().GameState.LastKnownPlayerRunSpeed = speed.Speed;
+        }
 
         // Convenience in vanilla to use SwimSpeed as FlySpeed
         if (universalOpcode is Opcode.SMSG_MOVE_UPDATE_SWIM_SPEED
@@ -1594,6 +1614,8 @@ public partial class WorldClient
 
                     MoveSetFlag unroot = new MoveSetFlag(Opcode.SMSG_MOVE_UNROOT);
                     unroot.MoverGUID = playerGuid;
+                    // P1-2: own counter, so the FORCE_UNROOT ack stays in the proxy (see SendTaxiDismountRestore).
+                    unroot.MoveCounter = SynthMoveCounters.TaxiDismountUnroot;
                     capturedClient.SendPacketToClient(unroot);
 
                     System.Threading.Volatile.Write(ref capturedSession.GameState.IsInTaxiFlight, false);

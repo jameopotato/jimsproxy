@@ -5,6 +5,23 @@ Quick reference for anyone (human or AI) adding a proxy → client synthesized
 modern client. Background and rationale are in commits `dc39c39`, `fc86903`,
 `a3e763a`, `f414896`.
 
+**Status 2026-10-17 (P1-2): the transport-clear synth described here is
+deleted**, together with everything that existed only for it: the dispatcher
+in `UpdateHandler.ReadMovementUpdateBlock`, `DeferredTransportSynthMode`,
+`PendingDeferredTransportSynth`, `TransportClearGate`,
+`FireDeferredTransportClearSynth`, the 0xFFFFFFFF ack sentinel with its drop
+in `HandleMoveTeleportAck`, and the `movement.transport_clear.*` events. The
+field logs have it sent 752 times across 490 logs and acknowledged 0 times
+(an applied teleport is always acknowledged). It was built inside the
+player's own create, so it always left 1 to 3 packets ahead of the
+UpdateObject that creates the player, and the client drops a movement packet
+for a unit it has not received yet. Its one recorded delivery after the
+create (the 2026-05-17 experiment below) teleported a passenger off a
+zeppelin into the ocean. The post-teleport run-speed reassert, built in the
+same movement block and redundant with the create's own run speed, is
+deleted with it. The rest of this file is the record of the trap and of why
+the synth existed; the code it names is gone.
+
 ## TL;DR
 
 If you're synthesizing a movement-state packet after the proxy receives
@@ -114,6 +131,13 @@ If you genuinely need "synth lands after destination state with no race",
 stash + fire after `SendPacketToClient(updateObject)` works at the wire
 level. Make sure your synth payload is correct for that ordering.
 
+**Update 2026-10-17 (P1-2):** the inline order above made this synth a no-op
+at every latency, not only a race: it was never acknowledged in the field.
+A new synth for the player at world entry must reach the client after the
+UpdateObject that creates the player, and must carry its own MoveCounter
+(`World/Client/SynthMoveCounters.cs`, its acknowledgement kept in the proxy)
+so that the acknowledgement shows it applied.
+
 ## Why Login is no longer special-cased
 
 Earlier drafts of this pattern always-fired the Login synth, including
@@ -141,6 +165,10 @@ For non-transport logins, the synth is a harmless no-op (clearing a
 transport flag that wasn't set) — fires safely.
 
 ## Diagnostic events to grep when triaging
+
+The `movement.transport_clear.*` events below are deleted since P1-2
+(2026-10-17) and appear only in older logs; `movement.player_update.transport_state`
+is still emitted.
 
 - `movement.transport_clear.synthesized` — the synth fired. Includes
   `deferred: true` and `mode` (NewWorld | Login).

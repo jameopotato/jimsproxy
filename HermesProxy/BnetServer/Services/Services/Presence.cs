@@ -11,25 +11,28 @@ namespace BNetServer.Services;
 // available; without these the client logs "disconnected because no presence"
 // and drops the BNet session after some idle threshold (the AFK-DC bug).
 //
-// We do not actually maintain presence state — these handlers ack with Ok and
-// (for query/batch-subscribe) an empty payload. That is enough for the client
-// to consider presence "alive" and stop trying to renegotiate.
+// We do not actually maintain presence state. Every handler answers Ok. The
+// NoData methods (Subscribe, Unsubscribe, Update, BatchUnsubscribe) declare a
+// NoData response so the dispatcher sends the empty Ok reply that closes the
+// client's request token; Query and BatchSubscribe return an empty payload.
+// A handler without a response parameter returns Ok but sends NOTHING, which
+// leaves the client's token open until its RPC deadline fires.
 public partial class BnetServices
 {
     [Service(ServiceRequirement.LoggedIn, OriginalHash.PresenceService, 1)]
-    BattlenetRpcErrorCode HandlePresenceSubscribe(SubscribeRequest request)
+    BattlenetRpcErrorCode HandlePresenceSubscribe(SubscribeRequest request, NoData response)
     {
         return BattlenetRpcErrorCode.Ok;
     }
 
     [Service(ServiceRequirement.LoggedIn, OriginalHash.PresenceService, 2)]
-    BattlenetRpcErrorCode HandlePresenceUnsubscribe(UnsubscribeRequest request)
+    BattlenetRpcErrorCode HandlePresenceUnsubscribe(UnsubscribeRequest request, NoData response)
     {
         return BattlenetRpcErrorCode.Ok;
     }
 
     [Service(ServiceRequirement.LoggedIn, OriginalHash.PresenceService, 3)]
-    BattlenetRpcErrorCode HandlePresenceUpdate(UpdateRequest request)
+    BattlenetRpcErrorCode HandlePresenceUpdate(UpdateRequest request, NoData response)
     {
         return BattlenetRpcErrorCode.Ok;
     }
@@ -47,7 +50,7 @@ public partial class BnetServices
     }
 
     [Service(ServiceRequirement.LoggedIn, OriginalHash.PresenceService, 9)]
-    BattlenetRpcErrorCode HandlePresenceBatchUnsubscribe(BatchUnsubscribeRequest request)
+    BattlenetRpcErrorCode HandlePresenceBatchUnsubscribe(BatchUnsubscribeRequest request, NoData response)
     {
         return BattlenetRpcErrorCode.Ok;
     }
