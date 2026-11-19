@@ -10,6 +10,7 @@ Core.lua
 Options.lua
 PetFix.lua
 PetBar.lua
+HealPrediction.lua
 TaxiFix.lua
 TooltipFix.lua
 ZoneSync.lua

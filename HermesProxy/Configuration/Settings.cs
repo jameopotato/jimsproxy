@@ -268,8 +268,9 @@ public static class Settings
     // also reaches the client's own incoming-heal number (UnitGetIncomingHeals): the bridge
     // sends the server's cast start again with the announced amount attached (see
     // HealCommBridge.AttachNativeAmount). Without it only LibHealComm-4.0 addons show that
-    // heal. The cost is a second "begins to cast" combat log line for the cast. Default OFF,
-    // opt-in until tried in game.
+    // heal. The cost is a second "begins to cast" combat log line for the cast. Default OFF:
+    // each player can turn it on for themselves in JimsPlus (Cast Bars page, the H sideband).
+    // Setting this key turns it on for every player on this proxy, whatever JimsPlus says.
     public static bool HealCommNativeAmountInRange;
     // JimsProxy (announced heals): when set, our own HC-1.0 heal announcement carries the spell
     // being cast as a fifth field ("Heal/<target>/<amount>/<castMs>/<spellId>/"), so a proxied

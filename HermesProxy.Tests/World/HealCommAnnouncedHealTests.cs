@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using HermesProxy.World;
@@ -709,5 +710,96 @@ public class HealCommAnnouncedHealTests
         h.Announce("Healstop");
 
         Assert.Empty(h.Sideband);
+    }
+
+    // ---- The JimsPlus switch for the client's own number (off by default) ------------------------
+
+    // A JimsPlus "JP" addon message, as WorldSocket.HandleAddonMessage hands it on.
+    private static void JimsPlusMessage(WorldSocket socket, string body) =>
+        typeof(WorldSocket).GetMethod("HandleJimsPlusSideband", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(socket, new object[] { body });
+
+    // Nobody turned it on in JimsPlus and the config key is off (both defaults): a heal from a
+    // healer in range gets no repeated cast start. Only LibHealComm frames show it.
+    [Fact]
+    public void AdoptedHeal_SendsNoRepeat_WhenNobodyTurnedItOn()
+    {
+        var h = new ClientHarness { Bridge = { NativeAmountInRangeForTest = false } };
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, CastTimeMs));
+        h.ClearSent();
+
+        h.Announce(HealAnnouncement);
+
+        Assert.Empty(h.SpellStarts);
+    }
+
+    // The player ticks the JimsPlus checkbox: its H message reaches the bridge, and the next heal
+    // from a healer in range carries the amount. Unticked, the next heal does not.
+    [Fact]
+    public void JimsPlusSwitch_TurnsTheAmountOnAndOff()
+    {
+        var h = new ClientHarness { Bridge = { NativeAmountInRangeForTest = false } };
+        var socket = WorldSocket.CreateForTest(h.Session);
+
+        JimsPlusMessage(socket, "H\tAMOUNT\t1");
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, CastTimeMs));
+        h.ClearSent();
+        h.Announce(HealAnnouncement);
+        Assert.Equal(900u, Assert.Single(h.SpellStarts).Cast.Predict.Points);
+
+        h.Dispatch(SpellGoPacket(LegacyHealer, FlashHealRank7));
+        JimsPlusMessage(socket, "H\tAMOUNT\t0");
+        h.NowMs += 2000;
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, CastTimeMs));
+        h.ClearSent();
+        h.Announce(HealAnnouncement);
+        Assert.Empty(h.SpellStarts);
+    }
+
+    // The config key turns it on for every player on the proxy, whatever the checkbox says.
+    [Fact]
+    public void ConfigKey_TurnsItOnWhateverJimsPlusSays()
+    {
+        var h = new ClientHarness { Bridge = { NativeAmountInRangeForTest = true } };
+        JimsPlusMessage(WorldSocket.CreateForTest(h.Session), "H\tAMOUNT\t0");
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, CastTimeMs));
+        h.ClearSent();
+
+        h.Announce(HealAnnouncement);
+
+        Assert.Single(h.SpellStarts);
+    }
+
+    // Anything but AMOUNT 0 or 1 changes nothing.
+    [Theory]
+    [InlineData("H\tAMOUNT\tyes")]
+    [InlineData("H\tAMOUNT")]
+    [InlineData("H\tLOUDER\t1")]
+    public void JimsPlusSwitch_IgnoresAnythingElse(string body)
+    {
+        var h = new ClientHarness { Bridge = { NativeAmountInRangeForTest = false } };
+        JimsPlusMessage(WorldSocket.CreateForTest(h.Session), body);
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, CastTimeMs));
+        h.ClearSent();
+
+        h.Announce(HealAnnouncement);
+
+        Assert.Empty(h.SpellStarts);
+    }
+
+    // In a battleground HealComm-1.0 posts the same announcement to raid and to battleground chat.
+    // The cast start is repeated for the first copy only: a second repeat would add one more
+    // "begins to cast" line and nothing else.
+    [Fact]
+    public void SameAnnouncementTwice_RepeatsTheCastStartOnce()
+    {
+        var h = new ClientHarness { Bridge = { NativeAmountInRangeForTest = true } };
+        h.Dispatch(SpellStartPacket(LegacyHealer, FlashHealRank7, CastTimeMs));
+        h.ClearSent();
+
+        h.Announce(HealAnnouncement);
+        h.Announce(HealAnnouncement);
+
+        Assert.Single(h.SpellStarts);
     }
 }

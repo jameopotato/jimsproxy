@@ -150,7 +150,7 @@ end
 
 -- Top-right shortcut to the Cast Bars sub-page (also reachable from the left tree).
 local btnCastTop = CreateButton(root, -16, "Cast Bars  >", 120,
-    "Open the Cast Bars page: cast bars for targets, nameplates, focus,\nparty members, and your own bar, plus Performance Mode.")
+    "Open the Cast Bars page: cast bars for targets, nameplates, focus,\nparty members, and your own bar, plus Performance Mode and\nincoming heals on Blizzard frames.")
 btnCastTop:ClearAllPoints()
 btnCastTop:SetPoint("TOPRIGHT", root, "TOPRIGHT", -16, -16)
 btnCastTop:SetScript("OnClick", function() OpenPanel(panelCast) end)
@@ -268,6 +268,16 @@ y = y - 8
 local cbPerf = CreateCheckbox(panelCast, y,
     "Performance Mode  |cFFFFD100(suspends cast bars)|r",
     "For crowded fights (battlegrounds, big pulls) where FPS tanks: fully suspends the\ncast-bar engine — stops rendering, stops per-event tracking, and tells the proxy to\nstop sending cast data entirely. Toggle on when it's a zerg, off when it clears.\n\nAll other JimsPlus fixes stay active. Shortcut: /jp perf")
+y = y - 42
+
+CreateSection(panelCast, "Incoming Heals", y)
+y = y - 26
+CreateDescription(panelCast, "A vanilla server never says how much a heal will heal. Unit frame addons that use HealComm get the amount from the healer's addon; Blizzard's own frames need the proxy to pass it on.", y)
+y = y - 34
+
+local cbHealAmount = CreateCheckbox(panelCast, y,
+    "Show other healers' incoming heals on Blizzard frames",
+    "Blizzard's party and raid frames, and other frames that use the\ngame's own incoming-heal number, show nothing for another player's\nheal on a vanilla server. With this on, the proxy adds the amount\nthe healer's HealComm addon announces, for healers near you.\n\nUnit frame addons that use HealComm already show these heals and\ndon't need this.\n\nSide effect: cast-bar addons that read the combat log (other than\nJimsPlus) restart a healer's bar once, a split second into the cast.\n\nOff by default. Takes effect immediately. Shortcut: /jp heals")
 
 ---------------------------------------------------------------------------
 -- Sync checkbox state from saved variables
@@ -289,6 +299,7 @@ local function RefreshCheckboxes()
     end
 
     cbPerf:SetChecked((namespace.db and namespace.db.performanceMode) and true or false)
+    cbHealAmount:SetChecked((namespace.db and namespace.db.nativeHealAmount) and true or false)
     cbPetLock:SetChecked(JimsPlusCharDB and JimsPlusCharDB.petBarLock and true or false)
 end
 root:SetScript("OnShow", RefreshCheckboxes)
@@ -355,6 +366,10 @@ cbPetLock:SetScript("OnClick", function(self)
     namespace:SetPetBarLock(self:GetChecked() and true or false)
 end)
 
+cbHealAmount:SetScript("OnClick", function(self)
+    namespace:SetNativeHealAmount(self:GetChecked() and true or false)
+end)
+
 for _, info in ipairs(castbarUnits) do
     local key = info.key
     castbarCBs[key]:SetScript("OnClick", function(self)
@@ -391,6 +406,11 @@ SlashCmdList["JIMSPLUS"] = function(msg)
     end
     if msg == "petlock" then
         namespace:SetPetBarLock(not namespace:IsPetBarLocked())
+        RefreshCheckboxes()
+        return
+    end
+    if msg == "heals" then
+        namespace:SetNativeHealAmount(not namespace:IsNativeHealAmountOn())
         RefreshCheckboxes()
         return
     end

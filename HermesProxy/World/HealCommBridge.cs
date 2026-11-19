@@ -233,6 +233,7 @@ public sealed class HealCommBridge
     private sealed class NativeAmount
     {
         public WowGuid128 Caster;
+        public WowGuid128 Target;
         public WowGuid128 CastId;
         public uint SpellId;
         public uint SpellVisualId;
@@ -249,6 +250,26 @@ public sealed class HealCommBridge
 
     // Test seam for Settings.HealCommNativeAmountInRange (a static, shared by every test class).
     internal bool? NativeAmountInRangeForTest;
+
+    // JimsProxy (announced heals): the player's own choice, from the JimsPlus checkbox "Show
+    // other healers' incoming heals on Blizzard frames" (account-wide, off by default), sent over
+    // the H sideband. Settings.HealCommNativeAmountInRange turns the amount on for every player
+    // on this proxy whatever the checkbox says; with it off (the default) the checkbox decides.
+    private volatile bool _nativeAmountOptedIn;
+
+    // Called from the JimsPlus H sideband ("AMOUNT\t1" or "AMOUNT\t0"). JimsPlus sends its
+    // setting at every loading screen, so this follows the checkbox for the whole session.
+    // Returns true when the choice changed.
+    public bool SetNativeAmountEnabled(bool on)
+    {
+        if (_nativeAmountOptedIn == on)
+            return false;
+        _nativeAmountOptedIn = on;
+        return true;
+    }
+
+    internal bool NativeAmountEnabled =>
+        (NativeAmountInRangeForTest ?? Framework.Settings.HealCommNativeAmountInRange) || _nativeAmountOptedIn;
 
     private enum RealCastMatch
     {
@@ -782,9 +803,10 @@ public sealed class HealCommBridge
         };
     }
 
-    // JimsProxy (announced heals), opt-in (Settings.HealCommNativeAmountInRange): put the
-    // announced amount on a cast the server started, so the client's own incoming-heal number
-    // (UnitGetIncomingHeals) has it for a healer in range.
+    // JimsProxy (announced heals), off by default: on for a player who turned it on in JimsPlus
+    // (see SetNativeAmountEnabled), or for everyone with Settings.HealCommNativeAmountInRange.
+    // Put the announced amount on a cast the server started, so the client's own incoming-heal
+    // number (UnitGetIncomingHeals) has it for a healer in range.
     //
     // The client takes that number only from a cast-start packet, and the server's own start
     // went out before the healer's addon announced the amount. Read from the 1.14.2 client:
@@ -802,10 +824,25 @@ public sealed class HealCommBridge
     // what the bridge has to do about the rest.
     private void AttachNativeAmount(WowGuid128 casterGuid, RealCast real, WowGuid128 targetGuid, uint amount)
     {
-        if (!(NativeAmountInRangeForTest ?? Framework.Settings.HealCommNativeAmountInRange))
+        if (!NativeAmountEnabled)
             return;
         var worldClient = _session.WorldClient;
         if (worldClient == null) return;
+
+        // Once per cast. In a battleground HealComm-1.0 posts the same announcement to raid and to
+        // battleground chat; repeating the start for the second copy would only post one more
+        // "begins to cast" line (the client keys the entry by caster, spell and cast id, so the
+        // amount was never counted twice).
+        if (_nativeAmounts.TryGetValue(real.CastId, out var attached) && attached.Target == targetGuid)
+        {
+            if (Framework.Settings.DebugOutput)
+                Log.Event("healcomm.native_amount.repeat_skipped", new
+                {
+                    caster_low = casterGuid.GetCounter(),
+                    spell_id = real.SpellId,
+                });
+            return;
+        }
 
         long remainingMs = Math.Max(1, real.EndMs - ClockMsForTest());
 
@@ -828,11 +865,13 @@ public sealed class HealCommBridge
         repeat.Cast.Predict.BeaconGUID = WowGuid128.Empty;
         worldClient.SendPacketToClient(repeat);
 
-        // One record per cast: a repeated announcement of the same cast (another target, the
-        // same message on a second channel) adds to the same cast on the client.
+        // One record per cast. An announcement of the same cast for another target (not seen
+        // from HealComm-1.0, which names one target per cast) is attached as before and replaces
+        // this record.
         var entry = new NativeAmount
         {
             Caster = casterGuid,
+            Target = targetGuid,
             CastId = real.CastId,
             SpellId = real.SpellId,
             SpellVisualId = real.SpellVisualId,
@@ -966,8 +1005,8 @@ public sealed class HealCommBridge
 
         // JimsProxy (announced heals): what the combat log line for this cast cannot say. The
         // JimsPlus bar takes its cast from this instead: the exact cast time, who is being
-        // healed, and whether the spell is known ("Flash of Light → Tank") or not ("Unknown
-        // Heal → Tank"). Sent after the start, like JP_CS; the addon accepts either order.
+        // healed, and whether the spell is known ("Flash of Light » Tank") or not ("Unknown
+        // Heal » Tank"). Sent after the start, like JP_CS; the addon accepts either order.
         bool sideband = gameState.IsJimsPlusSidebandActive();
         if (sideband)
             SendSideband($"JP_HC:S:{senderGuid.ToClientGuidString()}:{spellId}:{castTimeMs}:{(certain ? 1 : 0)}:{targetName}");
