@@ -218,30 +218,46 @@ local cbBowSheathe = CreateCheckbox(root, y,
 y = y - 40
 
 ---------------------------------------------------------------------------
--- Main page: Incoming Heals
+-- Main page: Incoming Heals. One main switch, and under it one smaller, indented switch per
+-- kind of frame, greyed while the main switch is off.
 ---------------------------------------------------------------------------
 CreateSection(root, "Incoming Heals", y)
 y = y - 26
-do
-    local lead = root:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    lead:SetPoint("TOPLEFT", root, "TOPLEFT", 18, y)
-    lead:SetText("Show incoming heals on the default Blizzard frames:")
-end
-y = y - 20
 
--- One switch per kind of frame, four across.
-local HEAL_SOURCES = "\n\nWith a HealComm addon loaded (unit frame and heal addons carry the\nlibrary), the bars show your own heals and every heal other players'\naddons announce, in view or not.\n\nWithout one, the proxy supplies the amounts for other healers in view\nand your own heals can't be shown. In that case cast-bar addons that\nread the combat log, other than JimsPlus, restart a healer's bar once,\na fraction of a second into the cast.\n\nA healer with no HealComm addon announces nothing, so nothing can be\nshown for them.\n\nOff by default. Takes effect immediately. /jp heals turns all four on\nor off."
+local cbHealShow = CreateCheckbox(root, y,
+    "Show incoming heals on the default Blizzard frames",
+    "Draws incoming heals on the default Blizzard frames ticked below:\nyour own heal first, then other healers'.\n\nWith a HealComm addon loaded (unit frame and heal addons carry the\nlibrary), the bars show your own heals and every heal other players'\naddons announce, in view or not.\n\nWithout one, the proxy supplies the amounts for other healers in view\nand your own heals can't be shown. In that case cast-bar addons that\nread the combat log, other than JimsPlus, restart a healer's bar once,\na fraction of a second into the cast.\n\nA healer with no HealComm addon announces nothing, so nothing can be\nshown for them.\n\nOff by default. Takes effect immediately. Shortcut: /jp heals")
+y = y - 26
+
 local healKinds = {
-    { key = "raid",   label = "Raid frames",  tooltip = "Draws incoming heals on the default raid frames and raid-style party\nframes: your own heal first, then other healers'." },
-    { key = "party",  label = "Party frames", tooltip = "Draws incoming heals on the default party frames, raid-style or not:\nyour own heal first, then other healers'." },
-    { key = "player", label = "Player frame", tooltip = "Draws incoming heals on your own player frame: your own heal first,\nthen other healers'." },
-    { key = "target", label = "Target frame", tooltip = "Draws incoming heals on the target frame, for a target in your party\nor raid: your own heal first, then other healers'." },
+    { key = "raid",   label = "Raid frames",  tooltip = "Draws incoming heals on the default raid frames and raid-style party\nframes.\n\nOn by default." },
+    { key = "party",  label = "Party frames", tooltip = "Draws incoming heals on the default party frames, raid-style or not.\n\nOn by default." },
+    { key = "player", label = "Player frame", tooltip = "Draws incoming heals on your own player frame.\n\nOn by default." },
+    { key = "target", label = "Target frame", tooltip = "Draws incoming heals on the target frame, for a target in your party\nor raid.\n\nOn by default." },
 }
 local healCBs = {}
 for index, info in ipairs(healKinds) do
-    healCBs[info.key] = CreateCheckbox(root, y, info.label, info.tooltip .. HEAL_SOURCES, 16 + (index - 1) * 148)
+    local cb = CreateCheckbox(root, y, info.label, info.tooltip, 40 + (index - 1) * 128)
+    -- Smaller than the main switch and indented under it: they belong to it.
+    cb:SetSize(22, 22)
+    cb.Text:SetFontObject(GameFontHighlightSmall)
+    healCBs[info.key] = cb
 end
-y = y - 40
+y = y - 36
+
+-- The frame switches only do something while the main switch is on: greyed otherwise.
+local function SetHealKindsEnabled(enabled)
+    for _, info in ipairs(healKinds) do
+        local cb = healCBs[info.key]
+        if enabled then
+            cb:Enable()
+            cb.Text:SetTextColor(1, 1, 1)
+        else
+            cb:Disable()
+            cb.Text:SetTextColor(0.5, 0.5, 0.5)
+        end
+    end
+end
 
 ---------------------------------------------------------------------------
 -- Main page: Pet Bar (hunters & warlocks)
@@ -321,9 +337,12 @@ local function RefreshCheckboxes()
     end
 
     cbPerf:SetChecked((namespace.db and namespace.db.performanceMode) and true or false)
+    local healShow = namespace:IsIncomingHealsShown()
+    cbHealShow:SetChecked(healShow)
     for _, info in ipairs(healKinds) do
-        healCBs[info.key]:SetChecked(namespace:IsIncomingHealsOn(info.key))
+        healCBs[info.key]:SetChecked(namespace:IsIncomingHealsKindTicked(info.key))
     end
+    SetHealKindsEnabled(healShow)
     cbPetLock:SetChecked(JimsPlusCharDB and JimsPlusCharDB.petBarLock and true or false)
 end
 root:SetScript("OnShow", RefreshCheckboxes)
@@ -390,6 +409,12 @@ cbPetLock:SetScript("OnClick", function(self)
     namespace:SetPetBarLock(self:GetChecked() and true or false)
 end)
 
+cbHealShow:SetScript("OnClick", function(self)
+    local on = self:GetChecked() and true or false
+    namespace:SetIncomingHealsShown(on)
+    SetHealKindsEnabled(on)
+end)
+
 for _, info in ipairs(healKinds) do
     local key = info.key
     healCBs[key]:SetScript("OnClick", function(self)
@@ -437,7 +462,7 @@ SlashCmdList["JIMSPLUS"] = function(msg)
         return
     end
     if msg == "heals" then
-        namespace:ToggleAllIncomingHeals()
+        namespace:SetIncomingHealsShown(not namespace:IsIncomingHealsShown())
         RefreshCheckboxes()
         return
     end

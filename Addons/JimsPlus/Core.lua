@@ -36,13 +36,23 @@ f:SetScript("OnEvent", function(_, _, addon)
     if JimsPlusDB.taxiFix == nil then JimsPlusDB.taxiFix = true end
     if JimsPlusDB.bagSortOrder == nil then JimsPlusDB.bagSortOrder = false end
     if JimsPlusDB.performanceMode == nil then JimsPlusDB.performanceMode = false end
-    -- Incoming heals: one switch per kind of frame, all off by default. A test build had a
-    -- single switch for the raid frames (nativeHealAmount); carry it over once.
-    if JimsPlusDB.healRaid == nil then JimsPlusDB.healRaid = JimsPlusDB.nativeHealAmount and true or false end
-    if JimsPlusDB.healParty == nil then JimsPlusDB.healParty = false end
-    if JimsPlusDB.healPlayer == nil then JimsPlusDB.healPlayer = false end
-    if JimsPlusDB.healTarget == nil then JimsPlusDB.healTarget = false end
+    -- Incoming heals: a main switch, off by default, and under it one switch per kind of frame,
+    -- on by default. Test builds saved the kinds alone (all off by default) and before that one
+    -- raid switch (nativeHealAmount): a test install with a kind on keeps it and gets the main
+    -- switch on; one with none on starts from the defaults.
+    if JimsPlusDB.healRaid == nil and JimsPlusDB.nativeHealAmount then JimsPlusDB.healRaid = true end
     JimsPlusDB.nativeHealAmount = nil
+    if JimsPlusDB.healShow == nil then
+        local anyKind = JimsPlusDB.healRaid or JimsPlusDB.healParty or JimsPlusDB.healPlayer or JimsPlusDB.healTarget
+        JimsPlusDB.healShow = anyKind and true or false
+        if not anyKind then
+            JimsPlusDB.healRaid, JimsPlusDB.healParty, JimsPlusDB.healPlayer, JimsPlusDB.healTarget = nil, nil, nil, nil
+        end
+    end
+    if JimsPlusDB.healRaid == nil then JimsPlusDB.healRaid = true end
+    if JimsPlusDB.healParty == nil then JimsPlusDB.healParty = true end
+    if JimsPlusDB.healPlayer == nil then JimsPlusDB.healPlayer = true end
+    if JimsPlusDB.healTarget == nil then JimsPlusDB.healTarget = true end
     -- ApiCompat shims are opt-in from 1.2.4. 1.2.3 turned them on by default and wrote
     -- apiCompat = true into every SavedVariables on first load without the player choosing
     -- it, so a plain nil-default would leave every existing install on. Reset once to off;

@@ -25,8 +25,9 @@ local ADDON_NAME, namespace = ...
 --
 -- A healer who runs no HealComm addon announces nothing, so no source has an amount for them.
 --
--- Account-wide, all four off by default. The proxy's flag only lasts a session, so the choice
--- is sent at every loading screen. Talks over the JP addon sideband (both ends ours).
+-- Account-wide: one main switch, off by default, and under it one switch per kind of frame, on
+-- by default; a kind is drawn while both are on. The proxy's flag only lasts a session, so the
+-- choice is sent at every loading screen. Talks over the JP addon sideband (both ends ours).
 
 local UnitGetIncomingHeals = UnitGetIncomingHeals
 local UnitHealth, UnitHealthMax, UnitGUID = UnitHealth, UnitHealthMax, UnitGUID
@@ -52,16 +53,31 @@ local LIB_EVENTS = {
 local RAID_GROUPS, GROUP_SIZE = 8, 5
 local PARTY_MEMBERS = 4
 
--- The four switches and where each is saved.
+-- The main switch and the four frame switches under it, and where each is saved.
+local SHOW_KEY = "healShow"
 local KINDS = { "raid", "party", "player", "target" }
 local DB_KEYS = { raid = "healRaid", party = "healParty", player = "healPlayer", target = "healTarget" }
 local KIND_NAMES = {
     raid = "raid frames", party = "party frames", player = "the player frame", target = "the target frame",
 }
 
-local function IsOn(kind)
-    local db = namespace.db or JimsPlusDB
+local function DB()
+    return namespace.db or JimsPlusDB
+end
+
+local function IsShown()
+    local db = DB()
+    return db and db[SHOW_KEY] and true or false
+end
+
+local function IsTicked(kind)
+    local db = DB()
     return db and db[DB_KEYS[kind]] and true or false
+end
+
+-- A kind of frame is drawn while the main switch is on and its own switch is ticked.
+local function IsOn(kind)
+    return IsShown() and IsTicked(kind)
 end
 
 local function AnyOn()
@@ -343,34 +359,37 @@ local function Apply()
     SetDrawing(AnyOn())
 end
 
-function namespace:IsIncomingHealsOn(kind)
-    return IsOn(kind)
+-- The main switch.
+function namespace:IsIncomingHealsShown()
+    return IsShown()
 end
 
+-- A frame switch as ticked, whatever the main switch says (the settings page shows it greyed).
+function namespace:IsIncomingHealsKindTicked(kind)
+    return IsTicked(kind)
+end
+
+-- The main switch; /jp heals flips it.
+function namespace:SetIncomingHealsShown(on)
+    on = on and true or false
+    local db = DB()
+    if db then db[SHOW_KEY] = on end
+    Send(AnyOn())
+    Apply()
+    print("|cFF00FF00[JimsPlus]|r Incoming heals on the default Blizzard frames: " ..
+        (on and "|cFFFFD100on|r." or "|cFF00FF00off|r."))
+end
+
+-- One frame switch under the main one.
 function namespace:SetIncomingHeals(kind, on)
     local key = DB_KEYS[kind]
     if not key then return end
     on = on and true or false
-    local db = self.db or JimsPlusDB
+    local db = DB()
     if db then db[key] = on end
     Send(AnyOn())
     Apply()
     print("|cFF00FF00[JimsPlus]|r Incoming heals on " .. KIND_NAMES[kind] .. ": " ..
-        (on and "|cFFFFD100on|r." or "|cFF00FF00off|r."))
-end
-
--- /jp heals: all four off if any is on, otherwise all four on.
-function namespace:ToggleAllIncomingHeals()
-    local on = not AnyOn()
-    local db = self.db or JimsPlusDB
-    if db then
-        for _, kind in ipairs(KINDS) do
-            db[DB_KEYS[kind]] = on
-        end
-    end
-    Send(on)
-    Apply()
-    print("|cFF00FF00[JimsPlus]|r Incoming heals on the raid, party, player and target frames: " ..
         (on and "|cFFFFD100on|r." or "|cFF00FF00off|r."))
 end
 
