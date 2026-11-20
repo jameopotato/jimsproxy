@@ -93,6 +93,7 @@ public class MountCacheResetTests
             Session.WorldClient = Client;
             // The out-of-range path drops the unit's threat lists too.
             Session.ThreatTracker = new ThreatTracker(Session);
+            Session.HealCommBridge = new HealCommBridge(Session); // the destroy and out-of-range paths tell it a unit is leaving view
             State.CurrentPlayerGuid = LegacyPlayer.To128(State);
             State.CurrentPlayerStorage = new CurrentPlayerStorage(Session);
             typeof(CurrentPlayerStorage).GetProperty(nameof(CurrentPlayerStorage.Settings))!
