@@ -91,7 +91,7 @@ local function KR_Step()
         if KR_IsNonKey(KR_ItemID(KEYRING, slot)) then
             local bag, bslot = KR_FirstFreeBagSlot()
             if not bag then
-                print("|cFF00FF00[JimsPlus]|r Keyring cleanup: bags are full - free a slot and click again.")
+                print("|cFF00FF00[JimsPlus]|r Bag Audit stopped: your bags are full. Free a slot and click again.")
                 KR_cleaning = false
                 return
             end
@@ -103,13 +103,13 @@ local function KR_Step()
             return
         end
     end
-    if KR_cleaning then print("|cFF00FF00[JimsPlus]|r Keyring cleanup complete.") end
+    if KR_cleaning then print("|cFF00FF00[JimsPlus]|r Bag Audit finished.") end
     KR_cleaning = false
 end
 
 local function KR_StartCleanup()
     if InCombatLockdown() then
-        print("|cFF00FF00[JimsPlus]|r Can't clean the keyring in combat.")
+        print("|cFF00FF00[JimsPlus]|r Bag Audit can't run in combat.")
         return
     end
     if KR_cleaning then return end
@@ -118,9 +118,13 @@ local function KR_StartCleanup()
 end
 
 ---------------------------------------------------------------------------
--- Panels: the "JimsPlus" page carries the client fixes, with a Pet Bar and a
--- Bags section; Cast Bars is the one sub-page in the Interface Options left
--- tree (it is the largest, most distinct group). Kept deliberately shallow.
+-- Panels: the "JimsPlus" page carries the client fixes (two columns, to leave room),
+-- Incoming Heals, Pet Bar and Bags; Cast Bars is the one sub-page in the Interface
+-- Options left tree (it is the largest, most distinct group). Kept deliberately shallow.
+--
+-- Wording follows the launcher's UI voice guide: sentence-case labels, Title Case
+-- section headers and buttons, a plain first line in each tooltip with the detail
+-- after it, what a setting does rather than how good it is, digits, no exclamation.
 ---------------------------------------------------------------------------
 local root = CreateFrame("Frame", "JimsPlusOptionsPanel", UIParent)
 root.name = "JimsPlus"
@@ -150,7 +154,7 @@ end
 
 -- Top-right shortcut to the Cast Bars sub-page (also reachable from the left tree).
 local btnCastTop = CreateButton(root, -16, "Cast Bars  >", 120,
-    "Open the Cast Bars page: cast bars for targets, nameplates, focus,\nparty members, and your own bar, plus Performance Mode and\nincoming heals on Blizzard frames.")
+    "Open the Cast Bars page: which units get a cast bar, and\nPerformance Mode.")
 btnCastTop:ClearAllPoints()
 btnCastTop:SetPoint("TOPRIGHT", root, "TOPRIGHT", -16, -16)
 btnCastTop:SetScript("OnClick", function() OpenPanel(panelCast) end)
@@ -167,67 +171,84 @@ local function CreateSection(parent, text, yOffset)
 end
 
 ---------------------------------------------------------------------------
--- Main page: Client Fixes
+-- Main page: Client Fixes (two columns)
 ---------------------------------------------------------------------------
+local COLUMN_2 = 318
+local TAG_ALWAYS = "  |cFF888888(always on)|r"
+local TAG_RELOAD = "  |cFFFF6600(/reload)|r"
+
 local y = -56
 CreateSection(root, "Client Fixes", y)
 y = y - 26
-CreateDescription(root, "These fix bugs in the 1.14 client when connected to a vanilla server. The greyed ones are always on.", y)
-y = y - 26
+CreateDescription(root, "Fixes for 1.14 client bugs that show up on a vanilla server. The greyed ones are always on.", y)
+y = y - 24
 
 local cbPetFix = CreateCheckbox(root, y,
-    "Pet UI crash fix  |cFF888888(always on)|r",
-    "Prevents Lua errors when opening the pet stats or stable UI.\nHunter pets from vanilla servers don't have a player class,\nwhich crashes the 1.14 client's FrameXML code.\n\nThis fix cannot be disabled — without it the pet UI is broken.")
+    "Pet UI crash fix" .. TAG_ALWAYS,
+    "Stops the Lua errors when you open the pet stats or stable window.\n\nA pet from a vanilla server has no player class, and the 1.14\nclient's pet code expects one.\n\nAlways on. Without it those windows throw errors.")
 cbPetFix:SetChecked(true)
 cbPetFix:Disable()
 cbPetFix.Text:SetTextColor(0.5, 0.5, 0.5)
-y = y - 28
 
 local cbTaxiFix = CreateCheckbox(root, y,
-    "Hide early-landing button  |cFF888888(always on)|r",
-    "Hides the \"Stop at next flight path\" button during flights.\nVanilla servers don't support early landing — clicking it\ndoes nothing.\n\nThis fix cannot be disabled — the button has no function on vanilla servers.")
+    "Hide early-landing button" .. TAG_ALWAYS,
+    "Hides the \"Stop at next flight path\" button during flights.\n\nA vanilla server has no early landing, so the button does nothing.\n\nAlways on.",
+    COLUMN_2)
 cbTaxiFix:SetChecked(true)
 cbTaxiFix:Disable()
 cbTaxiFix.Text:SetTextColor(0.5, 0.5, 0.5)
 y = y - 28
 
 local cbTooltipFix = CreateCheckbox(root, y,
-    "Off-class armor / weapon red text  |cFFFF6600(reload required)|r",
-    "Recolors armor type and weapon type to red on item tooltips and vendor\nrows when your class can't use the item (e.g. \"Mail\" on a rogue, \"Plate\"\non a hunter), based on the proficiencies you've actually trained.\n\nThe 1.14 Classic Era client gets this signal from a hardcoded table\nthe proxy can't reach over the wire — this addon does the recolor\nclient-side.\n\nChanges take effect after /reload.")
-y = y - 28
+    "Red text on gear you can't use" .. TAG_RELOAD,
+    "Turns the armor or weapon type red on item tooltips and vendor rows\nwhen you can't use the item, for example \"Mail\" on a rogue. It goes\nby the proficiencies you've trained.\n\nThe 1.14 client takes this from a built-in table the proxy can't\nchange, so the addon recolors the text itself.\n\nOff by default. Takes effect after /reload.")
 
 local cbMoonkinSound = CreateCheckbox(root, y,
-    "Moonkin Form sound  |cFF888888(Druid only)|r",
-    "Gives Moonkin Form a distinct transformation sound instead\nof reusing the Bear Form sound.\n\nOnly affects Druid characters.")
+    "Moonkin Form sound  |cFF888888(druids)|r",
+    "Plays Moonkin Form's own transformation sound. Without this the\n1.14 client plays the Bear Form sound.\n\nDruids only. On by default. Takes effect after /reload.",
+    COLUMN_2)
 y = y - 28
 
 local cbApiCompat = CreateCheckbox(root, y,
-    "Modern addon API shims  |cFFFF6600(reload)|r",
-    "Fills in modern APIs that are missing on the 1.14.2 client so newer\naddons and WeakAuras packs stop erroring: C_Container, the\nC_Spell range check, vehicle API stubs, and a scroll-frame helper.\n\nOnly ever adds what is missing; never overrides anything the\nclient already provides.\n\nBased on HermesCompat by techgeekpr (MIT).\n\nOff by default; turn it on only if an addon you use needs it.\nChanges take effect after /reload.")
-y = y - 28
+    "Modern addon API shims" .. TAG_RELOAD,
+    "Adds newer addon APIs the 1.14.2 client lacks, so addons and\nWeakAuras written for later clients stop erroring: C_Container, the\nC_Spell range check, vehicle API stubs and a scroll-frame helper.\n\nIt only adds what's missing. Nothing the client already has is\nreplaced.\n\nBased on HermesCompat by techgeekpr (MIT).\n\nOff by default. Turn it on if an addon you use needs it.\nTakes effect after /reload.")
 
 local cbBowSheathe = CreateCheckbox(root, y,
-    "Show 2H weapon on back with a bow",
-    "Fixes a 1.14 client bug where a sheathed two-handed weapon\n(and your quiver) disappears from your back after combat while\na bow is equipped (guns and crossbows are unaffected).\n\nYour character puts the bow away a few seconds after combat\nends; if the client sheathes on its own first, the addon instantly\nre-sheathes to restore the models.\n\nTakes effect immediately.")
-y = y - 42
+    "Keep 2H weapon on back with a bow",
+    "With a bow equipped, the 1.14 client drops your sheathed two-handed\nweapon and quiver from your back after combat. Guns and crossbows\naren't affected.\n\nYour character puts the bow away a few seconds after combat. If the\nclient sheathes first, the addon sheathes again and the models come\nback.\n\nOn by default. Takes effect immediately.",
+    COLUMN_2)
+y = y - 40
+
+---------------------------------------------------------------------------
+-- Main page: Incoming Heals
+---------------------------------------------------------------------------
+CreateSection(root, "Incoming Heals", y)
+y = y - 26
+CreateDescription(root, "A vanilla server never says how much a heal will heal, and the 1.14 raid frames don't draw incoming heals. JimsPlus supplies both for other healers in view.", y)
+y = y - 30
+
+local cbHealAmount = CreateCheckbox(root, y,
+    "Show other healers' incoming heals on raid frames",
+    "Draws an incoming-heal bar on Blizzard's raid frames and raid-style\nparty frames while another player is casting a heal on that unit.\n\nThe amount comes from the healer's HealComm addon and reaches you\nthrough the proxy, so it shows for healers in view who run one. Your\nown heals aren't included.\n\nUnit frame addons that read the game's incoming heals get the same\namounts. Addons that use HealComm already show these heals and\ndon't need this.\n\nSide effect: cast-bar addons that read the combat log, other than\nJimsPlus, restart a healer's bar once, a fraction of a second into\nthe cast.\n\nOff by default. Takes effect immediately. Shortcut: /jp heals")
+y = y - 40
 
 ---------------------------------------------------------------------------
 -- Main page: Pet Bar (hunters & warlocks)
 ---------------------------------------------------------------------------
 CreateSection(root, "Pet Bar", y)
 y = y - 26
-CreateDescription(root, "Keep the pet's command and stance buttons on the bar; the 1.14 client can't drag them back once a spell knocks one off.", y)
-y = y - 28
+CreateDescription(root, "For hunters and warlocks. The 1.14 client can't put a pet command or stance button back on the bar once a spell has replaced it.", y)
+y = y - 30
 
 local cbPetLock = CreateCheckbox(root, y,
-    "Lock pet command & stance buttons",
-    "Hunters and warlocks: keep Attack, Follow, Stay and the\nAggressive/Defensive/Passive buttons on the pet bar, and\nput them back if a spell gets dropped onto one and knocks\nit off. Off by default. Turn it on only if you've lost those\nbuttons or want them protected.\n\nShortcut: /jp petlock")
+    "Lock pet command and stance buttons",
+    "Keeps Attack, Follow, Stay and the Aggressive, Defensive and Passive\nbuttons on the pet bar, and puts one back if a spell is dropped\nonto it.\n\nOff by default. Shortcut: /jp petlock")
 y = y - 32
 
 local btnPetReset = CreateButton(root, y, "Reset Pet Bar", 150,
-    "Rebuilds your pet's command and stance buttons right now,\nwithout a resummon. Works best with the lock above turned\non, otherwise it comes back the next time you summon.\n\nShortcut: /jp petreset")
+    "Puts your pet's command and stance buttons back now, without\nresummoning the pet.\n\nWith the lock above off, the bar can lose them again the next time\nyou summon.\n\nShortcut: /jp petreset")
 btnPetReset:SetScript("OnClick", function() namespace:ResetPetBar() end)
-y = y - 42
+y = y - 40
 
 ---------------------------------------------------------------------------
 -- Main page: Bags
@@ -235,27 +256,27 @@ y = y - 42
 CreateSection(root, "Bags", y)
 y = y - 26
 local btnBagAudit = CreateButton(root, y, "Bag Audit", 150,
-    "Moves non-key items out of your keyring and into your bags.\nUse it if a character has items stuck in the keyring from a past\nbug. Keys are left in place.")
+    "Moves items that aren't keys out of your keyring and into your bags.\nKeys stay where they are.\n\nFor characters with items stuck in the keyring from an older bug.\nNeeds free bag slots and can't run in combat.")
 btnBagAudit:SetScript("OnClick", KR_StartCleanup)
 y = y - 30
 
 local cbBagSort = CreateCheckbox(root, y,
-    "Custom bag sort order  |cFF888888(Bagnon)|r",
-    "Changes Bagnon's sort button to a curated layout:\npermanent fixtures (hearthstone) first, then profession and\ngathering tools, quest items, soulbound gear, other gear,\nconsumables, everything else, and junk last.\n\nAlso applies to Bagnon's bank sort. Takes effect on the\nnext sort — no reload needed.")
+    "Custom sort order for Bagnon",
+    "Changes the order Bagnon's sort button uses: permanent items such as\nthe hearthstone first, then profession and gathering tools, quest\nitems, soulbound gear, other gear, consumables, everything else, and\njunk last.\n\nApplies to Bagnon's bank sort too. Off by default. Takes effect on\nthe next sort.")
 
 ---------------------------------------------------------------------------
 -- Cast Bars sub-page (reached from the "Cast Bars" entry in the left tree)
 ---------------------------------------------------------------------------
 y = -44
-CreateDescription(panelCast, "Show cast bars for other players and NPCs. The vanilla server sends cast data through the proxy, but the 1.14 client doesn't display it natively — these fill that gap.", y)
-y = y - 34
+CreateDescription(panelCast, "Cast bars for other players and NPCs, which the 1.14 client doesn't show by itself. The proxy sends these bars what the combat log doesn't carry: the server's exact cast time for every cast, when a channel starts and ends, and the heals of grouped healers you can't see.", y)
+y = y - 46
 
 local castbarUnits = {
-    { key = "target",    label = "Target",     tooltip = "Shows what your current target is casting.\nEssential for interrupting enemy spells." },
-    { key = "nameplate", label = "Nameplates",  tooltip = "Shows cast bars on nameplates above characters' heads.\nUseful in dungeons and PvP to see multiple casts at once." },
-    { key = "focus",     label = "Focus",       tooltip = "Shows what your focus target is casting.\nUseful for watching a specific mob while targeting another." },
-    { key = "player",    label = "Player  |cFF888888(reskins Blizzard bar)|r", tooltip = "Replaces the default Blizzard cast bar with the JimsPlus style.\nAlso fixes incorrect icons on tradeskill craft bars.\n\nDisable if you prefer the default look or use another cast bar addon." },
-    { key = "party",     label = "Party members", tooltip = "Shows cast bars on party member frames.\nUseful for seeing when your healer is casting." },
+    { key = "target",    label = "Target",     tooltip = "Shows what your target is casting." },
+    { key = "nameplate", label = "Nameplates",  tooltip = "Shows a cast bar on each nameplate, so several casts are visible\nat once." },
+    { key = "focus",     label = "Focus",       tooltip = "Shows what your focus is casting while you target something else." },
+    { key = "player",    label = "Player  |cFF888888(restyles the Blizzard bar)|r", tooltip = "Gives your own cast bar the JimsPlus look and corrects the icon on\ntradeskill casts.\n\nTurn it off to keep Blizzard's look, or if another addon styles your\ncast bar." },
+    { key = "party",     label = "Party members", tooltip = "Shows a cast bar on each party member's frame, in groups of up to 5.\n\nFor a grouped healer you can't see, the bar shows the heal their\nHealComm addon announces: the spell's name when it is certain,\n\"Unknown Heal\" when it isn't." },
 }
 
 local castbarCBs = {}
@@ -266,18 +287,8 @@ end
 
 y = y - 8
 local cbPerf = CreateCheckbox(panelCast, y,
-    "Performance Mode  |cFFFFD100(suspends cast bars)|r",
-    "For crowded fights (battlegrounds, big pulls) where FPS tanks: fully suspends the\ncast-bar engine — stops rendering, stops per-event tracking, and tells the proxy to\nstop sending cast data entirely. Toggle on when it's a zerg, off when it clears.\n\nAll other JimsPlus fixes stay active. Shortcut: /jp perf")
-y = y - 42
-
-CreateSection(panelCast, "Incoming Heals", y)
-y = y - 26
-CreateDescription(panelCast, "A vanilla server never says how much a heal will heal. Unit frame addons that use HealComm get the amount from the healer's addon; Blizzard's own frames need the proxy to pass it on.", y)
-y = y - 34
-
-local cbHealAmount = CreateCheckbox(panelCast, y,
-    "Show other healers' incoming heals on Blizzard frames",
-    "Blizzard's party and raid frames, and other frames that use the\ngame's own incoming-heal number, show nothing for another player's\nheal on a vanilla server. With this on, the proxy adds the amount\nthe healer's HealComm addon announces, for healers near you.\n\nUnit frame addons that use HealComm already show these heals and\ndon't need this.\n\nSide effect: cast-bar addons that read the combat log (other than\nJimsPlus) restart a healer's bar once, a split second into the cast.\n\nOff by default. Takes effect immediately. Shortcut: /jp heals")
+    "Performance Mode  |cFFFFD100(turns cast bars off)|r",
+    "Stops all JimsPlus cast bars: nothing is drawn, no casts are tracked,\nand the proxy stops sending cast data. For crowded fights where the\nframe rate drops, such as battlegrounds and large pulls.\n\nEvery other JimsPlus fix stays on. Shortcut: /jp perf")
 
 ---------------------------------------------------------------------------
 -- Sync checkbox state from saved variables
@@ -322,7 +333,7 @@ cbTooltipFix:SetScript("OnClick", function(self)
     if namespace.db then
         namespace.db.tooltipFix = enabled
     end
-    print("|cFF00FF00[JimsPlus]|r Off-class armor red text " .. (enabled and "enabled" or "disabled") .. ". Type /reload to apply.")
+    print("|cFF00FF00[JimsPlus]|r Red text on gear you can't use: " .. (enabled and "on" or "off") .. ". Takes effect after /reload.")
 end)
 
 cbMoonkinSound:SetScript("OnClick", function(self)
@@ -330,7 +341,7 @@ cbMoonkinSound:SetScript("OnClick", function(self)
     if namespace.db then
         namespace.db.moonkinSound = enabled
     end
-    print("|cFF00FF00[JimsPlus]|r Moonkin Form sound " .. (enabled and "enabled" or "disabled") .. ". Type /reload to apply.")
+    print("|cFF00FF00[JimsPlus]|r Moonkin Form sound: " .. (enabled and "on" or "off") .. ". Takes effect after /reload.")
 end)
 
 cbApiCompat:SetScript("OnClick", function(self)
@@ -338,7 +349,7 @@ cbApiCompat:SetScript("OnClick", function(self)
     if namespace.db then
         namespace.db.apiCompat = enabled
     end
-    print("|cFF00FF00[JimsPlus]|r Modern addon API shims " .. (enabled and "enabled" or "disabled") .. ". Type /reload to apply.")
+    print("|cFF00FF00[JimsPlus]|r Modern addon API shims: " .. (enabled and "on" or "off") .. ". Takes effect after /reload.")
 end)
 
 -- JimsProxy (bow sheathe fix): purely addon-side (BowSheatheFix.lua re-sheathe nudge), read live from db
@@ -347,7 +358,7 @@ cbBowSheathe:SetScript("OnClick", function(self)
     if namespace.db then
         namespace.db.bowSheatheFix = enabled
     end
-    print("|cFF00FF00[JimsPlus]|r Bow 2H-sheathe fix " .. (enabled and "enabled" or "disabled") .. ".")
+    print("|cFF00FF00[JimsPlus]|r 2H weapon on back with a bow: " .. (enabled and "on" or "off") .. ".")
 end)
 
 cbBagSort:SetScript("OnClick", function(self)
@@ -355,7 +366,7 @@ cbBagSort:SetScript("OnClick", function(self)
     if namespace.db then
         namespace.db.bagSortOrder = enabled
     end
-    print("|cFF00FF00[JimsPlus]|r Custom bag sort order " .. (enabled and "enabled" or "disabled") .. ".")
+    print("|cFF00FF00[JimsPlus]|r Custom sort order for Bagnon: " .. (enabled and "on" or "off") .. ".")
 end)
 
 cbPerf:SetScript("OnClick", function(self)

@@ -22,9 +22,9 @@ function namespace:SetPerformanceMode(on)
     if cb then
         if on then cb:SuspendCastbars() else cb:ResumeCastbars() end
     end
-    print("|cFF00FF00[JimsPlus]|r Performance Mode " ..
-        (on and "|cFFFFD100ON|r — cast bars suspended (other fixes stay active)"
-             or "|cFF00FF00OFF|r — cast bars restored") .. ".")
+    print("|cFF00FF00[JimsPlus]|r Performance Mode: " ..
+        (on and "|cFFFFD100on|r. Cast bars are off. Every other fix stays on."
+             or "|cFF00FF00off|r. Cast bars are back."))
 end
 
 local f = CreateFrame("Frame")
