@@ -1,12 +1,12 @@
 local ADDON_NAME, namespace = ...
 
--- JimsPlus incoming heals on the default raid frames (opt-in)
+-- JimsPlus incoming heals on the default raid and party frames (opt-in)
 --
--- The 1.14.2 client's raid frames carry the textures for incoming-heal bars but nothing sizes
--- or shows them, and the frames don't listen for UNIT_HEAL_PREDICTION. This file draws the
--- bars: on Blizzard's raid frames and raid-style party frames, to the right of the health
--- fill, the player's own heal first and other healers' after it, for the part that fits into
--- the missing health.
+-- The 1.14.2 client's own frames never draw incoming heals. The raid frames carry the textures
+-- for the bars but nothing sizes or shows them; the party frames have none. This file draws the
+-- bars on Blizzard's raid frames, raid-style party frames and party frames: to the right of
+-- the health fill, the player's own heal first and other healers' after it, for the part that
+-- fits into the missing health.
 --
 -- Where the amounts come from, best source first:
 --
@@ -31,9 +31,10 @@ local UnitGetIncomingHeals = UnitGetIncomingHeals
 local UnitHealth, UnitHealthMax, UnitGUID = UnitHealth, UnitHealthMax, UnitGUID
 local UnitExists, UnitIsDeadOrGhost, UnitIsUnit = UnitExists, UnitIsDeadOrGhost, UnitIsUnit
 
--- The raid frames' own health fill, tinted with the stock colours for the player's and for
--- another player's incoming heal.
-local BAR_TEXTURE = "Interface\\RaidFrame\\Raid-Bar-Hp-Fill"
+-- Each kind of frame keeps its own health fill; the bars are tinted with the stock colours for
+-- the player's and for another player's incoming heal.
+local RAID_TEXTURE = "Interface\\RaidFrame\\Raid-Bar-Hp-Fill"
+local PARTY_TEXTURE = "Interface\\TargetingFrame\\UI-StatusBar"
 local MY_R, MY_G, MY_B = 0.0, 0.827, 0.765
 local OTHER_R, OTHER_G, OTHER_B = 0.0, 0.631, 0.557
 
@@ -46,13 +47,18 @@ local LIB_EVENTS = {
 
 -- Blizzard names its raid and raid-style party frames this way; they are created on demand and
 -- reused, so the list is rebuilt on every roster change.
-local FRAME_PATTERNS = {
+local COMPACT_PATTERNS = {
     { "CompactRaidFrame%d", 40 },
     { "CompactPartyFrameMember%d", 5 },
 }
 local RAID_GROUPS, GROUP_SIZE = 8, 5
+local PARTY_MEMBERS = 4
 
-local frames = {}   -- array of the compact frames that exist right now
+-- One entry per frame that can show the bars:
+--   frame, healthBar, mine, other (the two textures), texture (their fill),
+--   unit (fixed unit, party frames only; raid frames name theirs themselves)
+local targets = {}
+local partyBars = {} -- [health bar] = { mine = texture, other = texture }, made once
 local styled = setmetatable({}, { __mode = "k" }) -- [texture] = true once it has a fill
 local shown = setmetatable({}, { __mode = "k" })  -- [texture] = true while we show it
 local drawing = false
@@ -68,23 +74,53 @@ local function FindLibrary()
     return lib
 end
 
+local function AddCompact(frame)
+    if frame and frame.myHealPrediction and frame.otherHealPrediction and frame.healthBar then
+        targets[#targets + 1] = {
+            frame = frame, healthBar = frame.healthBar,
+            mine = frame.myHealPrediction, other = frame.otherHealPrediction,
+            texture = RAID_TEXTURE,
+        }
+    end
+end
+
+-- The party frames have no textures for this, so two are added to each health bar. They sit
+-- on the bar itself, under the frame's border art, like the health fill.
+local function AddParty(index)
+    local frame = _G["PartyMemberFrame" .. index]
+    local healthBar = _G["PartyMemberFrame" .. index .. "HealthBar"]
+    if not frame or not healthBar then return end
+    local bars = partyBars[healthBar]
+    if not bars then
+        bars = {
+            mine = healthBar:CreateTexture(nil, "ARTWORK", nil, 1),
+            other = healthBar:CreateTexture(nil, "ARTWORK", nil, 1),
+        }
+        bars.mine:Hide()
+        bars.other:Hide()
+        partyBars[healthBar] = bars
+    end
+    targets[#targets + 1] = {
+        frame = frame, healthBar = healthBar,
+        mine = bars.mine, other = bars.other,
+        texture = PARTY_TEXTURE, unit = "party" .. index,
+    }
+end
+
 local function Scan()
-    wipe(frames)
-    for _, pattern in ipairs(FRAME_PATTERNS) do
+    wipe(targets)
+    for _, pattern in ipairs(COMPACT_PATTERNS) do
         for i = 1, pattern[2] do
-            local frame = _G[pattern[1]:format(i)]
-            if frame and frame.myHealPrediction and frame.otherHealPrediction and frame.healthBar then
-                frames[#frames + 1] = frame
-            end
+            AddCompact(_G[pattern[1]:format(i)])
         end
     end
     for group = 1, RAID_GROUPS do
         for member = 1, GROUP_SIZE do
-            local frame = _G["CompactRaidGroup" .. group .. "Member" .. member]
-            if frame and frame.myHealPrediction and frame.otherHealPrediction and frame.healthBar then
-                frames[#frames + 1] = frame
-            end
+            AddCompact(_G["CompactRaidGroup" .. group .. "Member" .. member])
         end
+    end
+    for index = 1, PARTY_MEMBERS do
+        AddParty(index)
     end
 end
 
@@ -95,15 +131,15 @@ local function HideBar(bar)
     end
 end
 
-local function HideBars(frame)
-    HideBar(frame.myHealPrediction)
-    HideBar(frame.otherHealPrediction)
+local function HideBars(target)
+    HideBar(target.mine)
+    HideBar(target.other)
 end
 
 -- Puts `bar` to the right of `anchor`, `amount` health wide. Returns the bar, to stack the next on.
-local function PlaceBar(bar, anchor, amount, maxHealth, width, r, g, b)
+local function PlaceBar(bar, anchor, amount, maxHealth, width, texture, r, g, b)
     if not styled[bar] then
-        bar:SetTexture(BAR_TEXTURE)
+        bar:SetTexture(texture)
         bar:SetVertexColor(r, g, b)
         styled[bar] = true
     end
@@ -129,20 +165,24 @@ local function Amounts(unit)
     return 0, UnitGetIncomingHeals(unit) or 0
 end
 
-local function UpdateFrame(frame)
-    local unit = frame.displayedUnit or frame.unit
-    if not unit or not frame:IsShown() or not UnitExists(unit) or UnitIsDeadOrGhost(unit) then
-        return HideBars(frame)
+local function UnitOf(target)
+    return target.unit or target.frame.displayedUnit or target.frame.unit
+end
+
+local function UpdateTarget(target)
+    local unit = UnitOf(target)
+    if not unit or not target.frame:IsShown() or not UnitExists(unit) or UnitIsDeadOrGhost(unit) then
+        return HideBars(target)
     end
 
     local maxHealth = UnitHealthMax(unit) or 0
-    local width = frame.healthBar:GetWidth() or 0
-    local fill = frame.healthBar:GetStatusBarTexture()
+    local width = target.healthBar:GetWidth() or 0
+    local fill = target.healthBar:GetStatusBarTexture()
     if maxHealth <= 0 or width <= 0 or not fill then
-        return HideBars(frame)
+        return HideBars(target)
     end
 
-    -- Only the part that fits: a raid frame has no room past full health.
+    -- Only the part that fits: the frames have no room past full health.
     local room = maxHealth - (UnitHealth(unit) or 0)
     local mine, others = Amounts(unit)
     if mine > room then mine = room end
@@ -151,30 +191,30 @@ local function UpdateFrame(frame)
 
     local anchor = fill
     if mine > 0 then
-        anchor = PlaceBar(frame.myHealPrediction, anchor, mine, maxHealth, width, MY_R, MY_G, MY_B)
+        anchor = PlaceBar(target.mine, anchor, mine, maxHealth, width, target.texture, MY_R, MY_G, MY_B)
     else
-        HideBar(frame.myHealPrediction)
+        HideBar(target.mine)
     end
     if others > 0 then
-        PlaceBar(frame.otherHealPrediction, anchor, others, maxHealth, width, OTHER_R, OTHER_G, OTHER_B)
+        PlaceBar(target.other, anchor, others, maxHealth, width, target.texture, OTHER_R, OTHER_G, OTHER_B)
     else
-        HideBar(frame.otherHealPrediction)
+        HideBar(target.other)
     end
 end
 
 local function UpdateAll()
-    for i = 1, #frames do
-        UpdateFrame(frames[i])
+    for i = 1, #targets do
+        UpdateTarget(targets[i])
     end
 end
 
 local function UpdateUnit(unit)
     if not unit then return end
-    for i = 1, #frames do
-        local frame = frames[i]
-        local frameUnit = frame.displayedUnit or frame.unit
-        if frameUnit and (frameUnit == unit or UnitIsUnit(frameUnit, unit)) then
-            UpdateFrame(frame)
+    for i = 1, #targets do
+        local target = targets[i]
+        local targetUnit = UnitOf(target)
+        if targetUnit and (targetUnit == unit or UnitIsUnit(targetUnit, unit)) then
+            UpdateTarget(target)
         end
     end
 end
@@ -246,10 +286,10 @@ local function SetDrawing(on)
                 pcall(lib.UnregisterCallback, libOwner, event)
             end
         end
-        for i = 1, #frames do
-            HideBars(frames[i])
+        for i = 1, #targets do
+            HideBars(targets[i])
         end
-        wipe(frames)
+        wipe(targets)
     end
 end
 
@@ -273,7 +313,7 @@ function namespace:SetNativeHealAmount(on)
     if db then db.nativeHealAmount = on end
     Send(on)
     SetDrawing(on)
-    print("|cFF00FF00[JimsPlus]|r Incoming heals on raid frames: " .. (on and "|cFFFFD100on|r." or "|cFF00FF00off|r."))
+    print("|cFF00FF00[JimsPlus]|r Incoming heals on raid and party frames: " .. (on and "|cFFFFD100on|r." or "|cFF00FF00off|r."))
 end
 
 local f = CreateFrame("Frame")
