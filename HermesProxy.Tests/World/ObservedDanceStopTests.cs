@@ -34,6 +34,7 @@ public class ObservedDanceStopTests
             Session.GameState = State;
             Session.WorldClient = Client;
             Session.ThreatTracker = new ThreatTracker(Session);
+            Session.HealCommBridge = new HealCommBridge(Session); // the destroy and out-of-range paths tell it a unit is leaving view
             State.CurrentPlayerGuid = LegacyPlayer.To128(State);
             State.CurrentPlayerStorage = new CurrentPlayerStorage(Session);
             typeof(CurrentPlayerStorage).GetProperty(nameof(CurrentPlayerStorage.Settings))!

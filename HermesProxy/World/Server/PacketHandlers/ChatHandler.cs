@@ -574,7 +574,8 @@ public partial class WorldSocket
     // JimsProxy sideband: addon-driven commands the 1.14 modern client wire
     // protocol no longer carries. Body grammar:
     //   "1" / "0"          — handshake on/off (legacy castbar/HC interop)
-    //   "<cmd>\t<args>..." — structured command, e.g. "Z\tStormwind City", "P\tLOCK\t1"
+    //   "<cmd>\t<args>..." — structured command, e.g. "Z\tStormwind City", "P\tLOCK\t1",
+    //                        "H\tAMOUNT\t1"
     private void HandleJimsPlusSideband(string body)
     {
         if (string.IsNullOrEmpty(body)) return;
@@ -602,7 +603,34 @@ public partial class WorldSocket
             case "P":
                 HandlePetSideband(args);
                 break;
+            case "H":
+                HandleHealCommSideband(args);
+                break;
         }
+    }
+
+    // HealComm sideband (JimsPlus checkbox "Show other healers' incoming heals on Blizzard
+    // frames", account-wide, off by default): "AMOUNT\t1" turns the in-range amount on for this
+    // player, "AMOUNT\t0" off (HealCommBridge.SetNativeAmountEnabled). JimsPlus sends its setting
+    // at every loading screen. Receive-only, like the other letters: nothing goes to the server.
+    private void HandleHealCommSideband(string args)
+    {
+        if (args == null) return;
+
+        int tab = args.IndexOf('\t');
+        string verb = (tab >= 0 ? args.Substring(0, tab) : args).Trim().ToUpperInvariant();
+        string rest = tab >= 0 ? args.Substring(tab + 1).Trim() : string.Empty;
+
+        if (verb == "AMOUNT" && (rest == "0" || rest == "1"))
+        {
+            bool on = rest == "1";
+            // Logged when the choice changes only, not on every loading screen's repeat.
+            if (GetSession().HealCommBridge.SetNativeAmountEnabled(on))
+                Log.Event("healcomm.native_amount.set", new { on });
+            return;
+        }
+
+        Log.Event("chat.healcomm_sideband.unknown", new { args });
     }
 
     // Pet sideband (JimsPlus pet-bar lock, opt-in): "LOCK\t1"/"LOCK\t0" turns the command/stance

@@ -264,6 +264,22 @@ public static class Settings
     // legacy CMSG_CANCEL_CAST for started cast-time casts on strafe starts, gated on the 1.12
     // movement-interrupt flag (SpellMovementInterrupt CSV). Kill switch — leave ON.
     public static bool StrafeCancelPreempt;
+    // JimsProxy (announced heals): when set, a heal announced by the addon of a healer in range
+    // also reaches the client's own incoming-heal number (UnitGetIncomingHeals): the bridge
+    // sends the server's cast start again with the announced amount attached (see
+    // HealCommBridge.AttachNativeAmount). Without it only LibHealComm-4.0 addons show that
+    // heal. The cost is a second "begins to cast" combat log line for the cast. Default OFF:
+    // each player can turn it on for themselves in JimsPlus (Cast Bars page, the H sideband).
+    // Setting this key turns it on for every player on this proxy, whatever JimsPlus says.
+    public static bool HealCommNativeAmountInRange;
+    // JimsProxy (announced heals): when set, our own HC-1.0 heal announcement carries the spell
+    // being cast as a fifth field ("Heal/<target>/<amount>/<castMs>/<spellId>/"), so a proxied
+    // receiver out of range of this healer shows the real spell. HealComm-1.0, pfUI and
+    // LibHermesHealComm read fields two to four by position and ignore the rest. Default OFF,
+    // opt-in: every 1.12 player in the group receives the message, and an addon with a stricter
+    // parser than those three would stop showing this healer's heals. A received fifth field is
+    // read either way.
+    public static bool HealCommAnnounceSpellId;
     // JimsProxy (#313): width (ms) of the spell-queue hold window. A press arriving in the
     // last SpellQueueWindowMs of an active GCD or cast bar is held and fired at expiry; earlier
     // presses are forwarded and the server arbitrates (NOT_READY / SpellInProgress). Mirrors the
@@ -363,6 +379,8 @@ public static class Settings
             : RttPrefireMode.Off;
         FormExitStartDeferMs = Math.Clamp(config.GetInt("FormExitStartDeferMs", 100), 0, 300);
         StrafeCancelPreempt = config.GetBoolean("StrafeCancelPreempt", true);
+        HealCommNativeAmountInRange = config.GetBoolean("HealCommNativeAmountInRange", false);
+        HealCommAnnounceSpellId = config.GetBoolean("HealCommAnnounceSpellId", false);
         SpellQueueWindowMs = Math.Clamp(config.GetInt("SpellQueueWindowMs", 400), 0, 1300);
         ThreatEngine = config.GetBoolean("ThreatEngine", false);
         var serverTypeStr = config.GetString("ServerType", "Kronos");

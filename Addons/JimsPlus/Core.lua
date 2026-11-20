@@ -22,9 +22,9 @@ function namespace:SetPerformanceMode(on)
     if cb then
         if on then cb:SuspendCastbars() else cb:ResumeCastbars() end
     end
-    print("|cFF00FF00[JimsPlus]|r Performance Mode " ..
-        (on and "|cFFFFD100ON|r — cast bars suspended (other fixes stay active)"
-             or "|cFF00FF00OFF|r — cast bars restored") .. ".")
+    print("|cFF00FF00[JimsPlus]|r Performance Mode: " ..
+        (on and "|cFFFFD100on|r. Cast bars are off. Every other fix stays on."
+             or "|cFF00FF00off|r. Cast bars are back."))
 end
 
 local f = CreateFrame("Frame")
@@ -36,6 +36,23 @@ f:SetScript("OnEvent", function(_, _, addon)
     if JimsPlusDB.taxiFix == nil then JimsPlusDB.taxiFix = true end
     if JimsPlusDB.bagSortOrder == nil then JimsPlusDB.bagSortOrder = false end
     if JimsPlusDB.performanceMode == nil then JimsPlusDB.performanceMode = false end
+    -- Incoming heals: a main switch, off by default, and under it one switch per kind of frame,
+    -- on by default. Test builds saved the kinds alone (all off by default) and before that one
+    -- raid switch (nativeHealAmount): a test install with a kind on keeps it and gets the main
+    -- switch on; one with none on starts from the defaults.
+    if JimsPlusDB.healRaid == nil and JimsPlusDB.nativeHealAmount then JimsPlusDB.healRaid = true end
+    JimsPlusDB.nativeHealAmount = nil
+    if JimsPlusDB.healShow == nil then
+        local anyKind = JimsPlusDB.healRaid or JimsPlusDB.healParty or JimsPlusDB.healPlayer or JimsPlusDB.healTarget
+        JimsPlusDB.healShow = anyKind and true or false
+        if not anyKind then
+            JimsPlusDB.healRaid, JimsPlusDB.healParty, JimsPlusDB.healPlayer, JimsPlusDB.healTarget = nil, nil, nil, nil
+        end
+    end
+    if JimsPlusDB.healRaid == nil then JimsPlusDB.healRaid = true end
+    if JimsPlusDB.healParty == nil then JimsPlusDB.healParty = true end
+    if JimsPlusDB.healPlayer == nil then JimsPlusDB.healPlayer = true end
+    if JimsPlusDB.healTarget == nil then JimsPlusDB.healTarget = true end
     -- ApiCompat shims are opt-in from 1.2.4. 1.2.3 turned them on by default and wrote
     -- apiCompat = true into every SavedVariables on first load without the player choosing
     -- it, so a plain nil-default would leave every existing install on. Reset once to off;

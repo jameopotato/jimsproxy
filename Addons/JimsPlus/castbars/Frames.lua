@@ -79,7 +79,7 @@ function addon:SetTargetCastbarPosition(castbar, parentFrame)
 end
 
 function addon:SetCastbarIconAndText(castbar, cast, db)
-    local spellName = cast.spellName
+    local spellName = cast.displayName or cast.spellName
     if not castbar.isTesting and castbar.Text:GetText() == spellName then return end
 
     if cast.icon == 136235 then -- unknown texture

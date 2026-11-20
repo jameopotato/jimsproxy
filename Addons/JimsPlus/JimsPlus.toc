@@ -4,12 +4,13 @@
 ## SavedVariables: JimsPlusDB, JimsPlusCastbarsDB
 ## SavedVariablesPerCharacter: JimsPlusCastbarsCharDB, JimsPlusCharDB
 ## Author: JimsProxy Team (CastBars based on ClassicCastbars by Wardz; ApiCompat based on HermesCompat by techgeekpr)
-## Version: 1.2.6
+## Version: 1.2.7
 
 Core.lua
 Options.lua
 PetFix.lua
 PetBar.lua
+HealPrediction.lua
 TaxiFix.lua
 TooltipFix.lua
 ZoneSync.lua
