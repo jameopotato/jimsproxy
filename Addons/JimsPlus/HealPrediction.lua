@@ -1,12 +1,13 @@
 local ADDON_NAME, namespace = ...
 
--- JimsPlus incoming heals on the default raid and party frames (opt-in)
+-- JimsPlus incoming heals on the default unit frames (opt-in, one switch per kind of frame)
 --
 -- The 1.14.2 client's own frames never draw incoming heals. The raid frames carry the textures
--- for the bars but nothing sizes or shows them; the party frames have none. This file draws the
--- bars on Blizzard's raid frames, raid-style party frames and party frames: to the right of
--- the health fill, the player's own heal first and other healers' after it, for the part that
--- fits into the missing health.
+-- for the bars but nothing sizes or shows them; the party, player and target frames have none.
+-- This file draws the bars on Blizzard's raid frames, party frames (raid-style or not), player
+-- frame and target frame, each behind its own switch: to the right of the health fill, the
+-- player's own heal first and other healers' after it, for the part that fits into the
+-- missing health.
 --
 -- Where the amounts come from, best source first:
 --
@@ -24,8 +25,8 @@ local ADDON_NAME, namespace = ...
 --
 -- A healer who runs no HealComm addon announces nothing, so no source has an amount for them.
 --
--- Account-wide, off by default. The proxy's flag only lasts a session, so the choice is sent
--- at every loading screen. Talks over the JP addon sideband (both ends ours).
+-- Account-wide, all four off by default. The proxy's flag only lasts a session, so the choice
+-- is sent at every loading screen. Talks over the JP addon sideband (both ends ours).
 
 local UnitGetIncomingHeals = UnitGetIncomingHeals
 local UnitHealth, UnitHealthMax, UnitGUID = UnitHealth, UnitHealthMax, UnitGUID
@@ -34,7 +35,7 @@ local UnitExists, UnitIsDeadOrGhost, UnitIsUnit = UnitExists, UnitIsDeadOrGhost,
 -- Each kind of frame keeps its own health fill; the bars are tinted with the stock colours for
 -- the player's and for another player's incoming heal.
 local RAID_TEXTURE = "Interface\\RaidFrame\\Raid-Bar-Hp-Fill"
-local PARTY_TEXTURE = "Interface\\TargetingFrame\\UI-StatusBar"
+local UNIT_TEXTURE = "Interface\\TargetingFrame\\UI-StatusBar"
 local MY_R, MY_G, MY_B = 0.0, 0.827, 0.765
 local OTHER_R, OTHER_G, OTHER_B = 0.0, 0.631, 0.557
 
@@ -45,20 +46,36 @@ local LIB_EVENTS = {
     "HealComm_HealUpdated", "HealComm_ModifierChanged", "HealComm_GUIDDisappeared",
 }
 
--- Blizzard names its raid and raid-style party frames this way; they are created on demand and
--- reused, so the list is rebuilt on every roster change.
-local COMPACT_PATTERNS = {
-    { "CompactRaidFrame%d", 40 },
-    { "CompactPartyFrameMember%d", 5 },
-}
+-- Blizzard's raid frames (CompactRaidFrame<n>, CompactRaidGroup<g>Member<m>) and raid-style
+-- party frames (CompactPartyFrameMember<n>) are created on demand and reused, so the list is
+-- rebuilt on every roster change.
 local RAID_GROUPS, GROUP_SIZE = 8, 5
 local PARTY_MEMBERS = 4
 
+-- The four switches and where each is saved.
+local KINDS = { "raid", "party", "player", "target" }
+local DB_KEYS = { raid = "healRaid", party = "healParty", player = "healPlayer", target = "healTarget" }
+local KIND_NAMES = {
+    raid = "raid frames", party = "party frames", player = "the player frame", target = "the target frame",
+}
+
+local function IsOn(kind)
+    local db = namespace.db or JimsPlusDB
+    return db and db[DB_KEYS[kind]] and true or false
+end
+
+local function AnyOn()
+    for _, kind in ipairs(KINDS) do
+        if IsOn(kind) then return true end
+    end
+    return false
+end
+
 -- One entry per frame that can show the bars:
 --   frame, healthBar, mine, other (the two textures), texture (their fill),
---   unit (fixed unit, party frames only; raid frames name theirs themselves)
+--   unit (fixed unit, for the party, player and target frames; raid frames name theirs themselves)
 local targets = {}
-local partyBars = {} -- [health bar] = { mine = texture, other = texture }, made once
+local addedBars = {} -- [health bar] = { mine = texture, other = texture }, made once
 local styled = setmetatable({}, { __mode = "k" }) -- [texture] = true once it has a fill
 local shown = setmetatable({}, { __mode = "k" })  -- [texture] = true while we show it
 local drawing = false
@@ -84,13 +101,11 @@ local function AddCompact(frame)
     end
 end
 
--- The party frames have no textures for this, so two are added to each health bar. They sit
--- on the bar itself, under the frame's border art, like the health fill.
-local function AddParty(index)
-    local frame = _G["PartyMemberFrame" .. index]
-    local healthBar = _G["PartyMemberFrame" .. index .. "HealthBar"]
+-- The party, player and target frames have no textures for this, so two are added to the
+-- health bar. They sit on the bar itself, under the frame's border art, like the health fill.
+local function AddUnitFrame(frame, healthBar, unit)
     if not frame or not healthBar then return end
-    local bars = partyBars[healthBar]
+    local bars = addedBars[healthBar]
     if not bars then
         bars = {
             mine = healthBar:CreateTexture(nil, "ARTWORK", nil, 1),
@@ -98,29 +113,45 @@ local function AddParty(index)
         }
         bars.mine:Hide()
         bars.other:Hide()
-        partyBars[healthBar] = bars
+        addedBars[healthBar] = bars
     end
     targets[#targets + 1] = {
         frame = frame, healthBar = healthBar,
         mine = bars.mine, other = bars.other,
-        texture = PARTY_TEXTURE, unit = "party" .. index,
+        texture = UNIT_TEXTURE, unit = unit,
     }
 end
 
+-- Rebuilds the list from the switches that are on. Raid-style party frames belong to both
+-- the raid and the party switch: they are party frames that look like raid frames.
 local function Scan()
     wipe(targets)
-    for _, pattern in ipairs(COMPACT_PATTERNS) do
-        for i = 1, pattern[2] do
-            AddCompact(_G[pattern[1]:format(i)])
+    local raid, party = IsOn("raid"), IsOn("party")
+    if raid then
+        for i = 1, 40 do
+            AddCompact(_G["CompactRaidFrame" .. i])
+        end
+        for group = 1, RAID_GROUPS do
+            for member = 1, GROUP_SIZE do
+                AddCompact(_G["CompactRaidGroup" .. group .. "Member" .. member])
+            end
         end
     end
-    for group = 1, RAID_GROUPS do
-        for member = 1, GROUP_SIZE do
-            AddCompact(_G["CompactRaidGroup" .. group .. "Member" .. member])
+    if raid or party then
+        for i = 1, 5 do
+            AddCompact(_G["CompactPartyFrameMember" .. i])
         end
     end
-    for index = 1, PARTY_MEMBERS do
-        AddParty(index)
+    if party then
+        for index = 1, PARTY_MEMBERS do
+            AddUnitFrame(_G["PartyMemberFrame" .. index], _G["PartyMemberFrame" .. index .. "HealthBar"], "party" .. index)
+        end
+    end
+    if IsOn("player") then
+        AddUnitFrame(_G.PlayerFrame, _G.PlayerFrameHealthBar, "player")
+    end
+    if IsOn("target") then
+        AddUnitFrame(_G.TargetFrame, _G.TargetFrameHealthBar, "target")
     end
 end
 
@@ -229,7 +260,7 @@ local function Rescan()
 end
 
 local UNIT_EVENTS = { "UNIT_HEAL_PREDICTION", "UNIT_HEALTH", "UNIT_HEALTH_FREQUENT", "UNIT_MAXHEALTH" }
-local ROSTER_EVENTS = { "GROUP_ROSTER_UPDATE", "PLAYER_REGEN_ENABLED" }
+local ROSTER_EVENTS = { "GROUP_ROSTER_UPDATE", "PLAYER_REGEN_ENABLED", "PLAYER_TARGET_CHANGED" }
 
 local drawFrame = CreateFrame("Frame")
 drawFrame:SetScript("OnEvent", function(_, event, unit)
@@ -239,6 +270,8 @@ drawFrame:SetScript("OnEvent", function(_, event, unit)
     elseif event == "PLAYER_REGEN_ENABLED" then
         -- Frames Blizzard could not create or reassign in combat appear now.
         C_Timer.After(0.2, Rescan)
+    elseif event == "PLAYER_TARGET_CHANGED" then
+        UpdateUnit("target")
     else
         UpdateUnit(unit)
     end
@@ -302,25 +335,50 @@ local function Send(on)
     end
 end
 
-function namespace:IsNativeHealAmountOn()
-    local db = self.db or JimsPlusDB
-    return db and db.nativeHealAmount and true or false
+-- Applies the switches: hides what is showing, then draws again for the kinds that are on.
+local function Apply()
+    for i = 1, #targets do
+        HideBars(targets[i])
+    end
+    SetDrawing(AnyOn())
 end
 
-function namespace:SetNativeHealAmount(on)
+function namespace:IsIncomingHealsOn(kind)
+    return IsOn(kind)
+end
+
+function namespace:SetIncomingHeals(kind, on)
+    local key = DB_KEYS[kind]
+    if not key then return end
     on = on and true or false
     local db = self.db or JimsPlusDB
-    if db then db.nativeHealAmount = on end
+    if db then db[key] = on end
+    Send(AnyOn())
+    Apply()
+    print("|cFF00FF00[JimsPlus]|r Incoming heals on " .. KIND_NAMES[kind] .. ": " ..
+        (on and "|cFFFFD100on|r." or "|cFF00FF00off|r."))
+end
+
+-- /jp heals: all four off if any is on, otherwise all four on.
+function namespace:ToggleAllIncomingHeals()
+    local on = not AnyOn()
+    local db = self.db or JimsPlusDB
+    if db then
+        for _, kind in ipairs(KINDS) do
+            db[DB_KEYS[kind]] = on
+        end
+    end
     Send(on)
-    SetDrawing(on)
-    print("|cFF00FF00[JimsPlus]|r Incoming heals on raid and party frames: " .. (on and "|cFFFFD100on|r." or "|cFF00FF00off|r."))
+    Apply()
+    print("|cFF00FF00[JimsPlus]|r Incoming heals on the raid, party, player and target frames: " ..
+        (on and "|cFFFFD100on|r." or "|cFF00FF00off|r."))
 end
 
 local f = CreateFrame("Frame")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
 f:SetScript("OnEvent", function()
     -- The proxy's flag is per session and starts off: send the saved choice every time.
-    local on = namespace:IsNativeHealAmountOn()
+    local on = AnyOn()
     Send(on)
     SetDrawing(on)
     if on then

@@ -36,7 +36,13 @@ f:SetScript("OnEvent", function(_, _, addon)
     if JimsPlusDB.taxiFix == nil then JimsPlusDB.taxiFix = true end
     if JimsPlusDB.bagSortOrder == nil then JimsPlusDB.bagSortOrder = false end
     if JimsPlusDB.performanceMode == nil then JimsPlusDB.performanceMode = false end
-    if JimsPlusDB.nativeHealAmount == nil then JimsPlusDB.nativeHealAmount = false end
+    -- Incoming heals: one switch per kind of frame, all off by default. A test build had a
+    -- single switch for the raid frames (nativeHealAmount); carry it over once.
+    if JimsPlusDB.healRaid == nil then JimsPlusDB.healRaid = JimsPlusDB.nativeHealAmount and true or false end
+    if JimsPlusDB.healParty == nil then JimsPlusDB.healParty = false end
+    if JimsPlusDB.healPlayer == nil then JimsPlusDB.healPlayer = false end
+    if JimsPlusDB.healTarget == nil then JimsPlusDB.healTarget = false end
+    JimsPlusDB.nativeHealAmount = nil
     -- ApiCompat shims are opt-in from 1.2.4. 1.2.3 turned them on by default and wrote
     -- apiCompat = true into every SavedVariables on first load without the player choosing
     -- it, so a plain nil-default would leave every existing install on. Reset once to off;

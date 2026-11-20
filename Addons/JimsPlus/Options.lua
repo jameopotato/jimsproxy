@@ -222,10 +222,25 @@ y = y - 40
 ---------------------------------------------------------------------------
 CreateSection(root, "Incoming Heals", y)
 y = y - 26
+do
+    local lead = root:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    lead:SetPoint("TOPLEFT", root, "TOPLEFT", 18, y)
+    lead:SetText("Show incoming heals on the default Blizzard frames:")
+end
+y = y - 20
 
-local cbHealAmount = CreateCheckbox(root, y,
-    "Show incoming heals on the default Blizzard raid frames",
-    "Draws incoming heals on the default raid frames and party frames:\nyour own heal first, then other healers'.\n\nWith a HealComm addon loaded (unit frame and heal addons carry the\nlibrary), the bars show your own heals and every heal other players'\naddons announce, in view or not.\n\nWithout one, the proxy supplies the amounts for other healers in view\nand your own heals can't be shown. In that case cast-bar addons that\nread the combat log, other than JimsPlus, restart a healer's bar once,\na fraction of a second into the cast.\n\nA healer with no HealComm addon announces nothing, so nothing can be\nshown for them.\n\nOff by default. Takes effect immediately. Shortcut: /jp heals")
+-- One switch per kind of frame, four across.
+local HEAL_SOURCES = "\n\nWith a HealComm addon loaded (unit frame and heal addons carry the\nlibrary), the bars show your own heals and every heal other players'\naddons announce, in view or not.\n\nWithout one, the proxy supplies the amounts for other healers in view\nand your own heals can't be shown. In that case cast-bar addons that\nread the combat log, other than JimsPlus, restart a healer's bar once,\na fraction of a second into the cast.\n\nA healer with no HealComm addon announces nothing, so nothing can be\nshown for them.\n\nOff by default. Takes effect immediately. /jp heals turns all four on\nor off."
+local healKinds = {
+    { key = "raid",   label = "Raid frames",  tooltip = "Draws incoming heals on the default raid frames and raid-style party\nframes: your own heal first, then other healers'." },
+    { key = "party",  label = "Party frames", tooltip = "Draws incoming heals on the default party frames, raid-style or not:\nyour own heal first, then other healers'." },
+    { key = "player", label = "Player frame", tooltip = "Draws incoming heals on your own player frame: your own heal first,\nthen other healers'." },
+    { key = "target", label = "Target frame", tooltip = "Draws incoming heals on the target frame, for a target in your party\nor raid: your own heal first, then other healers'." },
+}
+local healCBs = {}
+for index, info in ipairs(healKinds) do
+    healCBs[info.key] = CreateCheckbox(root, y, info.label, info.tooltip .. HEAL_SOURCES, 16 + (index - 1) * 148)
+end
 y = y - 40
 
 ---------------------------------------------------------------------------
@@ -306,7 +321,9 @@ local function RefreshCheckboxes()
     end
 
     cbPerf:SetChecked((namespace.db and namespace.db.performanceMode) and true or false)
-    cbHealAmount:SetChecked((namespace.db and namespace.db.nativeHealAmount) and true or false)
+    for _, info in ipairs(healKinds) do
+        healCBs[info.key]:SetChecked(namespace:IsIncomingHealsOn(info.key))
+    end
     cbPetLock:SetChecked(JimsPlusCharDB and JimsPlusCharDB.petBarLock and true or false)
 end
 root:SetScript("OnShow", RefreshCheckboxes)
@@ -373,9 +390,12 @@ cbPetLock:SetScript("OnClick", function(self)
     namespace:SetPetBarLock(self:GetChecked() and true or false)
 end)
 
-cbHealAmount:SetScript("OnClick", function(self)
-    namespace:SetNativeHealAmount(self:GetChecked() and true or false)
-end)
+for _, info in ipairs(healKinds) do
+    local key = info.key
+    healCBs[key]:SetScript("OnClick", function(self)
+        namespace:SetIncomingHeals(key, self:GetChecked() and true or false)
+    end)
+end
 
 for _, info in ipairs(castbarUnits) do
     local key = info.key
@@ -417,7 +437,7 @@ SlashCmdList["JIMSPLUS"] = function(msg)
         return
     end
     if msg == "heals" then
-        namespace:SetNativeHealAmount(not namespace:IsNativeHealAmountOn())
+        namespace:ToggleAllIncomingHeals()
         RefreshCheckboxes()
         return
     end
