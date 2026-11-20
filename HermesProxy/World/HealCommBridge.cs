@@ -161,7 +161,7 @@ public sealed class HealCommBridge
     // spell ID — at most one synth cast per caster at a time, matching how
     // vanilla HealComm-1.0 itself models a caster's pending cast.
     //
-    // JimsProxy (announced heals), read from the 1.14.2 client: the incoming-heal entry is
+    // JimsProxy (announced heals): on the 1.14.2 client the incoming-heal entry is
     // recorded only when the caster's unit object exists on the client, and so is the combat
     // log line. A synthesized cast for a healer with no unit there (the usual out-of-range
     // case) is therefore dropped whole; that healer's heal reaches only LibHealComm-4.0 (the
@@ -809,8 +809,8 @@ public sealed class HealCommBridge
     // number (UnitGetIncomingHeals) has it for a healer in range.
     //
     // The client takes that number only from a cast-start packet, and the server's own start
-    // went out before the healer's addon announced the amount. Read from the 1.14.2 client:
-    // a second SMSG_SPELL_START with the same cast id runs the whole start again on the existing
+    // went out before the healer's addon announced the amount. On the 1.14.2 client a second
+    // SMSG_SPELL_START with the same cast id runs the whole start again on the existing
     // cast and records the prediction on it. For another unit's cast that costs one thing, a
     // second "begins to cast" combat log line: the client keeps no cast bar and fires no cast
     // event for other units on this setup, and the running visual is neither restarted nor

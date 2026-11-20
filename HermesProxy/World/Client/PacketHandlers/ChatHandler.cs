@@ -282,7 +282,7 @@ public partial class WorldClient
             // Skip for addon messages — those carry binary payloads that look nothing like
             // item links and must not be passed through the link parser.
             // JimsProxy (chronoboon-chat-link): the boon alias rewrite must only touch the echo of OUR OWN link — others' boon links must resolve to the sender's boon, not our alias.
-            bool selfMessage = sender != null && sender == GetSession().GameState.CurrentPlayerGuid;
+            bool selfMessage = !sender.IsEmpty() && sender == GetSession().GameState.CurrentPlayerGuid;
             text = ExpandVanillaItemLinkToModern(text, selfMessage);
         }
 
