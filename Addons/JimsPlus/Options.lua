@@ -174,8 +174,6 @@ end
 -- Main page: Client Fixes (two columns)
 ---------------------------------------------------------------------------
 local COLUMN_2 = 318
-local TAG_ALWAYS = "  |cFF888888(always on)|r"
-local TAG_RELOAD = "  |cFFFF6600(/reload)|r"
 
 local y = -56
 CreateSection(root, "Client Fixes", y)
@@ -184,14 +182,14 @@ CreateDescription(root, "Fixes for 1.14 client bugs that show up on a vanilla se
 y = y - 24
 
 local cbPetFix = CreateCheckbox(root, y,
-    "Pet UI crash fix" .. TAG_ALWAYS,
+    "Pet UI crash fix  |cFF888888(always on)|r",
     "Stops the Lua errors when you open the pet stats or stable window.\n\nA pet from a vanilla server has no player class, and the 1.14\nclient's pet code expects one.\n\nAlways on. Without it those windows throw errors.")
 cbPetFix:SetChecked(true)
 cbPetFix:Disable()
 cbPetFix.Text:SetTextColor(0.5, 0.5, 0.5)
 
 local cbTaxiFix = CreateCheckbox(root, y,
-    "Hide early-landing button" .. TAG_ALWAYS,
+    "Hide early-landing button  |cFF888888(always on)|r",
     "Hides the \"Stop at next flight path\" button during flights.\n\nA vanilla server has no early landing, so the button does nothing.\n\nAlways on.",
     COLUMN_2)
 cbTaxiFix:SetChecked(true)
@@ -200,23 +198,23 @@ cbTaxiFix.Text:SetTextColor(0.5, 0.5, 0.5)
 y = y - 28
 
 local cbTooltipFix = CreateCheckbox(root, y,
-    "Red text on gear you can't use" .. TAG_RELOAD,
+    "Off-class armor / weapon red text  |cFFFF6600(reload required)|r",
     "Turns the armor or weapon type red on item tooltips and vendor rows\nwhen you can't use the item, for example \"Mail\" on a rogue. It goes\nby the proficiencies you've trained.\n\nThe 1.14 client takes this from a built-in table the proxy can't\nchange, so the addon recolors the text itself.\n\nOff by default. Takes effect after /reload.")
+y = y - 28
 
 local cbMoonkinSound = CreateCheckbox(root, y,
-    "Moonkin Form sound  |cFF888888(druids)|r",
-    "Plays Moonkin Form's own transformation sound. Without this the\n1.14 client plays the Bear Form sound.\n\nDruids only. On by default. Takes effect after /reload.",
+    "Moonkin Form sound  |cFF888888(Druid only)|r",
+    "Plays Moonkin Form's own transformation sound. Without this the\n1.14 client plays the Bear Form sound.\n\nDruids only. On by default. Takes effect after /reload.")
+
+local cbApiCompat = CreateCheckbox(root, y,
+    "Modern addon API shims  |cFFFF6600(reload)|r",
+    "Adds newer addon APIs the 1.14.2 client lacks, so addons and\nWeakAuras written for later clients stop erroring: C_Container, the\nC_Spell range check, vehicle API stubs and a scroll-frame helper.\n\nIt only adds what's missing. Nothing the client already has is\nreplaced.\n\nBased on HermesCompat by techgeekpr (MIT).\n\nOff by default. Turn it on if an addon you use needs it.\nTakes effect after /reload.",
     COLUMN_2)
 y = y - 28
 
-local cbApiCompat = CreateCheckbox(root, y,
-    "Modern addon API shims" .. TAG_RELOAD,
-    "Adds newer addon APIs the 1.14.2 client lacks, so addons and\nWeakAuras written for later clients stop erroring: C_Container, the\nC_Spell range check, vehicle API stubs and a scroll-frame helper.\n\nIt only adds what's missing. Nothing the client already has is\nreplaced.\n\nBased on HermesCompat by techgeekpr (MIT).\n\nOff by default. Turn it on if an addon you use needs it.\nTakes effect after /reload.")
-
 local cbBowSheathe = CreateCheckbox(root, y,
-    "Keep 2H weapon on back with a bow",
-    "With a bow equipped, the 1.14 client drops your sheathed two-handed\nweapon and quiver from your back after combat. Guns and crossbows\naren't affected.\n\nYour character puts the bow away a few seconds after combat. If the\nclient sheathes first, the addon sheathes again and the models come\nback.\n\nOn by default. Takes effect immediately.",
-    COLUMN_2)
+    "Show 2H weapon on back with a bow",
+    "With a bow equipped, the 1.14 client drops your sheathed two-handed\nweapon and quiver from your back after combat. Guns and crossbows\naren't affected.\n\nYour character puts the bow away a few seconds after combat. If the\nclient sheathes first, the addon sheathes again and the models come\nback.\n\nOn by default. Takes effect immediately.")
 y = y - 40
 
 ---------------------------------------------------------------------------
@@ -241,7 +239,7 @@ CreateDescription(root, "For hunters and warlocks. The 1.14 client can't put a p
 y = y - 30
 
 local cbPetLock = CreateCheckbox(root, y,
-    "Lock pet command and stance buttons",
+    "Lock pet command & stance buttons",
     "Keeps Attack, Follow, Stay and the Aggressive, Defensive and Passive\nbuttons on the pet bar, and puts one back if a spell is dropped\nonto it.\n\nOff by default. Shortcut: /jp petlock")
 y = y - 32
 
@@ -261,7 +259,7 @@ btnBagAudit:SetScript("OnClick", KR_StartCleanup)
 y = y - 30
 
 local cbBagSort = CreateCheckbox(root, y,
-    "Custom sort order for Bagnon",
+    "Custom bag sort order  |cFF888888(Bagnon)|r",
     "Changes the order Bagnon's sort button uses: permanent items such as\nthe hearthstone first, then profession and gathering tools, quest\nitems, soulbound gear, other gear, consumables, everything else, and\njunk last.\n\nApplies to Bagnon's bank sort too. Off by default. Takes effect on\nthe next sort.")
 
 ---------------------------------------------------------------------------
@@ -275,7 +273,7 @@ local castbarUnits = {
     { key = "target",    label = "Target",     tooltip = "Shows what your target is casting." },
     { key = "nameplate", label = "Nameplates",  tooltip = "Shows a cast bar on each nameplate, so several casts are visible\nat once." },
     { key = "focus",     label = "Focus",       tooltip = "Shows what your focus is casting while you target something else." },
-    { key = "player",    label = "Player  |cFF888888(restyles the Blizzard bar)|r", tooltip = "Gives your own cast bar the JimsPlus look and corrects the icon on\ntradeskill casts.\n\nTurn it off to keep Blizzard's look, or if another addon styles your\ncast bar." },
+    { key = "player",    label = "Player  |cFF888888(reskins Blizzard bar)|r", tooltip = "Gives your own cast bar the JimsPlus look and corrects the icon on\ntradeskill casts.\n\nTurn it off to keep Blizzard's look, or if another addon styles your\ncast bar." },
     { key = "party",     label = "Party members", tooltip = "Shows a cast bar on each party member's frame, in groups of up to 5.\n\nFor a grouped healer you can't see, the bar shows the heal their\nHealComm addon announces: the spell's name when it is certain,\n\"Unknown Heal\" when it isn't." },
 }
 
@@ -287,7 +285,7 @@ end
 
 y = y - 8
 local cbPerf = CreateCheckbox(panelCast, y,
-    "Performance Mode  |cFFFFD100(turns cast bars off)|r",
+    "Performance Mode  |cFFFFD100(suspends cast bars)|r",
     "Stops all JimsPlus cast bars: nothing is drawn, no casts are tracked,\nand the proxy stops sending cast data. For crowded fights where the\nframe rate drops, such as battlegrounds and large pulls.\n\nEvery other JimsPlus fix stays on. Shortcut: /jp perf")
 
 ---------------------------------------------------------------------------
@@ -333,7 +331,7 @@ cbTooltipFix:SetScript("OnClick", function(self)
     if namespace.db then
         namespace.db.tooltipFix = enabled
     end
-    print("|cFF00FF00[JimsPlus]|r Red text on gear you can't use: " .. (enabled and "on" or "off") .. ". Takes effect after /reload.")
+    print("|cFF00FF00[JimsPlus]|r Off-class armor red text: " .. (enabled and "on" or "off") .. ". Takes effect after /reload.")
 end)
 
 cbMoonkinSound:SetScript("OnClick", function(self)
@@ -358,7 +356,7 @@ cbBowSheathe:SetScript("OnClick", function(self)
     if namespace.db then
         namespace.db.bowSheatheFix = enabled
     end
-    print("|cFF00FF00[JimsPlus]|r 2H weapon on back with a bow: " .. (enabled and "on" or "off") .. ".")
+    print("|cFF00FF00[JimsPlus]|r Bow 2H-sheathe fix: " .. (enabled and "on" or "off") .. ".")
 end)
 
 cbBagSort:SetScript("OnClick", function(self)
@@ -366,7 +364,7 @@ cbBagSort:SetScript("OnClick", function(self)
     if namespace.db then
         namespace.db.bagSortOrder = enabled
     end
-    print("|cFF00FF00[JimsPlus]|r Custom sort order for Bagnon: " .. (enabled and "on" or "off") .. ".")
+    print("|cFF00FF00[JimsPlus]|r Custom bag sort order: " .. (enabled and "on" or "off") .. ".")
 end)
 
 cbPerf:SetScript("OnClick", function(self)
