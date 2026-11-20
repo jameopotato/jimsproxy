@@ -1,34 +1,48 @@
 local ADDON_NAME, namespace = ...
 
--- JimsPlus incoming heals on raid frames (opt-in)
+-- JimsPlus incoming heals on the default raid frames (opt-in)
 --
--- Two halves, both needed:
+-- The 1.14.2 client's raid frames carry the textures for incoming-heal bars but nothing sizes
+-- or shows them, and the frames don't listen for UNIT_HEAL_PREDICTION. This file draws the
+-- bars: on Blizzard's raid frames and raid-style party frames, to the right of the health
+-- fill, the player's own heal first and other healers' after it, for the part that fits into
+-- the missing health.
 --
--- 1. The amount. A vanilla server never tells the client how much a heal will heal, so the
---    game's own incoming-heal number (UnitGetIncomingHeals) is empty for another player's heal.
---    With this on, the proxy adds the amount the healer's HealComm addon announced to that
+-- Where the amounts come from, best source first:
+--
+-- 1. LibHealComm-4.0, when an addon on this client has loaded it (unit frame and heal addons
+--    carry it). It knows the player's own heals and every heal another player's HealComm addon
+--    announced, whether that healer is in view or not. The proxy translates the 1.12 form of
+--    those announcements, so 1.12 healers are included.
+--
+-- 2. Without the library: the game's own number (UnitGetIncomingHeals). A vanilla server never
+--    fills it, so the proxy is asked to add the amount a healer's addon announced to that
 --    healer's cast, for healers in view. It sends the healer's cast start a second time to do
---    it, which puts a second "begins to cast" line in the combat log: JimsPlus cast bars know to
---    ignore it; other cast-bar addons that read the combat log restart that bar once.
+--    it, which puts a second "begins to cast" line in the combat log: JimsPlus cast bars know
+--    to ignore it; other cast-bar addons that read the combat log restart that bar once. The
+--    player's own heals have no amount in this mode.
 --
--- 2. The drawing. The 1.14.2 client's raid frames carry the textures for an incoming-heal bar
---    but nothing sizes or shows them, and the frames don't listen for UNIT_HEAL_PREDICTION. So
---    this file draws the bar: on Blizzard's raid frames and raid-style party frames, to the
---    right of the health fill, for the part of the heal that fits into the missing health.
+-- A healer who runs no HealComm addon announces nothing, so no source has an amount for them.
 --
--- Only other players' heals get an amount this way. The player's own heals have none.
---
--- Account-wide, off by default, and sent to the proxy at every loading screen because the
--- proxy's flag only lasts a session. Talks over the JP addon sideband (both ends ours).
+-- Account-wide, off by default. The proxy's flag only lasts a session, so the choice is sent
+-- at every loading screen. Talks over the JP addon sideband (both ends ours).
 
 local UnitGetIncomingHeals = UnitGetIncomingHeals
-local UnitHealth, UnitHealthMax = UnitHealth, UnitHealthMax
+local UnitHealth, UnitHealthMax, UnitGUID = UnitHealth, UnitHealthMax, UnitGUID
 local UnitExists, UnitIsDeadOrGhost, UnitIsUnit = UnitExists, UnitIsDeadOrGhost, UnitIsUnit
 
--- The raid frames' own health fill, tinted with the stock colour for another player's
--- incoming heal.
+-- The raid frames' own health fill, tinted with the stock colours for the player's and for
+-- another player's incoming heal.
 local BAR_TEXTURE = "Interface\\RaidFrame\\Raid-Bar-Hp-Fill"
-local BAR_R, BAR_G, BAR_B = 0.0, 0.631, 0.557
+local MY_R, MY_G, MY_B = 0.0, 0.827, 0.765
+local OTHER_R, OTHER_G, OTHER_B = 0.0, 0.631, 0.557
+
+-- LibHealComm-4.0's flag for heals with a cast: direct heals and channels, not HoT ticks.
+local CASTED_HEALS = 0x03
+local LIB_EVENTS = {
+    "HealComm_HealStarted", "HealComm_HealStopped", "HealComm_HealDelayed",
+    "HealComm_HealUpdated", "HealComm_ModifierChanged", "HealComm_GUIDDisappeared",
+}
 
 -- Blizzard names its raid and raid-style party frames this way; they are created on demand and
 -- reused, so the list is rebuilt on every roster change.
@@ -39,16 +53,27 @@ local FRAME_PATTERNS = {
 local RAID_GROUPS, GROUP_SIZE = 8, 5
 
 local frames = {}   -- array of the compact frames that exist right now
-local styled = setmetatable({}, { __mode = "k" }) -- [frame] = true once its bar has a texture
-local shown = setmetatable({}, { __mode = "k" })  -- [frame] = true while we show its bar
+local styled = setmetatable({}, { __mode = "k" }) -- [texture] = true once it has a fill
+local shown = setmetatable({}, { __mode = "k" })  -- [texture] = true while we show it
 local drawing = false
+local lib            -- LibHealComm-4.0, once an addon has loaded it
+local libOwner = {}  -- identity for the library's callbacks
+local playerGUID
+
+local function FindLibrary()
+    if not lib then
+        local stub = _G.LibStub
+        lib = stub and stub("LibHealComm-4.0", true) or nil
+    end
+    return lib
+end
 
 local function Scan()
     wipe(frames)
     for _, pattern in ipairs(FRAME_PATTERNS) do
         for i = 1, pattern[2] do
             local frame = _G[pattern[1]:format(i)]
-            if frame and frame.otherHealPrediction and frame.healthBar then
+            if frame and frame.myHealPrediction and frame.otherHealPrediction and frame.healthBar then
                 frames[#frames + 1] = frame
             end
         end
@@ -56,57 +81,85 @@ local function Scan()
     for group = 1, RAID_GROUPS do
         for member = 1, GROUP_SIZE do
             local frame = _G["CompactRaidGroup" .. group .. "Member" .. member]
-            if frame and frame.otherHealPrediction and frame.healthBar then
+            if frame and frame.myHealPrediction and frame.otherHealPrediction and frame.healthBar then
                 frames[#frames + 1] = frame
             end
         end
     end
 end
 
-local function HideBar(frame)
-    if shown[frame] then
-        frame.otherHealPrediction:Hide()
-        shown[frame] = nil
+local function HideBar(bar)
+    if shown[bar] then
+        bar:Hide()
+        shown[bar] = nil
     end
+end
+
+local function HideBars(frame)
+    HideBar(frame.myHealPrediction)
+    HideBar(frame.otherHealPrediction)
+end
+
+-- Puts `bar` to the right of `anchor`, `amount` health wide. Returns the bar, to stack the next on.
+local function PlaceBar(bar, anchor, amount, maxHealth, width, r, g, b)
+    if not styled[bar] then
+        bar:SetTexture(BAR_TEXTURE)
+        bar:SetVertexColor(r, g, b)
+        styled[bar] = true
+    end
+    bar:ClearAllPoints()
+    bar:SetPoint("TOPLEFT", anchor, "TOPRIGHT", 0, 0)
+    bar:SetPoint("BOTTOMLEFT", anchor, "BOTTOMRIGHT", 0, 0)
+    bar:SetWidth(amount / maxHealth * width)
+    bar:Show()
+    shown[bar] = true
+    return bar
+end
+
+-- The player's own incoming heal on `unit`, and everyone else's.
+local function Amounts(unit)
+    if lib then
+        local guid = UnitGUID(unit)
+        if not guid then return 0, 0 end
+        local modifier = lib:GetHealModifier(guid) or 1
+        local mine = playerGUID and lib:GetHealAmount(guid, CASTED_HEALS, nil, playerGUID) or 0
+        local others = lib:GetOthersHealAmount(guid, CASTED_HEALS) or 0
+        return mine * modifier, others * modifier
+    end
+    return 0, UnitGetIncomingHeals(unit) or 0
 end
 
 local function UpdateFrame(frame)
     local unit = frame.displayedUnit or frame.unit
     if not unit or not frame:IsShown() or not UnitExists(unit) or UnitIsDeadOrGhost(unit) then
-        return HideBar(frame)
+        return HideBars(frame)
     end
 
-    local incoming = UnitGetIncomingHeals(unit) or 0
     local maxHealth = UnitHealthMax(unit) or 0
-    if incoming <= 0 or maxHealth <= 0 then
-        return HideBar(frame)
+    local width = frame.healthBar:GetWidth() or 0
+    local fill = frame.healthBar:GetStatusBarTexture()
+    if maxHealth <= 0 or width <= 0 or not fill then
+        return HideBars(frame)
     end
 
     -- Only the part that fits: a raid frame has no room past full health.
-    local missing = maxHealth - (UnitHealth(unit) or 0)
-    if incoming > missing then incoming = missing end
-    local width = frame.healthBar:GetWidth() or 0
-    if incoming <= 0 or width <= 0 then
-        return HideBar(frame)
-    end
+    local room = maxHealth - (UnitHealth(unit) or 0)
+    local mine, others = Amounts(unit)
+    if mine > room then mine = room end
+    room = room - mine
+    if others > room then others = room end
 
-    local bar = frame.otherHealPrediction
-    if not styled[frame] then
-        bar:SetTexture(BAR_TEXTURE)
-        bar:SetVertexColor(BAR_R, BAR_G, BAR_B)
-        styled[frame] = true
+    local anchor = fill
+    if mine > 0 then
+        anchor = PlaceBar(frame.myHealPrediction, anchor, mine, maxHealth, width, MY_R, MY_G, MY_B)
+    else
+        HideBar(frame.myHealPrediction)
     end
-
-    local fill = frame.healthBar:GetStatusBarTexture()
-    if not fill then
-        return HideBar(frame)
+    if others > 0 then
+        PlaceBar(frame.otherHealPrediction, anchor, others, maxHealth, width, OTHER_R, OTHER_G, OTHER_B)
+    else
+        HideBar(frame.otherHealPrediction)
     end
-    bar:ClearAllPoints()
-    bar:SetPoint("TOPLEFT", fill, "TOPRIGHT", 0, 0)
-    bar:SetPoint("BOTTOMLEFT", fill, "BOTTOMRIGHT", 0, 0)
-    bar:SetWidth(incoming / maxHealth * width)
-    bar:Show()
-    shown[frame] = true
 end
 
 local function UpdateAll()
@@ -126,8 +179,11 @@ local function UpdateUnit(unit)
     end
 end
 
+local ListenToLibrary -- defined below
+
 local function Rescan()
     if not drawing then return end
+    ListenToLibrary()
     Scan()
     UpdateAll()
 end
@@ -148,6 +204,21 @@ drawFrame:SetScript("OnEvent", function(_, event, unit)
     end
 end)
 
+-- The library says a heal started, stopped or changed. It names the targets by GUID; the
+-- frames are few, so all of them are refreshed.
+local function OnLibraryEvent()
+    if drawing then UpdateAll() end
+end
+
+local listening = false
+function ListenToLibrary()
+    if listening or not FindLibrary() then return end
+    listening = true
+    for _, event in ipairs(LIB_EVENTS) do
+        pcall(lib.RegisterCallback, libOwner, event, OnLibraryEvent)
+    end
+end
+
 local function SetDrawing(on)
     on = on and true or false
     if on == drawing then
@@ -156,6 +227,7 @@ local function SetDrawing(on)
     end
     drawing = on
     if on then
+        playerGUID = UnitGUID("player")
         for _, event in ipairs(UNIT_EVENTS) do
             -- pcall: an event name this client does not know raises an error.
             pcall(drawFrame.RegisterEvent, drawFrame, event)
@@ -163,20 +235,30 @@ local function SetDrawing(on)
         for _, event in ipairs(ROSTER_EVENTS) do
             drawFrame:RegisterEvent(event)
         end
+        ListenToLibrary()
         Scan()
         UpdateAll()
     else
         drawFrame:UnregisterAllEvents()
+        if listening then
+            listening = false
+            for _, event in ipairs(LIB_EVENTS) do
+                pcall(lib.UnregisterCallback, libOwner, event)
+            end
+        end
         for i = 1, #frames do
-            HideBar(frames[i])
+            HideBars(frames[i])
         end
         wipe(frames)
     end
 end
 
+-- The proxy's amount is only needed when no library on this client has the heals already;
+-- asking for it then would cost other cast-bar addons a bar restart for nothing.
 local function Send(on)
     if C_ChatInfo and C_ChatInfo.SendAddonMessage then
-        C_ChatInfo.SendAddonMessage("JP", "H\tAMOUNT\t" .. (on and "1" or "0"), "WHISPER", UnitName("player"))
+        local wanted = on and not FindLibrary()
+        C_ChatInfo.SendAddonMessage("JP", "H\tAMOUNT\t" .. (wanted and "1" or "0"), "WHISPER", UnitName("player"))
     end
 end
 

@@ -225,7 +225,7 @@ y = y - 26
 
 local cbHealAmount = CreateCheckbox(root, y,
     "Show incoming heals on the default Blizzard raid frames",
-    "Draws an incoming-heal bar on Blizzard's raid frames and raid-style\nparty frames while another player is casting a heal on that unit.\n\nThe amount comes from the healer's HealComm addon and reaches you\nthrough the proxy, so it shows for healers in view who run one. Your\nown heals aren't included.\n\nUnit frame addons that read the game's incoming heals get the same\namounts. Addons that use HealComm already show these heals and\ndon't need this.\n\nSide effect: cast-bar addons that read the combat log, other than\nJimsPlus, restart a healer's bar once, a fraction of a second into\nthe cast.\n\nOff by default. Takes effect immediately. Shortcut: /jp heals")
+    "Draws incoming heals on the default raid frames and raid-style party\nframes: your own heal first, then other healers'.\n\nWith a HealComm addon loaded (unit frame and heal addons carry the\nlibrary), the bars show your own heals and every heal other players'\naddons announce, in view or not.\n\nWithout one, the proxy supplies the amounts for other healers in view\nand your own heals can't be shown. In that case cast-bar addons that\nread the combat log, other than JimsPlus, restart a healer's bar once,\na fraction of a second into the cast.\n\nA healer with no HealComm addon announces nothing, so nothing can be\nshown for them.\n\nOff by default. Takes effect immediately. Shortcut: /jp heals")
 y = y - 40
 
 ---------------------------------------------------------------------------
