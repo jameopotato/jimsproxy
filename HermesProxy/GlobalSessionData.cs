@@ -3610,6 +3610,38 @@ public sealed class GameSessionData
         }
     }
 
+    // JimsProxy (next-melee slot wedge, Lucifron Dominate Mind, 2026-11-18): the next-melee slot
+    // (CurrentClientNextMeleeCast) is cleared by the swing's SPELL_GO, by the same-spell CAST_FAILED,
+    // or by a session reset. Kronos normally ends an interrupted queued swing with SPELL_FAILURE
+    // followed within a few ms by CAST_FAILED, which clears the slot as before. A charm on the
+    // player (Molten Core, Flamewaker Protector Dominate Mind 20604) sends the SPELL_FAILURE alone:
+    // the slot stayed set, and HandleCastSpell then rejected every later Heroic Strike / Maul press
+    // with SpellInProgress ("Another action is in progress") until relog — 684 rejected Maul presses
+    // over 20 minutes in the reporter's capture. The client has already closed its own press on that
+    // SPELL_FAILURE. Mark the request instead of clearing it, so the normal failure pair keeps its
+    // exact shape (the trailing CAST_FAILED still resolves and clears the slot); a marked slot only
+    // stops counting as occupied for the next press.
+    public bool MarkNextMeleeServerFailure(uint spellId)
+    {
+        var slot = CurrentClientNextMeleeCast;
+        if (slot == null || slot.SpellId != spellId)
+            return false;
+        slot.ServerFailureSeen = true;
+        return true;
+    }
+
+    // Called by HandleCastSpell before its occupied-slot reject: if the server already ended the
+    // queued swing (marked above) and no CAST_FAILED came, the slot is stale — free it and return the
+    // released request so the caller can log it. Returns null when the slot is empty or still live.
+    public ClientCastRequest? TryReleaseServerFailedNextMeleeSlot()
+    {
+        var slot = CurrentClientNextMeleeCast;
+        if (slot == null || !slot.ServerFailureSeen)
+            return null;
+        CurrentClientNextMeleeCast = null;
+        return slot;
+    }
+
     /// <summary>
     /// JimsProxy reconnect-state-cleanup: drop all in-flight cast bookkeeping
     /// after an unplanned disconnect+reconnect. The legacy server forgets
@@ -4579,6 +4611,11 @@ public class ClientCastRequest
     public long HeldAtTickMs;
 
     public bool HasSentPrepare;
+
+    // JimsProxy (next-melee slot wedge, 2026-11-18): set on the request held in the next-melee
+    // slot when the server's SMSG_SPELL_FAILURE for that spell arrives, i.e. the server has
+    // dropped the queued swing. See GameSessionData.MarkNextMeleeServerFailure.
+    public bool ServerFailureSeen;
 
     // JimsProxy (stuck action button, RE round 15, 2026-09-08): true once a SpellPrepare
     // (client cast id -> server cast id) has gone to the client for this press, which is the

@@ -316,6 +316,23 @@ public partial class WorldSocket
             if (isAutoRepeat)
                 castRequest.HeldPacketForReplay = BuildCastSpellPacket(cast);
 
+            // JimsProxy (next-melee slot wedge, 2026-11-18): a slot whose queued swing the server
+            // already ended with SPELL_FAILURE, and whose CAST_FAILED never came (a charm such as
+            // Lucifron's Dominate Mind), is stale. Free it before the occupied-slot reject below so this
+            // press is forwarded, instead of every Heroic Strike / Maul press being rejected with
+            // SpellInProgress until relog. Ungated: it fires only on that edge.
+            if (!isAutoRepeat && GetSession().GameState.TryReleaseServerFailedNextMeleeSlot() is { } staleSlot)
+            {
+                Log.Event("cast.next_melee.slot_released_after_spell_failure", new
+                {
+                    released_spell_id = staleSlot.SpellId,
+                    released_client_cast_id = staleSlot.ClientGUID.ToString(),
+                    released_age_ms = Environment.TickCount - staleSlot.Timestamp,
+                    spell_id = cast.Cast.SpellID,
+                    client_cast_id = cast.Cast.CastID.ToString(),
+                });
+            }
+
             // Get the appropriate tracking variable based on spell type
             ref ClientCastRequest? currentCast = ref (isAutoRepeat
                 ? ref GetSession().GameState.CurrentClientAutoRepeatCast

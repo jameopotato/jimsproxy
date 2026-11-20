@@ -1434,6 +1434,11 @@ public partial class WorldClient
             // hardcode reason 0, the real reason follows in CAST_FAILED) — retract a deferred/
             // stashed form-exit START for this spell before the failure reaches the client.
             CancelFormExitDeferredCast(spellId, "spell_failure");
+
+            // JimsProxy (next-melee slot wedge): the server has dropped this queued swing. Mark the
+            // next-melee slot so a CAST_FAILED that never comes (charm) cannot leave it occupied;
+            // the normal trailing CAST_FAILED still clears it below. See MarkNextMeleeServerFailure.
+            GetSession().GameState.MarkNextMeleeServerFailure(spellId);
         }
 
         // Ranged auto-attack exception (mirrors the SPELL_START allowlist in

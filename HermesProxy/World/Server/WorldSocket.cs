@@ -129,6 +129,11 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         return socket;
     }
 
+    // Test seam (next-melee slot handler tests): observe every packet this socket sends the modern
+    // client, in emission order, instead of writing it to a socket (a CreateForTest socket has none).
+    // Same convention as WorldClient.ClientSendSpyForTest.
+    internal Action<ServerPacket>? ClientSendSpyForTest;
+
     public override void Accept()
     {
         string ip_address = GetRemoteIpAddress()!.ToString();
@@ -575,6 +580,12 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
     // C<P S: Sends data to modern client
     public void SendPacket(ServerPacket packet)
     {
+        if (ClientSendSpyForTest is { } spy)
+        {
+            spy(packet);
+            return;
+        }
+
         if (!IsOpen())
         {
             Log.PrintNet(LogType.Error, LogNetDir.P2C, $"Can't send {packet.GetUniversalOpcode()}, socket is closed!");
