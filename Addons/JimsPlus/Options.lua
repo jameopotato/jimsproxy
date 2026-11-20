@@ -222,11 +222,9 @@ y = y - 40
 ---------------------------------------------------------------------------
 CreateSection(root, "Incoming Heals", y)
 y = y - 26
-CreateDescription(root, "A vanilla server never says how much a heal will heal, and the 1.14 raid frames don't draw incoming heals. JimsPlus supplies both for other healers in view.", y)
-y = y - 30
 
 local cbHealAmount = CreateCheckbox(root, y,
-    "Show other healers' incoming heals on raid frames",
+    "Show incoming heals on the default Blizzard raid frames",
     "Draws an incoming-heal bar on Blizzard's raid frames and raid-style\nparty frames while another player is casting a heal on that unit.\n\nThe amount comes from the healer's HealComm addon and reaches you\nthrough the proxy, so it shows for healers in view who run one. Your\nown heals aren't included.\n\nUnit frame addons that read the game's incoming heals get the same\namounts. Addons that use HealComm already show these heals and\ndon't need this.\n\nSide effect: cast-bar addons that read the combat log, other than\nJimsPlus, restart a healer's bar once, a fraction of a second into\nthe cast.\n\nOff by default. Takes effect immediately. Shortcut: /jp heals")
 y = y - 40
 
